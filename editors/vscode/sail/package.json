@@ -1,17 +1,37 @@
 {
     "name": "sail",
     "displayName": "sail",
-    "description": "Syntax support for the Sail ISA specification language",
+    "description": "Language support for the Sail ISA specification language",
     "version": "0.0.4",
     "publisher": "rems-project",
     "icon": "images/sail_icon.png",
+    "license": "BSD-2-Clause",
+    "main": "./extension.js",
+    "scripts": {
+        "check": "node --check extension.js && node -e \"JSON.parse(require('fs').readFileSync('package.json','utf8'))\"",
+        "package": "vsce package",
+        "install-local": "code --install-extension sail-*.vsix"
+    },
     "repository": {
       "type": "git",
       "url": "https://github.com/rems-project/sail"
     },
     "engines": {
-        "vscode": "^1.42.0"
+        "vscode": "^1.82.0"
     },
+    "activationEvents": [
+        "onLanguage:sail",
+        "onCommand:sail.goToGeneratedC",
+        "onCommand:sail.showCName",
+        "onCommand:sail.showType",
+        "onCommand:sail.showDocumentation",
+        "onCommand:sail.checkCurrentFile",
+        "onCommand:sail.formatCurrentFile",
+        "onCommand:sail.chooseProjectFile",
+        "onCommand:sail.setProjectModules",
+        "onCommand:sail.restartLanguageServer",
+        "onTaskType:sail"
+    ],
     "categories": [
         "Programming Languages"
     ],
@@ -32,6 +52,9 @@
                 "extensions": [
                     ".sail"
                 ],
+                "filenames": [
+                    ".sail_project"
+                ],
                 "configuration": "./language-configuration.json"
             }
         ],
@@ -41,6 +64,161 @@
                 "scopeName": "source.sail",
                 "path": "./syntaxes/sail.tmLanguage.json"
             }
-        ]
+        ],
+        "snippets": [
+            {
+                "language": "sail",
+                "path": "./snippets/sail.json"
+            }
+        ],
+        "commands": [
+            {
+                "command": "sail.goToGeneratedC",
+                "title": "Sail: Go to Generated C"
+            },
+            {
+                "command": "sail.showCName",
+                "title": "Sail: Show Generated C Name"
+            },
+            {
+                "command": "sail.showType",
+                "title": "Sail: Show Type"
+            },
+            {
+                "command": "sail.showDocumentation",
+                "title": "Sail: Show Documentation"
+            },
+            {
+                "command": "sail.checkCurrentFile",
+                "title": "Sail: Check Current File"
+            },
+            {
+                "command": "sail.formatCurrentFile",
+                "title": "Sail: Format Current File"
+            },
+            {
+                "command": "sail.chooseProjectFile",
+                "title": "Sail: Choose Project File"
+            },
+            {
+                "command": "sail.setProjectModules",
+                "title": "Sail: Set Project Modules"
+            },
+            {
+                "command": "sail.restartLanguageServer",
+                "title": "Sail: Restart Language Server"
+            }
+        ],
+        "taskDefinitions": [
+            {
+                "type": "sail",
+                "required": [
+                    "task"
+                ],
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Sail task to run: checkFile, checkProject, or generateC."
+                    },
+                    "file": {
+                        "type": "string",
+                        "description": "Sail source file for checkFile or generateC tasks."
+                    },
+                    "projectFile": {
+                        "type": "string",
+                        "description": "Sail project file for checkProject tasks."
+                    },
+                    "projectModules": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Project modules for checkProject tasks."
+                    },
+                    "projectAllModules": {
+                        "type": "boolean",
+                        "description": "Pass -all_modules for checkProject tasks when no projectModules are set."
+                    },
+                    "emitLspMap": {
+                        "type": "boolean",
+                        "description": "Emit generated-C LSP sidecar and artifact manifest for generateC tasks."
+                    }
+                }
+            }
+        ],
+        "configuration": {
+            "title": "Sail",
+            "properties": {
+                "sail.lsp.path": {
+                    "type": "string",
+                    "default": "sail_lsp",
+                    "description": "Path to the sail_lsp executable."
+                },
+                "sail.lsp.args": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [
+                        "--stdio"
+                    ],
+                    "description": "Arguments passed to sail_lsp."
+                },
+                "sail.executablePath": {
+                    "type": "string",
+                    "default": "sail",
+                    "description": "Path to the Sail compiler executable used by diagnostics, formatting, and command-palette tasks."
+                },
+                "sail.projectFile": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Sail project file used for compiler-backed diagnostics and the check command."
+                },
+                "sail.projectModules": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "description": "Project modules to check when sail.projectFile is set. When empty, the extension checks all modules by default."
+                },
+                "sail.projectAllModules": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Pass -all_modules for project checks when sail.projectFile is set and sail.projectModules is empty."
+                },
+                "sail.diagnostics.enable": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Enable compiler-backed diagnostics on file open and save."
+                },
+                "sail.cOutput": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Generated C implementation file used for Sail-to-C navigation."
+                },
+                "sail.cMap": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Generated C sidecar JSON file emitted by --c-emit-lsp-map or --c-lsp-map."
+                },
+                "sail.docinfo": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Documentation info JSON file emitted by the Sail documentation backend."
+                },
+                "sail.artifactIndex": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Sail LSP artifact manifest, conventionally sail.lsp.json. Explicit cOutput, cMap, docinfo, and project settings take precedence."
+                }
+            }
+        }
+    },
+    "dependencies": {
+        "vscode-languageclient": "^9.0.1"
+    },
+    "devDependencies": {
+        "@vscode/vsce": "^3.0.0"
     }
 }

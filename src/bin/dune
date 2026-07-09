@@ -24,6 +24,13 @@
    (linenoise -> repl.enabled.ml)
    (-> repl.disabled.ml))))
 
+(executable
+ (name sail_lsp)
+ (modes native byte)
+ (public_name sail_lsp)
+ (package sail)
+ (libraries libsail yojson unix))
+
 ; For legacy reasons install all the Sail files in lib as part of this package
 
 (install

@@ -61,6 +61,10 @@ let opt_no_lib = ref false
 let opt_no_main = ref false
 let opt_no_mangle = ref false
 let opt_no_rts = ref false
+let opt_emit_lsp_map = ref false
+let opt_lsp_map = ref None
+let opt_emit_lsp_index = ref false
+let opt_lsp_index = ref None
 let opt_preserve_types = ref IdSet.empty
 let opt_specialize_c = ref false
 let opt_cpp_class_name = ref "Model"
@@ -81,6 +85,30 @@ let c_options =
     (Flag.create ~prefix:["c"] "no_mangle", Arg.Set opt_no_mangle, "produce readable names");
     (Flag.create ~prefix:["c"] "no_main", Arg.Set opt_no_main, "do not generate the main() function");
     (Flag.create ~prefix:["c"] "no_rts", Arg.Set opt_no_rts, "do not include the Sail runtime");
+    ( Flag.create ~prefix:["c"] "emit_lsp_map",
+      Arg.Set opt_emit_lsp_map,
+      "emit a JSON sidecar mapping Sail symbols to generated C/C++ symbols"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"file" "lsp_map",
+      Arg.String
+        (fun path ->
+          opt_emit_lsp_map := true;
+          opt_lsp_map := Some path
+        ),
+      "emit the Sail LSP generated-C navigation sidecar to the given file"
+    );
+    ( Flag.create ~prefix:["c"] "emit_lsp_index",
+      Arg.Set opt_emit_lsp_index,
+      "emit a Sail LSP artifact manifest for generated outputs"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"file" "lsp_index",
+      Arg.String
+        (fun path ->
+          opt_emit_lsp_index := true;
+          opt_lsp_index := Some path
+        ),
+      "emit the Sail LSP artifact manifest to the given file"
+    );
     ( Flag.create ~prefix:["c"] "no_lib",
       Arg.Tuple [Arg.Set opt_no_lib; Arg.Set opt_no_rts],
       "do not include the Sail runtime or library"
@@ -217,6 +245,118 @@ let collect_c_name_info ast (mode : c_backend_mode) =
     ast.defs;
   (!reserved, !overrides)
 
+type lsp_position = { line : int; character : int }
+
+type lsp_range = { start_pos : lsp_position; end_pos : lsp_position }
+
+let is_c_ident_char = function 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> true | _ -> false
+
+let identifier_at line name start =
+  let name_len = String.length name in
+  start + name_len <= String.length line
+  && String.sub line start name_len = name
+  && (start = 0 || not (is_c_ident_char line.[start - 1]))
+  && (start + name_len = String.length line || not (is_c_ident_char line.[start + name_len]))
+
+let find_identifier_in_line line name =
+  let name_len = String.length name in
+  let rec search i =
+    if i + name_len > String.length line then None else if identifier_at line name i then Some i else search (i + 1)
+  in
+  search 0
+
+let lines_of_text text =
+  String.split_on_char '\n' text
+  |> List.map (fun line ->
+      let len = String.length line in
+      if len > 0 && line.[len - 1] = '\r' then String.sub line 0 (len - 1) else line
+  )
+
+let find_symbol_range impl c_name =
+  let rec scan line_no = function
+    | [] -> None
+    | line :: rest -> (
+        match find_identifier_in_line line c_name with
+        | Some character ->
+            Some
+              {
+                start_pos = { line = line_no; character };
+                end_pos = { line = line_no; character = character + String.length c_name };
+              }
+        | None -> scan (line_no + 1) rest
+      )
+  in
+  scan 0 (lines_of_text impl)
+
+let lsp_position_json position = `Assoc [("line", `Int position.line); ("character", `Int position.character)]
+
+let lsp_range_json range =
+  `Assoc [("start", lsp_position_json range.start_pos); ("end", lsp_position_json range.end_pos)]
+
+let lsp_symbol_map_json (mode : c_backend_mode) c_file impl symbols =
+  let symbol_entry (entry : C_backend.c_symbol_map_entry) =
+    let range = find_symbol_range impl entry.c_name in
+    let fields =
+      [
+        ("sailName", `String entry.sail_name);
+        ("cName", `String entry.c_name);
+        ("kind", `String entry.kind);
+        ("generated", `Bool entry.generated);
+        ("rangeStatus", `String (match range with Some _ -> "resolved" | None -> "missing"));
+      ]
+    in
+    let fields = match range with Some range -> ("cRange", lsp_range_json range) :: fields | None -> fields in
+    `Assoc fields
+  in
+  `Assoc
+    [
+      ("schema", `String "sail.c.symbols");
+      ("version", `Int 2);
+      ("target", `String (string_of_mode mode));
+      ("language", `String (match mode with C -> "c" | Cpp -> "cpp"));
+      ("cFile", `String c_file);
+      ("symbols", `List (List.map symbol_entry symbols));
+    ]
+
+let write_lsp_symbol_map mode out_file impl symbols =
+  let c_file = out_file ^ "." ^ string_of_mode mode in
+  let map_file = Option.value !opt_lsp_map ~default:(c_file ^ ".symbols.json") in
+  let map_out = Util.open_output_with_check map_file in
+  Yojson.Safe.pretty_to_channel ~std:true map_out.channel (lsp_symbol_map_json mode c_file impl symbols);
+  output_char map_out.channel '\n';
+  flush map_out.channel;
+  Util.close_output_with_check map_out;
+  map_file
+
+let canonical_or_absolute_path path =
+  try Unix.realpath path
+  with Unix.Unix_error _ -> if Filename.is_relative path then Filename.concat (Sys.getcwd ()) path else path
+
+let lsp_artifact_index_json mode c_file map_file =
+  `Assoc
+    [
+      ("schema", `String "sail.lsp.artifacts");
+      ("version", `Int 1);
+      ("target", `String (string_of_mode mode));
+      ("language", `String (match mode with C -> "c" | Cpp -> "cpp"));
+      ( "artifacts",
+        `Assoc
+          [
+            ("cOutput", `String (canonical_or_absolute_path c_file));
+            ("cMap", `String (canonical_or_absolute_path map_file));
+          ]
+      );
+    ]
+
+let write_lsp_artifact_index mode out_file map_file =
+  let c_file = out_file ^ "." ^ string_of_mode mode in
+  let index_file = Option.value !opt_lsp_index ~default:(out_file ^ ".sail_lsp.json") in
+  let index_out = Util.open_output_with_check index_file in
+  Yojson.Safe.pretty_to_channel ~std:true index_out.channel (lsp_artifact_index_json mode c_file map_file);
+  output_char index_out.channel '\n';
+  flush index_out.channel;
+  Util.close_output_with_check index_out
+
 let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_sail_dir; _ } =
   let reserveds, overrides = collect_c_name_info ast mode in
 
@@ -251,7 +391,7 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
   let out_file = Option.value out_file ~default:"out" in
   let basename = Filename.basename out_file in
 
-  let header, impl = Codegen.compile_ast env effect_info basename ast in
+  let header, impl, symbol_map = Codegen.compile_ast env effect_info basename ast in
 
   let impl_out = Util.open_output_with_check (out_file ^ "." ^ string_of_mode mode) in
   output_string impl_out.channel impl;
@@ -262,6 +402,11 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
   output_string header_out.channel header;
   flush header_out.channel;
   Util.close_output_with_check header_out;
+
+  if !opt_emit_lsp_map || !opt_emit_lsp_index then (
+    let map_file = write_lsp_symbol_map mode out_file impl symbol_map in
+    write_lsp_artifact_index mode out_file map_file
+  );
 
   if !opt_build then (
     let sail_dir = Reporting.get_sail_dir default_sail_dir in

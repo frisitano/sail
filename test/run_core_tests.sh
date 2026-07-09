@@ -41,4 +41,10 @@ printf "==========================================\n"
 
 ./float/run_tests.py || returncode=1
 
+printf "\n==========================================\n"
+printf "LSP tests\n"
+printf "==========================================\n"
+
+./lsp/run_tests.py || returncode=1
+
 exit $returncode

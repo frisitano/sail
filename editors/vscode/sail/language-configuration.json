@@ -3,6 +3,7 @@
         "lineComment": "//",
         "blockComment": [ "/*", "*/" ]
     },
+    "wordPattern": "[A-Za-z_][A-Za-z0-9_'#]*|[$%&*+\\-./:<=>?@^|~!]+",
     "brackets": [
         ["{", "}"],
         ["[", "]"],
@@ -21,5 +22,15 @@
         ["(", ")"],
         ["\"", "\""],
         ["'", "'"]
-    ]
+    ],
+    "folding": {
+        "markers": {
+            "start": "^\\s*/\\*\\s*#region\\b.*\\*/",
+            "end": "^\\s*/\\*\\s*#endregion\\b.*\\*/"
+        }
+    },
+    "indentationRules": {
+        "increaseIndentPattern": "^\\s*(.*\\b(then|do|of|struct|union|enum|scattered|mapping|function)\\b.*|.*[\\{\\(\\[]\\s*)$",
+        "decreaseIndentPattern": "^\\s*(end|\\}|\\]|\\))\\b?.*$"
+    }
 }

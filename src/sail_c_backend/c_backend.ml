@@ -78,6 +78,8 @@ let optimize_alias = ref false
 let optimize_fixed_int = ref false
 let optimize_fixed_bits = ref false
 
+type c_symbol_map_entry = { sail_name : string; c_name : string; kind : string; generated : bool }
+
 let ngensym = symbol_generator ()
 
 let c_error ?loc:(l = Parse_ast.Unknown) message = raise (Reporting.err_general l ("\nC backend: " ^ message))
@@ -1068,6 +1070,26 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     if Config.no_mangle then str else !opt_prefix ^ String.sub str 1 (String.length str - 1)
 
   let codegen_function_id id = string (sgen_function_id id)
+
+  let c_symbol_map_entry ctx = function
+    | CDEF_aux (CDEF_fundef (id, _, _, _), _) when not (ctx_is_extern id ctx) ->
+        Some { sail_name = string_of_id id; c_name = sgen_function_id id; kind = "function"; generated = true }
+    | CDEF_aux (CDEF_val (id, _, _, _, Some c_name), _) ->
+        Some { sail_name = string_of_id id; c_name; kind = "extern"; generated = false }
+    | _ -> None
+
+  let deduplicate_symbol_map entries =
+    let seen = Hashtbl.create 64 in
+    List.filter
+      (fun entry ->
+        let key = (entry.sail_name, entry.c_name, entry.kind) in
+        if Hashtbl.mem seen key then false
+        else (
+          Hashtbl.add seen key ();
+          true
+        )
+      )
+      entries
 
   let rec sgen_ctyp = function
     | CT_unit -> "unit"
@@ -2666,6 +2688,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
          some value < 256 (100 seems reasonable). *)
       let cdefs = List.map (Jib_optimize.flatten_cdef ~max_depth:100) cdefs in
 
+      let symbol_map = List.filter_map (c_symbol_map_entry ctx) cdefs |> deduplicate_symbol_map in
+
       let docs = List.map (codegen_def ctx) cdefs |> List.concat in
 
       let docs = docs @ gen_model_init_fini ctx cdefs @ gen_unit_test_defs ctx cdefs in
@@ -2860,7 +2884,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           )
       in
 
-      (header, impl)
+      (header, impl, symbol_map)
     with Type_error.Type_error (l, err) ->
       c_error ~loc:l ("Unexpected type error when compiling to C:\n" ^ fst (Type_error.string_of_type_error err))
 end

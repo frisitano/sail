@@ -121,7 +121,8 @@ some Sail specifications and related tools.
 * Documentation for generating Isabelle and working with the ISA specs
   in Isabelle in [lib/isabelle/manual.pdf](lib/isabelle/manual.pdf)
 
-* Simple emacs and VSCode modes with syntax highlighting (in [editors/](editors/))
+* Editor modes for Emacs, VSCode, JetBrains IDEs, and Vim, including optional
+  `sail_lsp` integration for Emacs and VSCode (in [editors/](editors/))
 
 * A test suite for Sail (in [test/](test/))
 
@@ -140,13 +141,27 @@ Editor support
 
 **Emacs Mode**
 [editors/sail-mode.el](editors/sail-mode.el) contains an Emacs mode
-for the most recent version of Sail which provides some basic syntax
-highlighting.
+for the most recent version of Sail. It provides syntax highlighting,
+`.sail_project` highlighting, legacy interactive `sail -i -emacs`
+commands, and optional thin-client `sail_lsp` integration through either lsp-mode or
+Eglot. Use `M-x sail-lsp-enable` in a Sail buffer after installing/loading one
+of those clients, or set `sail-lsp-auto-start` to start the language server
+automatically. The Emacs LSP commands include generated-C navigation,
+generated-C name display, type display, and documentation display. Configure
+`sail-lsp-c-output`, `sail-lsp-c-map`, `sail-lsp-docinfo`,
+`sail-lsp-artifact-index`, `sail-lsp-project-file`,
+`sail-lsp-project-modules`, and `sail-lsp-diagnostics-enable` when explicit
+artifacts or project-backed diagnostics are needed.
 
 **VSCode Mode**
-[editors/vscode](editors/vscode) contains a Visual Studio Code mode
-which provides some basic syntax highlighting. It is also available
-on the VSCode Marketplace.
+[editors/vscode/sail](editors/vscode/sail) contains the primary packaged
+Visual Studio Code client for `sail_lsp`. In addition to syntax highlighting,
+it provides Sail source navigation, explicit generated-C navigation,
+documentation/type display, completions, document/workspace symbols,
+diagnostics, formatting, source/artifact file watching, project selection, and
+Sail task definitions. See [editors/vscode/sail/README.md](editors/vscode/sail/README.md)
+for setup and generated-C sidecar configuration. The extension is also
+available on the VSCode Marketplace.
 
 **CLion/PyCharm Syntax highlighting**
 [editors/vscode/sail](editors/vscode/sail) contains a Visual Studio Code
@@ -413,6 +428,3 @@ opinions, and/or findings contained in these articles OR presentations are
 those of the author(s)/presenter(s) and should not be interpreted as
 representing the official views or policies of the Department of
 Defense or the U.S. Government.
-
-
-

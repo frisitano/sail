@@ -1,0 +1,38 @@
+{
+  "functions": {
+    "foo": {
+      "comment": "Fixture function used by Sail LSP navigation tests.",
+      "type": "unit -> unit",
+      "docUrl": "https://example.invalid/sail-docs#foo",
+      "source": "function foo() = ()",
+      "location": {
+        "file": "defs.sail",
+        "loc": [
+          5,
+          0,
+          0,
+          5,
+          0,
+          19
+        ]
+      }
+    },
+    "call_foo": {
+      "comment": "Calls foo from another file.",
+      "type": "unit -> unit",
+      "docUrl": "https://example.invalid/sail-docs#call_foo",
+      "source": "function call_foo() = foo()",
+      "location": {
+        "file": "main.sail",
+        "loc": [
+          5,
+          0,
+          0,
+          5,
+          0,
+          27
+        ]
+      }
+    }
+  }
+}

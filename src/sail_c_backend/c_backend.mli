@@ -76,6 +76,8 @@ val optimize_alias : bool ref
 val optimize_fixed_int : bool ref
 val optimize_fixed_bits : bool ref
 
+type c_symbol_map_entry = { sail_name : string; c_name : string; kind : string; generated : bool }
+
 module type CODEGEN_CONFIG = sig
   (** A list of includes for the generated C file *)
   val includes : string list
@@ -123,5 +125,6 @@ end
 
 module Codegen (Config : CODEGEN_CONFIG) : sig
   val jib_of_ast : Env.t -> Effects.side_effect_info -> typed_ast -> cdef list * Jib_compile.ctx
-  val compile_ast : Env.t -> Effects.side_effect_info -> string -> typed_ast -> string * string
+  val compile_ast :
+    Env.t -> Effects.side_effect_info -> string -> typed_ast -> string * string * c_symbol_map_entry list
 end

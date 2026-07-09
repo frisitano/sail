@@ -1,0 +1,49 @@
+{
+    "Value specification": {
+        "prefix": "val",
+        "body": [
+            "val ${1:name} : ${2:type}"
+        ],
+        "description": "Declare a Sail value specification."
+    },
+    "Function": {
+        "prefix": "function",
+        "body": [
+            "val ${1:name} : ${2:type}",
+            "function ${1:name}(${3:args}) = {",
+            "  ${0:()};",
+            "}"
+        ],
+        "description": "Declare a Sail function with a value specification."
+    },
+    "Mapping": {
+        "prefix": "mapping",
+        "body": [
+            "mapping ${1:name} : ${2:left} <-> ${3:right} = {",
+            "  ${0}",
+            "}"
+        ],
+        "description": "Declare a Sail mapping."
+    },
+    "Register": {
+        "prefix": "register",
+        "body": [
+            "register ${1:name} : ${2:type}"
+        ],
+        "description": "Declare a Sail register."
+    },
+    "Type": {
+        "prefix": "type",
+        "body": [
+            "type ${1:name} = ${0:type}"
+        ],
+        "description": "Declare a Sail type."
+    },
+    "C extern value specification": {
+        "prefix": "cval",
+        "body": [
+            "val ${1:name} = { c: \"${2:c_name}\", _: \"${1:name}\" } : ${3:type}"
+        ],
+        "description": "Declare a Sail value specification with an explicit C backend name."
+    }
+}
