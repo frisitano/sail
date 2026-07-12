@@ -48,6 +48,7 @@ class Clause:
 
     text: str
     comment: Optional[str] = None
+    file: Optional[str] = None
     start: Optional[int] = None  # absolute character range when known
     end: Optional[int] = None
 
@@ -112,6 +113,7 @@ class Bundle:
         self._data = data
         self._embedding = data.get("embedding", "plain")
         self._path = path
+        self._intervals: Optional[dict[str, list[tuple[int, int, Definition]]]] = None
 
     @classmethod
     def load(cls, path: str | Path) -> "Bundle":
@@ -134,7 +136,13 @@ class Bundle:
             loc = source.get("loc")
             if isinstance(loc, list) and len(loc) == 6:
                 # loc = [line1, bol1, char1, line2, bol2, char2]
-                return Clause(text=self._decode(source["contents"]), comment=comment, start=loc[2], end=loc[5])
+                return Clause(
+                    text=self._decode(source["contents"]),
+                    comment=comment,
+                    file=source.get("file"),
+                    start=loc[2],
+                    end=loc[5],
+                )
             return Clause(text=self._decode(source["contents"]), comment=comment)
         raise BundleError(
             "Definition source is a location reference without contents; "
@@ -187,6 +195,28 @@ class Bundle:
                 return self._definition_from_entry(section_kind, label, identifier, entry)
         wanted = f"{kind} " if kind else ""
         raise BundleError(f"No {wanted}definition named {identifier!r} in docinfo bundle {self._path or ''}")
+
+    def definition_at(self, file: str, offset: int) -> Optional[Definition]:
+        """The definition whose source range contains (file, offset), if any.
+
+        Used to re-anchor references docinfo has no section for (e.g. a
+        union constructor resolves to the clause inside its owning type).
+        """
+        if self._intervals is None:
+            self._intervals = {}
+            for kind, identifier in self.identifiers():
+                try:
+                    definition = self.find(identifier, kind=kind)
+                except BundleError:
+                    continue
+                for clause in definition.clauses:
+                    if clause.file is not None and clause.start is not None and clause.end is not None:
+                        self._intervals.setdefault(clause.file, []).append((clause.start, clause.end, definition))
+        best = None
+        for start, end, definition in self._intervals.get(file, []):
+            if start <= offset < end and (best is None or end - start < best[0]):
+                best = (end - start, definition)
+        return best[1] if best else None
 
     def identifiers(self) -> Iterator[tuple[str, str]]:
         """Yield every (kind, identifier) pair in the bundle."""

@@ -55,6 +55,37 @@ Each rendered definition gets:
   whichever page renders the target definition. Unresolvable references
   degrade to plain text (`optional` autorefs), so partial sites build clean.
 
+## Optional: semantic highlighting and full identifier links via sail-lsp
+
+The docinfo bundle only records *function call* and *register use* sites.
+With a [Sail language server](https://github.com/rems-project) available,
+the bundled `sail-lsp-index` tool captures semantic tokens
+(`textDocument/semanticTokens/full`) and the server's `sail/sourceMap`
+reference graph into one JSON index:
+
+```sh
+# run from the project root so paths match the docinfo bundle
+sail-lsp-index --binary sail_lsp --root . --output doc/lsp-index.json
+```
+
+```yaml
+handlers:
+  sail:
+    bundle: doc/doc.json
+    lsp_index: doc/lsp-index.json   # optional
+```
+
+With the index configured, rendered source gains:
+
+- **semantic highlighting** (functions, types, registers, enum members
+  classified by the compiler rather than by regex), falling back to the
+  lexical lexer for files the index doesn't cover;
+- **links on every resolved identifier** — type references, constructor
+  uses (anchored at their owning union/enum), mappings, and top-level lets,
+  in addition to docinfo's call/register links. docinfo's compiler-proven
+  links always take precedence where spans overlap; `sourceMap` references
+  are name-based, so heavily overloaded names may need care.
+
 ## Options
 
 Global (under `handlers.sail.options`) or per-directive:

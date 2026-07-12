@@ -21,5 +21,8 @@ dependencies = [
 [project.entry-points."pygments.lexers"]
 sail = "mkdocstrings_handlers.sail._lexer:SailLexer"
 
+[project.scripts]
+sail-lsp-index = "mkdocstrings_handlers.sail._lsp:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["mkdocstrings_handlers"]

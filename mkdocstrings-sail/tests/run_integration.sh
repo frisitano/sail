@@ -47,4 +47,27 @@ if grep -qF '<autoref' "$site_src/site/index.html"; then
 fi
 echo "ok: no unresolved autorefs"
 
+# Second pass with a sail-lsp semantic index, when the binary is available
+lsp_binary="${SAIL_LSP:-$(command -v sail_lsp || true)}"
+if [ -n "$lsp_binary" ]; then
+    echo "== generating sail-lsp index"
+    (cd "$fixture" && uv run --with-editable "$pkg_dir" sail-lsp-index \
+        --binary "$lsp_binary" --root . --output "$site_src/doc/lsp-index.json")
+    echo "== building site with lsp index"
+    (cd "$site_src" && uv run --with-editable "$pkg_dir" --with mkdocs-material \
+        mkdocs build --strict -f mkdocs-lsp.yml -d site-lsp)
+    check_lsp() {
+        if ! grep -qF "$2" "$site_src/site-lsp/$1"; then
+            echo "FAIL: $3 — pattern not found in $1: $2"
+            exit 1
+        fi
+        echo "ok: $3"
+    }
+    check_lsp definitions/index.html 'href="#type-word"' "type reference links via lsp index"
+    check_lsp index.html 'class="nf"' "semantic token classes from lsp index"
+    check_lsp definitions/index.html 'href="#mapping-flag_bit"' "docinfo links still win with lsp index"
+else
+    echo "sail_lsp not found, skipping lsp index pass (set SAIL_LSP to enable)"
+fi
+
 echo "PASS: mkdocstrings-sail integration"

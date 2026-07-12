@@ -12,6 +12,8 @@ import unittest
 
 from mkdocstrings_handlers.sail import Bundle, BundleError, anchor_for
 from mkdocstrings_handlers.sail._handler import _highlight_linked
+from mkdocstrings_handlers.sail._index import LspIndex
+from mkdocstrings_handlers.sail._lsp import decode_semantic_tokens
 
 # Shaped exactly like sail --doc --doc-format identity --doc-embed plain
 # --doc-embed-with-location output (loc = [line1, bol1, char1, line2, bol2, char2]).
@@ -158,6 +160,72 @@ class TestHighlightLinked(unittest.TestCase):
         html = _highlight_linked('let s = "a <b> & c"', [])
         self.assertNotIn("<b>", html)
         self.assertIn("&lt;b&gt;", html)
+
+    def test_explicit_semantic_tokens_override_lexer(self):
+        html = _highlight_linked("foo bar", [(4, 7, "type-bar")], tokens=[(0, 3, "nf"), (4, 7, "kt")])
+        self.assertIn('<span class="nf">foo</span>', html)
+        self.assertIn('<autoref identifier="type-bar" optional><span class="kt">bar</span></autoref>', html)
+
+
+# 'legend' matching sail-lsp indices; tokens/references use absolute offsets
+INDEX = {
+    "version": 1,
+    "legend": ["type", "function", "keyword"],
+    "files": {
+        "spec/core/machine.sail": {
+            # covering "register PC : word" starting at offset 28
+            "tokens": [[28, 36, 2], [37, 39, 1], [42, 46, 0]],
+        }
+    },
+    "references": [
+        {
+            "name": "word",
+            "kind": "type",
+            "file": "spec/core/machine.sail",
+            "start": 42,
+            "end": 46,
+            "targetFile": "spec/lib/util.sail",
+            "targetStart": 74,
+        },
+        {
+            "name": "ADD",
+            "kind": "constructor",
+            "file": "spec/core/machine.sail",
+            "start": 150,
+            "end": 153,
+            "targetFile": "spec/lib/util.sail",
+            "targetStart": 80,
+        },
+    ],
+}
+
+
+class TestLspIndex(unittest.TestCase):
+    def setUp(self):
+        self.index = LspIndex(dict(INDEX))
+
+    def test_decode_semantic_tokens(self):
+        text = "function step() = {\n    PC = increment(PC)\n}"
+        # [deltaLine, deltaStartChar, length, type, modifiers]
+        tokens = decode_semantic_tokens([0, 0, 8, 2, 0, 1, 4, 2, 1, 0], text)
+        self.assertEqual(tokens, [[0, 8, 2], [24, 26, 1]])
+        self.assertEqual(text[24:26], "PC")
+
+    def test_tokens_within_clips_and_maps_classes(self):
+        tokens = self.index.tokens_within("spec/core/machine.sail", 28, 46)
+        self.assertEqual(tokens, [(0, 8, "k"), (9, 11, "nf"), (14, 18, "kt")])
+
+    def test_references_within_are_clause_relative(self):
+        refs = self.index.references_within("spec/core/machine.sail", 28, 46)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual((refs[0].start, refs[0].end, refs[0].name), (14, 18, "word"))
+
+    def test_definition_at_finds_containing_type(self):
+        bundle = Bundle(dict(BUNDLE))
+        owner = bundle.definition_at("spec/lib/util.sail", 80)
+        self.assertIsNotNone(owner)
+        self.assertEqual(owner.anchor, "type-word")
+        self.assertIsNone(bundle.definition_at("spec/lib/util.sail", 5000))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ site — cross-page, with no path computation here.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, ClassVar, Mapping, Optional
 
@@ -17,7 +18,8 @@ from markupsafe import Markup, escape
 from mkdocstrings import BaseHandler, CollectionError, get_logger
 from pygments.token import STANDARD_TYPES, Text as TextToken
 
-from ._bundle import Bundle, BundleError, Definition
+from ._bundle import Bundle, BundleError, Clause, Definition
+from ._index import IndexReference, LspIndex
 from ._lexer import SailLexer
 
 logger = get_logger(__name__)
@@ -41,45 +43,58 @@ def _token_class(ttype) -> str:
     return ""
 
 
-def _highlight_linked(text: str, links: list[tuple[int, int, str]]) -> str:
-    """Highlight Sail source, wrapping link spans in <autoref> elements.
+def _lexical_tokens(text: str) -> list[tuple[int, int, str]]:
+    """Fallback highlight segments from the bundled regex lexer."""
+    tokens = []
+    for pos, ttype, value in SailLexer().get_tokens_unprocessed(text):
+        cls = _token_class(ttype) if ttype is not TextToken else ""
+        tokens.append((pos, pos + len(value), cls))
+    return tokens
+
+
+def _highlight_linked(
+    text: str, links: list[tuple[int, int, str]], tokens: list[tuple[int, int, str]] | None = None
+) -> str:
+    """Render source as HTML, wrapping link spans in <autoref> elements.
 
     ``links`` are non-overlapping (relative start, relative end, anchor)
-    triples. Tokens are split at link boundaries so anchors and highlight
-    spans nest cleanly.
+    triples; ``tokens`` are non-overlapping (start, end, css class)
+    highlight segments (semantic when a sail-lsp index is configured,
+    lexical otherwise). Segments are split at every boundary so anchors and
+    highlight spans nest cleanly.
     """
-    bounds = sorted({b for start, end, _ in links for b in (start, end)})
-    anchors = {start: (end, anchor) for start, end, anchor in links}
+    if tokens is None:
+        tokens = _lexical_tokens(text)
+    links = sorted(links)
+    tokens = sorted(tokens)
+
+    bounds = {0, len(text)}
+    for start, end, _ in links:
+        bounds.update((start, end))
+    for start, end, _ in tokens:
+        bounds.update((start, end))
+    points = sorted(p for p in bounds if 0 <= p <= len(text))
 
     out = []
     open_until = None
-
-    def emit(pos: int, ttype, value: str) -> None:
-        nonlocal open_until
-        if open_until is not None and pos >= open_until:
+    link_i = 0
+    token_i = 0
+    for a, b in zip(points, points[1:]):
+        if open_until is not None and a >= open_until:
             out.append("</autoref>")
             open_until = None
-        if pos in anchors and open_until is None:
-            end, anchor = anchors[pos]
-            out.append(f'<autoref identifier="{escape(anchor)}" optional>')
-            open_until = end
-        cls = _token_class(ttype) if ttype is not TextToken else ""
-        if cls:
-            out.append(f'<span class="{cls}">{escape(value)}</span>')
-        else:
-            out.append(str(escape(value)))
-
-    for pos, ttype, value in SailLexer().get_tokens_unprocessed(text):
-        # split the token at any link boundary that falls inside it
-        offset = pos
-        remaining = value
-        for bound in bounds:
-            if offset < bound < offset + len(remaining):
-                head, remaining = remaining[: bound - offset], remaining[bound - offset :]
-                emit(offset, ttype, head)
-                offset = bound
-        if remaining:
-            emit(offset, ttype, remaining)
+        while link_i < len(links) and links[link_i][1] <= a:
+            link_i += 1
+        if open_until is None and link_i < len(links) and links[link_i][0] == a:
+            out.append(f'<autoref identifier="{escape(links[link_i][2])}" optional>')
+            open_until = links[link_i][1]
+        while token_i < len(tokens) and tokens[token_i][1] <= a:
+            token_i += 1
+        cls = ""
+        if token_i < len(tokens) and tokens[token_i][0] <= a < tokens[token_i][1]:
+            cls = tokens[token_i][2]
+        segment = escape(text[a:b])
+        out.append(f'<span class="{cls}">{segment}</span>' if cls else str(segment))
     if open_until is not None:
         out.append("</autoref>")
     return "".join(out)
@@ -105,6 +120,9 @@ class SailHandler(BaseHandler):
             raise CollectionError("The Sail handler needs a 'bundle' path (sail --doc output) in its configuration")
         self._bundle_path = Path(base_dir, bundle)
         self._bundle: Optional[Bundle] = None
+        lsp_index = config.get("lsp_index")
+        self._lsp_index_path = Path(base_dir, lsp_index) if lsp_index else None
+        self._lsp_index: Optional[LspIndex] = None
         self._global_options: Mapping[str, Any] = config.get("options", {})
 
     @property
@@ -115,6 +133,64 @@ class SailHandler(BaseHandler):
             except BundleError as error:
                 raise CollectionError(str(error)) from error
         return self._bundle
+
+    @property
+    def lsp_index(self) -> Optional[LspIndex]:
+        if self._lsp_index is None and self._lsp_index_path is not None:
+            try:
+                self._lsp_index = LspIndex.load(self._lsp_index_path)
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                raise CollectionError(f"Cannot load sail-lsp index {self._lsp_index_path}: {error}") from error
+        return self._lsp_index
+
+    # sail/sourceMap kinds -> docinfo bundle kinds for direct anchor lookup
+    _REF_KINDS = {
+        "type": "type",
+        "union": "type",
+        "struct": "type",
+        "enum": "type",
+        "register": "register",
+        "mapping": "mapping",
+        "let": "let",
+        "constant": "let",
+    }
+
+    def _anchor_for_reference(self, ref: IndexReference) -> Optional[str]:
+        if ref.kind in ("function", "val"):
+            try:
+                return self.bundle.find(ref.name).anchor
+            except BundleError:
+                return None
+        mapped = self._REF_KINDS.get(ref.kind)
+        if mapped is not None:
+            try:
+                return self.bundle.find(ref.name, kind=mapped).anchor
+            except BundleError:
+                pass
+        # constructors, enum members, and anything else docinfo has no
+        # section for: anchor at whichever definition contains the target
+        owner = self.bundle.definition_at(ref.target_file, ref.target_start)
+        return owner.anchor if owner else None
+
+    def _clause_links(self, data: Definition, clause: Clause) -> list[tuple[int, int, str]]:
+        links = clause.links_within(data.links)
+        index = self.lsp_index
+        if index is not None and clause.file is not None and clause.start is not None and index.has_file(clause.file):
+            for ref in index.references_within(clause.file, clause.start, clause.end):
+                if any(ref.start < end and ref.end > start for start, end, _ in links):
+                    continue  # docinfo's compiler-proven links win
+                anchor = self._anchor_for_reference(ref)
+                if anchor is not None:
+                    links.append((ref.start, ref.end, anchor))
+        return sorted(links)
+
+    def _clause_tokens(self, clause: Clause) -> Optional[list[tuple[int, int, str]]]:
+        index = self.lsp_index
+        if index is not None and clause.file is not None and clause.start is not None and index.has_file(clause.file):
+            tokens = index.tokens_within(clause.file, clause.start, clause.end)
+            if tokens:
+                return tokens
+        return None  # fall back to the regex lexer
 
     def get_options(self, local_options: Mapping[str, Any]) -> Mapping[str, Any]:
         unknown = set(local_options) - set(_DEFAULT_OPTIONS)
@@ -162,8 +238,8 @@ class SailHandler(BaseHandler):
             parts.append(str(self.do_convert_markdown(data.comment.strip(), heading_level + 1)))
         if options["show_source"]:
             for clause in data.clauses:
-                links = clause.links_within(data.links) if options["link_code"] else []
-                code = _highlight_linked(clause.text, links)
+                links = self._clause_links(data, clause) if options["link_code"] else []
+                code = _highlight_linked(clause.text, links, tokens=self._clause_tokens(clause))
                 parts.append(f'<div class="sail-source language-sail highlight"><pre><code>{code}</code></pre></div>')
         parts.append("</div>")
         return "".join(parts)
