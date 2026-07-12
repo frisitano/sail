@@ -160,18 +160,33 @@ once. mike stores each version in its own subdirectory of `gh-pages` with a
 every deployed variant side by side. CI runs bundle generation + `mike
 deploy` per published branch, using the branch name as the version name.
 
-## Generating a full reference book
+## Literate Sail: generating the whole book from sources
 
-`examples/gen_reference.py` generates one reference page per project source
-file (a `::: name` directive per definition, in source order, skipping ids
-already rendered by hand-authored pages) plus a nav tree and `mkdocs.yml`.
-Combined with authored chapters it produces a complete, fully cross-linked
-spec book:
+`sail-book-gen` generates the complete book directly from the Sail sources,
+so no intermediary Markdown files are needed. Prose lives in the sources at
+three levels:
+
+- ``/*md ... */`` — Markdown prose blocks. Ordinary Sail comments (invisible
+  to the compiler, preserved by `sail --fmt`), interleaved with definitions
+  by source position: a block at the top of a file starting with a
+  `# Title` heading is the module doc (and names the page in the nav);
+  `## Section` blocks between definitions open sections; heading level and
+  position express the whole hierarchy with one construct.
+- `/*! ... */` — definition-level doc comments, rendered under the
+  definition's heading (and summarized into hover tooltips).
+- Ordinary `/* ... */` comments stay code-only: visible in source fences
+  when inside a definition's span, otherwise omitted.
 
 ```sh
-files=$(sail --project model.sail_project --list-files core)
-uv run --with-editable . python examples/gen_reference.py path/to/book "$files"
+sail-book-gen --root . --project model.sail_project --module core \
+              --book book --site-name "My Spec"
 ```
+
+emits one page per source file under `book/docs/reference/` (`/*md` blocks
+and `::: name` directives in source order), a nav tree mirroring the source
+layout in compilation order, and `mkdocs.yml` (`--no-config` to keep yours).
+Hand-authored pages under `book/docs/` still work: identifiers they render
+are skipped in the generated pages.
 
 ## Development
 

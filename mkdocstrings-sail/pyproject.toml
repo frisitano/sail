@@ -23,6 +23,7 @@ sail = "mkdocstrings_handlers.sail._lexer:SailLexer"
 
 [project.scripts]
 sail-lsp-index = "mkdocstrings_handlers.sail._lsp:main"
+sail-book-gen = "mkdocstrings_handlers.sail._book:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mkdocstrings_handlers"]

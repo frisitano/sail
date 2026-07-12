@@ -11,6 +11,7 @@ from __future__ import annotations
 import unittest
 
 from mkdocstrings_handlers.sail import Bundle, BundleError, anchor_for
+from mkdocstrings_handlers.sail._book import markdown_blocks, page_items, render_page
 from mkdocstrings_handlers.sail._handler import _comment_summary, _highlight_linked
 from mkdocstrings_handlers.sail._index import LspIndex
 from mkdocstrings_handlers.sail._lsp import decode_semantic_tokens
@@ -247,6 +248,71 @@ class TestLspIndex(unittest.TestCase):
         self.assertIsNotNone(owner)
         self.assertEqual(owner.anchor, "type-word")
         self.assertIsNone(bundle.definition_at("spec/lib/util.sail", 5000))
+
+
+SOURCE = """/*md
+# Machine
+
+The machine module.
+*/
+
+/*! The program counter. */
+register PC : word
+
+/*md
+## Stepping /* nested comment */ works
+*/
+
+val step : unit -> unit
+
+function step() = ()
+"""
+
+
+class TestBook(unittest.TestCase):
+    def test_markdown_blocks_positions_and_nesting(self):
+        blocks = markdown_blocks(SOURCE)
+        self.assertEqual(len(blocks), 2)
+        self.assertTrue(blocks[0][1].startswith("# Machine"))
+        self.assertIn("/* nested comment */ works", blocks[1][1])
+        self.assertNotIn("*/", blocks[1][1].split("works")[1])
+
+    def test_marker_requires_whitespace(self):
+        self.assertEqual(markdown_blocks("/*mdx not a block */"), [])
+
+    def test_page_interleaves_prose_and_definitions(self):
+        # register at SOURCE offset of "register PC", function after section block
+        reg_at = SOURCE.index("register PC")
+        fn_at = SOURCE.index("function step")
+        bundle = Bundle(
+            {
+                "version": 1,
+                "embedding": "plain",
+                "registers": {
+                    "PC": {
+                        "register": {
+                            "source": {"contents": "register PC : word", "file": "m.sail", "loc": [0, 0, reg_at, 0, 0, reg_at + 18]},
+                            "comment": " The program counter. ",
+                        }
+                    }
+                },
+                "functions": {
+                    "step": {
+                        "function": {
+                            "source": {"contents": "function step() = ()", "file": "m.sail", "loc": [0, 0, fn_at, 0, 0, fn_at + 20]}
+                        }
+                    }
+                },
+            }
+        )
+        items = page_items(bundle, "m.sail", SOURCE, excluded=set())
+        self.assertEqual([item[0] for item in items], ["md", "def", "md", "def"])
+        title, markdown = render_page("m.sail", items)
+        self.assertEqual(title, "Machine")
+        self.assertLess(markdown.index("# Machine"), markdown.index("::: PC"))
+        self.assertLess(markdown.index("::: PC"), markdown.index("## Stepping"))
+        self.assertLess(markdown.index("## Stepping"), markdown.index("::: step"))
+        self.assertIn("kind: register", markdown)
 
 
 if __name__ == "__main__":
