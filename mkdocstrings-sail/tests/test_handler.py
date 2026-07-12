@@ -12,7 +12,13 @@ import unittest
 
 from mkdocstrings_handlers.sail import Bundle, BundleError, anchor_for
 from mkdocstrings_handlers.sail._book import markdown_blocks, page_items, render_page
-from mkdocstrings_handlers.sail._handler import _comment_summary, _highlight_linked
+from mkdocstrings_handlers.sail._handler import (
+    _body_preview,
+    _byte_to_str_spans,
+    _comment_summary,
+    _highlight_linked,
+)
+from mkdocstrings_handlers.sail._lsp import _LineIndex
 from mkdocstrings_handlers.sail._index import LspIndex
 from mkdocstrings_handlers.sail._lsp import decode_semantic_tokens
 
@@ -174,6 +180,21 @@ class TestHighlightLinked(unittest.TestCase):
             html,
         )
 
+    def test_body_preview_truncates(self):
+        step = Bundle(dict(BUNDLE)).find("step")
+        preview = _body_preview(step)
+        self.assertTrue(preview.startswith("function step()"))
+        long = Bundle(
+            {
+                "version": 1,
+                "functions": {"f": {"function": {"source": "function f() = {\n" + "    x;\n" * 20 + "}"}}},
+            }
+        ).find("f")
+        preview = _body_preview(long)
+        self.assertEqual(len(preview.splitlines()), 9)  # 8 lines + ellipsis
+        self.assertTrue(preview.endswith("…"))
+        self.assertIsNone(_body_preview(None))
+
     def test_comment_summary_first_sentence_plain_text(self):
         self.assertEqual(
             _comment_summary(" Increment a `word` by one. Wraps on overflow. "),
@@ -241,6 +262,21 @@ class TestLspIndex(unittest.TestCase):
         self.assertEqual(self.index.signature("type", "word"), "bits(8)")
         self.assertEqual(self.index.signature("function", "increment"), "word -> word")
         self.assertIsNone(self.index.signature("function", "unknown"))
+
+    def test_lsp_positions_map_to_byte_offsets(self):
+        # an em dash (3 bytes, 1 codepoint, 1 utf-16 unit) before the code
+        text = "/*md — dash */\nregister PC : word\n"
+        index = _LineIndex(text)
+        offset = index.offset(1, 9)  # start of "PC"
+        self.assertEqual(text.encode("utf-8")[offset : offset + 2], b"PC")
+
+    def test_byte_spans_convert_to_str_indices(self):
+        text = "/* — */ PC"
+        (span,) = _byte_to_str_spans(text, [(10, 12, "register-PC")])
+        self.assertEqual(text[span[0] : span[1]], "PC")
+        self.assertEqual(span[2], "register-PC")
+        # ascii fast path is identity
+        self.assertEqual(_byte_to_str_spans("PC = 1", [(0, 2, "x")]), [(0, 2, "x")])
 
     def test_definition_at_finds_containing_type(self):
         bundle = Bundle(dict(BUNDLE))

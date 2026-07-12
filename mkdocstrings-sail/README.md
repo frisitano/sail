@@ -96,7 +96,10 @@ With the index configured, rendered source gains:
 - **hover tooltips**: linked identifiers carry a `title` composed of the
   target's type signature (from `sourceMap`) and the first sentence of its
   doc comment (from the bundle), e.g. `word -> word — Increment a word by
-  one.`; definition headings carry their signature. Browsers show these
+  one.`, followed by a truncated source preview of the target's body
+  (`hover_previews: false` to disable) — the same content the Sail LSP
+  shows on editor hover, sourced from the bundle. Definition headings
+  carry their signature. Browsers show these
   natively; add `content.tooltips` under `theme.features` for styled
   Material tooltips, and disable autorefs' own link titles so they don't
   compete:
@@ -122,6 +125,7 @@ Global (under `handlers.sail.options`) or per-directive:
 | `show_comment` | `true` | Render the doc comment |
 | `show_source` | `true` | Render the definition source |
 | `link_code` | `true` | Wrap use sites in the source with cross-reference links |
+| `hover_previews` | `true` | Append a truncated body preview of the target to link tooltips |
 | `toc_label` | identifier | Label in the page table of contents |
 
 Per-directive options nest under an `options:` key (mkdocstrings syntax):

@@ -30,8 +30,12 @@ _DEFAULT_OPTIONS: dict[str, Any] = {
     "show_comment": True,
     "show_source": True,
     "link_code": True,
+    "hover_previews": True,
     "toc_label": None,
 }
+
+_PREVIEW_LINES = 8
+_PREVIEW_CHARS = 700
 
 
 def _token_class(ttype) -> str:
@@ -41,6 +45,20 @@ def _token_class(ttype) -> str:
             return cls
         ttype = ttype.parent
     return ""
+
+
+def _body_preview(definition: Optional[Definition]) -> Optional[str]:
+    """A truncated source preview of a definition, for hover tooltips."""
+    if definition is None or not definition.clauses:
+        return None
+    text = definition.clauses[0].text.strip()
+    if not text:
+        return None
+    lines = text.splitlines()
+    preview = "\n".join(lines[:_PREVIEW_LINES])
+    if len(lines) > _PREVIEW_LINES:
+        preview += "\n…"
+    return preview[:_PREVIEW_CHARS]
 
 
 def _comment_summary(comment: Optional[str]) -> Optional[str]:
@@ -53,6 +71,18 @@ def _comment_summary(comment: Optional[str]) -> Optional[str]:
             text = text[: text.index(stop) + 1]
             break
     return text[:140] or None
+
+
+def _byte_to_str_spans(text: str, spans: list) -> list:
+    """Convert byte-offset spans (docinfo / lsp-index convention) to str indices."""
+    if text.isascii() or not spans:
+        return spans
+    data = text.encode("utf-8")
+
+    def index(byte_offset: int) -> int:
+        return len(data[:byte_offset].decode("utf-8", "ignore"))
+
+    return [(index(span[0]), index(span[1]), *span[2:]) for span in spans]
 
 
 def _lexical_tokens(text: str) -> list[tuple[int, int, str]]:
@@ -134,6 +164,8 @@ class SailHandler(BaseHandler):
     .sail-source .autorefs { color: inherit; border-bottom: 1px dotted currentcolor; }
     .sail-source .autorefs:hover { border-bottom-style: solid; }
     .doc-sail-kind { font-size: 0.65em; font-weight: 400; opacity: 0.7; margin-right: 0.4em; }
+    /* multi-line hover previews (signature + body) in Material tooltips */
+    .md-tooltip__inner { white-space: pre-line; font-family: var(--md-code-font-family, monospace); font-size: 0.6rem; }
     """
 
     def __init__(self, config: Mapping[str, Any], base_dir: Path, **kwargs: Any) -> None:
@@ -197,13 +229,22 @@ class SailHandler(BaseHandler):
         owner = self.bundle.definition_at(ref.target_file, ref.target_start)
         return (owner.anchor, owner) if owner else (None, None)
 
-    def _tooltip(self, signature: Optional[str], definition: Optional[Definition]) -> Optional[str]:
+    def _tooltip(
+        self, signature: Optional[str], definition: Optional[Definition], *, preview: bool
+    ) -> Optional[str]:
         summary = _comment_summary(definition.comment) if definition is not None else None
         if signature and summary:
-            return f"{signature} — {summary}"
-        return signature or summary
+            head = f"{signature} — {summary}"
+        else:
+            head = signature or summary
+        body = _body_preview(definition) if preview else None
+        if head and body:
+            return f"{head}\n\n{body}"
+        return head or body
 
-    def _clause_links(self, data: Definition, clause: Clause) -> list[tuple[int, int, str, Optional[str]]]:
+    def _clause_links(
+        self, data: Definition, clause: Clause, *, preview: bool
+    ) -> list[tuple[int, int, str, Optional[str]]]:
         index = self.lsp_index
         links: list[tuple[int, int, str, Optional[str]]] = []
         for start, end, record in clause.records_within(data.links):
@@ -213,7 +254,7 @@ class SailHandler(BaseHandler):
             except BundleError:
                 pass
             signature = index.signature(record.kind, record.identifier) if index is not None else None
-            links.append((start, end, record.anchor, self._tooltip(signature, target)))
+            links.append((start, end, record.anchor, self._tooltip(signature, target, preview=preview)))
         if index is not None and clause.file is not None and clause.start is not None and index.has_file(clause.file):
             for ref in index.references_within(clause.file, clause.start, clause.end):
                 if any(ref.start < end and ref.end > start for start, end, _, _ in links):
@@ -221,7 +262,7 @@ class SailHandler(BaseHandler):
                 anchor, target = self._resolve_reference(ref)
                 if anchor is not None:
                     signature = index.signature(ref.kind, ref.name)
-                    links.append((ref.start, ref.end, anchor, self._tooltip(signature, target)))
+                    links.append((ref.start, ref.end, anchor, self._tooltip(signature, target, preview=preview)))
         return sorted(links, key=lambda link: link[:3])
 
     def _clause_tokens(self, clause: Clause) -> Optional[list[tuple[int, int, str]]]:
@@ -283,8 +324,16 @@ class SailHandler(BaseHandler):
             parts.append(str(self.do_convert_markdown(data.comment.strip(), heading_level + 1)))
         if options["show_source"]:
             for clause in data.clauses:
-                links = self._clause_links(data, clause) if options["link_code"] else []
-                code = _highlight_linked(clause.text, links, tokens=self._clause_tokens(clause))
+                links = (
+                    self._clause_links(data, clause, preview=bool(options["hover_previews"]))
+                    if options["link_code"]
+                    else []
+                )
+                links = _byte_to_str_spans(clause.text, links)
+                tokens = self._clause_tokens(clause)
+                if tokens is not None:
+                    tokens = _byte_to_str_spans(clause.text, tokens)
+                code = _highlight_linked(clause.text, links, tokens=tokens)
                 parts.append(f'<div class="sail-source language-sail highlight"><pre><code>{code}</code></pre></div>')
         parts.append("</div>")
         return "".join(parts)

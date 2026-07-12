@@ -38,17 +38,23 @@ def _utf16_to_str_index(line: str, units: int) -> int:
 
 
 class _LineIndex:
-    """Maps LSP (line, character) positions to absolute character offsets."""
+    """Maps LSP (line, character) positions to absolute *byte* offsets.
+
+    Sail's docinfo bundle counts offsets in bytes (OCaml lexing positions),
+    so the index must too, or definitions preceded by any multi-byte
+    character (e.g. an em dash in a comment) get misaligned spans.
+    """
 
     def __init__(self, text: str):
         self.lines = text.split("\n")
         self.starts = [0]
         for line in self.lines[:-1]:
-            self.starts.append(self.starts[-1] + len(line) + 1)
+            self.starts.append(self.starts[-1] + len(line.encode("utf-8")) + 1)
 
     def offset(self, line: int, character: int) -> int:
         line = min(line, len(self.lines) - 1)
-        return self.starts[line] + _utf16_to_str_index(self.lines[line], character)
+        line_text = self.lines[line]
+        return self.starts[line] + len(line_text[: _utf16_to_str_index(line_text, character)].encode("utf-8"))
 
 
 def decode_semantic_tokens(data: list[int], text: str) -> list[list[int]]:
