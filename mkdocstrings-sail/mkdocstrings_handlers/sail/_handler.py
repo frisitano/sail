@@ -43,6 +43,18 @@ def _token_class(ttype) -> str:
     return ""
 
 
+def _comment_summary(comment: Optional[str]) -> Optional[str]:
+    """First sentence of a doc comment as tooltip-safe plain text."""
+    if not comment:
+        return None
+    text = " ".join(comment.replace("`", "").replace("*", "").split())
+    for stop in (". ", ".\n"):
+        if stop in text:
+            text = text[: text.index(stop) + 1]
+            break
+    return text[:140] or None
+
+
 def _lexical_tokens(text: str) -> list[tuple[int, int, str]]:
     """Fallback highlight segments from the bundled regex lexer."""
     tokens = []
@@ -65,11 +77,15 @@ def _highlight_linked(
     """
     if tokens is None:
         tokens = _lexical_tokens(text)
-    links = sorted(links)
+    # links may be (start, end, anchor) or (start, end, anchor, tooltip)
+    links = sorted(
+        ((start, end, anchor, rest[0] if rest else None) for start, end, anchor, *rest in links),
+        key=lambda link: link[:3],
+    )
     tokens = sorted(tokens)
 
     bounds = {0, len(text)}
-    for start, end, _ in links:
+    for start, end, _, _ in links:
         bounds.update((start, end))
     for start, end, _ in tokens:
         bounds.update((start, end))
@@ -77,17 +93,24 @@ def _highlight_linked(
 
     out = []
     open_until = None
+    close_tag = ""
     link_i = 0
     token_i = 0
     for a, b in zip(points, points[1:]):
         if open_until is not None and a >= open_until:
-            out.append("</autoref>")
+            out.append(close_tag)
             open_until = None
         while link_i < len(links) and links[link_i][1] <= a:
             link_i += 1
         if open_until is None and link_i < len(links) and links[link_i][0] == a:
-            out.append(f'<autoref identifier="{escape(links[link_i][2])}" optional>')
-            open_until = links[link_i][1]
+            _, end, anchor, tooltip = links[link_i]
+            out.append(f'<autoref identifier="{escape(anchor)}" optional>')
+            if tooltip:
+                out.append(f'<span title="{escape(tooltip)}">')
+                close_tag = "</span></autoref>"
+            else:
+                close_tag = "</autoref>"
+            open_until = end
         while token_i < len(tokens) and tokens[token_i][1] <= a:
             token_i += 1
         cls = ""
@@ -96,7 +119,7 @@ def _highlight_linked(
         segment = escape(text[a:b])
         out.append(f'<span class="{cls}">{segment}</span>' if cls else str(segment))
     if open_until is not None:
-        out.append("</autoref>")
+        out.append(close_tag)
     return "".join(out)
 
 
@@ -155,34 +178,51 @@ class SailHandler(BaseHandler):
         "constant": "let",
     }
 
-    def _anchor_for_reference(self, ref: IndexReference) -> Optional[str]:
+    def _resolve_reference(self, ref: IndexReference) -> tuple[Optional[str], Optional[Definition]]:
         if ref.kind in ("function", "val"):
             try:
-                return self.bundle.find(ref.name).anchor
+                definition = self.bundle.find(ref.name)
+                return definition.anchor, definition
             except BundleError:
-                return None
+                return None, None
         mapped = self._REF_KINDS.get(ref.kind)
         if mapped is not None:
             try:
-                return self.bundle.find(ref.name, kind=mapped).anchor
+                definition = self.bundle.find(ref.name, kind=mapped)
+                return definition.anchor, definition
             except BundleError:
                 pass
         # constructors, enum members, and anything else docinfo has no
         # section for: anchor at whichever definition contains the target
         owner = self.bundle.definition_at(ref.target_file, ref.target_start)
-        return owner.anchor if owner else None
+        return (owner.anchor, owner) if owner else (None, None)
 
-    def _clause_links(self, data: Definition, clause: Clause) -> list[tuple[int, int, str]]:
-        links = clause.links_within(data.links)
+    def _tooltip(self, signature: Optional[str], definition: Optional[Definition]) -> Optional[str]:
+        summary = _comment_summary(definition.comment) if definition is not None else None
+        if signature and summary:
+            return f"{signature} — {summary}"
+        return signature or summary
+
+    def _clause_links(self, data: Definition, clause: Clause) -> list[tuple[int, int, str, Optional[str]]]:
         index = self.lsp_index
+        links: list[tuple[int, int, str, Optional[str]]] = []
+        for start, end, record in clause.records_within(data.links):
+            target = None
+            try:
+                target = self.bundle.find(record.identifier, kind=None if record.kind == "function" else record.kind)
+            except BundleError:
+                pass
+            signature = index.signature(record.kind, record.identifier) if index is not None else None
+            links.append((start, end, record.anchor, self._tooltip(signature, target)))
         if index is not None and clause.file is not None and clause.start is not None and index.has_file(clause.file):
             for ref in index.references_within(clause.file, clause.start, clause.end):
-                if any(ref.start < end and ref.end > start for start, end, _ in links):
+                if any(ref.start < end and ref.end > start for start, end, _, _ in links):
                     continue  # docinfo's compiler-proven links win
-                anchor = self._anchor_for_reference(ref)
+                anchor, target = self._resolve_reference(ref)
                 if anchor is not None:
-                    links.append((ref.start, ref.end, anchor))
-        return sorted(links)
+                    signature = index.signature(ref.kind, ref.name)
+                    links.append((ref.start, ref.end, anchor, self._tooltip(signature, target)))
+        return sorted(links, key=lambda link: link[:3])
 
     def _clause_tokens(self, clause: Clause) -> Optional[list[tuple[int, int, str]]]:
         index = self.lsp_index
@@ -220,9 +260,13 @@ class SailHandler(BaseHandler):
     def render(self, data: Definition, options: Mapping[str, Any], *, locale: str | None = None) -> str:
         heading_level = int(options["heading_level"])
         parts = [f'<div class="doc doc-sail doc-{escape(data.kind)}">']
-        heading = Markup('<span class="doc-sail-kind">{kind}</span><code>{id}</code>').format(
+        heading = Markup('<span class="doc-sail-kind">{kind} </span><code>{id}</code>').format(
             kind=data.kind, id=data.identifier
         )
+        attributes = {}
+        signature = self.lsp_index.signature(data.kind, data.identifier) if self.lsp_index is not None else None
+        if signature:
+            attributes["title"] = signature
         parts.append(
             str(
                 self.do_heading(
@@ -231,6 +275,7 @@ class SailHandler(BaseHandler):
                     role=data.kind,
                     id=data.anchor,
                     toc_label=options.get("toc_label") or data.identifier,
+                    **attributes,
                 )
             )
         )

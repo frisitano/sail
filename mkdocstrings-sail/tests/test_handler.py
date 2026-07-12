@@ -11,7 +11,7 @@ from __future__ import annotations
 import unittest
 
 from mkdocstrings_handlers.sail import Bundle, BundleError, anchor_for
-from mkdocstrings_handlers.sail._handler import _highlight_linked
+from mkdocstrings_handlers.sail._handler import _comment_summary, _highlight_linked
 from mkdocstrings_handlers.sail._index import LspIndex
 from mkdocstrings_handlers.sail._lsp import decode_semantic_tokens
 
@@ -166,6 +166,21 @@ class TestHighlightLinked(unittest.TestCase):
         self.assertIn('<span class="nf">foo</span>', html)
         self.assertIn('<autoref identifier="type-bar" optional><span class="kt">bar</span></autoref>', html)
 
+    def test_link_tooltip_becomes_title_span(self):
+        html = _highlight_linked("foo bar", [(4, 7, "type-bar", 'bits(8) — A "word".')], tokens=[])
+        self.assertIn(
+            '<autoref identifier="type-bar" optional><span title="bits(8) — A &#34;word&#34;.">bar</span></autoref>',
+            html,
+        )
+
+    def test_comment_summary_first_sentence_plain_text(self):
+        self.assertEqual(
+            _comment_summary(" Increment a `word` by one. Wraps on overflow. "),
+            "Increment a word by one.",
+        )
+        self.assertIsNone(_comment_summary(None))
+        self.assertIsNone(_comment_summary("   "))
+
 
 # 'legend' matching sail-lsp indices; tokens/references use absolute offsets
 INDEX = {
@@ -197,6 +212,7 @@ INDEX = {
             "targetStart": 80,
         },
     ],
+    "signatures": {"val:increment": "word -> word", "type:word": "bits(8)"},
 }
 
 
@@ -219,6 +235,11 @@ class TestLspIndex(unittest.TestCase):
         refs = self.index.references_within("spec/core/machine.sail", 28, 46)
         self.assertEqual(len(refs), 1)
         self.assertEqual((refs[0].start, refs[0].end, refs[0].name), (14, 18, "word"))
+
+    def test_signature_falls_back_to_val_entry(self):
+        self.assertEqual(self.index.signature("type", "word"), "bits(8)")
+        self.assertEqual(self.index.signature("function", "increment"), "word -> word")
+        self.assertIsNone(self.index.signature("function", "unknown"))
 
     def test_definition_at_finds_containing_type(self):
         bundle = Bundle(dict(BUNDLE))

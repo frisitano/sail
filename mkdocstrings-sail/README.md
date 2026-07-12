@@ -92,7 +92,24 @@ With the index configured, rendered source gains:
   uses (anchored at their owning union/enum), mappings, and top-level lets,
   in addition to docinfo's call/register links. docinfo's compiler-proven
   links always take precedence where spans overlap; `sourceMap` references
-  are name-based, so heavily overloaded names may need care.
+  are name-based, so heavily overloaded names may need care;
+- **hover tooltips**: linked identifiers carry a `title` composed of the
+  target's type signature (from `sourceMap`) and the first sentence of its
+  doc comment (from the bundle), e.g. `word -> word — Increment a word by
+  one.`; definition headings carry their signature. Browsers show these
+  natively; add `content.tooltips` under `theme.features` for styled
+  Material tooltips, and disable autorefs' own link titles so they don't
+  compete:
+
+  ```yaml
+  plugins:
+    - autorefs:
+        link_titles: false
+  ```
+
+  Identifiers whose target is not rendered anywhere in the site degrade to
+  plain text titled with the would-be anchor (mkdocs-autorefs' fallback for
+  unresolved optional references).
 
 ## Options
 

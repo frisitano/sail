@@ -52,17 +52,21 @@ class Clause:
     start: Optional[int] = None  # absolute character range when known
     end: Optional[int] = None
 
-    def links_within(self, links: list[Link]) -> list[tuple[int, int, str]]:
-        """Return (relative start, relative end, anchor) for links inside this clause."""
+    def records_within(self, links: list[Link]) -> list[tuple[int, int, "Link"]]:
+        """Return (relative start, relative end, link) for links inside this clause."""
         if self.start is None or self.end is None:
             return []
         out = []
         last_end = -1
         for link in sorted(links, key=lambda l: l.start):
             if link.start >= self.start and link.end <= self.end and link.start >= last_end:
-                out.append((link.start - self.start, link.end - self.start, link.anchor))
+                out.append((link.start - self.start, link.end - self.start, link))
                 last_end = link.end
         return out
+
+    def links_within(self, links: list[Link]) -> list[tuple[int, int, str]]:
+        """Return (relative start, relative end, anchor) for links inside this clause."""
+        return [(start, end, link.anchor) for start, end, link in self.records_within(links)]
 
 
 @dataclass

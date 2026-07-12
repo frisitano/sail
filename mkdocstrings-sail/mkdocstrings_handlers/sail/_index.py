@@ -61,6 +61,7 @@ class LspIndex:
         self._legend = data.get("legend", [])
         self._files = data.get("files", {})
         self._references = data.get("references", [])
+        self._signatures = data.get("signatures", {})
 
     @classmethod
     def load(cls, path: str | Path) -> "LspIndex":
@@ -70,6 +71,18 @@ class LspIndex:
 
     def has_file(self, file: Optional[str]) -> bool:
         return file is not None and file in self._files
+
+    def signature(self, kind: str, name: str) -> Optional[str]:
+        """The type signature recorded for a definition, if any.
+
+        Signatures usually live on the val entry, so fall back through
+        related kinds.
+        """
+        for k in (kind, "val", "function"):
+            signature = self._signatures.get(f"{k}:{name}")
+            if signature:
+                return signature
+        return None
 
     def tokens_within(self, file: str, start: int, end: int) -> list[tuple[int, int, str]]:
         """Semantic highlight segments for [start, end), clause-relative."""

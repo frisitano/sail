@@ -188,10 +188,13 @@ def build_index(
         entries = client.request("sail/sourceMap", {}) or []
 
         references = []
+        signatures: dict[str, str] = {}
         for entry in entries:
             target_file = _relative_to(root, entry["location"]["uri"])
             if target_file is None:
                 continue
+            if entry.get("type"):
+                signatures[f"{entry['kind']}:{entry['name']}"] = entry["type"]
             target_range = entry["location"]["range"]
             for ref in entry.get("references", []):
                 ref_file = _relative_to(root, ref["uri"])
@@ -244,6 +247,7 @@ def build_index(
             "legend": legend,
             "files": file_tokens,
             "references": resolved,
+            "signatures": signatures,
         }
     finally:
         client.close()
