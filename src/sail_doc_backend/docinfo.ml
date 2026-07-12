@@ -311,9 +311,7 @@ let json_of_valspec_doc docinfo =
     @ json_of_comment docinfo.comment @ json_of_attributes docinfo.attributes
     )
 
-type type_def_doc = location_or_raw
-
-let json_of_type_def_doc = json_of_location_or_raw
+type type_def_doc = { source : location_or_raw; comment : Parse_ast.doc_comment option }
 
 type register_doc = {
   source : location_or_raw;
@@ -364,6 +362,18 @@ let json_of_linkable x_label f linkable =
       in
       `Assoc ((x_label, x) :: (links @ path))
 
+(* The comment is emitted as a sibling of the "type" key, so consumers of the previous format (where the linkable
+   payload was the source location alone) keep working. *)
+let json_of_type_def_linkable (linkable : type_def_doc linkable) =
+  let links =
+    match linkable.links with [] -> [] | _ -> [("links", `List (List.map json_of_hyperlink linkable.links))]
+  in
+  let path =
+    match linkable.module_path with None -> [] | Some mods -> [("path", `List (List.map (fun m -> `String m) mods))]
+  in
+  `Assoc
+    (((("type", json_of_location_or_raw linkable.doc.source) :: json_of_comment linkable.doc.comment) @ links) @ path)
+
 type 'a docinfo = {
   embedding : embedding;
   git : (string * bool) option;
@@ -393,7 +403,7 @@ let json_of_docinfo docinfo =
         ("functions", json_of_bindings docinfo.functions (json_of_linkable "function" json_of_function_doc));
         ("mappings", json_of_bindings docinfo.mappings (json_of_linkable "mapping" json_of_mapping_doc));
         ("vals", json_of_bindings docinfo.valspecs (json_of_linkable "val" json_of_valspec_doc));
-        ("types", json_of_bindings docinfo.type_defs (json_of_linkable "type" json_of_type_def_doc));
+        ("types", json_of_bindings docinfo.type_defs json_of_type_def_linkable);
         ("registers", json_of_bindings docinfo.registers (json_of_linkable "register" json_of_register_doc));
         ("lets", json_of_bindings docinfo.lets (json_of_linkable "let" json_of_let_doc));
         ("anchors", json_of_bindings docinfo.anchors (json_of_linkable "anchor" json_of_anchor_doc));
@@ -458,8 +468,11 @@ module Generator (Converter : Markdown.CONVERTER) (Config : CONFIG) = struct
       attributes = List.map (fun (_, attr_info) -> attr_info) def_annot.attrs;
     }
 
-  let docinfo_for_type_def (TD_aux (_, annot) as td) =
-    doc_loc (fst annot) Type_check.strip_typedef Reformatter.doc_type_def td
+  let docinfo_for_type_def def_annot (TD_aux (_, annot) as td) : type_def_doc =
+    {
+      source = doc_loc (fst annot) Type_check.strip_typedef Reformatter.doc_type_def td;
+      comment = get_doc_comment def_annot;
+    }
 
   let docinfo_for_register def_annot (DEC_aux (DEC_reg ((Typ_aux (_, typ_l) as typ), _, exp), rd_annot) as rd) =
     {
@@ -700,7 +713,8 @@ module Generator (Converter : Markdown.CONVERTER) (Config : CONFIG) = struct
           let id = id_of_type_def td in
           ( {
               docinfo with
-              type_defs = Bindings.add id { doc = docinfo_for_type_def td; links; module_path } docinfo.type_defs;
+              type_defs =
+                Bindings.add id { doc = docinfo_for_type_def def_annot td; links; module_path } docinfo.type_defs;
             },
             skips
           )
