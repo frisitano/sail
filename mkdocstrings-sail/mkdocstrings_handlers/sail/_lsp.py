@@ -138,8 +138,17 @@ def _relative_to(root: Path, uri: str) -> Optional[str]:
         return None  # outside the workspace (e.g. Sail stdlib)
 
 
+def project_files(sail_binary: str, root: Path, project: str, module: str, variables: list[str]) -> list[str]:
+    """The project's resolved file closure, from ``sail --list-files``."""
+    command = [sail_binary, "--project", project, "--list-files", module]
+    for variable in variables:
+        command += ["--variable", variable]
+    result = subprocess.run(command, cwd=root, capture_output=True, text=True, check=True)
+    return result.stdout.split()
+
+
 def build_index(
-    binary: str, root: Path, *, compiler_tokens: bool = True, extra_files: list[str] | None = None
+    binary: str, root: Path, *, compiler_tokens: bool = True, files: list[str] | None = None
 ) -> dict[str, Any]:
     client = LspClient([binary, "--stdio"])
     try:
@@ -155,12 +164,13 @@ def build_index(
         legend = init["capabilities"]["semanticTokensProvider"]["legend"]["tokenTypes"]
         client.notify("initialized", {})
 
-        # Open every .sail file first: the server resolves its source graph
-        # (and hence sail/sourceMap) from opened documents.
-        files = sorted(
-            {str(p.relative_to(root)) for p in root.rglob("*.sail") if "_build" not in p.parts}
-            | set(extra_files or [])
-        )
+        # Open the files first: the server resolves its source graph (and
+        # hence sail/sourceMap) from opened documents. Prefer the project
+        # closure (--project); the workspace glob fallback can open files
+        # outside the model, whose same-named definitions would pollute the
+        # name-based reference graph.
+        if files is None:
+            files = sorted(str(p.relative_to(root)) for p in root.rglob("*.sail") if "_build" not in p.parts)
         texts: dict[str, str] = {}
         line_indexes: dict[str, _LineIndex] = {}
         for rel in files:
@@ -245,14 +255,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default=".", help="workspace root; paths are stored relative to it")
     parser.add_argument("--output", required=True, help="output JSON path")
     parser.add_argument("--no-compiler-tokens", action="store_true", help="skip compiler-derived token overlay")
-    parser.add_argument("files", nargs="*", help="extra root-relative .sail files to tokenize")
+    parser.add_argument("--project", help="a .sail_project file; index exactly its resolved file closure")
+    parser.add_argument("--module", help="project module to resolve (with --project)")
+    parser.add_argument("--variable", action="append", default=[], help="project variable NAME=VALUE (repeatable)")
+    parser.add_argument("--sail", default="sail", help="sail binary for --list-files (default: sail on PATH)")
+    parser.add_argument("files", nargs="*", help="root-relative .sail files to index (instead of the workspace glob)")
     args = parser.parse_args(argv)
+
+    root = Path(args.root).resolve()
+    files = args.files or None
+    if args.project:
+        if not args.module:
+            parser.error("--project requires --module")
+        files = project_files(args.sail, root, args.project, args.module, args.variable) + (args.files or [])
 
     index = build_index(
         args.binary,
-        Path(args.root).resolve(),
+        root,
         compiler_tokens=not args.no_compiler_tokens,
-        extra_files=args.files,
+        files=files,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

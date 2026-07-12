@@ -52,7 +52,9 @@ lsp_binary="${SAIL_LSP:-$(command -v sail_lsp || true)}"
 if [ -n "$lsp_binary" ]; then
     echo "== generating sail-lsp index"
     (cd "$fixture" && uv run --with-editable "$pkg_dir" sail-lsp-index \
-        --binary "$lsp_binary" --root . --output "$site_src/doc/lsp-index.json")
+        --binary "$lsp_binary" --sail "$sail" --root . \
+        --project spec.sail_project --module spec \
+        --output "$site_src/doc/lsp-index.json")
     echo "== building site with lsp index"
     (cd "$site_src" && uv run --with-editable "$pkg_dir" --with mkdocs-material \
         mkdocs build --strict -f mkdocs-lsp.yml -d site-lsp)

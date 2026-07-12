@@ -65,8 +65,16 @@ reference graph into one JSON index:
 
 ```sh
 # run from the project root so paths match the docinfo bundle
-sail-lsp-index --binary sail_lsp --root . --output doc/lsp-index.json
+sail-lsp-index --root . --project model.sail_project --module core \
+               --output doc/lsp-index.json
 ```
+
+`--project` resolves the model's exact file closure via
+`sail --list-files`, which is strongly recommended: the fallback (a
+workspace-wide `*.sail` glob, or an explicit file list) can index files
+outside the model, and same-named definitions in stray files pollute the
+name-based reference graph. `--binary`/`--sail` override which `sail_lsp`
+and `sail` executables are used.
 
 ```yaml
 handlers:
