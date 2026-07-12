@@ -160,6 +160,19 @@ once. mike stores each version in its own subdirectory of `gh-pages` with a
 every deployed variant side by side. CI runs bundle generation + `mike
 deploy` per published branch, using the branch name as the version name.
 
+## Generating a full reference book
+
+`examples/gen_reference.py` generates one reference page per project source
+file (a `::: name` directive per definition, in source order, skipping ids
+already rendered by hand-authored pages) plus a nav tree and `mkdocs.yml`.
+Combined with authored chapters it produces a complete, fully cross-linked
+spec book:
+
+```sh
+files=$(sail --project model.sail_project --list-files core)
+uv run --with-editable . python examples/gen_reference.py path/to/book "$files"
+```
+
 ## Development
 
 ```sh
