@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mkdocstrings-sail"
+version = "0.1.0"
+description = "Sail handler for mkdocstrings, rendering definitions from sail --doc docinfo bundles"
+readme = "README.md"
+license = { text = "BSD-2-Clause" }
+requires-python = ">=3.10"
+dependencies = [
+    "mkdocstrings>=1.0",
+    # MkDocs 2.0 (unreleased) removes the plugin system entirely; this
+    # handler, mkdocstrings, and mkdocs-autorefs all require the 1.x API.
+    "mkdocs>=1.6,<2",
+    "Pygments>=2.12",
+    "MarkupSafe>=2.0",
+]
+
+[project.entry-points."pygments.lexers"]
+sail = "mkdocstrings_handlers.sail._lexer:SailLexer"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mkdocstrings_handlers"]

@@ -1,0 +1,5 @@
+tests/integration/doc/
+tests/integration/site/
+__pycache__/
+*.egg-info/
+uv.lock

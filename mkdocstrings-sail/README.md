@@ -1,0 +1,126 @@
+# mkdocstrings-sail
+
+A [mkdocstrings](https://mkdocstrings.github.io/) handler for
+[Sail](https://github.com/rems-project/sail), letting hand-written MkDocs
+pages embed live Sail definitions with `::: identifier` directives. It also
+registers a Pygments lexer for Sail, so every ` ```sail ` code fence in the
+site is syntax highlighted.
+
+The handler consumes the docinfo JSON bundle produced by the Sail compiler
+(no Sail parsing in Python):
+
+```sh
+sail --doc --doc-format identity --doc-embed plain --doc-embed-with-location \
+     --doc-bundle doc.json -o doc <files or project>
+```
+
+## Usage
+
+```yaml
+# mkdocs.yml
+theme:
+  name: material
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: sail
+      handlers:
+        sail:
+          bundle: doc/doc.json   # relative to mkdocs.yml
+```
+
+Then, in any Markdown page:
+
+```markdown
+The interpreter advances one instruction at a time:
+
+::: step
+
+Registers referenced above link to their definitions, wherever they are
+rendered — see [PC][register-PC], or just [step][] in prose.
+```
+
+Doc comments on `type` definitions need a Sail whose docinfo emits them
+(the accompanying docinfo patch, > 0.20.2); with older bundles types render
+without prose and everything else works.
+
+Each rendered definition gets:
+
+- a heading with a stable `<kind>-<id>` anchor (`#function-step`,
+  `#register-PC`, …), derived only from the definition kind and name;
+- its Sail doc comment (`/*! … */`) rendered as Markdown;
+- its source, highlighted by the bundled Sail lexer, with function calls and
+  register uses wrapped in `<autoref>` elements that
+  [mkdocs-autorefs](https://mkdocstrings.github.io/autorefs/) resolves to
+  whichever page renders the target definition. Unresolvable references
+  degrade to plain text (`optional` autorefs), so partial sites build clean.
+
+## Options
+
+Global (under `handlers.sail.options`) or per-directive:
+
+| Option | Default | Effect |
+| ------ | ------- | ------ |
+| `kind` | `null` | Restrict lookup: `function`, `mapping`, `type`, `register`, `let`, `val`, `anchor`, `span` |
+| `heading_level` | `2` | Heading level of the rendered definition |
+| `show_comment` | `true` | Render the doc comment |
+| `show_source` | `true` | Render the definition source |
+| `link_code` | `true` | Wrap use sites in the source with cross-reference links |
+| `toc_label` | identifier | Label in the page table of contents |
+
+Per-directive options nest under an `options:` key (mkdocstrings syntax):
+
+```markdown
+::: increment
+    options:
+      kind: val
+      heading_level: 3
+```
+
+Bare identifiers resolve by priority (`function` before `val`, etc.); use
+`kind:` to disambiguate as above.
+
+## Design notes
+
+**Why MkDocs Material?** It consumes plain Markdown with no JavaScript
+build toolchain, it is the established convention for Ethereum
+specification sites (consensus-specs), and versioning, search, permalinks,
+and code-copy are configuration rather than code. mdBook has no
+mike-equivalent versioned-deployment story and its single-`SUMMARY.md`
+model fits hand-authored narratives poorly once content is generated;
+Docusaurus requires a Node/MDX toolchain and copies docs trees per version,
+which suits hand-maintained docs rather than regenerated output.
+
+**Anchors.** Rendered definitions get stable `<kind>-<id>` heading anchors
+(`#function-step`), derived only from the definition kind and identifier,
+so deep links survive regeneration as long as definitions keep their names.
+
+**Versioning with mike.** Set `extra.version.provider: mike` in
+`mkdocs.yml`, then deploy each fork/branch/hard-fork variant as a mike
+version — `mike deploy --push --update-aliases main latest`,
+`mike deploy --push prague`, etc., with `mike set-default --push latest`
+once. mike stores each version in its own subdirectory of `gh-pages` with a
+`versions.json` manifest, and Material renders a version selector listing
+every deployed variant side by side. CI runs bundle generation + `mike
+deploy` per published branch, using the branch name as the version name.
+
+## Development
+
+```sh
+uv run --with . python -m unittest discover tests   # unit tests
+tests/run_integration.sh                            # end-to-end mkdocs build
+```
+
+Sail's docinfo format is versioned (`"version": 1`); the handler refuses
+bundles with other versions.
+
+## Ecosystem note (2026)
+
+MkDocs 1.x is effectively frozen (last release 1.6.1, Aug 2024) and the
+announced MkDocs 2.0 removes the plugin system this handler relies on, so
+dependencies are pinned to `mkdocs<2`. The stack still builds fine on the
+frozen 1.x line; drop-in continuations (ProperDocs) and the Material team's
+successor (Zensical, which reads `mkdocs.yml` and is where the mkdocstrings
+author now works) are the migration paths if that changes. The handler's
+inputs (docinfo JSON) and outputs (plain HTML with stable anchors) are
+deliberately generator-neutral, so a port targets a small surface.
