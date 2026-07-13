@@ -42,5 +42,13 @@
     card.style.left = Math.max(8, left) + "px";
   });
 
-  document.addEventListener("scroll", hide, true);
+  document.addEventListener(
+    "scroll",
+    function (event) {
+      // scrolling inside the card keeps it open
+      if (card && card.contains(event.target)) return;
+      hide();
+    },
+    true
+  );
 })();

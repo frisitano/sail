@@ -35,8 +35,10 @@ _DEFAULT_OPTIONS: dict[str, Any] = {
     "toc_label": None,
 }
 
-_PREVIEW_LINES = 8
+_PREVIEW_LINES = 8  # plain-text title tooltips
 _PREVIEW_CHARS = 700
+_CARD_LINES = 120  # scrollable hover cards
+_CARD_CHARS = 20_000
 
 
 def _token_class(ttype) -> str:
@@ -48,18 +50,20 @@ def _token_class(ttype) -> str:
     return ""
 
 
-def _body_preview(definition: Optional[Definition]) -> Optional[str]:
-    """A truncated source preview of a definition, for hover tooltips."""
+def _body_preview(
+    definition: Optional[Definition], max_lines: int = _PREVIEW_LINES, max_chars: int = _PREVIEW_CHARS
+) -> Optional[str]:
+    """A truncated source preview of a definition, for hover tooltips/cards."""
     if definition is None or not definition.clauses:
         return None
     text = definition.clauses[0].text.strip()
     if not text:
         return None
     lines = text.splitlines()
-    preview = "\n".join(lines[:_PREVIEW_LINES])
-    if len(lines) > _PREVIEW_LINES:
+    preview = "\n".join(lines[:max_lines])
+    if len(lines) > max_lines:
         preview += "\n…"
-    return preview[:_PREVIEW_CHARS]
+    return preview[:max_chars]
 
 
 def _comment_summary(comment: Optional[str]) -> Optional[str]:
@@ -301,7 +305,7 @@ class SailHandler(BaseHandler):
             parts.append(
                 f'<div class="sail-hovercard-doc">{self.do_convert_markdown(definition.comment.strip(), 6)}</div>'
             )
-        preview = _body_preview(definition)
+        preview = _body_preview(definition, max_lines=_CARD_LINES, max_chars=_CARD_CHARS)
         if preview:
             code = _highlight_linked(preview, [])
             parts.append(f'<div class="sail-hovercard-code highlight"><pre><code>{code}</code></pre></div>')
