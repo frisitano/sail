@@ -179,7 +179,6 @@ class SailHandler(BaseHandler):
       background: var(--md-default-bg-color); color: var(--md-default-fg-color);
       border: 1px solid var(--md-default-fg-color--lightest); border-radius: 0.2rem;
       box-shadow: var(--md-shadow-z2, 0 0.2rem 0.5rem rgba(0,0,0,.2)); padding: 0.5rem 0.7rem; font-size: 0.64rem; }
-    .sail-hovercard-float .sail-hovercard-head { opacity: 0.75; margin-bottom: 0.3rem; }
     .sail-hovercard-float .sail-hovercard-doc { margin-bottom: 0.3rem; }
     .sail-hovercard-float pre { margin: 0; white-space: pre; overflow-x: auto; }
     """
@@ -271,7 +270,7 @@ class SailHandler(BaseHandler):
         def link_entry(start, end, anchor, target, signature):
             hover = None
             if cards is not None and target is not None:
-                cards.setdefault(anchor, (target, signature))
+                cards.setdefault(anchor, target)
                 hover = anchor
             tooltip = None if hover else self._tooltip(signature, target, preview=preview)
             return (start, end, anchor, tooltip, hover)
@@ -295,15 +294,9 @@ class SailHandler(BaseHandler):
                     links.append(link_entry(ref.start, ref.end, anchor, target, signature))
         return sorted(links, key=lambda link: link[:3])
 
-    def _hover_card(self, anchor: str, definition: Definition, signature: Optional[str]) -> str:
-        """A hidden IDE-style hover card: header, doc comment, highlighted body."""
-        header = f"{definition.kind} {definition.identifier}"
-        if signature:
-            header += f" : {signature}"
-        parts = [
-            f'<template class="sail-hovercard" data-anchor="{escape(anchor)}">',
-            f'<div class="sail-hovercard-head"><code>{escape(header)}</code></div>',
-        ]
+    def _hover_card(self, anchor: str, definition: Definition) -> str:
+        """A hidden IDE-style hover card: doc comment + highlighted body."""
+        parts = [f'<template class="sail-hovercard" data-anchor="{escape(anchor)}">']
         if definition.comment:
             parts.append(
                 f'<div class="sail-hovercard-doc">{self.do_convert_markdown(definition.comment.strip(), 6)}</div>'
@@ -373,9 +366,7 @@ class SailHandler(BaseHandler):
         if options["show_comment"] and data.comment:
             parts.append(str(self.do_convert_markdown(data.comment.strip(), heading_level + 1)))
         if options["show_source"]:
-            cards: Optional[dict[str, tuple[Definition, Optional[str]]]] = (
-                {} if options["hover_cards"] else None
-            )
+            cards: Optional[dict[str, Definition]] = {} if options["hover_cards"] else None
             for clause in data.clauses:
                 links = (
                     self._clause_links(data, clause, preview=bool(options["hover_previews"]), cards=cards)
@@ -389,7 +380,7 @@ class SailHandler(BaseHandler):
                 code = _highlight_linked(clause.text, links, tokens=tokens)
                 parts.append(f'<div class="sail-source language-sail highlight"><pre><code>{code}</code></pre></div>')
             if cards:
-                parts.extend(self._hover_card(anchor, defn, sig) for anchor, (defn, sig) in sorted(cards.items()))
+                parts.extend(self._hover_card(anchor, defn) for anchor, defn in sorted(cards.items()))
         parts.append("</div>")
         return "".join(parts)
 

@@ -70,7 +70,6 @@ if [ -n "$lsp_binary" ]; then
     check_lsp definitions/index.html 'href="#mapping-flag_bit"' "docinfo links still win with lsp index"
     check_lsp index.html 'title="unit -&gt; unit"' "signature tooltip on definition heading"
     check_lsp index.html 'data-sail-hover="function-increment"' "hover card key on in-code link"
-    check_lsp index.html '<code>register PC : word</code>' "hover card header (kind name : signature)"
     check_lsp index.html 'The program counter.' "target doc comment embedded in hover card"
     check_lsp index.html 'template class="sail-hovercard" data-anchor="register-PC"' "hover card template emitted"
 else
