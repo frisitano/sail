@@ -173,6 +173,11 @@ class TestHighlightLinked(unittest.TestCase):
         self.assertIn('<span class="nf">foo</span>', html)
         self.assertIn('<autoref identifier="type-bar" optional><span class="kt">bar</span></autoref>', html)
 
+    def test_hover_card_key_becomes_data_attribute(self):
+        html = _highlight_linked("foo bar", [(4, 7, "type-bar", None, "type-bar")], tokens=[])
+        self.assertIn('<span data-sail-hover="type-bar">', html)
+        self.assertNotIn("title=", html)
+
     def test_link_tooltip_becomes_title_span(self):
         html = _highlight_linked("foo bar", [(4, 7, "type-bar", 'bits(8) — A "word".')], tokens=[])
         self.assertIn(

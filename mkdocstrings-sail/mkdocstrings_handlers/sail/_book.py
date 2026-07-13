@@ -25,11 +25,14 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import sys
 from pathlib import Path
 
 from ._bundle import Bundle
 from ._lsp import project_files
+
+_HOVER_JS = Path(__file__).parent / "assets/sail-hover.js"
 
 _HEADING = re.compile(r"^#\s+(.+)$", re.M)
 
@@ -148,6 +151,8 @@ markdown_extensions:
 extra:
   version:
     provider: mike
+extra_javascript:
+  - assets/sail-hover.js
 nav:
 {nav}
 """
@@ -192,6 +197,10 @@ def main(argv: list[str] | None = None) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(markdown)
         pages.append((file, "reference/" + page, title))
+
+    assets = book / "docs/assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    shutil.copy(_HOVER_JS, assets / "sail-hover.js")
 
     if not args.no_config:
         authored = sorted(p.name for p in (book / "docs").glob("*.md"))

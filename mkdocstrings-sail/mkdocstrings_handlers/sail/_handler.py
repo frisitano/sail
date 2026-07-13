@@ -31,6 +31,7 @@ _DEFAULT_OPTIONS: dict[str, Any] = {
     "show_source": True,
     "link_code": True,
     "hover_previews": True,
+    "hover_cards": True,
     "toc_label": None,
 }
 
@@ -107,15 +108,18 @@ def _highlight_linked(
     """
     if tokens is None:
         tokens = _lexical_tokens(text)
-    # links may be (start, end, anchor) or (start, end, anchor, tooltip)
+    # links: (start, end, anchor[, tooltip[, hover-card key]])
     links = sorted(
-        ((start, end, anchor, rest[0] if rest else None) for start, end, anchor, *rest in links),
+        (
+            (start, end, anchor, *(tuple(rest) + (None, None))[:2])
+            for start, end, anchor, *rest in links
+        ),
         key=lambda link: link[:3],
     )
     tokens = sorted(tokens)
 
     bounds = {0, len(text)}
-    for start, end, _, _ in links:
+    for start, end, *_ in links:
         bounds.update((start, end))
     for start, end, _ in tokens:
         bounds.update((start, end))
@@ -133,9 +137,13 @@ def _highlight_linked(
         while link_i < len(links) and links[link_i][1] <= a:
             link_i += 1
         if open_until is None and link_i < len(links) and links[link_i][0] == a:
-            _, end, anchor, tooltip = links[link_i]
+            _, end, anchor, tooltip, hover = links[link_i]
             out.append(f'<autoref identifier="{escape(anchor)}" optional>')
-            if tooltip:
+            if hover:
+                # a hover card replaces the plain-text tooltip entirely
+                out.append(f'<span data-sail-hover="{escape(hover)}">')
+                close_tag = "</span></autoref>"
+            elif tooltip:
                 out.append(f'<span title="{escape(tooltip)}">')
                 close_tag = "</span></autoref>"
             else:
@@ -166,6 +174,14 @@ class SailHandler(BaseHandler):
     .doc-sail-kind { font-size: 0.65em; font-weight: 400; opacity: 0.7; margin-right: 0.4em; }
     /* multi-line hover previews (signature + body) in Material tooltips */
     .md-tooltip__inner { white-space: pre-line; font-family: var(--md-code-font-family, monospace); font-size: 0.6rem; }
+    /* IDE-style hover cards (positioned by sail-hover.js) */
+    .sail-hovercard-float { position: fixed; z-index: 20; max-width: 42rem; max-height: 22rem; overflow: auto;
+      background: var(--md-default-bg-color); color: var(--md-default-fg-color);
+      border: 1px solid var(--md-default-fg-color--lightest); border-radius: 0.2rem;
+      box-shadow: var(--md-shadow-z2, 0 0.2rem 0.5rem rgba(0,0,0,.2)); padding: 0.5rem 0.7rem; font-size: 0.64rem; }
+    .sail-hovercard-float .sail-hovercard-head { opacity: 0.75; margin-bottom: 0.3rem; }
+    .sail-hovercard-float .sail-hovercard-doc { margin-bottom: 0.3rem; }
+    .sail-hovercard-float pre { margin: 0; white-space: pre; overflow-x: auto; }
     """
 
     def __init__(self, config: Mapping[str, Any], base_dir: Path, **kwargs: Any) -> None:
@@ -243,10 +259,24 @@ class SailHandler(BaseHandler):
         return head or body
 
     def _clause_links(
-        self, data: Definition, clause: Clause, *, preview: bool
-    ) -> list[tuple[int, int, str, Optional[str]]]:
+        self,
+        data: Definition,
+        clause: Clause,
+        *,
+        preview: bool,
+        cards: Optional[dict[str, tuple[Definition, Optional[str]]]] = None,
+    ) -> list[tuple[int, int, str, Optional[str], Optional[str]]]:
         index = self.lsp_index
-        links: list[tuple[int, int, str, Optional[str]]] = []
+
+        def link_entry(start, end, anchor, target, signature):
+            hover = None
+            if cards is not None and target is not None:
+                cards.setdefault(anchor, (target, signature))
+                hover = anchor
+            tooltip = None if hover else self._tooltip(signature, target, preview=preview)
+            return (start, end, anchor, tooltip, hover)
+
+        links: list[tuple[int, int, str, Optional[str], Optional[str]]] = []
         for start, end, record in clause.records_within(data.links):
             target = None
             try:
@@ -254,16 +284,36 @@ class SailHandler(BaseHandler):
             except BundleError:
                 pass
             signature = index.signature(record.kind, record.identifier) if index is not None else None
-            links.append((start, end, record.anchor, self._tooltip(signature, target, preview=preview)))
+            links.append(link_entry(start, end, record.anchor, target, signature))
         if index is not None and clause.file is not None and clause.start is not None and index.has_file(clause.file):
             for ref in index.references_within(clause.file, clause.start, clause.end):
-                if any(ref.start < end and ref.end > start for start, end, _, _ in links):
+                if any(ref.start < end and ref.end > start for start, end, *_ in links):
                     continue  # docinfo's compiler-proven links win
                 anchor, target = self._resolve_reference(ref)
                 if anchor is not None:
                     signature = index.signature(ref.kind, ref.name)
-                    links.append((ref.start, ref.end, anchor, self._tooltip(signature, target, preview=preview)))
+                    links.append(link_entry(ref.start, ref.end, anchor, target, signature))
         return sorted(links, key=lambda link: link[:3])
+
+    def _hover_card(self, anchor: str, definition: Definition, signature: Optional[str]) -> str:
+        """A hidden IDE-style hover card: header, doc comment, highlighted body."""
+        header = f"{definition.kind} {definition.identifier}"
+        if signature:
+            header += f" : {signature}"
+        parts = [
+            f'<template class="sail-hovercard" data-anchor="{escape(anchor)}">',
+            f'<div class="sail-hovercard-head"><code>{escape(header)}</code></div>',
+        ]
+        if definition.comment:
+            parts.append(
+                f'<div class="sail-hovercard-doc">{self.do_convert_markdown(definition.comment.strip(), 6)}</div>'
+            )
+        preview = _body_preview(definition)
+        if preview:
+            code = _highlight_linked(preview, [])
+            parts.append(f'<div class="sail-hovercard-code highlight"><pre><code>{code}</code></pre></div>')
+        parts.append("</template>")
+        return "".join(parts)
 
     def _clause_tokens(self, clause: Clause) -> Optional[list[tuple[int, int, str]]]:
         index = self.lsp_index
@@ -323,9 +373,12 @@ class SailHandler(BaseHandler):
         if options["show_comment"] and data.comment:
             parts.append(str(self.do_convert_markdown(data.comment.strip(), heading_level + 1)))
         if options["show_source"]:
+            cards: Optional[dict[str, tuple[Definition, Optional[str]]]] = (
+                {} if options["hover_cards"] else None
+            )
             for clause in data.clauses:
                 links = (
-                    self._clause_links(data, clause, preview=bool(options["hover_previews"]))
+                    self._clause_links(data, clause, preview=bool(options["hover_previews"]), cards=cards)
                     if options["link_code"]
                     else []
                 )
@@ -335,6 +388,8 @@ class SailHandler(BaseHandler):
                     tokens = _byte_to_str_spans(clause.text, tokens)
                 code = _highlight_linked(clause.text, links, tokens=tokens)
                 parts.append(f'<div class="sail-source language-sail highlight"><pre><code>{code}</code></pre></div>')
+            if cards:
+                parts.extend(self._hover_card(anchor, defn, sig) for anchor, (defn, sig) in sorted(cards.items()))
         parts.append("</div>")
         return "".join(parts)
 

@@ -110,6 +110,16 @@ With the index configured, rendered source gains:
         link_titles: false
   ```
 
+  With `hover_cards` (default), in-code links instead get **IDE-style hover
+  cards** — the target's header (`kind name : signature`), its doc comment
+  rendered as Markdown, and its body syntax-highlighted — matching the Sail
+  LSP's editor hover. Cards are embedded as inert `<template>` elements and
+  positioned by `assets/sail-hover.js` (`sail-book-gen` installs and wires
+  it; for hand-written configs copy it from the package and list it under
+  `extra_javascript`). Without the script, links fall back gracefully (set
+  `hover_cards: false` to restore plain-text `title` tooltips). Definition
+  headings keep their signature `title` either way.
+
   Identifiers whose target is not rendered anywhere in the site degrade to
   plain text titled with the would-be anchor (mkdocs-autorefs' fallback for
   unresolved optional references).
@@ -126,6 +136,7 @@ Global (under `handlers.sail.options`) or per-directive:
 | `show_source` | `true` | Render the definition source |
 | `link_code` | `true` | Wrap use sites in the source with cross-reference links |
 | `hover_previews` | `true` | Append a truncated body preview of the target to link tooltips |
+| `hover_cards` | `true` | Emit IDE-style hover cards (rendered comment + highlighted body) for in-code links |
 | `toc_label` | identifier | Label in the page table of contents |
 
 Per-directive options nest under an `options:` key (mkdocstrings syntax):
