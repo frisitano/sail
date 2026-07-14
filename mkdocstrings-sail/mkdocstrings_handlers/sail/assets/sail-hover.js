@@ -43,7 +43,7 @@
     );
     if (!template) return;
     card = document.createElement("div");
-    card.className = "sail-hovercard-float";
+    card.className = "sail-hovercard-float md-typeset";
     card.dataset.for = key;
     card.appendChild(template.content.cloneNode(true));
     document.body.appendChild(card);

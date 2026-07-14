@@ -96,7 +96,7 @@ class EipIndex:
         body = markdown.markdown(
             text,
             extensions=["extra", "codehilite", "sane_lists"],
-            extension_configs={"codehilite": {"css_class": "highlight", "guess_lang": False}},
+            extension_configs={"codehilite": {"css_class": "highlight", "guess_lang": True}},
         )
         title = escape(meta.get("title", f"EIP-{number}"))
         status = f' <small>({escape(meta["status"])})</small>' if meta.get("status") else ""
