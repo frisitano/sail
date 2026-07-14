@@ -93,6 +93,17 @@ class EipIndex:
                 key, _, value = line.partition(":")
                 meta[key.strip()] = value.strip()
             text = text[end + 4 :]
+        # EIP specification code is Python by convention (EIP-1); default
+        # untagged fences to it — pygments' guesser misfires on pseudocode.
+        lines = text.split("\n")
+        inside = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                if not inside and stripped == "```":
+                    lines[i] = line.replace("```", "```python", 1)
+                inside = not inside
+        text = "\n".join(lines)
         body = markdown.markdown(
             text,
             extensions=["extra", "codehilite", "sane_lists"],
