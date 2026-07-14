@@ -198,10 +198,11 @@ class SailHandler(BaseHandler):
       border: 1px solid var(--md-default-fg-color--lightest); border-radius: 0.2rem;
       box-shadow: var(--md-shadow-z2, 0 0.2rem 0.5rem rgba(0,0,0,.2)); padding: 0.5rem 0.7rem; font-size: 0.7rem; }
     .sail-hovercard-float .sail-hovercard-doc { margin-bottom: 0.3rem; }
-    /* EIP cards use the page's own typography (md-typeset); only size,
-       scrolling, and table overflow are constrained here */
-    .sail-hovercard-float.sail-hovercard-eip { max-width: min(50rem, 92vw);
-      max-height: min(32rem, 72vh); font-size: 0.8rem; }
+    /* EIP cards use the page's own typography (md-typeset) and a fixed
+       box, applied at creation so every hover is the same size and is
+       positioned exactly once */
+    .sail-hovercard-float.sail-hovercard-eip { width: min(48rem, 92vw);
+      height: min(30rem, 72vh); max-width: none; max-height: none; font-size: 0.8rem; }
     .sail-hovercard-float.sail-hovercard-eip table { display: block; overflow-x: auto; }
     .sail-hovercard-float.sail-hovercard-eip h2 { margin-top: 0; }
     .sail-hovercard-float pre { margin: 0; white-space: pre; overflow-x: auto; }
