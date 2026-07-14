@@ -34,7 +34,7 @@ from ._bundle import Bundle
 from ._eips import EipIndex, link_eip_references
 from ._lsp import project_files
 
-_HOVER_JS = Path(__file__).parent / "assets/sail-hover.js"
+_ASSETS_DIR = Path(__file__).parent / "assets"
 
 _HEADING = re.compile(r"^#\s+(.+)$", re.M)
 
@@ -159,6 +159,8 @@ extra:
   version:
     provider: mike
 extra_javascript:
+  - assets/marked.min.js
+  - assets/highlight.min.js
   - assets/sail-hover.js
 """
 
@@ -220,7 +222,8 @@ def main(argv: list[str] | None = None) -> int:
 
     assets = book / "docs/assets"
     assets.mkdir(parents=True, exist_ok=True)
-    shutil.copy(_HOVER_JS, assets / "sail-hover.js")
+    for script in _ASSETS_DIR.glob("*.js"):
+        shutil.copy(script, assets / script.name)
 
     # pre-render every referenced EIP as an on-demand hover fragment
     if eips is not None:

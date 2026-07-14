@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mkdocstrings-sail"
-version = "0.1.0"
+version = "0.2.0"
 description = "Sail handler for mkdocstrings, rendering definitions from sail --doc docinfo bundles"
 readme = "README.md"
 license = { text = "BSD-2-Clause" }
@@ -30,3 +30,8 @@ sail-book-gen = "mkdocstrings_handlers.sail._book:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mkdocstrings_handlers"]
+
+# invalidate uv's cached wheel when any package file changes, not just
+# pyproject.toml (the default) — `uv run --with <this dir>` stays fresh
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "mkdocstrings_handlers/**" }, { file = "README.md" }]

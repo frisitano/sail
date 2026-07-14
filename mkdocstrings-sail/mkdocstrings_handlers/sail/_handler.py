@@ -206,6 +206,20 @@ class SailHandler(BaseHandler):
     .sail-hovercard-float.sail-hovercard-eip table { display: block; overflow-x: auto; }
     .sail-hovercard-float.sail-hovercard-eip h2 { margin-top: 0; }
     .sail-hovercard-float pre { margin: 0; white-space: pre; overflow-x: auto; }
+    /* live EIP cards highlight code client-side (highlight.js); map its
+       token classes onto Material's code palette so they match the page */
+    .sail-hovercard-eip .hljs-keyword, .sail-hovercard-eip .hljs-literal,
+    .sail-hovercard-eip .hljs-built_in { color: var(--md-code-hl-keyword-color); }
+    .sail-hovercard-eip .hljs-string, .sail-hovercard-eip .hljs-regexp { color: var(--md-code-hl-string-color); }
+    .sail-hovercard-eip .hljs-number { color: var(--md-code-hl-number-color); }
+    .sail-hovercard-eip .hljs-comment, .sail-hovercard-eip .hljs-doctag { color: var(--md-code-hl-comment-color); }
+    .sail-hovercard-eip .hljs-title, .sail-hovercard-eip .hljs-title.function_,
+    .sail-hovercard-eip .hljs-title.class_ { color: var(--md-code-hl-function-color); }
+    .sail-hovercard-eip .hljs-type, .sail-hovercard-eip .hljs-symbol,
+    .sail-hovercard-eip .hljs-meta { color: var(--md-code-hl-special-color); }
+    .sail-hovercard-eip .hljs-attr, .sail-hovercard-eip .hljs-variable,
+    .sail-hovercard-eip .hljs-params { color: var(--md-code-hl-variable-color); }
+    .sail-hovercard-eip .hljs-operator, .sail-hovercard-eip .hljs-punctuation { color: var(--md-code-hl-operator-color); }
     """
 
     def __init__(self, config: Mapping[str, Any], base_dir: Path, **kwargs: Any) -> None:

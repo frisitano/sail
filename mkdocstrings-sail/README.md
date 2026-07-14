@@ -215,6 +215,16 @@ you don't list explicitly (titled by their `# Title` heading), so new
 source files appear without touching the nav. When no `SUMMARY.md` exists,
 a default is generated that includes everything in alphabetical order.
 
+With `--eips <path to an ethereum/EIPs EIPS/ checkout>`, `EIP-N`
+references in prose become links carrying full-document cards. Card
+content is **loaded at runtime**: on first use the EIP's markdown is
+fetched from the canonical `ethereum/EIPs` repository, rendered
+client-side (vendored `marked` 12, MIT + `highlight.js` 11, BSD-3;
+untagged code fences default to Python per EIP-1 convention; raw HTML is
+sanitized), and cached in `localStorage` for a day — so upstream EIP
+edits appear without rebuilding the site. A fragment pre-rendered at
+build time from the local checkout is the offline fallback.
+
 [mkdocs-literate-nav]: https://oprypin.github.io/mkdocs-literate-nav/
 [mkdocs-section-index]: https://oprypin.github.io/mkdocs-section-index/
 
