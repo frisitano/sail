@@ -198,6 +198,12 @@ class SailHandler(BaseHandler):
       border: 1px solid var(--md-default-fg-color--lightest); border-radius: 0.2rem;
       box-shadow: var(--md-shadow-z2, 0 0.2rem 0.5rem rgba(0,0,0,.2)); padding: 0.5rem 0.7rem; font-size: 0.64rem; }
     .sail-hovercard-float .sail-hovercard-doc { margin-bottom: 0.3rem; }
+    .sail-hovercard-float.sail-hovercard-eip { max-width: 46rem; max-height: 30rem; }
+    .sail-hovercard-float h3, .sail-hovercard-float h4, .sail-hovercard-float h5,
+    .sail-hovercard-float h6 { margin: 0.6em 0 0.2em; font-size: 0.75rem; }
+    .sail-hovercard-float .sail-hovercard-doc pre { margin: 0.3rem 0; padding: 0.3rem;
+      background: var(--md-code-bg-color, rgba(0,0,0,.05)); }
+    .sail-hovercard-float ul { margin: 0.2rem 0 0.2rem 1rem; }
     .sail-hovercard-float pre { margin: 0; white-space: pre; overflow-x: auto; }
     """
 

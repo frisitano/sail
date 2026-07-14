@@ -44,23 +44,113 @@
   });
 
   /* Live EIP content: fetch the EIP's current Markdown from ethereum/EIPs
-   * master at hover time, so upstream edits appear without rebuilding the
-   * spec. The baked card is the instant/offline fallback. */
+   * master at hover time and render it in full (scrollable), so upstream
+   * edits appear without rebuilding the spec. The baked summary card is
+   * the instant/offline fallback. All text is inserted as text nodes; only
+   * http(s) links are emitted. */
   var eipCache = {};
+
+  function inline(text, parent) {
+    // minimal inline rendering: `code` spans and [text](url) links
+    var parts = text.split(/(`[^`]*`)/);
+    for (var i = 0; i < parts.length; i++) {
+      if (i % 2) {
+        var code = document.createElement("code");
+        code.textContent = parts[i].slice(1, -1);
+        parent.appendChild(code);
+        continue;
+      }
+      var rest = parts[i].replace(/!\[[^\]]*\]\([^)]*\)/g, "");
+      var re = /\[([^\]]+)\]\(([^)\s]+)\)/g;
+      var last = 0, m;
+      while ((m = re.exec(rest))) {
+        parent.appendChild(document.createTextNode(rest.slice(last, m.index)));
+        if (/^https?:\/\//.test(m[2])) {
+          var a = document.createElement("a");
+          a.href = m[2];
+          a.target = "_blank";
+          a.rel = "noopener";
+          a.textContent = m[1];
+          parent.appendChild(a);
+        } else {
+          parent.appendChild(document.createTextNode(m[1]));
+        }
+        last = m.index + m[0].length;
+      }
+      parent.appendChild(document.createTextNode(rest.slice(last)));
+    }
+  }
+
+  function renderMarkdown(md, container) {
+    var lines = md.split("\n");
+    var i = 0, para = [];
+    function flush() {
+      if (!para.length) return;
+      var pEl = document.createElement("p");
+      inline(para.join(" "), pEl);
+      container.appendChild(pEl);
+      para = [];
+    }
+    while (i < lines.length) {
+      var line = lines[i];
+      var fence = line.match(/^```/);
+      if (fence) {
+        flush();
+        var buf = [];
+        i++;
+        while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
+        i++;
+        var pre = document.createElement("pre");
+        var code = document.createElement("code");
+        code.textContent = buf.join("\n");
+        pre.appendChild(code);
+        container.appendChild(pre);
+        continue;
+      }
+      var h = line.match(/^(#{1,6})\s+(.*)$/);
+      if (h) {
+        flush();
+        var hEl = document.createElement("h" + Math.min(6, h[1].length + 2));
+        inline(h[2], hEl);
+        container.appendChild(hEl);
+        i++;
+        continue;
+      }
+      var li = line.match(/^\s*(?:[-*+]|\d+\.)\s+(.*)$/);
+      if (li) {
+        flush();
+        var ul = container.lastChild && container.lastChild.tagName === "UL"
+          ? container.lastChild : container.appendChild(document.createElement("ul"));
+        var liEl = document.createElement("li");
+        inline(li[1], liEl);
+        ul.appendChild(liEl);
+        i++;
+        continue;
+      }
+      if (!line.trim()) {
+        flush();
+        i++;
+        continue;
+      }
+      para.push(line.trim());
+      i++;
+    }
+    flush();
+  }
+
   function liveEip(n, target) {
     function render(eip) {
       if (!card || card !== target || card.dataset.for !== "eip-" + n) return;
+      card.classList.add("sail-hovercard-eip");
       var doc = card.querySelector(".sail-hovercard-doc") || card;
       doc.textContent = "";
       var head = document.createElement("strong");
       head.textContent = "EIP-" + n + ": " + eip.title;
       var status = document.createElement("small");
       status.textContent = eip.status ? " (" + eip.status + ", live)" : " (live)";
-      var body = document.createElement("p");
-      body.textContent = eip.summary;
       doc.appendChild(head);
       doc.appendChild(status);
-      doc.appendChild(body);
+      renderMarkdown(eip.body, doc);
     }
     if (eipCache[n]) {
       if (eipCache[n] !== "pending" && eipCache[n] !== "failed") render(eipCache[n]);
@@ -74,29 +164,12 @@
         if (text.indexOf("---") === 0) {
           var end = text.indexOf("\n---", 3);
           text.slice(3, end).split("\n").forEach(function (line) {
-            var i = line.indexOf(":");
-            if (i > 0) meta[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+            var j = line.indexOf(":");
+            if (j > 0) meta[line.slice(0, j).trim()] = line.slice(j + 1).trim();
           });
           text = text.slice(end + 4);
         }
-        var summary = "";
-        var sections = text.split(/^## +/m).slice(1);
-        for (var i = 0; i < sections.length; i++) {
-          var nl = sections[i].indexOf("\n");
-          var heading = sections[i].slice(0, nl).trim().toLowerCase();
-          if (heading === "simple summary" || heading === "abstract") {
-            summary = sections[i].slice(nl + 1).trim();
-            break;
-          }
-        }
-        if (!summary && sections.length) summary = sections[0].slice(sections[0].indexOf("\n") + 1).trim();
-        summary = summary
-          .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-          .replace(/`/g, "")
-          .split(/\n\n+/).slice(0, 2).join(" ")
-          .replace(/\s+/g, " ");
-        if (summary.length > 600) summary = summary.slice(0, 600) + "…";
-        eipCache[n] = { title: meta.title || "EIP-" + n, status: meta.status || "", summary: summary };
+        eipCache[n] = { title: meta.title || "EIP-" + n, status: meta.status || "", body: text };
         render(eipCache[n]);
       })
       .catch(function () { eipCache[n] = "failed"; });
