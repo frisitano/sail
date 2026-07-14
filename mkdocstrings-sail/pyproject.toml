@@ -15,6 +15,7 @@ dependencies = [
     # handler, mkdocstrings, and mkdocs-autorefs all require the 1.x API.
     "mkdocs>=1.6,<2",
     "Markdown>=3.3",
+    "mkdocs-literate-nav>=0.6",
     "Pygments>=2.12",
     "MarkupSafe>=2.0",
 ]

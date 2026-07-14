@@ -198,10 +198,18 @@ sail-book-gen --root . --project model.sail_project --module core \
 ```
 
 emits one page per source file under `book/docs/reference/` (`/*md` blocks
-and `::: name` directives in source order), a nav tree mirroring the source
-layout in compilation order, and `mkdocs.yml` (`--no-config` to keep yours).
-Hand-authored pages under `book/docs/` still work: identifiers they render
-are skipped in the generated pages.
+and `::: name` directives in source order) and `mkdocs.yml` (`--no-config`
+to keep yours). Hand-authored pages under `book/docs/` still work:
+identifiers they render are skipped in the generated pages.
+
+Navigation uses [mkdocs-literate-nav]: author `book/docs/SUMMARY.md` as a
+Markdown list of `[Title](path.md)` links, `Section` headers, and `*.md`
+globs to control reading order and section grouping; globs pick up pages
+you don't list explicitly (titled by their `# Title` heading), so new
+source files appear without touching the nav. When no `SUMMARY.md` exists,
+a default is generated that includes everything in alphabetical order.
+
+[mkdocs-literate-nav]: https://oprypin.github.io/mkdocs-literate-nav/
 
 ## Development
 

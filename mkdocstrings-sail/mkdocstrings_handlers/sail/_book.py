@@ -115,70 +115,6 @@ def render_page(
     return title, "\n".join(out)
 
 
-def read_nav_order(book: Path) -> tuple[list[str], dict[str, str]]:
-    """Parse book/nav-order.txt: file paths in desired order, plus
-    ``dir: Title`` section-title lines. Returns (ordered paths, titles)."""
-    path = book / "nav-order.txt"
-    order: list[str] = []
-    titles: dict[str, str] = {}
-    if not path.exists():
-        return order, titles
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ":" in line and not line.endswith(".sail"):
-            prefix, _, title = line.partition(":")
-            titles[prefix.strip()] = title.strip()
-        else:
-            order.append(line)
-    return order, titles
-
-
-def order_pages(pages: list[tuple[str, str, str]], order: list[str]) -> list[tuple[str, str, str]]:
-    """Reorder pages per the nav order; unlisted pages keep compilation
-    order after the listed ones."""
-    if not order:
-        return pages
-    rank = {file: i for i, file in enumerate(order)}
-    return sorted(pages, key=lambda p: (rank.get(p[0], len(order)), pages.index(p)))
-
-
-def nav_lines(pages: list[tuple[str, str, str]], indent: str, section_titles: dict[str, str] | None = None) -> list[str]:
-    """Nested nav mirroring the source tree, in page order.
-
-    The directory prefix common to every page (e.g. a top-level ``sail/``)
-    is hoisted so nav sections start at the topic level. Section titles
-    come from the nav-order file, defaulting to the capitalized dir name."""
-    section_titles = section_titles or {}
-    parents = [Path(file).parent.parts for file, _, _ in pages]
-    common = 0
-    if parents:
-        while all(len(parts) > common and parts[common] == parents[0][common] for parts in parents):
-            common += 1
-    tree: dict = {}
-    for file, page, title in pages:
-        node = tree
-        parts = Path(file).parent.parts
-        for depth, part in enumerate(parts[common:], start=common):
-            dir_path = "/".join(parts[: depth + 1])
-            label = section_titles.get(dir_path, part.capitalize())
-            node = node.setdefault(label, {})
-        node[title] = page
-
-    def emit(node: dict, indent: str) -> list[str]:
-        lines = []
-        for key, value in node.items():
-            if isinstance(value, dict):
-                lines.append(f'{indent}- "{key}":')
-                lines.extend(emit(value, indent + "    "))
-            else:
-                lines.append(f'{indent}- "{key}": {value}')
-        return lines
-
-    return emit(tree, indent)
-
-
 _CONFIG_TEMPLATE = """site_name: "{site_name}"
 theme:
   name: material
@@ -189,6 +125,8 @@ theme:
     - search.highlight
 plugins:
   - search
+  - literate-nav:
+      nav_file: SUMMARY.md
   - autorefs:
       link_titles: false
   - mkdocstrings:
@@ -208,8 +146,6 @@ extra:
     provider: mike
 extra_javascript:
   - assets/sail-hover.js
-nav:
-{nav}
 """
 
 
@@ -284,16 +220,16 @@ def main(argv: list[str] | None = None) -> int:
         toc = "\n".join(f"- [{title}]({page})" for _, page, title in pages)
         index.write_text(f"# {args.site_name}\n\n## Modules\n\n" + toc + "\n")
 
+    # navigation lives in docs/SUMMARY.md (mkdocs-literate-nav); generate a
+    # default covering everything when none is authored
+    summary = book / "docs/SUMMARY.md"
+    if not summary.exists():
+        summary.write_text("- [Home](index.md)\n- *.md\n- reference/*\n")
+
     if not args.no_config:
-        nav_order, section_titles = read_nav_order(book)
-        pages = order_pages(pages, nav_order)
-        authored = sorted(p.name for p in (book / "docs").glob("*.md") if p.name != "index.md")
-        nav = ["  - Home: index.md"]
-        nav += [f"  - {name.removesuffix('.md').replace('_', ' ').title()}: {name}" for name in authored]
-        nav += nav_lines(pages, "  ", section_titles)
         eips_config = f"\n          eips_dir: {Path(args.eips).resolve()}" if args.eips else ""
         (book / "mkdocs.yml").write_text(
-            _CONFIG_TEMPLATE.format(site_name=args.site_name, nav="\n".join(nav), eips_config=eips_config)
+            _CONFIG_TEMPLATE.format(site_name=args.site_name, eips_config=eips_config)
         )
 
     print(
