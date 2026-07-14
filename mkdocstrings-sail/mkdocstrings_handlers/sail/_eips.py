@@ -74,6 +74,34 @@ class EipIndex:
         out = " ".join(" ".join(paragraphs[:2]).split())
         return out[:600] + ("…" if len(out) > 600 else "")
 
+    def render_full_html(self, number: int) -> Optional[str]:
+        """The complete EIP rendered to HTML (tables, highlighted code),
+        for on-demand hover fragments. Uses the site's pygments classes so
+        the page stylesheet applies."""
+        import markdown
+
+        if self._dir is None:
+            return None
+        path = self._dir / f"eip-{number}.md"
+        if not path.exists():
+            return None
+        text = path.read_text(errors="replace")
+        meta = {}
+        if text.startswith("---"):
+            end = text.find("\n---", 3)
+            for line in text[3:end].strip().splitlines():
+                key, _, value = line.partition(":")
+                meta[key.strip()] = value.strip()
+            text = text[end + 4 :]
+        body = markdown.markdown(
+            text,
+            extensions=["extra", "codehilite", "sane_lists"],
+            extension_configs={"codehilite": {"css_class": "highlight", "guess_lang": False}},
+        )
+        title = escape(meta.get("title", f"EIP-{number}"))
+        status = f' <small>({escape(meta["status"])})</small>' if meta.get("status") else ""
+        return f"<h2>EIP-{number}: {title}{status}</h2>\n{body}"
+
     def card_html(self, number: int) -> Optional[str]:
         eip = self.lookup(number)
         if eip is None:

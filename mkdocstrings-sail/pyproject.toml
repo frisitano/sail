@@ -14,6 +14,7 @@ dependencies = [
     # MkDocs 2.0 (unreleased) removes the plugin system entirely; this
     # handler, mkdocstrings, and mkdocs-autorefs all require the 1.x API.
     "mkdocs>=1.6,<2",
+    "Markdown>=3.3",
     "Pygments>=2.12",
     "MarkupSafe>=2.0",
 ]

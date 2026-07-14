@@ -198,11 +198,17 @@ class SailHandler(BaseHandler):
       border: 1px solid var(--md-default-fg-color--lightest); border-radius: 0.2rem;
       box-shadow: var(--md-shadow-z2, 0 0.2rem 0.5rem rgba(0,0,0,.2)); padding: 0.5rem 0.7rem; font-size: 0.64rem; }
     .sail-hovercard-float .sail-hovercard-doc { margin-bottom: 0.3rem; }
-    .sail-hovercard-float.sail-hovercard-eip { width: min(48rem, 90vw); height: min(32rem, 70vh);
-      max-width: none; max-height: none; padding: 0; overflow: hidden; display: flex;
-      flex-direction: column; }
-    .sail-hovercard-float.sail-hovercard-eip .sail-hovercard-doc { padding: 0.5rem 0.7rem; }
-    .sail-eip-frame { border: 0; flex: 1; width: 100%; min-height: 0; background: #fff; }
+    .sail-hovercard-float.sail-hovercard-eip { max-width: min(46rem, 90vw);
+      max-height: min(30rem, 70vh); }
+    .sail-hovercard-float.sail-hovercard-eip table { display: block; overflow-x: auto;
+      border-collapse: collapse; font-size: 0.62rem; }
+    .sail-hovercard-float.sail-hovercard-eip td, .sail-hovercard-float.sail-hovercard-eip th {
+      border: 1px solid var(--md-default-fg-color--lightest); padding: 0.15rem 0.4rem; }
+    .sail-hovercard-float.sail-hovercard-eip pre { padding: 0.3rem;
+      background: var(--md-code-bg-color, rgba(0,0,0,.05)); }
+    .sail-hovercard-float.sail-hovercard-eip h2 { font-size: 0.85rem; margin: 0 0 0.4rem; }
+    .sail-hovercard-float.sail-hovercard-eip h3, .sail-hovercard-float.sail-hovercard-eip h4 {
+      font-size: 0.72rem; margin: 0.6em 0 0.2em; }
     .sail-hovercard-float pre { margin: 0; white-space: pre; overflow-x: auto; }
     """
 

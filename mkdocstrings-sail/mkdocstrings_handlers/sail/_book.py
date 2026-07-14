@@ -225,6 +225,25 @@ def main(argv: list[str] | None = None) -> int:
     assets.mkdir(parents=True, exist_ok=True)
     shutil.copy(_HOVER_JS, assets / "sail-hover.js")
 
+    # pre-render every referenced EIP as an on-demand hover fragment
+    if eips is not None:
+        from ._eips import _EIP_REF
+
+        numbers: set[int] = set()
+        for file in files:
+            source = root / file
+            if source.exists():
+                numbers.update(int(m.group(1)) for m in _EIP_REF.finditer(source.read_text()))
+        fragments = assets / "eips"
+        fragments.mkdir(exist_ok=True)
+        rendered = 0
+        for n in sorted(numbers):
+            html = eips.render_full_html(n)
+            if html:
+                (fragments / f"eip-{n}.html").write_text(html)
+                rendered += 1
+        print(f"rendered {rendered} EIP hover fragments", file=sys.stderr)
+
     # a home page is required for the site root; generate one if not authored
     index = book / "docs/index.md"
     if not index.exists():
