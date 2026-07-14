@@ -13,6 +13,7 @@ import unittest
 from mkdocstrings_handlers.sail import Bundle, BundleError, anchor_for
 from mkdocstrings_handlers.sail._book import markdown_blocks, page_items, render_page
 from mkdocstrings_handlers.sail._handler import (
+    _dedent_comment,
     _body_preview,
     _byte_to_str_spans,
     _comment_summary,
@@ -199,6 +200,12 @@ class TestHighlightLinked(unittest.TestCase):
         self.assertEqual(len(preview.splitlines()), 9)  # 8 lines + ellipsis
         self.assertTrue(preview.endswith("…"))
         self.assertIsNone(_body_preview(None))
+
+    def test_dedent_comment_prevents_code_blocks(self):
+        comment = " First line.\n\n    Second paragraph, indented under the comment\n    marker.\n\n    - a list item\n        - nested"
+        dedented = _dedent_comment(comment)
+        self.assertTrue(dedented.startswith("First line.\n\nSecond paragraph"))
+        self.assertIn("\n- a list item\n    - nested", dedented)
 
     def test_comment_summary_first_sentence_plain_text(self):
         self.assertEqual(

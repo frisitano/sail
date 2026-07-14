@@ -11,6 +11,7 @@ site — cross-page, with no path computation here.
 from __future__ import annotations
 
 import json
+import textwrap
 from pathlib import Path
 from typing import Any, ClassVar, Mapping, Optional
 
@@ -64,6 +65,18 @@ def _body_preview(
     if len(lines) > max_lines:
         preview += "\n…"
     return preview[:max_chars]
+
+
+def _dedent_comment(comment: str) -> str:
+    """Strip the comment's continuation indent so Markdown sees column 0.
+
+    Doc comments indent continuation lines to align under ``/*!``; without
+    dedenting, a paragraph after a blank line becomes a Markdown code block,
+    and admonitions/lists cannot be expressed. The first line keeps only its
+    own strip; relative indentation of later lines is preserved.
+    """
+    first, sep, rest = comment.partition("\n")
+    return first.strip() + sep + textwrap.dedent(rest)
 
 
 def _comment_summary(comment: Optional[str]) -> Optional[str]:
@@ -303,7 +316,8 @@ class SailHandler(BaseHandler):
         parts = [f'<template class="sail-hovercard" data-anchor="{escape(anchor)}">']
         if definition.comment:
             parts.append(
-                f'<div class="sail-hovercard-doc">{self.do_convert_markdown(definition.comment.strip(), 6)}</div>'
+                f'<div class="sail-hovercard-doc">'
+                f'{self.do_convert_markdown(_dedent_comment(definition.comment).strip(), 6)}</div>'
             )
         preview = _body_preview(definition, max_lines=_CARD_LINES, max_chars=_CARD_CHARS)
         if preview:
@@ -368,7 +382,7 @@ class SailHandler(BaseHandler):
             )
         )
         if options["show_comment"] and data.comment:
-            parts.append(str(self.do_convert_markdown(data.comment.strip(), heading_level + 1)))
+            parts.append(str(self.do_convert_markdown(_dedent_comment(data.comment).strip(), heading_level + 1)))
         if options["show_source"]:
             cards: Optional[dict[str, Definition]] = {} if options["hover_cards"] else None
             for clause in data.clauses:
