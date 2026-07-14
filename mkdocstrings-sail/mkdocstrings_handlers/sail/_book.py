@@ -202,9 +202,22 @@ def main(argv: list[str] | None = None) -> int:
     assets.mkdir(parents=True, exist_ok=True)
     shutil.copy(_HOVER_JS, assets / "sail-hover.js")
 
+    # a home page is required for the site root; generate one if not authored
+    index = book / "docs/index.md"
+    if not index.exists():
+        toc = "\n".join(f"- [{title}]({page})" for _, page, title in pages)
+        index.write_text(
+            f"# {args.site_name}\n\n"
+            "This specification is generated from the Sail sources: module and\n"
+            "section prose from `/*md ... */` comments, definition documentation\n"
+            "from `/*! ... */` doc comments, interleaved with the definitions in\n"
+            "source order.\n\n## Modules\n\n" + toc + "\n"
+        )
+
     if not args.no_config:
-        authored = sorted(p.name for p in (book / "docs").glob("*.md"))
-        nav = [f"  - {name.removesuffix('.md').replace('_', ' ').title()}: {name}" for name in authored]
+        authored = sorted(p.name for p in (book / "docs").glob("*.md") if p.name != "index.md")
+        nav = ["  - Home: index.md"]
+        nav += [f"  - {name.removesuffix('.md').replace('_', ' ').title()}: {name}" for name in authored]
         nav += ["  - Reference:"] + nav_lines(pages, "      ")
         (book / "mkdocs.yml").write_text(_CONFIG_TEMPLATE.format(site_name=args.site_name, nav="\n".join(nav)))
 
