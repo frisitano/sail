@@ -229,13 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     index = book / "docs/index.md"
     if not index.exists():
         toc = "\n".join(f"- [{title}]({page})" for _, page, title in pages)
-        index.write_text(
-            f"# {args.site_name}\n\n"
-            "This specification is generated from the Sail sources: module and\n"
-            "section prose from `/*md ... */` comments, definition documentation\n"
-            "from `/*! ... */` doc comments, interleaved with the definitions in\n"
-            "source order.\n\n## Modules\n\n" + toc + "\n"
-        )
+        index.write_text(f"# {args.site_name}\n\n## Modules\n\n" + toc + "\n")
 
     if not args.no_config:
         authored = sorted(p.name for p in (book / "docs").glob("*.md") if p.name != "index.md")
