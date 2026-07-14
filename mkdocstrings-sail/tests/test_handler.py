@@ -298,6 +298,24 @@ class TestLspIndex(unittest.TestCase):
         self.assertIsNone(bundle.definition_at("spec/lib/util.sail", 5000))
 
 
+class TestEips(unittest.TestCase):
+    def test_link_eip_references_wraps_and_records(self):
+        from mkdocstrings_handlers.sail._eips import link_eip_references
+        seen = set()
+        out = link_eip_references("Per EIP-2929, cold access. See `EIP-9999` in code.", seen, hover=True)
+        self.assertIn("[EIP-2929](https://eips.ethereum.org/EIPS/eip-2929)", out)
+        self.assertIn('data-sail-hover="eip-2929"', out)
+        self.assertIn("`EIP-9999`", out)  # code spans untouched
+        self.assertEqual(seen, {2929})
+
+    def test_existing_links_not_rewrapped(self):
+        from mkdocstrings_handlers.sail._eips import link_eip_references
+        seen = set()
+        out = link_eip_references("[EIP-140](https://example.com)", seen, hover=True)
+        self.assertEqual(out, "[EIP-140](https://example.com)")
+        self.assertEqual(seen, set())
+
+
 SOURCE = """/*md
 # Machine
 

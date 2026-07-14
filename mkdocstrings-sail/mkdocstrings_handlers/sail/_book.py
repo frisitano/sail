@@ -28,8 +28,10 @@ import re
 import shutil
 import sys
 from pathlib import Path
+from typing import Optional
 
 from ._bundle import Bundle
+from ._eips import EipIndex, link_eip_references
 from ._lsp import project_files
 
 _HOVER_JS = Path(__file__).parent / "assets/sail-hover.js"
@@ -84,30 +86,49 @@ def page_items(bundle: Bundle, file: str, text: str, excluded: set[str]) -> list
     return [item for _, item in sorted(entries, key=lambda entry: entry[0])]
 
 
-def render_page(file: str, items: list[tuple[str, ...]]) -> tuple[str, str]:
+def render_page(
+    file: str, items: list[tuple[str, ...]], eips: Optional[EipIndex] = None
+) -> tuple[str, str]:
     """Render a page; returns (nav title, markdown). The first ``/*md`` block's
     leading ``# heading`` names the page; otherwise the file path does."""
     title = Path(file).stem
     out = []
+    eips_seen: set[int] = set()
     if not (items and items[0][0] == "md" and _HEADING.match(items[0][1])):
         out.append(f"# `{file}`\n")
     else:
         title = _HEADING.match(items[0][1]).group(1).strip()
     for item in items:
         if item[0] == "md":
-            out.append(item[1] + "\n")
+            block = item[1]
+            if eips is not None:
+                block = link_eip_references(block, eips_seen, hover=True)
+            out.append(block + "\n")
         else:
             _, kind, name = item
             out.append(f"::: {name}\n    options:\n      kind: {kind}\n")
+    if eips is not None:
+        for n in sorted(eips_seen):
+            card = eips.card_html(n)
+            if card:
+                out.append(card + "\n")
     return title, "\n".join(out)
 
 
 def nav_lines(pages: list[tuple[str, str, str]], indent: str) -> list[str]:
-    """Nested nav mirroring the source tree, in compilation order."""
+    """Nested nav mirroring the source tree, in compilation order.
+
+    The directory prefix common to every page (e.g. a top-level ``sail/``)
+    is hoisted so nav sections start at the topic level."""
+    parents = [Path(file).parent.parts for file, _, _ in pages]
+    common = 0
+    if parents:
+        while all(len(parts) > common and parts[common] == parents[0][common] for parts in parents):
+            common += 1
     tree: dict = {}
     for file, page, title in pages:
         node = tree
-        for part in Path(file).parent.parts:
+        for part in Path(file).parent.parts[common:]:
             node = node.setdefault(part, {})
         node[title] = page
 
@@ -130,7 +151,6 @@ theme:
   features:
     - content.code.copy
     - content.tooltips
-    - navigation.tabs
     - navigation.top
     - search.highlight
 plugins:
@@ -142,9 +162,10 @@ plugins:
       handlers:
         sail:
           bundle: doc/doc.json
-          lsp_index: doc/lsp-index.json
+          lsp_index: doc/lsp-index.json{eips_config}
 markdown_extensions:
   - admonition
+  - attr_list
   - toc:
       permalink: true
   - pymdownx.superfences
@@ -167,11 +188,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sail", default="sail", help="sail binary for --list-files")
     parser.add_argument("--book", required=True, help="book directory (holds mkdocs.yml, docs/, doc/doc.json)")
     parser.add_argument("--site-name", default="Sail Specification")
+    parser.add_argument("--eips", help="local ethereum/EIPs EIPS/ directory for EIP hover cards")
     parser.add_argument("--no-config", action="store_true", help="do not (re)write mkdocs.yml")
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
     book = Path(args.book)
+    eips = EipIndex(Path(args.eips).resolve()) if args.eips else None
     bundle = Bundle.load(book / "doc/doc.json")
     files = project_files(args.sail, root, args.project, args.module, args.variable)
 
@@ -191,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         if not items:
             continue
         definitions += sum(1 for item in items if item[0] == "def")
-        title, markdown = render_page(file, items)
+        title, markdown = render_page(file, items, eips)
         page = str(Path(file).with_suffix(".md"))
         path = book / "docs/reference" / page
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,8 +241,11 @@ def main(argv: list[str] | None = None) -> int:
         authored = sorted(p.name for p in (book / "docs").glob("*.md") if p.name != "index.md")
         nav = ["  - Home: index.md"]
         nav += [f"  - {name.removesuffix('.md').replace('_', ' ').title()}: {name}" for name in authored]
-        nav += ["  - Reference:"] + nav_lines(pages, "      ")
-        (book / "mkdocs.yml").write_text(_CONFIG_TEMPLATE.format(site_name=args.site_name, nav="\n".join(nav)))
+        nav += nav_lines(pages, "  ")
+        eips_config = f"\n          eips_dir: {Path(args.eips).resolve()}" if args.eips else ""
+        (book / "mkdocs.yml").write_text(
+            _CONFIG_TEMPLATE.format(site_name=args.site_name, nav="\n".join(nav), eips_config=eips_config)
+        )
 
     print(
         f"generated {len(pages)} pages covering {definitions} definitions"
