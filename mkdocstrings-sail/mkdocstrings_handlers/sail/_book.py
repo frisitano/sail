@@ -115,6 +115,19 @@ def render_page(
     return title, "\n".join(out)
 
 
+def render_mod_page(text: str, eips: Optional[EipIndex] = None) -> str:
+    """Render a directory's mod.md overview, with EIP references linked."""
+    if eips is None:
+        return text
+    eips_seen: set[int] = set()
+    out = link_eip_references(text, eips_seen, hover=True)
+    for n in sorted(eips_seen):
+        card = eips.card_html(n)
+        if card:
+            out += "\n" + card + "\n"
+    return out
+
+
 _CONFIG_TEMPLATE = """site_name: "{site_name}"
 theme:
   name: material
@@ -127,6 +140,7 @@ plugins:
   - search
   - literate-nav:
       nav_file: SUMMARY.md
+  - section-index
   - autorefs:
       link_titles: false
   - mkdocstrings:
@@ -191,6 +205,19 @@ def main(argv: list[str] | None = None) -> int:
         path.write_text(markdown)
         pages.append((file, "reference/" + page, title))
 
+    # a mod.md in a source directory is its section overview; rendered as
+    # the directory's index page (mkdocs-section-index attaches it to the
+    # nav section, making the section title clickable)
+    mod_files = []
+    for directory in sorted({str(Path(file).parent) for file in files if (root / file).exists()}):
+        mod = root / directory / "mod.md"
+        if mod.exists():
+            mod_files.append(mod)
+            markdown = render_mod_page(mod.read_text(), eips)
+            path = book / "docs/reference" / directory / "index.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(markdown)
+
     assets = book / "docs/assets"
     assets.mkdir(parents=True, exist_ok=True)
     shutil.copy(_HOVER_JS, assets / "sail-hover.js")
@@ -200,8 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         from ._eips import _EIP_REF
 
         numbers: set[int] = set()
-        for file in files:
-            source = root / file
+        for source in [root / file for file in files] + mod_files:
             if source.exists():
                 numbers.update(int(m.group(1)) for m in _EIP_REF.finditer(source.read_text()))
         fragments = assets / "eips"

@@ -202,6 +202,12 @@ and `::: name` directives in source order) and `mkdocs.yml` (`--no-config`
 to keep yours). Hand-authored pages under `book/docs/` still work:
 identifiers they render are skipped in the generated pages.
 
+A `mod.md` in a source directory is that directory's section overview: it
+is rendered (EIP references linked) as the directory's `index.md` under
+`reference/`, and [mkdocs-section-index] attaches it to the nav section,
+so the section title itself opens the overview. List it as the section's
+first entry in `SUMMARY.md`.
+
 Navigation uses [mkdocs-literate-nav]: author `book/docs/SUMMARY.md` as a
 Markdown list of `[Title](path.md)` links, `Section` headers, and `*.md`
 globs to control reading order and section grouping; globs pick up pages
@@ -210,6 +216,7 @@ source files appear without touching the nav. When no `SUMMARY.md` exists,
 a default is generated that includes everything in alphabetical order.
 
 [mkdocs-literate-nav]: https://oprypin.github.io/mkdocs-literate-nav/
+[mkdocs-section-index]: https://oprypin.github.io/mkdocs-section-index/
 
 ## Development
 

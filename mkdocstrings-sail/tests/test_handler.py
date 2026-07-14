@@ -336,6 +336,11 @@ function step() = ()
 
 
 class TestBook(unittest.TestCase):
+    def test_render_mod_page_links_eips(self):
+        from mkdocstrings_handlers.sail._book import render_mod_page
+        text = "# Host interface\n\nWarming follows EIP-2929.\n"
+        self.assertEqual(render_mod_page(text, None), text)
+
     def test_markdown_blocks_positions_and_nesting(self):
         blocks = markdown_blocks(SOURCE)
         self.assertEqual(len(blocks), 2)
