@@ -341,6 +341,18 @@ class TestBook(unittest.TestCase):
         text = "# Host interface\n\nWarming follows EIP-2929.\n"
         self.assertEqual(render_mod_page(text, None), text)
 
+    def test_lean_page_items_split(self):
+        from mkdocstrings_handlers.sail._book import lean_page_items, render_lean_page
+        text = "import Sail\n\n/-! # Gas\n\nProse here. -/\n\n/-- The base fee. -/\ndef base_fee : Int := 7\n"
+        items = lean_page_items(text)
+        self.assertEqual([k for k, _ in items], ["code", "md", "md", "code"])
+        self.assertIn("# Gas", items[1][1])
+        title, markdown = render_lean_page("Gas", text)
+        self.assertEqual(title, "Gas")
+        self.assertTrue(markdown.startswith("# Gas"))  # title heading hoisted above the prelude
+        self.assertIn("```lean4\ndef base_fee : Int := 7\n```", markdown)
+        self.assertIn("The base fee.", markdown)
+
     def test_markdown_blocks_positions_and_nesting(self):
         blocks = markdown_blocks(SOURCE)
         self.assertEqual(len(blocks), 2)

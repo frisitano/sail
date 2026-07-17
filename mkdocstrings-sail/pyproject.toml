@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mkdocstrings-sail"
-version = "0.2.0"
+version = "0.2.1"
 description = "Sail handler for mkdocstrings, rendering definitions from sail --doc docinfo bundles"
 readme = "README.md"
 license = { text = "BSD-2-Clause" }

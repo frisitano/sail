@@ -115,6 +115,74 @@ def render_page(
     return title, "\n".join(out)
 
 
+def lean_page_items(text: str) -> list[tuple[str, str]]:
+    """Split a generated Lean file into ('md', prose) and ('code', chunk) items.
+
+    ``/-! ... -/`` module docstrings and ``/-- ... -/`` definition
+    docstrings (both carrying the specification prose in extracted code)
+    become Markdown; everything between is Lean source."""
+    items: list[tuple[str, str]] = []
+    code: list[str] = []
+    lines = text.split("\n")
+    i = 0
+
+    def flush_code() -> None:
+        chunk = "\n".join(code).strip("\n")
+        code.clear()
+        if chunk:
+            items.append(("code", chunk))
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        marker = next((m for m in ("/-!", "/--") if stripped.startswith(m)), None)
+        if marker and not stripped.startswith("/---"):
+            flush_code()
+            block: list[str] = [stripped[len(marker):]]
+            while not block[-1].rstrip().endswith("-/"):
+                i += 1
+                if i >= len(lines):
+                    break
+                block.append(lines[i])
+            block[-1] = block[-1].rstrip()[: -len("-/")]
+            prose = "\n".join(part.strip() if n == 0 else part for n, part in enumerate(block)).strip()
+            items.append(("md", prose))
+        else:
+            code.append(line)
+        i += 1
+    flush_code()
+    return items
+
+
+def render_lean_page(name: str, text: str, eips: Optional[EipIndex] = None) -> tuple[str, str]:
+    """Render an extracted Lean module; returns (title, markdown)."""
+    items = lean_page_items(text)
+    title = name
+    out = []
+    eips_seen: set[int] = set()
+    first = next((i for i, item in enumerate(items) if item[0] == "md"), None)
+    if first is not None and _HEADING.match(items[first][1]):
+        title = _HEADING.match(items[first][1]).group(1).strip()
+        # the title heading must open the page (MkDocs reads the page
+        # title from the leading block), ahead of the import prelude
+        items.insert(0, items.pop(first))
+    else:
+        out.append(f"# `{name}.lean`\n")
+    for kind, chunk in items:
+        if kind == "md":
+            if eips is not None:
+                chunk = link_eip_references(chunk, eips_seen, hover=True)
+            out.append(chunk + "\n")
+        else:
+            out.append("```lean4\n" + chunk + "\n```\n")
+    if eips is not None:
+        for n in sorted(eips_seen):
+            card = eips.card_html(n)
+            if card:
+                out.append(card + "\n")
+    return title, "\n".join(out)
+
+
 def render_mod_page(text: str, eips: Optional[EipIndex] = None) -> str:
     """Render a directory's mod.md overview, with EIP references linked."""
     if eips is None:
@@ -175,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--book", required=True, help="book directory (holds mkdocs.yml, docs/, doc/doc.json)")
     parser.add_argument("--site-name", default="Sail Specification")
     parser.add_argument("--eips", help="local ethereum/EIPs EIPS/ directory for EIP hover cards")
+    parser.add_argument("--lean", help="extracted Lean project directory; renders an extraction section")
     parser.add_argument("--no-config", action="store_true", help="do not (re)write mkdocs.yml")
     args = parser.parse_args(argv)
 
@@ -220,6 +289,21 @@ def main(argv: list[str] | None = None) -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(markdown)
 
+    # extracted Lean modules become literate pages under extraction/lean/
+    lean_files: list[Path] = []
+    if args.lean:
+        lean_root = Path(args.lean)
+        lean_files = sorted(
+            f for f in lean_root.rglob("*.lean") if ".lake" not in f.parts and f.name != "lakefile.lean"
+        )
+        for f in lean_files:
+            title, markdown = render_lean_page(f.stem, f.read_text(), eips)
+            path = book / "docs/extraction/lean" / f.relative_to(lean_root).with_suffix(".md")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(markdown)
+        if lean_files:
+            print(f"rendered {len(lean_files)} Lean extraction pages", file=sys.stderr)
+
     assets = book / "docs/assets"
     assets.mkdir(parents=True, exist_ok=True)
     for script in _ASSETS_DIR.glob("*.js"):
@@ -230,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         from ._eips import _EIP_REF
 
         numbers: set[int] = set()
-        for source in [root / file for file in files] + mod_files:
+        for source in [root / file for file in files] + mod_files + lean_files:
             if source.exists():
                 numbers.update(int(m.group(1)) for m in _EIP_REF.finditer(source.read_text()))
         fragments = assets / "eips"

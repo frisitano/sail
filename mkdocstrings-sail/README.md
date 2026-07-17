@@ -225,6 +225,15 @@ sanitized), and cached in `localStorage` for a day — so upstream EIP
 edits appear without rebuilding the site. A fragment pre-rendered at
 build time from the local checkout is the offline fallback.
 
+With `--lean <dir>` pointing at a project extracted by `sail --lean`,
+`sail-book-gen` renders a Lean-extraction section under
+`extraction/lean/`: the backend on this branch carries `/*!` doc
+comments into the extracted code as `/-- … -/` docstrings and each
+file's leading `/*md` block as a `/-! … -/` module docstring, and the
+generator renders those back as page prose (EIP references linked)
+around `lean4`-highlighted source. Add the section to `SUMMARY.md` with
+globs, e.g. `- Lean extraction:` / `extraction/lean/Out/*.md`.
+
 [mkdocs-literate-nav]: https://oprypin.github.io/mkdocs-literate-nav/
 [mkdocs-section-index]: https://oprypin.github.io/mkdocs-section-index/
 
