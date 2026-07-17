@@ -346,7 +346,9 @@ let doc_typ_quant_all ctx qs = List.map (doc_quant_item_all ctx) qs
 let doc_typ_quant_in_comment ctx tq =
   let typ_quants = doc_typ_quant_all ctx tq in
   if List.length typ_quants > 0 then
-    string "/-- Type quantifiers: " ^^ nest 2 (flow comma_sp typ_quants) ^^ string " -/" ^^ hardline
+    (* an ordinary comment: a doc comment here would clash with the
+       definition's Sail doc comment (two docstrings is a parse error) *)
+    string "/- Type quantifiers: " ^^ nest 2 (flow comma_sp typ_quants) ^^ string " -/" ^^ hardline
   else empty
 
 let doc_quant_item_relevant ctx (QI_aux (qi, annot)) =
@@ -1337,46 +1339,131 @@ let doc_val ctx pat exp =
   in
   (global, nest 2 (group (string "def" ^^ space ^^ idpp ^^ typpp ^^ space ^^ coloneq ^/^ base_pp)))
 
+
+(* Sail doc comments (/*! ... */) become Lean docstrings, and a file's
+   leading /*md ... */ block becomes a Lean module docstring, so extracted
+   code carries the specification prose. *)
+
+let escape_comment_close s =
+  (* a literal "-/" inside a Lean comment would terminate it *)
+  let buf = Buffer.create (String.length s) in
+  String.iteri
+    (fun i c -> if c = '/' && i > 0 && s.[i - 1] = '-' then Buffer.add_string buf " /" else Buffer.add_char buf c)
+    s;
+  Buffer.contents buf
+
+let dedent_comment s =
+  let leading l =
+    if String.trim l = "" then max_int
+    else (
+      let n = ref 0 in
+      while !n < String.length l && l.[!n] = ' ' do
+        incr n
+      done;
+      !n
+    )
+  in
+  match String.split_on_char '\n' s with
+  | [] -> s
+  | first :: rest ->
+      let width = List.fold_left (fun acc l -> min acc (leading l)) max_int rest in
+      let strip l =
+        if width <> max_int && String.length l >= width then String.sub l width (String.length l - width)
+        else String.trim l
+      in
+      String.concat "\n" (String.trim first :: List.map strip rest)
+
+let doc_comment_block ~is_module text =
+  let opener = if is_module then "/-! " else "/-- " in
+  let text = escape_comment_close (dedent_comment (String.trim text)) in
+  separate hardline (List.map string (String.split_on_char '\n' (opener ^ text ^ " -/"))) ^^ hardline
+
+let doc_docstring (dannot : 'a def_annot) =
+  match dannot.doc_comment with
+  | Some dc -> doc_comment_block ~is_module:false dc.Parse_ast.contents
+  | None -> empty
+
+let module_doc_of_file filename =
+  try
+    let ic = open_in filename in
+    let text = really_input_string ic (in_channel_length ic) in
+    close_in ic;
+    let len = String.length text in
+    let is_space c = c = ' ' || c = '\t' || c = '\n' || c = '\r' in
+    let rec find i =
+      if i + 4 >= len then None
+      else if String.sub text i 4 = "/*md" && is_space text.[i + 4] then Some (i + 4)
+      else find (i + 1)
+    in
+    let rec scan i depth =
+      if i + 1 >= len then None
+      else if text.[i] = '/' && text.[i + 1] = '*' then scan (i + 2) (depth + 1)
+      else if text.[i] = '*' && text.[i + 1] = '/' then if depth = 1 then Some i else scan (i + 2) (depth - 1)
+      else scan (i + 1) depth
+    in
+    match find 0 with
+    | None -> None
+    | Some start -> (
+        match scan start 1 with
+        | Some stop -> Some (String.trim (String.sub text start (stop - start)))
+        | None -> None
+      )
+  with _ -> None
+
+let doc_module_doc filename =
+  match module_doc_of_file filename with Some md -> doc_comment_block ~is_module:true md ^^ hardline | None -> empty
+
 let should_print_function_def def =
   match def with
   | DEF_aux (DEF_fundef fdef, dannot) -> not (Env.is_extern (id_of_fundef fdef) dannot.env "lean")
   | DEF_aux (DEF_let (pat, exp), _) -> true
   | _ -> false
 
-let rec doc_defs_rec ctx defs types (former_funcs : document list) (docdefs : document) =
+let rec doc_defs_rec ctx defs types (former_funcs : document list) (docdefs : document) (pending : document) =
+  (* [pending] holds the current file's module docstring; it is emitted
+     just before the file's first printed definition so that chunk
+     flushing (and hence import alignment) is unaffected for files that
+     print nothing. *)
   match defs with
   | [] -> (types, former_funcs @ [docdefs])
   | DEF_aux (DEF_fundef fdef, dannot) :: defs' ->
       let env = dannot.env in
-      let pp_f =
-        if Env.is_extern (id_of_fundef fdef) env "lean" then docdefs
-        else docdefs ^^ group (doc_fundef ctx fdef) ^/^ hardline
+      let pp_f, pending =
+        if Env.is_extern (id_of_fundef fdef) env "lean" then (docdefs, pending)
+        else (docdefs ^^ pending ^^ doc_docstring dannot ^^ group (doc_fundef ctx fdef) ^/^ hardline, empty)
       in
-      doc_defs_rec ctx defs' types former_funcs pp_f
+      doc_defs_rec ctx defs' types former_funcs pp_f pending
   | DEF_aux (DEF_internal_mutrec fdefs, dannot) :: defs' ->
       let funs = separate_map hardline (fun fdef -> doc_fundef ctx fdef) fdefs in
       let res = string "mutual" ^^ hardline ^^ funs ^^ hardline ^^ string "end" ^^ hardline in
-      doc_defs_rec ctx defs' types former_funcs (docdefs ^^ hardline ^^ res ^^ hardline)
+      doc_defs_rec ctx defs' types former_funcs (docdefs ^^ pending ^^ hardline ^^ res ^^ hardline) empty
   | DEF_aux (DEF_type tdef, _) :: defs' when List.mem (string_of_id (id_of_type_def tdef)) !opt_extern_types ->
-      doc_defs_rec ctx defs' types former_funcs docdefs
-  | DEF_aux (DEF_type tdef, _) :: defs' ->
-      doc_defs_rec ctx defs' (types ^^ group (doc_typdef ctx tdef) ^/^ hardline) former_funcs docdefs
-  | DEF_aux (DEF_let (pat, exp), _) :: defs' ->
+      doc_defs_rec ctx defs' types former_funcs docdefs pending
+  | DEF_aux (DEF_type tdef, dannot) :: defs' ->
+      doc_defs_rec ctx defs'
+        (types ^^ doc_docstring dannot ^^ group (doc_typdef ctx tdef) ^/^ hardline)
+        former_funcs docdefs pending
+  | DEF_aux (DEF_let (pat, exp), dannot) :: defs' ->
       let global, pp_val = doc_val ctx pat exp in
       let ctx = { ctx with global } in
-      doc_defs_rec ctx defs' types former_funcs (docdefs ^^ group pp_val ^/^ hardline)
+      doc_defs_rec ctx defs' types former_funcs
+        (docdefs ^^ pending ^^ doc_docstring dannot ^^ group pp_val ^/^ hardline)
+        empty
   | DEF_aux (DEF_pragma ("include_start", Pragma_line (file, _)), _) :: defs'
   | DEF_aux (DEF_pragma ("file_start", Pragma_line (file, _)), _) :: defs'
+    when Filename.check_suffix file ".sail" ->
+      if docdefs = empty then doc_defs_rec ctx defs' types former_funcs docdefs (doc_module_doc file)
+      else doc_defs_rec ctx defs' types (former_funcs @ [docdefs]) empty (doc_module_doc file)
   | DEF_aux (DEF_pragma ("include_end", Pragma_line (file, _)), _) :: defs'
   | DEF_aux (DEF_pragma ("file_end", Pragma_line (file, _)), _) :: defs'
     when Filename.check_suffix file ".sail" ->
-      if docdefs = empty then doc_defs_rec ctx defs' types former_funcs docdefs
-      else doc_defs_rec ctx defs' types (former_funcs @ [docdefs]) empty
+      if docdefs = empty then doc_defs_rec ctx defs' types former_funcs docdefs empty
+      else doc_defs_rec ctx defs' types (former_funcs @ [docdefs]) empty empty
   | d :: defs' ->
       if should_print_function_def d then failwith "this case of doc_defs_rec should be unreachable"
-      else doc_defs_rec ctx defs' types former_funcs docdefs
+      else doc_defs_rec ctx defs' types former_funcs docdefs pending
 
-let doc_defs ctx defs = doc_defs_rec ctx defs empty [] empty
+let doc_defs ctx defs = doc_defs_rec ctx defs empty [] empty empty
 
 let add_node_to_map_and_ref_set (cg : Callgraph.callgraph) (map : int Bindings.t) (acc : IntSet.t) (idx : int)
     (m : Callgraph.node) =
