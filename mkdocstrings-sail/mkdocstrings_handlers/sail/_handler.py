@@ -187,6 +187,10 @@ class SailHandler(BaseHandler):
     fallback_theme: ClassVar[str] = "material"
 
     extra_css = """
+    /* Material 9.6.23+ lays md-code__content out as a grid, which turns
+       every token span of a flat highlight stream into its own grid row;
+       our blocks are flat token streams, so force normal flow */
+    .md-typeset .sail-source pre > code { display: block !important; }
     .sail-source .autorefs { color: inherit; border-bottom: 1px dotted currentcolor; }
     .sail-source .autorefs:hover { border-bottom-style: solid; }
     .doc-sail-kind { font-size: 0.65em; font-weight: 400; opacity: 0.7; margin-right: 0.4em; }
