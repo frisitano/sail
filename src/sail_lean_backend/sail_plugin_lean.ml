@@ -74,6 +74,8 @@ let opt_lean_output_dir : string option ref = ref None
 
 let opt_lean_force_output : bool ref = ref false
 
+let opt_lean_source_root : string option ref = ref None
+
 let opt_lean_import_files : string list ref = ref []
 
 let opt_lean_noncomputable : bool ref = ref false
@@ -108,6 +110,10 @@ let lean_options =
     ( Flag.create ~prefix:["lean"] "force_output",
       Arg.Unit (fun () -> opt_lean_force_output := true),
       "removes the content of the output directory if it is non-empty"
+    );
+    ( Flag.create ~prefix:["lean"] ~arg:"directory" "source_root",
+      Arg.String (fun dir -> opt_lean_source_root := Some dir),
+      "preserve Sail source paths relative to this directory in the generated Lean module hierarchy"
     );
     ( Flag.create ~prefix:["lean"] "single_file",
       Arg.Unit (fun () -> opt_single_file := true),
@@ -256,6 +262,65 @@ let file_to_module (filename : string) =
   let base = Filename.basename filename in
   Filename.chop_extension base
 
+let split_path path =
+  let rec split path segments =
+    if path = "" || path = "." then segments
+    else (
+      let segment = Filename.basename path in
+      if segment = path then segment :: segments else split (Filename.dirname path) (segment :: segments)
+    )
+  in
+  split path []
+
+let normalize_path segments =
+  let rec normalize segments normalized =
+    match (segments, normalized) with
+    | [], _ -> List.rev normalized
+    | "." :: segments, _ -> normalize segments normalized
+    | ".." :: _, [] -> failwith "Lean source path escapes its root"
+    | ".." :: segments, _ :: normalized -> normalize segments normalized
+    | segment :: segments, _ -> normalize segments (segment :: normalized)
+  in
+  normalize segments []
+
+let join_path = function [] -> "" | segment :: segments -> List.fold_left Filename.concat segment segments
+
+let absolute_path path = if Filename.is_relative path then Filename.concat (Sys.getcwd ()) path else path
+
+let module_path_to_name path = path |> split_path |> List.map Libsail.Util.to_upper_camel_case |> String.concat "."
+
+let module_name_to_path name = name |> String.split_on_char '.' |> join_path
+
+let rec ensure_directory path =
+  if path = "" || path = "." || Sys.file_exists path then ()
+  else (
+    ensure_directory (Filename.dirname path);
+    Unix.mkdir path 0o775
+  )
+
+let open_module_file lean_src_dir module_name =
+  let filepath = Filename.concat lean_src_dir (module_name_to_path module_name ^ ".lean") in
+  ensure_directory (Filename.dirname filepath);
+  open_out filepath
+
+let rec strip_path_prefix root path =
+  match (root, path) with
+  | [], path -> Some path
+  | root_segment :: root, path_segment :: path when root_segment = path_segment -> strip_path_prefix root path
+  | _ -> None
+
+let source_file_to_module root filename =
+  let root = root |> absolute_path |> split_path |> normalize_path in
+  let path = filename |> absolute_path |> split_path |> normalize_path in
+  match strip_path_prefix root path with
+  | None -> file_to_module filename
+  | Some path -> (
+      match List.rev path with
+      | [] -> failwith "Lean source file has no path below --lean-source-root"
+      | filename :: directories ->
+          directories |> List.rev |> fun directories -> join_path (directories @ [Filename.chop_extension filename])
+    )
+
 let file_prelude version namespace =
   let non_computable = if !opt_lean_noncomputable then "noncomputable section\n" else "" in
   Printf.sprintf
@@ -288,7 +353,9 @@ let print_function_file_prelude interface_v file out_name_camel (imp_refs : stri
         output_string file "import Sail\n";
         output_string file ("import " ^ out_name_camel ^ ".Defs\n");
         List.iter
-          (fun filename -> output_string file ("import " ^ out_name_camel ^ "." ^ file_to_module filename ^ "\n"))
+          (fun filename ->
+            output_string file ("import " ^ out_name_camel ^ "." ^ module_path_to_name (file_to_module filename) ^ "\n")
+          )
           !opt_lean_import_files
     | ns -> List.iter (fun n -> output_string file ("import " ^ out_name_camel ^ "." ^ n ^ "\n")) ns
   in
@@ -315,9 +382,9 @@ let start_lean_output interface_v (out_name : string) (import_names : string lis
   close_out lean_toolchain;
   let sail_dir = Reporting.get_sail_dir default_sail_dir in
   let out_name_camel = Libsail.Util.to_upper_camel_case out_name in
-  let import_names_camel = List.map Libsail.Util.to_upper_camel_case import_names in
-  let import_refs_camel = List.map (fun rs -> List.map Libsail.Util.to_upper_camel_case rs) import_refs in
-  let main_import_refs_camel = List.map Libsail.Util.to_upper_camel_case main_import_refs in
+  let import_names_lean = List.map module_path_to_name import_names in
+  let import_refs_lean = List.map (fun rs -> List.map module_path_to_name rs) import_refs in
+  let main_import_refs_lean = List.map module_path_to_name main_import_refs in
   let lean_src_dir = Filename.concat project_dir out_name_camel in
   if not (Sys.file_exists lean_src_dir) then Unix.mkdir lean_src_dir 0o775;
   let real_numbers_file =
@@ -342,9 +409,7 @@ let start_lean_output interface_v (out_name : string) (import_names : string lis
   let funcs_file = open_out (Filename.concat project_dir (out_name_camel ^ ".lean")) in
   let lakefile = open_out (Filename.concat project_dir "lakefile.toml") in
   let lakemanifest = open_out (Filename.concat project_dir "lake-manifest.json") in
-  let import_files =
-    List.map (fun name -> open_out (Filename.concat lean_src_dir (name ^ ".lean"))) import_names_camel
-  in
+  let import_files = List.map (open_module_file lean_src_dir) import_names_lean in
   (* TODO get the last import name by other means than this fold *)
   let last_import_name =
     List.fold_left
@@ -353,9 +418,9 @@ let start_lean_output interface_v (out_name : string) (import_names : string lis
         [n]
       )
       []
-      (List.combine import_files (List.combine import_names_camel import_refs_camel))
+      (List.combine import_files (List.combine import_names_lean import_refs_lean))
   in
-  let funcs_file_imports = main_import_refs_camel @ last_import_name in
+  let funcs_file_imports = main_import_refs_lean @ last_import_name in
   print_function_file_prelude interface_v funcs_file out_name_camel funcs_file_imports;
   { out_name; out_name_camel; sail_dir; types_file; funcs_file; import_files; lakefile; lakemanifest }
 
@@ -403,14 +468,15 @@ let create_lake_project (ctx : lean_context) executable =
    ^ "\",\n \"lakeDir\": \".lake\"}\n"
     )
 
-let rec dedup_files (files : string list) (acc : string list) =
-  match files with
-  | [] -> acc
-  | f :: fs -> (
-      match List.fold_left (fun n y -> if y = f then n + 1 else n) 0 acc with
-      | 0 -> dedup_files fs (acc @ [f])
-      | n -> dedup_files fs (acc @ [f ^ Int.to_string (n - 1)])
+let dedup_files files =
+  let occurrences = Hashtbl.create 16 in
+  List.map
+    (fun file ->
+      let occurrence = Option.value (Hashtbl.find_opt occurrences file) ~default:0 in
+      Hashtbl.replace occurrences file (occurrence + 1);
+      if occurrence = 0 then file else file ^ Int.to_string (occurrence - 1)
     )
+    files
 
 let output (out_name : string) env effect_info ({ defs; _ } as ast : Libsail.Type_check.typed_ast) default_sail_dir
     single_file noncomputable =
@@ -422,11 +488,15 @@ let output (out_name : string) env effect_info ({ defs; _ } as ast : Libsail.Typ
       let import_sets = Pretty_print_lean.collect_imports cg defs in
       (* Collect all non-empty slices between include pragmas in the file *)
       let import_files = Pretty_print_lean.collect_import_files defs (out_name ^ ".sail") in
-      let import_files = List.map file_to_module import_files in
-      (* Discard the last import file, as we will use the main file instead *)
+      (* Discard the synthetic final output file before mapping source paths. *)
       let import_files = Util.butlast import_files in
+      let import_files =
+        List.map
+          (match !opt_lean_source_root with None -> file_to_module | Some root -> source_file_to_module root)
+          import_files
+      in
       (* Disambiguate import files *)
-      let import_files = dedup_files import_files [] in
+      let import_files = dedup_files import_files in
       (* Convert the integers in import_sets into Lean module names *)
       let import_refs : string list list =
         List.map
