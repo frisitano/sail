@@ -20,7 +20,7 @@ from mkdocstrings import BaseHandler, CollectionError, get_logger
 from pygments.token import STANDARD_TYPES, Text as TextToken
 
 from ._bundle import Bundle, BundleError, Clause, Definition
-from ._eips import EipIndex, link_eip_references
+from ._eips import link_eip_references
 from ._index import IndexReference, LspIndex
 from ._lexer import SailLexer
 
@@ -232,7 +232,6 @@ class SailHandler(BaseHandler):
         lsp_index = config.get("lsp_index")
         self._lsp_index_path = Path(base_dir, lsp_index) if lsp_index else None
         self._lsp_index: Optional[LspIndex] = None
-        self._eips = EipIndex(config.get("eips_dir"))
         self._global_options: Mapping[str, Any] = config.get("options", {})
 
     @property
@@ -406,13 +405,8 @@ class SailHandler(BaseHandler):
         )
         if options["show_comment"] and data.comment:
             comment = _dedent_comment(data.comment).strip()
-            eips_seen: set[int] = set()
-            comment = link_eip_references(comment, eips_seen, hover=True)
+            comment = link_eip_references(comment, set(), hover=True)
             parts.append(str(self.do_convert_markdown(comment, heading_level + 1)))
-            for n in sorted(eips_seen):
-                card = self._eips.card_html(n)
-                if card:
-                    parts.append(card)
         if options["show_source"]:
             cards: Optional[dict[str, Definition]] = {} if options["hover_cards"] else None
             for clause in data.clauses:

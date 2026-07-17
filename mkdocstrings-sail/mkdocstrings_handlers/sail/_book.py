@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 from ._bundle import Bundle
-from ._eips import EipIndex, link_eip_references
+from ._eips import link_eip_references
 from ._lsp import project_files
 
 _ASSETS_DIR = Path(__file__).parent / "assets"
@@ -86,32 +86,21 @@ def page_items(bundle: Bundle, file: str, text: str, excluded: set[str]) -> list
     return [item for _, item in sorted(entries, key=lambda entry: entry[0])]
 
 
-def render_page(
-    file: str, items: list[tuple[str, ...]], eips: Optional[EipIndex] = None
-) -> tuple[str, str]:
+def render_page(file: str, items: list[tuple[str, ...]]) -> tuple[str, str]:
     """Render a page; returns (nav title, markdown). The first ``/*md`` block's
     leading ``# heading`` names the page; otherwise the file path does."""
     title = Path(file).stem
     out = []
-    eips_seen: set[int] = set()
     if not (items and items[0][0] == "md" and _HEADING.match(items[0][1])):
         out.append(f"# `{file}`\n")
     else:
         title = _HEADING.match(items[0][1]).group(1).strip()
     for item in items:
         if item[0] == "md":
-            block = item[1]
-            if eips is not None:
-                block = link_eip_references(block, eips_seen, hover=True)
-            out.append(block + "\n")
+            out.append(link_eip_references(item[1], set(), hover=True) + "\n")
         else:
             _, kind, name = item
             out.append(f"::: {name}\n    options:\n      kind: {kind}\n")
-    if eips is not None:
-        for n in sorted(eips_seen):
-            card = eips.card_html(n)
-            if card:
-                out.append(card + "\n")
     return title, "\n".join(out)
 
 
@@ -154,12 +143,11 @@ def lean_page_items(text: str) -> list[tuple[str, str]]:
     return items
 
 
-def render_lean_page(name: str, text: str, eips: Optional[EipIndex] = None) -> tuple[str, str]:
+def render_lean_page(name: str, text: str) -> tuple[str, str]:
     """Render an extracted Lean module; returns (title, markdown)."""
     items = lean_page_items(text)
     title = name
     out = []
-    eips_seen: set[int] = set()
     first = next((i for i, item in enumerate(items) if item[0] == "md"), None)
     if first is not None and _HEADING.match(items[first][1]):
         title = _HEADING.match(items[first][1]).group(1).strip()
@@ -170,30 +158,15 @@ def render_lean_page(name: str, text: str, eips: Optional[EipIndex] = None) -> t
         out.append(f"# `{name}.lean`\n")
     for kind, chunk in items:
         if kind == "md":
-            if eips is not None:
-                chunk = link_eip_references(chunk, eips_seen, hover=True)
-            out.append(chunk + "\n")
+            out.append(link_eip_references(chunk, set(), hover=True) + "\n")
         else:
             out.append("```lean4\n" + chunk + "\n```\n")
-    if eips is not None:
-        for n in sorted(eips_seen):
-            card = eips.card_html(n)
-            if card:
-                out.append(card + "\n")
     return title, "\n".join(out)
 
 
-def render_mod_page(text: str, eips: Optional[EipIndex] = None) -> str:
+def render_mod_page(text: str) -> str:
     """Render a directory's mod.md overview, with EIP references linked."""
-    if eips is None:
-        return text
-    eips_seen: set[int] = set()
-    out = link_eip_references(text, eips_seen, hover=True)
-    for n in sorted(eips_seen):
-        card = eips.card_html(n)
-        if card:
-            out += "\n" + card + "\n"
-    return out
+    return link_eip_references(text, set(), hover=True)
 
 
 _CONFIG_TEMPLATE = """site_name: "{site_name}"
@@ -216,7 +189,7 @@ plugins:
       handlers:
         sail:
           bundle: doc/doc.json
-          lsp_index: doc/lsp-index.json{eips_config}
+          lsp_index: doc/lsp-index.json
 markdown_extensions:
   - admonition
   - attr_list
@@ -242,14 +215,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sail", default="sail", help="sail binary for --list-files")
     parser.add_argument("--book", required=True, help="book directory (holds mkdocs.yml, docs/, doc/doc.json)")
     parser.add_argument("--site-name", default="Sail Specification")
-    parser.add_argument("--eips", help="local ethereum/EIPs EIPS/ directory for EIP hover cards")
     parser.add_argument("--lean", help="extracted Lean project directory; renders an extraction section")
     parser.add_argument("--no-config", action="store_true", help="do not (re)write mkdocs.yml")
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
     book = Path(args.book)
-    eips = EipIndex(Path(args.eips).resolve()) if args.eips else None
     bundle = Bundle.load(book / "doc/doc.json")
     files = project_files(args.sail, root, args.project, args.module, args.variable)
 
@@ -269,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
         if not items:
             continue
         definitions += sum(1 for item in items if item[0] == "def")
-        title, markdown = render_page(file, items, eips)
+        title, markdown = render_page(file, items)
         page = str(Path(file).with_suffix(".md"))
         path = book / "docs/reference" / page
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -284,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         mod = root / directory / "mod.md"
         if mod.exists():
             mod_files.append(mod)
-            markdown = render_mod_page(mod.read_text(), eips)
+            markdown = render_mod_page(mod.read_text())
             path = book / "docs/reference" / directory / "index.md"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(markdown)
@@ -297,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             f for f in lean_root.rglob("*.lean") if ".lake" not in f.parts and f.name != "lakefile.lean"
         )
         for f in lean_files:
-            title, markdown = render_lean_page(f.stem, f.read_text(), eips)
+            title, markdown = render_lean_page(f.stem, f.read_text())
             path = book / "docs/extraction/lean" / f.relative_to(lean_root).with_suffix(".md")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(markdown)
@@ -308,24 +279,6 @@ def main(argv: list[str] | None = None) -> int:
     assets.mkdir(parents=True, exist_ok=True)
     for script in _ASSETS_DIR.glob("*.js"):
         shutil.copy(script, assets / script.name)
-
-    # pre-render every referenced EIP as an on-demand hover fragment
-    if eips is not None:
-        from ._eips import _EIP_REF
-
-        numbers: set[int] = set()
-        for source in [root / file for file in files] + mod_files + lean_files:
-            if source.exists():
-                numbers.update(int(m.group(1)) for m in _EIP_REF.finditer(source.read_text()))
-        fragments = assets / "eips"
-        fragments.mkdir(exist_ok=True)
-        rendered = 0
-        for n in sorted(numbers):
-            html = eips.render_full_html(n)
-            if html:
-                (fragments / f"eip-{n}.html").write_text(html)
-                rendered += 1
-        print(f"rendered {rendered} EIP hover fragments", file=sys.stderr)
 
     # a home page is required for the site root; generate one if not authored
     index = book / "docs/index.md"
@@ -340,10 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         summary.write_text("- [Home](index.md)\n- *.md\n- reference/*\n")
 
     if not args.no_config:
-        eips_config = f"\n          eips_dir: {Path(args.eips).resolve()}" if args.eips else ""
-        (book / "mkdocs.yml").write_text(
-            _CONFIG_TEMPLATE.format(site_name=args.site_name, eips_config=eips_config)
-        )
+        (book / "mkdocs.yml").write_text(_CONFIG_TEMPLATE.format(site_name=args.site_name))
 
     print(
         f"generated {len(pages)} pages covering {definitions} definitions"

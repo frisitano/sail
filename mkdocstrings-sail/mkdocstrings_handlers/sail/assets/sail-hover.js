@@ -13,9 +13,6 @@
     }
   }
 
-  var script = document.currentScript;
-  var assetBase = script && script.src ? script.src.replace(/sail-hover\.js.*$/, "") : "assets/";
-
   function position(target) {
     if (!card) return;
     var rect = target.getBoundingClientRect();
@@ -38,25 +35,35 @@
     var key = target.getAttribute("data-sail-hover");
     if (card && card.dataset.for === key) return;
     hide();
+    var isEip = key.indexOf("eip-") === 0;
     var template = document.querySelector(
       'template.sail-hovercard[data-anchor="' + (window.CSS ? CSS.escape(key) : key) + '"]'
     );
-    if (!template) return;
+    if (!template && !isEip) return;
     card = document.createElement("div");
     card.className = "sail-hovercard-float md-typeset";
-    if (key.indexOf("eip-") === 0) card.classList.add("sail-hovercard-eip");
+    if (isEip) card.classList.add("sail-hovercard-eip");
     card.dataset.for = key;
-    card.appendChild(template.content.cloneNode(true));
+    if (template) {
+      card.appendChild(template.content.cloneNode(true));
+    } else {
+      // EIP cards have no baked content: the document is fetched and
+      // rendered client-side on first view
+      var doc = document.createElement("div");
+      doc.className = "sail-hovercard-doc";
+      doc.innerHTML = "<p><em>Fetching " + key.toUpperCase() + "\u2026</em></p>";
+      card.appendChild(doc);
+    }
     document.body.appendChild(card);
     position(target);
-    if (key.indexOf("eip-") === 0) liveEip(key.slice(4), target);
+    if (isEip) liveEip(key.slice(4), target);
   });
 
-  /* Live EIP cards: the EIP's markdown is fetched from the canonical
-   * ethereum/EIPs repository on first use, rendered client-side (vendored
-   * marked + highlight.js; untagged fences default to Python per EIP-1
-   * convention), and cached for a day. The fragment pre-rendered at build
-   * time is the offline fallback. */
+  /* Live EIP cards: the EIP's markdown source is fetched from the
+   * canonical ethereum/EIPs repository on first use, rendered client-side
+   * (vendored marked + highlight.js; untagged fences default to Python
+   * per EIP-1 convention), and cached for a day. There is no build-time
+   * EIP content. */
   var EIP_SOURCE = "https://raw.githubusercontent.com/ethereum/EIPs/master/EIPS/eip-";
   var EIP_TTL_MS = 24 * 60 * 60 * 1000;
   var eipCache = {};
@@ -129,8 +136,13 @@
       var doc = card.querySelector(".sail-hovercard-doc") || card;
       doc.innerHTML = html;
     }
+    if (eipCache[n] === "pending") return;
+    if (eipCache[n] === "failed") {
+      render("<p><em>EIP-" + n + " could not be fetched.</em></p>");
+      return;
+    }
     if (eipCache[n]) {
-      if (eipCache[n] !== "pending" && eipCache[n] !== "failed") render(eipCache[n]);
+      render(eipCache[n]);
       return;
     }
     var cached = cacheGet(n);
@@ -150,14 +162,8 @@
         render(html);
       })
       .catch(function () {
-        // offline / fetch failure: the fragment baked at build time
-        fetch(assetBase + "eips/eip-" + n + ".html")
-          .then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); })
-          .then(function (html) {
-            eipCache[n] = html;
-            render(html);
-          })
-          .catch(function () { eipCache[n] = "failed"; });
+        eipCache[n] = "failed";
+        render("<p><em>EIP-" + n + " could not be fetched.</em></p>");
       });
   }
 

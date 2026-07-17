@@ -215,15 +215,14 @@ you don't list explicitly (titled by their `# Title` heading), so new
 source files appear without touching the nav. When no `SUMMARY.md` exists,
 a default is generated that includes everything in alphabetical order.
 
-With `--eips <path to an ethereum/EIPs EIPS/ checkout>`, `EIP-N`
-references in prose become links carrying full-document cards. Card
-content is **loaded at runtime**: on first use the EIP's markdown is
-fetched from the canonical `ethereum/EIPs` repository, rendered
-client-side (vendored `marked` 12, MIT + `highlight.js` 11, BSD-3;
-untagged code fences default to Python per EIP-1 convention; raw HTML is
-sanitized), and cached in `localStorage` for a day — so upstream EIP
-edits appear without rebuilding the site. A fragment pre-rendered at
-build time from the local checkout is the offline fallback.
+`EIP-N` references in prose become links carrying full-document cards.
+Card content is exclusively **rendered client-side from the actual
+source**: on first view the EIP's markdown is fetched from the canonical
+`ethereum/EIPs` repository, rendered in the browser (vendored `marked`
+12, MIT + `highlight.js` 11, BSD-3; untagged code fences default to
+Python per EIP-1 convention; raw HTML is sanitized), and cached in
+`localStorage` for a day — upstream EIP edits appear without rebuilding
+the site, and no local EIPs checkout or build-time EIP content exists.
 
 With `--lean <dir>` pointing at a project extracted by `sail --lean`,
 `sail-book-gen` renders a Lean-extraction section under

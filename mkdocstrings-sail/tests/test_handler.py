@@ -339,7 +339,9 @@ class TestBook(unittest.TestCase):
     def test_render_mod_page_links_eips(self):
         from mkdocstrings_handlers.sail._book import render_mod_page
         text = "# Host interface\n\nWarming follows EIP-2929.\n"
-        self.assertEqual(render_mod_page(text, None), text)
+        out = render_mod_page(text)
+        self.assertIn("[EIP-2929](https://eips.ethereum.org/EIPS/eip-2929)", out)
+        self.assertIn('data-sail-hover="eip-2929"', out)
 
     def test_lean_page_items_split(self):
         from mkdocstrings_handlers.sail._book import lean_page_items, render_lean_page
