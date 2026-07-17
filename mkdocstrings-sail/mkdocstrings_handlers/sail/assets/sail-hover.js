@@ -6,6 +6,9 @@
   "use strict";
   var card = null;
 
+  var script = document.currentScript;
+  var assetBase = script && script.src ? script.src.replace(/sail-hover\.js.*$/, "") : "assets/";
+
   function hide() {
     if (card) {
       card.remove();
@@ -36,10 +39,11 @@
     if (card && card.dataset.for === key) return;
     hide();
     var isEip = key.indexOf("eip-") === 0;
+    var isLean = key.indexOf("lean-") === 0;
     var template = document.querySelector(
       'template.sail-hovercard[data-anchor="' + (window.CSS ? CSS.escape(key) : key) + '"]'
     );
-    if (!template && !isEip) return;
+    if (!template && !isEip && !isLean) return;
     card = document.createElement("div");
     card.className = "sail-hovercard-float md-typeset";
     if (isEip) card.classList.add("sail-hovercard-eip");
@@ -51,13 +55,40 @@
       // rendered client-side on first view
       var doc = document.createElement("div");
       doc.className = "sail-hovercard-doc";
-      doc.innerHTML = "<p><em>Fetching " + key.toUpperCase() + "\u2026</em></p>";
+      doc.innerHTML = isEip ? "<p><em>Fetching " + key.toUpperCase() + "\u2026</em></p>" : "";
       card.appendChild(doc);
     }
     document.body.appendChild(card);
     position(target);
     if (isEip) liveEip(key.slice(4), target);
+    if (isLean && !template) leanCard(key, target);
   });
+
+  /* Lean definition cards are per-definition fragments generated at build
+   * time (assets/lean-cards/<anchor>.html), fetched on first use so pages
+   * embedding hundreds of references stay small. */
+  var leanCache = {};
+  function leanCard(key, target) {
+    function render(html) {
+      if (!card || card.dataset.for !== key) return;
+      var doc = card.querySelector(".sail-hovercard-doc") || card;
+      doc.outerHTML = html;
+      position(target);
+    }
+    if (leanCache[key] === "pending" || leanCache[key] === "failed") return;
+    if (leanCache[key]) {
+      render(leanCache[key]);
+      return;
+    }
+    leanCache[key] = "pending";
+    fetch(assetBase + "lean-cards/" + key + ".html")
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); })
+      .then(function (html) {
+        leanCache[key] = html;
+        render(html);
+      })
+      .catch(function () { leanCache[key] = "failed"; });
+  }
 
   /* Live EIP cards: the EIP's markdown source is fetched from the
    * canonical ethereum/EIPs repository on first use, rendered client-side

@@ -34,6 +34,14 @@ from ._bundle import Bundle
 from ._eips import link_eip_references
 from ._lsp import project_files
 
+import posixpath
+
+import markdown as _markdown
+from markupsafe import escape as _escape
+from pygments import highlight as _pyg_highlight
+from pygments.formatters import HtmlFormatter as _HtmlFormatter
+from pygments.lexers import get_lexer_by_name as _get_lexer
+
 _ASSETS_DIR = Path(__file__).parent / "assets"
 
 _HEADING = re.compile(r"^#\s+(.+)$", re.M)
@@ -143,7 +151,103 @@ def lean_page_items(text: str) -> list[tuple[str, str]]:
     return items
 
 
-def render_lean_page(name: str, text: str) -> tuple[str, str]:
+# --- Lean extraction: identifier links and hover cards -------------------
+#
+# The extraction preserves Sail identifier names verbatim, so a build-time
+# index over the extracted modules gives every definition's page,
+# docstring, and body. Identifier uses in Lean source link to their
+# definition site and carry the same IDE-style hover cards as Sail code.
+
+_LEAN_DEF = re.compile(
+    r"^(?:noncomputable\s+)?(?:private\s+)?(?:protected\s+)?(?:partial\s+)?(?:unsafe\s+)?"
+    r"(def|abbrev|inductive|structure|theorem|instance|opaque)\s+([A-Za-z_][A-Za-z0-9_'!?]*)",
+    re.M,
+)
+_LEAN_CTOR = re.compile(r"^\s*\|\s*([A-Za-z_][A-Za-z0-9_']*)", re.M)
+_LEAN_CARD_LINES = 120
+
+def lean_page_url(relpath) -> str:
+    return "extraction/lean/" + relpath.with_suffix("").as_posix() + "/"
+
+
+def lean_definition_index(lean_files: list[Path], lean_root: Path) -> dict[str, dict]:
+    """name -> {url, anchor, kind, doc, body} over all extracted modules."""
+    index: dict[str, dict] = {}
+    for f in lean_files:
+        url = lean_page_url(f.relative_to(lean_root))
+        items = lean_page_items(f.read_text())
+        for i, (kind, chunk) in enumerate(items):
+            if kind != "md" and (matches := list(_LEAN_DEF.finditer(chunk))):
+                for n, m in enumerate(matches):
+                    name = m.group(2)
+                    if name in index:
+                        continue
+                    body = chunk[m.start() : matches[n + 1].start() if n + 1 < len(matches) else len(chunk)]
+                    body = body.rstrip()
+                    doc = ""
+                    if n == 0 and i > 0 and items[i - 1][0] == "md" and not items[i - 1][1].startswith("# "):
+                        doc = items[i - 1][1]
+                    entry = {"url": url, "anchor": f"lean-{name}", "kind": m.group(1), "doc": doc, "body": body}
+                    index[name] = entry
+                    if m.group(1) in ("inductive", "structure"):
+                        for cm in _LEAN_CTOR.finditer(body):
+                            index.setdefault(cm.group(1), {**entry, "doc": "", "kind": "constructor"})
+    return index
+
+
+def _lean_href(entry: dict, page_url: str) -> str:
+    if entry["url"] == page_url:
+        return "#" + entry["anchor"]
+    rel = posixpath.relpath(entry["url"].rstrip("/"), page_url.rstrip("/"))
+    return rel + "/#" + entry["anchor"]
+
+
+def lean_linked_html(chunk: str, index: dict[str, dict], page_url: str) -> str:
+    """A Lean code chunk as highlighted HTML with definition links/anchors."""
+    from pygments.token import Name as _Name
+    from ._handler import _token_class
+
+    def_heads = {m.start(2): m.group(2) for m in _LEAN_DEF.finditer(chunk)}
+    out = []
+    for pos, ttype, value in _get_lexer("lean4").get_tokens_unprocessed(chunk):
+        cls = _token_class(ttype)
+        piece = str(_escape(value))
+        if cls:
+            piece = f'<span class="{cls}">{piece}</span>'
+        if def_heads.get(pos) == value:
+            piece = f'<span id="lean-{value}">{piece}</span>'
+        elif value in index and ttype in _Name:
+            entry = index[value]
+            piece = (
+                f'<a class="autorefs" href="{_lean_href(entry, page_url)}"'
+                f' data-sail-hover="{entry["anchor"]}">{piece}</a>'
+            )
+        out.append(piece)
+    return (
+        '<div class="highlight sail-source sail-lean-source"><pre><code>'
+        + "".join(out)
+        + "</code></pre></div>"
+    )
+
+
+def lean_card_html(entry: dict) -> str:
+    """The hover-card fragment for a Lean definition: docstring + body."""
+    parts = []
+    if entry["doc"]:
+        doc = _markdown.markdown(entry["doc"], extensions=["extra"])
+        parts.append(f'<div class="sail-hovercard-doc">{doc}</div>')
+    body = "\n".join(entry["body"].splitlines()[:_LEAN_CARD_LINES])
+    code = _pyg_highlight(body, _get_lexer("lean4"), _HtmlFormatter(nowrap=True)).rstrip()
+    parts.append(f'<div class="sail-hovercard-code highlight"><pre><code>{code}</code></pre></div>')
+    return "".join(parts)
+
+
+def render_lean_page(
+    name: str,
+    text: str,
+    index: Optional[dict[str, dict]] = None,
+    page_url: Optional[str] = None,
+) -> tuple[str, str]:
     """Render an extracted Lean module; returns (title, markdown)."""
     items = lean_page_items(text)
     title = name
@@ -159,6 +263,8 @@ def render_lean_page(name: str, text: str) -> tuple[str, str]:
     for kind, chunk in items:
         if kind == "md":
             out.append(link_eip_references(chunk, set(), hover=True) + "\n")
+        elif index is not None and page_url is not None:
+            out.append(lean_linked_html(chunk, index, page_url) + "\n")
         else:
             out.append("```lean4\n" + chunk + "\n```\n")
     return title, "\n".join(out)
@@ -267,13 +373,25 @@ def main(argv: list[str] | None = None) -> int:
         lean_files = sorted(
             f for f in lean_root.rglob("*.lean") if ".lake" not in f.parts and f.name != "lakefile.lean"
         )
+        lean_index = lean_definition_index(lean_files, lean_root)
         for f in lean_files:
-            title, markdown = render_lean_page(f.stem, f.read_text())
-            path = book / "docs/extraction/lean" / f.relative_to(lean_root).with_suffix(".md")
+            relpath = f.relative_to(lean_root)
+            title, page_md = render_lean_page(f.stem, f.read_text(), lean_index, lean_page_url(relpath))
+            path = book / "docs/extraction/lean" / relpath.with_suffix(".md")
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(markdown)
+            path.write_text(page_md)
+        cards_dir = book / "docs/assets/lean-cards"
+        cards_dir.mkdir(parents=True, exist_ok=True)
+        written: set[str] = set()
+        for entry in lean_index.values():
+            if entry["anchor"] not in written:
+                written.add(entry["anchor"])
+                (cards_dir / f"{entry['anchor']}.html").write_text(lean_card_html(entry))
         if lean_files:
-            print(f"rendered {len(lean_files)} Lean extraction pages", file=sys.stderr)
+            print(
+                f"rendered {len(lean_files)} Lean extraction pages, {len(written)} hover cards",
+                file=sys.stderr,
+            )
 
     assets = book / "docs/assets"
     assets.mkdir(parents=True, exist_ok=True)

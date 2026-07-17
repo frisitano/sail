@@ -355,6 +355,32 @@ class TestBook(unittest.TestCase):
         self.assertIn("```lean4\ndef base_fee : Int := 7\n```", markdown)
         self.assertIn("The base fee.", markdown)
 
+    def test_lean_linking_and_cards(self):
+        from pathlib import Path as P
+        import tempfile
+        from mkdocstrings_handlers.sail._book import (
+            lean_definition_index, lean_page_url, render_lean_page,
+        )
+        text = (
+            "/-! # Gas -/\n\n/-- The base fee. -/\ndef base_fee : Int := 7\n\n"
+            "def double_fee : Int := base_fee + base_fee\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            root = P(d)
+            (root / "Gas.lean").write_text(text)
+            files = [root / "Gas.lean"]
+            index = lean_definition_index(files, root)
+            self.assertEqual(index["base_fee"]["doc"], "The base fee.")
+            self.assertEqual(index["base_fee"]["anchor"], "lean-base_fee")
+            _, md = render_lean_page("Gas", text, index, lean_page_url(P("Gas.lean")))
+        self.assertIn('<span id="lean-base_fee">', md)
+        self.assertIn('href="#lean-base_fee" data-sail-hover="lean-base_fee"', md)
+        self.assertNotIn("<template", md)  # cards are fetch-on-demand fragments
+        from mkdocstrings_handlers.sail._book import lean_card_html
+        card = lean_card_html(index["base_fee"])
+        self.assertIn("The base fee.", card)
+        self.assertIn("sail-hovercard-code", card)
+
     def test_markdown_blocks_positions_and_nesting(self):
         blocks = markdown_blocks(SOURCE)
         self.assertEqual(len(blocks), 2)

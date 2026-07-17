@@ -233,6 +233,15 @@ generator renders those back as page prose (EIP references linked)
 around `lean4`-highlighted source. Add the section to `SUMMARY.md` with
 globs, e.g. `- Lean extraction:` / `extraction/lean/Out/*.md`.
 
+Lean code gets the same hover and navigation experience as Sail code:
+a build-time index over the extracted modules (identifier names carry
+over from Sail verbatim) anchors every definition site, links every
+identifier use to its definition — cross-page, including inductive
+constructors resolved to their owning type — and attaches IDE-style
+hover cards (docstring + highlighted body). Cards are per-definition
+fragments under `assets/lean-cards/`, fetched on first hover so pages
+referencing hundreds of definitions stay small.
+
 [mkdocs-literate-nav]: https://oprypin.github.io/mkdocs-literate-nav/
 [mkdocs-section-index]: https://oprypin.github.io/mkdocs-section-index/
 
