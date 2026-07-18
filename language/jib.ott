@@ -100,6 +100,9 @@ op :: '' ::=
   | gteq              :: :: igteq
   | add               :: :: iadd
   | sub               :: :: isub
+  | mul               :: :: imul
+  | div               :: :: idiv
+  | mod               :: :: imod
   | unsigned nat      :: :: unsigned
   | signed nat        :: :: signed
 % Bitvector ops
@@ -109,6 +112,9 @@ op :: '' ::=
   | bvxor             :: :: bvxor
   | bvadd             :: :: bvadd
   | bvsub             :: :: bvsub
+  | bvshiftl          :: :: bvshiftl
+  | bvshiftr          :: :: bvshiftr
+  | bvarith_shiftr    :: :: bvarith_shiftr
   | bvaccess          :: :: bvaccess
   | concat            :: :: concat
   | zero_extend nat   :: :: zero_extend
@@ -146,8 +152,10 @@ ctyp :: 'CT_' ::=
 %
 % lint is a large (l) arbitrary precision integer, mpz_t in C.
 % fint(n) is a fixed precision signed integer that is representable in exactly n bits
+% fuint(n) is a fixed precision unsigned integer that is representable in exactly n bits
   | lint                      :: :: lint
   | fint nat                  :: :: fint
+  | fuint nat                 :: :: fuint
   | constant big_int          :: :: constant
 
 % Bitvector types - flag represents bit indexing direction, true - dec or false - inc

@@ -1,0 +1,8 @@
+Left {
+  files left/shared.sail
+}
+
+Right {
+  requires Left
+  files right/shared.sail
+}

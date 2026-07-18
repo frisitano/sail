@@ -132,6 +132,50 @@ val enum_members : Ast.l -> ctx -> Ast.id -> IdSet.t
 module type CONFIG = sig
   val convert_typ : ctx -> typ -> ctyp
 
+  (** Choose the representation used when a concrete type becomes a generic
+      container argument. *)
+  val ctyp_suprema : ctyp -> ctyp
+
+  (** Optionally replace the compiled payload of a nominal newtype. *)
+  val specialize_newtype_payload : id -> ctyp -> ctyp
+
+  (** Return true when [represented] is a backend-specific, lossless
+      representation of [semantic]. This keeps such values in their native
+      representation while compiling newtype destructuring and local
+      bindings, until a real semantic-type boundary requires conversion. *)
+  val representation_refines : semantic:ctyp -> represented:ctyp -> bool
+
+  (** Return true when an ANF value carrying [semantic] may remain in
+      [represented] without crossing a checked conversion boundary. *)
+  val preserve_aval_representation : semantic:ctyp -> represented:ctyp -> bool
+
+  (** Return true when a newtype constructor may demand [represented] directly
+      from its payload expression. This is deliberately stricter than
+      [representation_refines]: checked numeric newtypes must first evaluate
+      their mathematical Sail value and only then cross the checked packing
+      boundary. *)
+  val propagate_newtype_payload_representation : id -> semantic:ctyp -> represented:ctyp -> bool
+
+  (** Preserve a backend-specific result representation across an external
+      operation when its represented arguments determine the result layout.
+      [id] is the external implementation name, not necessarily the Sail
+      source identifier. *)
+  val specialize_call_result : id -> ctyp list -> ctyp -> ctyp
+
+  (** Return true only when the implementation of [id] can write its semantic
+      result directly into [represented]. This is intentionally narrower than
+      [representation_refines], because ordinary runtime functions still use
+      their declared Sail/GMP calling convention. *)
+  val specialize_call_destination :
+    ctx -> id -> ctyp list -> semantic:ctyp -> represented:ctyp -> bool
+
+  (** Keep an argument in a backend-specific representation when a specialized
+      result or another represented argument supplies the matching native
+      implementation. The list contains every argument's representation before
+      call-boundary conversions. *)
+  val specialize_call_argument :
+    ctx -> id -> ctyp -> ctyp list -> int -> semantic:ctyp -> represented:ctyp -> bool
+
   val optimize_anf : ctx -> typ aexp -> typ aexp
 
   (** Unroll all for loops a bounded number of times. Used for SMT generation. *)

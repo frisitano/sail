@@ -282,7 +282,7 @@ module Make (Config : CONFIG) = struct
 
   let rec smt_ctyp = function
     | CT_constant n -> return (Bitvec (required_width n))
-    | CT_fint n -> return (Bitvec n)
+    | CT_fint n | CT_fuint n -> return (Bitvec n)
     | CT_lint -> return (Bitvec Config.max_unknown_integer_width)
     | CT_unit -> return smt_unit
     | CT_fbits n -> return (Bitvec n)
@@ -1283,6 +1283,14 @@ end) : Jib_compile.CONFIG = struct
     let has_tuple = ctyp_has (function CT_tup _ -> true | _ -> false) in
     List.exists has_tuple param_ctyps || has_tuple ret_ctyp
 
+  let ctyp_suprema = Jib_util.ctyp_suprema
+  let specialize_newtype_payload _ ctyp = ctyp
+  let representation_refines ~semantic:_ ~represented:_ = false
+  let preserve_aval_representation ~semantic:_ ~represented:_ = false
+  let propagate_newtype_payload_representation _ ~semantic:_ ~represented:_ = false
+  let specialize_call_result _ _ ctyp = ctyp
+  let specialize_call_destination _ _ _ ~semantic:_ ~represented:_ = false
+  let specialize_call_argument _ _ _ _ _ ~semantic:_ ~represented:_ = false
   let ignore_64 = true
   let unroll_loops = Some Opts.unroll_limit
   let struct_value = true

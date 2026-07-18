@@ -45,7 +45,7 @@
 (****************************************************************************)
 
 (* Currently limited to:
-   - functions, no scattered, no preprocessor
+   - functions and non-scattered type definitions, no preprocessor
    - no new undefined functions (but no explicit check here yet)
 *)
 
@@ -55,38 +55,49 @@ open Ast_defs
 open Ast_util
 
 let scan_ast { defs; _ } =
-  let scan (ids, specs) (DEF_aux (aux, _) as def) =
+  let scan (ids, specs, type_defs) (DEF_aux (aux, _) as def) =
     match aux with
-    | DEF_fundef fd -> (IdSet.add (id_of_fundef fd) ids, specs)
-    | DEF_val (VS_aux (VS_val_spec (_, id, _), _) as vs) -> (ids, Bindings.add id vs specs)
-    | DEF_pragma (("file_start" | "file_end"), _) -> (ids, specs)
-    | _ -> raise (Reporting.err_general (def_loc def) "Definition in splice file isn't a spec or function")
+    | DEF_fundef fd -> (IdSet.add (id_of_fundef fd) ids, specs, type_defs)
+    | DEF_val (VS_aux (VS_val_spec (_, id, _), _) as vs) -> (ids, Bindings.add id vs specs, type_defs)
+    | DEF_type td -> (ids, specs, Bindings.add (id_of_type_def td) def type_defs)
+    | DEF_pragma (("file_start" | "file_end"), _) -> (ids, specs, type_defs)
+    | _ ->
+        raise
+          (Reporting.err_general (def_loc def) "Definition in splice file isn't a spec, function, or type definition")
   in
-  List.fold_left scan (IdSet.empty, Bindings.empty) defs
+  List.fold_left scan (IdSet.empty, Bindings.empty, Bindings.empty) defs
 
-let filter_old_ast repl_ids repl_specs { defs; _ } =
-  let check (rdefs, specs_found) (DEF_aux (aux, def_annot) as def) =
+let filter_old_ast repl_ids repl_specs repl_types { defs; _ } =
+  let check (rdefs, specs_found, types_found) (DEF_aux (aux, def_annot) as def) =
     match aux with
     | DEF_fundef fd ->
         let id = id_of_fundef fd in
         if IdSet.mem id repl_ids then
           ( DEF_aux (DEF_pragma ("spliced_function#", Pragma_line (string_of_id id, def_annot.loc)), def_annot) :: rdefs,
-            specs_found
+            specs_found,
+            types_found
           )
-        else (def :: rdefs, specs_found)
+        else (def :: rdefs, specs_found, types_found)
     | DEF_val (VS_aux (VS_val_spec (_, id, _), _)) -> (
         match Bindings.find_opt id repl_specs with
-        | Some vs -> (DEF_aux (DEF_val vs, def_annot) :: rdefs, IdSet.add id specs_found)
-        | None -> (def :: rdefs, specs_found)
+        | Some vs -> (DEF_aux (DEF_val vs, def_annot) :: rdefs, IdSet.add id specs_found, types_found)
+        | None -> (def :: rdefs, specs_found, types_found)
       )
-    | _ -> (def :: rdefs, specs_found)
+    | DEF_type td -> (
+        let id = id_of_type_def td in
+        match Bindings.find_opt id repl_types with
+        | Some repl_def -> (repl_def :: rdefs, specs_found, IdSet.add id types_found)
+        | None -> (def :: rdefs, specs_found, types_found)
+      )
+    | _ -> (def :: rdefs, specs_found, types_found)
   in
-  let rdefs, specs_found = List.fold_left check ([], IdSet.empty) defs in
-  (List.rev rdefs, specs_found)
+  let rdefs, specs_found, types_found = List.fold_left check ([], IdSet.empty, IdSet.empty) defs in
+  (List.rev rdefs, specs_found, types_found)
 
-let filter_replacements spec_found { defs; _ } =
+let filter_replacements specs_found types_found { defs; _ } =
   let not_found = function
-    | DEF_aux (DEF_val (VS_aux (VS_val_spec (_, id, _), _)), _) -> not (IdSet.mem id spec_found)
+    | DEF_aux (DEF_val (VS_aux (VS_val_spec (_, id, _), _)), _) -> not (IdSet.mem id specs_found)
+    | DEF_aux (DEF_type td, _) -> not (IdSet.mem (id_of_type_def td) types_found)
     | _ -> true
   in
   List.filter not_found defs
@@ -117,9 +128,9 @@ let splice ctx ast file =
   let repl_ast, _ = Initial_check.process_ast ctx (Parse_ast.Defs [(Some file, parsed_ast)]) in
   let repl_ast = map_ast_annot (fun (l, _) -> (l, Type_check.empty_tannot)) repl_ast in
   let repl_ast = annotate_ast repl_ast in
-  let repl_ids, repl_specs = scan_ast repl_ast in
-  let defs1, specs_found = filter_old_ast repl_ids repl_specs ast in
-  let defs2 = filter_replacements specs_found repl_ast in
+  let repl_ids, repl_specs, repl_types = scan_ast repl_ast in
+  let defs1, specs_found, types_found = filter_old_ast repl_ids repl_specs repl_types ast in
+  let defs2 = filter_replacements specs_found types_found repl_ast in
   { ast with defs = defs1 @ defs2 }
 
 let splice_files ctx ast files =

@@ -80,6 +80,26 @@ let opt_generate_extern_types : bool ref = ref false
 let opt_coq_record_update : bool ref = ref false
 let opt_coq_all_eq_dec : bool ref = ref true
 let opt_generic_values : bool ref = ref false
+let opt_semantic_range_types : bool ref = ref false
+
+type semantic_range = { low : nexp; high : nexp }
+
+type semantic_types = {
+  ranges : semantic_range Bindings.t;
+  aliases : typ Bindings.t;
+  valspecs : typ Bindings.t;
+  bindings : typ Bindings.t;
+  record_fields : typ Bindings.t Bindings.t;
+}
+
+let empty_semantic_types =
+  {
+    ranges = Bindings.empty;
+    aliases = Bindings.empty;
+    valspecs = Bindings.empty;
+    bindings = Bindings.empty;
+    record_fields = Bindings.empty;
+  }
 
 let prefix_recordtype = true
 
@@ -108,6 +128,7 @@ type global_context = {
   type_rename : id Bindings.t;
   effect_info : Effects.side_effect_info;
   library_style : library_style;
+  semantic_types : semantic_types;
 }
 
 type context = {
@@ -129,6 +150,8 @@ type context = {
       (* Number of implicit arguments and constraints for (mutually) recursive definitions, and whether there is a measure *)
   debug : bool;
   ret_typ_pp : PPrint.document; (* Return type formatted for use with returnR *)
+  semantic_return : typ option;
+      (* Public semantic return type when the function body uses the expanded arithmetic carrier. *)
   is_monadic : bool;
   proof_mode : bool;
       (* Is the body being given via a tactic in proof mode (affects implicit arguments in recursive definitions *)
@@ -143,6 +166,7 @@ let empty_ctxt =
         type_rename = Bindings.empty;
         effect_info = Effects.empty_side_effect_info;
         library_style = BBV;
+        semantic_types = empty_semantic_types;
       };
     early_ret = None;
     kid_renames = KBindings.empty;
@@ -155,6 +179,7 @@ let empty_ctxt =
     recursive_fns = Bindings.empty;
     debug = false;
     ret_typ_pp = PPrint.empty;
+    semantic_return = None;
     is_monadic = false;
     proof_mode = false;
     none_nesting_depth = 0;
@@ -206,7 +231,8 @@ let rec fix_id avoid remove_tick name =
   | "in" | "let" | "match" | "return" | "then" | "where" | "with" | "by" | "exists" | "exists2" | "using"
   (* other identifiers we shouldn't override *)
   | "assert" | "lsl" | "lsr" | "asr" | "type" | "function" | "raise" | "try" | "check" | "field" | "LT" | "GT" | "EQ"
-  | "Z" | "O" | "R" | "S" | "mod" | "M" | "tt" | "I" | "register_ref" | "vec" | "pair" | "option" | "bool" | "string" ->
+  | "Z" | "O" | "R" | "S" | "mod" | "M" | "tt" | "I" | "left" | "right" | "register_ref" | "vec" | "pair"
+  | "option" | "bool" | "string" ->
       name ^ "'"
   | _ ->
       if StringSet.mem name avoid then name ^ "'"
@@ -784,12 +810,201 @@ and doc_nc_exp ctx env nc =
 (* Sometimes we need to print a type in a position where any existential has already been stripped
    out. *)
 
-let doc_typ_exists_unfolded ctx env (Typ_aux (t, l) as ty) =
+let semantic_internal_typ env ty = if !opt_semantic_range_types then Env.expand_synonyms env ty else ty
+
+let doc_internal_typ ctx env ty = doc_typ ctx env (semantic_internal_typ env ty)
+
+let doc_typ_exists_unfolded ctx env ty =
+  let (Typ_aux (t, l) as ty) = semantic_internal_typ env ty in
   match t with
   | Typ_exist (kopts, _nc, ty') ->
       let skip_vars = List.fold_left (fun s kopt -> KidSet.add (kopt_kid kopt) s) KidSet.empty kopts in
       doc_typ ctx env ~skip_vars ty'
   | _ -> doc_typ ctx env ~skip_vars:KidSet.empty ty
+
+let semantic_range_id ctxt typ =
+  let rec resolve seen = function
+    | Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, []), _) ->
+        if Bindings.mem id ctxt.global.semantic_types.ranges then Some id
+        else if IdSet.mem id seen then None
+        else (
+          match Bindings.find_opt id ctxt.global.semantic_types.aliases with
+          | Some typ -> resolve (IdSet.add id seen) typ
+          | None -> None
+        )
+    | _ -> None
+  in
+  resolve IdSet.empty typ
+
+let rec has_semantic_range ctxt (Typ_aux (typ, _) as full_typ) =
+  match semantic_range_id ctxt full_typ with
+  | Some _ -> true
+  | None -> (
+      match typ with
+      | Typ_app (_, args) ->
+          List.exists (function A_aux (A_typ typ, _) -> has_semantic_range ctxt typ | _ -> false) args
+      | Typ_tuple typs -> List.exists (has_semantic_range ctxt) typs
+      | Typ_exist (_, _, typ) -> has_semantic_range ctxt typ
+      | Typ_fn (args, ret) -> List.exists (has_semantic_range ctxt) args || has_semantic_range ctxt ret
+      | _ -> false
+    )
+
+let semantic_lambda binder body = parens (string "fun " ^^ binder ^^ string " => " ^^ body)
+
+let semantic_value_field ctxt id = doc_field_name ctxt id (mk_id "value")
+
+let rec doc_semantic_pack ctxt typ value =
+  match semantic_range_id ctxt typ with
+  | Some id -> parens (string "Build_" ^^ doc_id_type ctxt.global None id ^^ space ^^ parens value)
+  | None -> (
+      match typ with
+      | Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _)
+        when has_semantic_range ctxt inner ->
+          parens
+            (string "option_map "
+            ^^ semantic_lambda (string "semanticValue") (doc_semantic_pack ctxt inner (string "semanticValue"))
+            ^^ space ^^ parens value
+            )
+      | Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _)
+        when has_semantic_range ctxt inner ->
+          parens
+            (string "List.map "
+            ^^ semantic_lambda (string "semanticValue") (doc_semantic_pack ctxt inner (string "semanticValue"))
+            ^^ space ^^ parens value
+            )
+      | Typ_aux
+          ( Typ_app
+              (Id_aux (Id "vector", _), [A_aux (A_nexp _, _); A_aux (A_typ inner, _)]),
+            _
+          )
+        when has_semantic_range ctxt inner ->
+          parens
+            (string "vec_map "
+            ^^ semantic_lambda (string "semanticValue") (doc_semantic_pack ctxt inner (string "semanticValue"))
+            ^^ space ^^ parens value
+            )
+      | Typ_aux (Typ_tuple typs, _) when List.exists (has_semantic_range ctxt) typs ->
+          let names = List.mapi (fun i _ -> Printf.sprintf "semanticValue%i" i) typs in
+          let pat = squote ^^ parens (separate (comma ^^ space) (List.map string names)) in
+          let body =
+            parens
+              (separate (comma ^^ space)
+                 (List.map2 (fun typ name -> doc_semantic_pack ctxt typ (string name)) typs names)
+              )
+          in
+          parens (separate space [string "let"; pat; coloneq; value; string "in"; body])
+      | Typ_aux (Typ_exist (_, _, inner), _) -> doc_semantic_pack ctxt inner value
+      | _ -> value
+    )
+
+let rec doc_semantic_unpack ctxt typ value =
+  match semantic_range_id ctxt typ with
+  | Some id -> parens value ^^ dot ^^ parens (semantic_value_field ctxt id)
+  | None -> (
+      match typ with
+      | Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _)
+        when has_semantic_range ctxt inner ->
+          parens
+            (string "option_map "
+            ^^ semantic_lambda (string "semanticValue") (doc_semantic_unpack ctxt inner (string "semanticValue"))
+            ^^ space ^^ parens value
+            )
+      | Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _)
+        when has_semantic_range ctxt inner ->
+          parens
+            (string "List.map "
+            ^^ semantic_lambda (string "semanticValue") (doc_semantic_unpack ctxt inner (string "semanticValue"))
+            ^^ space ^^ parens value
+            )
+      | Typ_aux
+          ( Typ_app
+              (Id_aux (Id "vector", _), [A_aux (A_nexp _, _); A_aux (A_typ inner, _)]),
+            _
+          )
+        when has_semantic_range ctxt inner ->
+          parens
+            (string "vec_map "
+            ^^ semantic_lambda (string "semanticValue") (doc_semantic_unpack ctxt inner (string "semanticValue"))
+            ^^ space ^^ parens value
+            )
+      | Typ_aux (Typ_tuple typs, _) when List.exists (has_semantic_range ctxt) typs ->
+          let names = List.mapi (fun i _ -> Printf.sprintf "semanticValue%i" i) typs in
+          let pat = squote ^^ parens (separate (comma ^^ space) (List.map string names)) in
+          let body =
+            parens
+              (separate (comma ^^ space)
+                 (List.map2 (fun typ name -> doc_semantic_unpack ctxt typ (string name)) typs names)
+              )
+          in
+          parens (separate space [string "let"; pat; coloneq; value; string "in"; body])
+      | Typ_aux (Typ_exist (_, _, inner), _) -> doc_semantic_unpack ctxt inner value
+      | _ -> value
+    )
+
+let semantic_function_type ctxt id =
+  match Bindings.find_opt id ctxt.global.semantic_types.valspecs with
+  | Some (Typ_aux (Typ_fn (args, ret), _)) -> Some (args, ret)
+  | _ -> None
+
+let semantic_unpack_binding ctxt id typ =
+  if has_semantic_range ctxt typ then
+    [
+      string "let " ^^ doc_id ctxt id ^^ string " := "
+      ^^ doc_semantic_unpack ctxt typ (doc_id ctxt id)
+      ^^ string " in";
+    ]
+  else []
+
+let rec semantic_pattern_unpacks_with_typ ctxt typ (P_aux (pat, _)) =
+  let recurse typ pat = semantic_pattern_unpacks_with_typ ctxt (Some typ) pat in
+  let recurse_many typs pats =
+    try List.concat (List.map2 recurse typs pats) with Invalid_argument _ -> []
+  in
+  match pat with
+  | P_id id -> Option.fold ~none:[] ~some:(semantic_unpack_binding ctxt id) typ
+  | P_typ (annotated, pat) -> recurse (Option.value ~default:annotated typ) pat
+  | P_var (pat, _) -> semantic_pattern_unpacks_with_typ ctxt typ pat
+  | P_as (pat, id) ->
+      let nested = semantic_pattern_unpacks_with_typ ctxt typ pat in
+      let binding = Option.fold ~none:[] ~some:(semantic_unpack_binding ctxt id) typ in
+      nested @ binding
+  | P_tuple pats -> (
+      match typ with Some (Typ_aux (Typ_tuple typs, _)) -> recurse_many typs pats | _ -> []
+    )
+  | P_list pats -> (
+      match typ with
+      | Some (Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _)) ->
+          List.concat_map (recurse inner) pats
+      | _ -> []
+    )
+  | P_cons (head, tail) -> (
+      match typ with
+      | Some (Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _) as list_typ) ->
+          recurse inner head @ recurse list_typ tail
+      | _ -> []
+    )
+  | P_app (constructor, pats) -> (
+      match semantic_function_type ctxt constructor with
+      | Some (arg_typs, _) -> recurse_many arg_typs pats
+      | None -> (
+          match (typ, pats) with
+          | Some (Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _)), [pat] ->
+              recurse inner pat
+          | _ -> []
+        )
+    )
+  | _ -> []
+
+let semantic_pattern_unpacks ctxt pat = semantic_pattern_unpacks_with_typ ctxt None pat
+
+let record_id_of_typ = function
+  | Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, _), _) -> Some id
+  | _ -> None
+
+let semantic_record_field ctxt record_id field =
+  match Bindings.find_opt record_id ctxt.global.semantic_types.record_fields with
+  | Some fields -> Bindings.find_opt field fields
+  | None -> None
 
 (* Check for variables in types that would be pretty-printed and are not
    bound in the val spec of the function. *)
@@ -816,7 +1031,7 @@ let contains_t_pp_var ctxt (Typ_aux (t, a) as typ) = KidSet.subset (coq_nvars_of
 
 let doc_tannot_core ctxt env tail_position eff typ =
   let of_typ typ =
-    let ta = if tail_position then doc_typ ctxt env typ else doc_typ_exists_unfolded ctxt env typ in
+    let ta = if tail_position then doc_internal_typ ctxt env typ else doc_typ_exists_unfolded ctxt env typ in
     if eff then (
       match ctxt.early_ret with
       | Some ret_typ ->
@@ -1640,7 +1855,16 @@ let doc_exp, doc_let =
             match args with
             | [exp] ->
                 let exp_pp = expY exp in
-                let ret_typ_pp = doc_atomic_typ ctxt (env_of exp) false (typ_of exp) in
+                let exp_pp =
+                  match ctxt.semantic_return with
+                  | Some typ -> doc_semantic_pack ctxt typ exp_pp
+                  | None -> exp_pp
+                in
+                let ret_typ_pp =
+                  match ctxt.semantic_return with
+                  | Some _ -> ctxt.ret_typ_pp
+                  | None -> doc_atomic_typ ctxt (env_of exp) false (typ_of exp)
+                in
                 let local_typ_pp = doc_atomic_typ ctxt (env_of full_exp) false (typ_of full_exp) in
                 let inj, monad, args =
                   if ctxt.is_monadic then ("early_return", "MR", [ret_typ_pp; local_typ_pp])
@@ -1673,6 +1897,13 @@ let doc_exp, doc_let =
               match fn_ty with
               | Typ_aux (Typ_fn (arg_typs, ret_typ), _) -> (arg_typs, ret_typ)
               | _ -> raise (Reporting.err_unreachable l __POS__ "Function not a function type")
+            in
+            let semantic_arg_typs, semantic_ret_typ =
+              match semantic_function_type ctxt f with
+              | Some (semantic_arg_typs, semantic_ret_typ)
+                when List.length semantic_arg_typs = List.length args ->
+                  (semantic_arg_typs, if is_ctor then None else Some semantic_ret_typ)
+              | _ -> (arg_typs, None)
             in
             let fn_typ_env = Env.add_typquant l tqs env in
             let is_monadic = not (Effects.function_is_pure f ctxt.global.effect_info) in
@@ -1888,16 +2119,36 @@ let doc_exp, doc_let =
             in
             let epp =
               if is_ctor then (
+                let doc_ctor_arg want_parens arg raw_typ semantic_typ =
+                  let arg_pp = doc_arg want_parens arg raw_typ in
+                  if has_semantic_range ctxt semantic_typ then doc_semantic_pack ctxt semantic_typ arg_pp else arg_pp
+                in
                 let argspp =
-                  match (args, arg_typs) with
-                  | [arg], [arg_typ] -> doc_arg true arg arg_typ
-                  | _, _ -> parens (flow (comma ^^ break 1) (List.map2 (doc_arg false) args arg_typs))
+                  match (args, arg_typs, semantic_arg_typs) with
+                  | [arg], [raw_typ], [semantic_typ] -> doc_ctor_arg true arg raw_typ semantic_typ
+                  | _, _, _ ->
+                      parens
+                        (flow (comma ^^ break 1)
+                           (List.map2
+                              (fun (arg, raw_typ) semantic_typ ->
+                                doc_ctor_arg false arg raw_typ semantic_typ
+                              )
+                              (List.combine args arg_typs) semantic_arg_typs
+                           )
+                        )
                 in
                 group (hang 2 (call ^^ break 1 ^^ argspp))
               )
               else (
                 let () = debug_depth := !debug_depth + 1 in
-                let argspp = List.map2 (doc_arg true) args arg_typs in
+                let argspp =
+                  List.map2
+                    (fun (arg, raw_typ) semantic_typ ->
+                      let arg_pp = doc_arg true arg raw_typ in
+                      if has_semantic_range ctxt semantic_typ then doc_semantic_pack ctxt semantic_typ arg_pp else arg_pp
+                    )
+                    (List.combine args arg_typs) semantic_arg_typs
+                in
                 let () = debug_depth := !debug_depth - 1 in
                 let all =
                   match is_rec with
@@ -1923,6 +2174,21 @@ let doc_exp, doc_let =
               List.fold_left (fun pp _kid -> string "projT2 " ^^ parens pp) epp relevant_kids
             in
 
+            (* Public semantic wrappers are erased within function bodies.  Calls
+               therefore construct wrappers at their arguments and project the
+               arithmetic carrier from their results. *)
+            let epp =
+              match semantic_ret_typ with
+              | Some typ when has_semantic_range ctxt typ ->
+                  if is_monadic then
+                    group
+                      (parens epp ^^ space ^^ string ">>= fun semanticResult =>"
+                      ^/^ string "returnM " ^^ doc_semantic_unpack ctxt typ (string "semanticResult")
+                      )
+                  else doc_semantic_unpack ctxt typ epp
+              | _ -> epp
+            in
+
             let () = debug ctxt (lazy (" autocast: " ^ string_of_auto_t autocast)) in
             let autocast_id = if is_monadic then "autocast_m" else "autocast" in
             let epp =
@@ -1939,7 +2205,11 @@ let doc_exp, doc_let =
           ->
             let fname = doc_field_name ctxt tid id in
             let exp_pp = expY fexp ^^ dot ^^ parens fname in
-            let field_typ = expand_range_type (Env.expand_synonyms env (typ_of_annot (l, annot))) in
+            let exp_pp =
+              match semantic_record_field ctxt tid id with
+              | Some typ when has_semantic_range ctxt typ -> doc_semantic_unpack ctxt typ exp_pp
+              | _ -> exp_pp
+            in
             exp_pp
         | _ -> raise (report l __POS__ "E_field expression with no register or record type")
       )
@@ -1961,11 +2231,14 @@ let doc_exp, doc_let =
           doc_id ctxt (append_id id "_ref")
         else if is_ctor env id then doc_id_ctor ctxt id
         else (
-          match Env.lookup_id id env with
-          | Local (_, typ) ->
-              let id_pp = doc_id ctxt id in
-              maybe_cast ("Variable " ^ string_of_id id) typ id_pp
-          | _ -> doc_id ctxt id
+          let id_pp = doc_id ctxt id in
+          match Bindings.find_opt id ctxt.global.semantic_types.bindings with
+          | Some typ when has_semantic_range ctxt typ -> doc_semantic_unpack ctxt typ id_pp
+          | _ -> (
+              match Env.lookup_id id env with
+              | Local (_, typ) -> maybe_cast ("Variable " ^ string_of_id id) typ id_pp
+              | _ -> id_pp
+            )
         )
     | E_lit lit ->
         let lit_pp = doc_lit lit in
@@ -2163,8 +2436,9 @@ let doc_exp, doc_let =
                   | P_aux (P_typ (typ, P_aux (P_var (P_aux (P_id id, _), _), _)), _)
                   | P_aux (P_var (P_aux (P_typ (typ, P_aux (P_id id, _)), _), _), _)
                     when not (is_enum env1 id) ->
-                      let full_typ = expand_range_type typ in
-                      let binder = parens (separate space [doc_id ctxt id; colon; doc_typ ctxt outer_env typ]) in
+                      let binder =
+                        parens (separate space [doc_id ctxt id; colon; doc_internal_typ ctxt outer_env typ])
+                      in
                       separate space [string ">>= fun"; binder; bigarrow]
                   | P_aux (P_id id, _) ->
                       (* Ideally we'd drop the parens and the squote when possible, but it's
@@ -2229,13 +2503,20 @@ let doc_exp, doc_let =
     | E_return r ->
         let ret_monad = " : MR" in
         let exp_pp = match ctxt.build_at_return with Some s -> parens (string s ^/^ expY r) | None -> expY r in
+        let exp_pp =
+          match ctxt.semantic_return with Some typ -> doc_semantic_pack ctxt typ exp_pp | None -> exp_pp
+        in
         let ta =
           if contains_t_pp_var ctxt (typ_of full_exp) || contains_t_pp_var ctxt (typ_of r) then empty
           else
             separate space
               [
                 string ret_monad;
-                parens (doc_typ ctxt (env_of full_exp) (typ_of r));
+                parens
+                  (match ctxt.semantic_return with
+                  | Some _ -> ctxt.ret_typ_pp
+                  | None -> doc_typ ctxt (env_of full_exp) (typ_of r)
+                  );
                 parens (doc_typ ctxt (env_of full_exp) (typ_of full_exp));
               ]
         in
@@ -2317,6 +2598,11 @@ let doc_exp, doc_let =
   and doc_fexp ctxt recordtyp (FE_aux (FE_fexp (id, e), _)) =
     let fname = doc_field_name ctxt recordtyp id in
     let e_pp = construct_dep_pairs ctxt (env_of e) false e (general_typ_of e) in
+    let e_pp =
+      match semantic_record_field ctxt recordtyp id with
+      | Some typ when has_semantic_range ctxt typ -> doc_semantic_pack ctxt typ e_pp
+      | _ -> e_pp
+    in
     group (doc_op coloneq fname e_pp)
   and doc_case ctxt old_env tail_position typ = function
     | Pat_aux (Pat_exp (pat, e), _) ->
@@ -2332,15 +2618,18 @@ let doc_exp, doc_let =
               ({ new_ctxt with none_nesting_depth = new_ctxt.none_nesting_depth + 1 }, new_ctxt.none_nesting_depth > 4)
           | _ -> (new_ctxt, false)
         in
+        let branch =
+          separate (break 1) (semantic_pattern_unpacks new_ctxt pat @ [top_exp new_ctxt false tail_position e])
+        in
         if hardline_pp then
           group
             (separate space [pipe; pat_pp; bigarrow]
             ^^ hardline ^^ hardline
-            ^^ group (top_exp new_ctxt false tail_position e)
+            ^^ group branch
             ^^ hardline
             )
         else
-          group (prefix 3 1 (separate space [pipe; pat_pp; bigarrow]) (group (top_exp new_ctxt false tail_position e)))
+          group (prefix 3 1 (separate space [pipe; pat_pp; bigarrow]) (group branch))
     | Pat_aux (Pat_when (_, _, _), (l, _)) ->
         raise
           (Reporting.err_unreachable l __POS__
@@ -2665,7 +2954,7 @@ let doc_enum_eq typ_id_pp num_of_id_pp of_num_id_pp =
   [lemma1; lemma2; eq_pp; beq_pp]
 
 (* TODO: check use of empty_ctxt below doesn't cause problems due to missing info *)
-let doc_typdef global generic_eq_types countable_types enum_number_defs (TD_aux (td, (l, annot))) =
+let rec doc_typdef global generic_eq_types countable_types enum_number_defs (TD_aux (td, (l, annot))) =
   let bare_ctxt = { empty_ctxt with global } in
   let doc_dec_eq_req = function
     | QI_aux (QI_id (KOpt_aux (KOpt_kind (K_aux (K_type, _), kid), _)), _) ->
@@ -2680,6 +2969,43 @@ let doc_typdef global generic_eq_types countable_types enum_number_defs (TD_aux 
     | _ -> None
   in
   match td with
+  | TD_abbrev
+      ( id,
+        [],
+        A_aux
+          ( A_typ
+              (Typ_aux
+                ( Typ_app
+                    (Id_aux (Id "range", _), [A_aux (A_nexp low, _); A_aux (A_nexp high, _)]),
+                  _
+                ) as range_typ
+              ),
+            _
+          )
+      )
+    when !opt_semantic_range_types ->
+      let value_id = mk_id "value" in
+      let value_field = doc_field_name bare_ctxt id value_id in
+      let type_id = doc_id_type global None id in
+      let value = string "x" ^^ dot ^^ parens value_field in
+      let record =
+        TD_aux (TD_record (id, [], [((value_id, range_typ), mk_def_annot l ())], false), (l, annot))
+      in
+      doc_typdef global generic_eq_types countable_types enum_number_defs record
+      ^^ group
+           (flow (break 1)
+              [
+                string "Definition";
+                type_id ^^ string "_valid";
+                parens (separate space [string "x"; colon; type_id]);
+                colon;
+                string "Prop";
+                coloneq;
+              ]
+           )
+      ^/^ separate space
+            [doc_nexp bare_ctxt Env.empty low; string "<="; value; string "/\\"; value; string "<="; doc_nexp bare_ctxt Env.empty high]
+      ^^ dot ^^ twice hardline
   | TD_abbrev (id, typq, A_aux (A_typ typ, _)) ->
       let typschm = TypSchm_aux (TypSchm_ts (typq, typ), l) in
       doc_op coloneq
@@ -3353,11 +3679,20 @@ let doc_funcl_init global proof_mode mutrec rec_opt ?rec_set (FCL_aux (FCL_funcl
     | Typ_aux (Typ_fn (arg_typs, ret_typ), _) -> (arg_typs, ret_typ, no_effect)
     | _ -> failwith ("Function " ^ string_of_id id ^ " does not have function type")
   in
+  let bare_ctxt = { empty_ctxt with global } in
+  let public_arg_typs, public_ret_typ =
+    match semantic_function_type bare_ctxt id with
+    | Some (arg_typs, ret_typ) -> (arg_typs, ret_typ)
+    | None -> (arg_typs, ret_typ)
+  in
   let is_monadic = not (Effects.function_is_pure id global.effect_info) in
   let ids_to_avoid = all_ids pexp in
   let bound_kids = tyvars_of_typquant tq in
   let pat, guard, exp, (l, _) = destruct_pexp pexp in
   let pats, bind = untuple_args_pat arg_typs pat in
+  let public_pats, _ = untuple_args_pat public_arg_typs pat in
+  let public_arg_typs = List.map snd public_pats in
+  let public_arg_typs = if List.length public_arg_typs = List.length pats then public_arg_typs else arg_typs in
   (* Fixpoint definitions can only use simple binders, but even Definitions
      can't handle as patterns *)
   let pattern_elim = match rec_opt with Rec_aux (Rec_nonrec, _) -> demote_as_pattern | _ -> demote_all_patterns env in
@@ -3394,6 +3729,7 @@ let doc_funcl_init global proof_mode mutrec rec_opt ?rec_set (FCL_aux (FCL_funcl
       debug = List.mem (string_of_id id) !opt_debug_on;
       ret_typ_pp = PPrint.empty;
       (* filled in below *)
+      semantic_return = None;
       is_monadic;
       proof_mode;
       none_nesting_depth = 0;
@@ -3402,8 +3738,9 @@ let doc_funcl_init global proof_mode mutrec rec_opt ?rec_set (FCL_aux (FCL_funcl
   let ctxt =
     {
       ctxt0 with
-      early_ret = (if has_early_return exp then Some ret_typ else None);
-      ret_typ_pp = doc_typ ctxt0 env ret_typ;
+      early_ret = (if has_early_return exp then Some public_ret_typ else None);
+      ret_typ_pp = doc_typ ctxt0 env public_ret_typ;
+      semantic_return = (if has_semantic_range ctxt0 public_ret_typ then Some public_ret_typ else None);
     }
   in
   let () =
@@ -3433,9 +3770,10 @@ let doc_funcl_init global proof_mode mutrec rec_opt ?rec_set (FCL_aux (FCL_funcl
   in
   let exp = List.fold_left (fun body f -> f body) (bind exp) binds in
   let used_a_pattern = ref false in
-  let doc_binder ((P_aux (p, ann) as pat), typ) =
+  let doc_binder (((P_aux (p, ann) as pat), typ), public_typ) =
     let env = env_of_annot ann in
     let typ = Type_check.subst_unifiers simple_type_equations typ in
+    let public_typ = Type_check.subst_unifiers simple_type_equations public_typ in
     let exp_typ = Env.expand_synonyms env typ in
     let () =
       debug ctxt (lazy (" pattern " ^ string_of_pat pat));
@@ -3444,7 +3782,9 @@ let doc_funcl_init global proof_mode mutrec rec_opt ?rec_set (FCL_aux (FCL_funcl
     match pat_is_plain_binder env pat with
     | Some id -> (
         let id_pp = match id with Some id -> doc_id ctxt id | None -> underscore in
-        match is_fixed_constant env exp_typ with
+        if has_semantic_range ctxt public_typ then parens (separate space [id_pp; colon; doc_typ ctxt env public_typ])
+        else
+          match is_fixed_constant env exp_typ with
         | Some constant ->
             parens
               (separate space [id_pp; colon; doc_typ ctxt env typ; string ":="; string (Big_int.to_string constant)])
@@ -3459,10 +3799,12 @@ let doc_funcl_init global proof_mode mutrec rec_opt ?rec_set (FCL_aux (FCL_funcl
         let pat_pp = doc_pat ctxt true pat exp_typ in
         squote ^^ parens (separate space [pat_pp; colon; doc_typ ctxt env typ])
   in
-  let binder_pps = List.map doc_binder pats in
+  let binder_pps = List.map doc_binder (List.combine pats public_arg_typs) in
   let patspp = flow (break 1) binder_pps in
   let atom_constrs = List.filter_map (atom_constraint ctxt) pats in
-  let retpp = if is_monadic then string "M" ^^ space ^^ parens ctxt.ret_typ_pp else doc_typ ctxt env ret_typ in
+  let retpp =
+    if is_monadic then string "M" ^^ space ^^ parens ctxt.ret_typ_pp else doc_typ ctxt env public_ret_typ
+  in
   let idpp = doc_id ctxt id in
   let type_equation_pps =
     KBindings.bindings simple_type_equations
@@ -3499,6 +3841,21 @@ let doc_funcl_init global proof_mode mutrec rec_opt ?rec_set (FCL_aux (FCL_funcl
         let d = match r with Rec_nonrec -> "Definition" | _ -> "Fixpoint" in
         (string d, [], [], [])
   in
+  let arg_unpacks =
+    List.map2
+      (fun (pat, _) public_typ ->
+        match pat_is_plain_binder env pat with
+        | Some (Some id) when has_semantic_range ctxt public_typ ->
+            Some
+              (string "let " ^^ doc_id ctxt id ^^ string " := "
+              ^^ doc_semantic_unpack ctxt public_typ (doc_id ctxt id)
+              ^^ string " in"
+              )
+        | _ -> None
+      )
+      pats public_arg_typs
+    |> List.filter_map Fun.id
+  in
   let intropp = match mutrec with NotMutrec -> intropp | FirstFn -> string "Fixpoint" | LaterFn -> string "with" in
   let ctxt =
     match (rec_opt, mutrec) with
@@ -3519,11 +3876,21 @@ let doc_funcl_init global proof_mode mutrec rec_opt ?rec_set (FCL_aux (FCL_funcl
       ^/^ flow (break 1) (measurepp @ [colon; retpp])
       ),
     ctxt,
-    (exp, is_monadic, fixupspp)
+    (exp, is_monadic, arg_unpacks @ fixupspp)
   )
 
 let doc_funcl_body ctxt (exp, is_monadic, fixupspp) =
   let bodypp = doc_fun_body ctxt is_monadic exp in
+  let bodypp =
+    match ctxt.semantic_return with
+    | Some typ when is_monadic ->
+        group
+          (parens bodypp ^^ space ^^ string ">>= fun semanticResult =>"
+          ^/^ string "returnM " ^^ doc_semantic_pack ctxt typ (string "semanticResult")
+          )
+    | Some typ -> doc_semantic_pack ctxt typ bodypp
+    | None -> bodypp
+  in
   let bodypp = separate (break 1) (fixupspp @ [bodypp]) in
   group bodypp
 
@@ -3693,14 +4060,16 @@ let doc_regtype_fields global (tname, (n1, n2, fields)) =
   separate_map hardline doc_field fields
 
 (* Remove some type variables in a similar fashion to merge_kids_atoms *)
-let doc_axiom_typschm typ_env is_monadic l (tqs, typ) =
+let doc_axiom_typschm ctxt typ_env is_monadic l (tqs, typ) =
   let simple_type_equations = Type_check.instantiate_simple_equations tqs in
   let typ = Type_check.subst_unifiers simple_type_equations typ in
   let typ_env = Env.add_typquant l tqs typ_env in
   match typ with
   | Typ_aux (Typ_fn (typs, ret_ty), l') ->
       let check_typ (args, used) typ =
-        match Type_check.destruct_atom_nexp typ_env typ with
+        if has_semantic_range ctxt typ then (args, KidSet.union used (tyvars_of_typ typ))
+        else
+          match Type_check.destruct_atom_nexp typ_env typ with
         | Some (Nexp_aux (Nexp_var kid, _)) -> if KidSet.mem kid used then (args, used) else (KidSet.add kid args, used)
         | Some _ -> (args, used)
         | _ -> (
@@ -3729,7 +4098,9 @@ let doc_axiom_typschm typ_env is_monadic l (tqs, typ) =
         string ("x" ^ string_of_int n)
       in
       let doc_typ' typ =
-        match Type_check.destruct_atom_nexp typ_env typ with
+        if has_semantic_range ctxt typ then parens (underscore ^^ string " : " ^^ doc_typ ctxt typ_env typ)
+        else
+          match Type_check.destruct_atom_nexp typ_env typ with
         | Some (Nexp_aux (Nexp_var kid, _)) when KBindings.mem kid simple_type_equations ->
             let v = KBindings.find kid simple_type_equations in
             parens (doc_var empty_ctxt kid ^^ string " := " ^^ doc_typ_arg empty_ctxt typ_env v)
@@ -3741,15 +4112,15 @@ let doc_axiom_typschm typ_env is_monadic l (tqs, typ) =
             match Type_check.destruct_atom_bool typ_env typ with
             | Some (NC_aux (NC_var kid, _)) when KidSet.mem kid args ->
                 parens (doc_var empty_ctxt kid ^^ string " : bool")
-            | _ -> parens (underscore ^^ string " : " ^^ doc_typ empty_ctxt Env.empty typ)
+            | _ -> parens (underscore ^^ string " : " ^^ doc_typ ctxt Env.empty typ)
           )
       in
       let arg_typs_pp = separate space (List.map doc_typ' typs) in
-      let ret_typ_pp = doc_typ empty_ctxt Env.empty ret_ty in
+      let ret_typ_pp = doc_typ ctxt Env.empty ret_ty in
       let ret_typ_pp = if is_monadic then string "M" ^^ space ^^ parens ret_typ_pp else ret_typ_pp in
-      let tyvars_pp, constrs_pp = doc_typquant_items_separate empty_ctxt typ_env braces tqs in
+      let tyvars_pp, constrs_pp = doc_typquant_items_separate ctxt typ_env braces tqs in
       string "forall" ^/^ separate space tyvars_pp ^/^ arg_typs_pp ^/^ separate space constrs_pp ^^ comma ^/^ ret_typ_pp
-  | _ -> doc_typschm empty_ctxt typ_env true (TypSchm_aux (TypSchm_ts (tqs, typ), l))
+  | _ -> doc_typschm ctxt typ_env true (TypSchm_aux (TypSchm_ts (tqs, typ), l))
 
 let doc_val_spec global def_annot unimplemented (VS_aux (VS_val_spec (_, id, _), (l, ann)) as vs) =
   let bare_ctxt = { empty_ctxt with global } in
@@ -3758,10 +4129,14 @@ let doc_val_spec global def_annot unimplemented (VS_aux (VS_val_spec (_, id, _),
     (* The type checker will expand the type scheme, and we need to look at the
        environment afterwards to find it. *)
     let _, next_env = check_val_spec typ_env def_annot (strip_val_spec vs) in
-    let tys = Env.get_val_spec id next_env in
+    let tqs, typ = Env.get_val_spec id next_env in
+    let typ = Option.value ~default:typ (Bindings.find_opt id global.semantic_types.valspecs) in
+    let tys = (tqs, typ) in
     let is_monadic = not (Effects.function_is_pure id global.effect_info) in
     nest 2
-      (flow (break 1) [string "Axiom"; doc_id bare_ctxt id; colon; doc_axiom_typschm typ_env is_monadic l tys] ^^ dot)
+      (flow (break 1) [string "Axiom"; doc_id bare_ctxt id; colon; doc_axiom_typschm bare_ctxt typ_env is_monadic l tys]
+      ^^ dot
+      )
     ^/^ hardline
   )
   else empty (* Type signatures appear in definitions *)
@@ -3792,6 +4167,9 @@ let doc_val global pat exp =
   let typpp =
     match pat_typ with None -> empty | Some typ -> space ^^ colon ^^ space ^^ doc_typ bare_ctxt Env.empty typ
   in
+  let semantic_typ =
+    match pat_typ with Some typ when has_semantic_range bare_ctxt typ -> Some typ | _ -> None
+  in
   let env = env_of exp in
   let ctxt = { bare_ctxt with debug = List.mem (string_of_id id) !opt_debug_on } in
   let () =
@@ -3801,6 +4179,7 @@ let doc_val global pat exp =
   let typpp, exp =
     match pat_typ with
     | None -> (typpp, exp)
+    | Some _ when Option.is_some semantic_typ -> (typpp, exp)
     | Some typ -> (
         let typ = expand_range_type (Env.expand_synonyms env typ) in
         match destruct_exist_plain typ with
@@ -3818,6 +4197,7 @@ let doc_val global pat exp =
   (* If the expression has assertions or incomplete pattern matches (if/when we allow that) then
      unwrap the value.  There will be a typechecking failure in Rocq if there's an effect. *)
   let def_pp = if effectful (effect_of exp) then group (string "unwrap_value" ^/^ parens base_pp) else base_pp in
+  let def_pp = match semantic_typ with Some typ -> doc_semantic_pack ctxt typ def_pp | None -> def_pp in
   let () = debug_depth := 0 in
   group (string "Definition" ^^ space ^^ idpp ^^ typpp ^^ space ^^ coloneq ^/^ def_pp ^^ dot)
   ^^ hardline
@@ -4716,6 +5096,76 @@ let calculate_type_rewrite env =
   let clashes = IdSet.filter (Env.bound_typ_id env) constructors in
   IdSet.fold (fun id m -> Bindings.add id (append_id id "_typ") m) clashes Bindings.empty
 
+let collect_semantic_types defs =
+  if not !opt_semantic_range_types then empty_semantic_types
+  else
+    let ranges, aliases =
+      List.fold_left
+        (fun (ranges, aliases) (DEF_aux (def, _)) ->
+          match def with
+          | DEF_type
+              (TD_aux
+                ( TD_abbrev
+                    ( id,
+                      [],
+                      A_aux
+                        ( A_typ
+                            (Typ_aux
+                              ( Typ_app
+                                  (Id_aux (Id "range", _), [A_aux (A_nexp low, _); A_aux (A_nexp high, _)]),
+                                _
+                              )
+                            ),
+                          _
+                        )
+                    ),
+                  _
+                )) ->
+              (Bindings.add id { low; high } ranges, aliases)
+          | DEF_type (TD_aux (TD_abbrev (id, [], A_aux (A_typ typ, _)), _)) ->
+              (ranges, Bindings.add id typ aliases)
+          | _ -> (ranges, aliases)
+        )
+        (Bindings.empty, Bindings.empty) defs
+    in
+    let valspecs, bindings, record_fields =
+      List.fold_left
+        (fun (valspecs, bindings, record_fields) (DEF_aux (def, _)) ->
+          match def with
+          | DEF_val
+              (VS_aux
+                (VS_val_spec (TypSchm_aux (TypSchm_ts (_, typ), _), id, _), _)) ->
+              (Bindings.add id typ valspecs, bindings, record_fields)
+          | DEF_let (P_aux (P_typ (typ, P_aux (P_id id, _)), _), _) ->
+              (valspecs, Bindings.add id typ bindings, record_fields)
+          | DEF_let
+              ( P_aux
+                  (P_typ (typ, P_aux (P_var (P_aux (P_id id, _), _), _)), _),
+                _
+              ) ->
+              (valspecs, Bindings.add id typ bindings, record_fields)
+          | DEF_type (TD_aux (TD_variant (id, _, arms, _), _)) ->
+              let valspecs =
+                List.fold_left
+                  (fun valspecs (Tu_aux (Tu_ty_id (payload, constructor), _)) ->
+                    Bindings.add constructor (function_typ [payload] (mk_id_typ id)) valspecs
+                  )
+                  valspecs arms
+              in
+              (valspecs, bindings, record_fields)
+          | DEF_type (TD_aux (TD_record (id, _, fields, _), _)) ->
+              let fields =
+                List.fold_left
+                  (fun fields ((field, typ), _) -> Bindings.add field typ fields)
+                  Bindings.empty fields
+              in
+              (valspecs, bindings, Bindings.add id fields record_fields)
+          | _ -> (valspecs, bindings, record_fields)
+        )
+        (Bindings.empty, Bindings.empty, Bindings.empty) defs
+    in
+    { ranges; aliases; valspecs; bindings; record_fields }
+
 let pp_ast_coq library_style (types_file, types_modules) (interface_file, interface_modules) (defs_file, defs_modules)
     type_defs_module opt_coq_isla ctx effect_info type_env ({ defs; _ } as ast) concurrency_monad_params top_line
     suppress_MR_M =
@@ -4725,7 +5175,8 @@ let pp_ast_coq library_style (types_file, types_modules) (interface_file, interf
     let unimplemented = find_unimplemented defs in
     let avoid_target_names = builtin_target_names defs in
     let type_rename = calculate_type_rewrite type_env in
-    let global = { types_mod = type_defs_module; avoid_target_names; type_rename; effect_info; library_style } in
+    let semantic_types = collect_semantic_types defs in
+    let global = { types_mod = type_defs_module; avoid_target_names; type_rename; effect_info; library_style; semantic_types } in
     let bare_doc_id = doc_id { empty_ctxt with global } in
     let registers = State.find_registers defs in
     let generic_eq_types = types_used_with_generic_eq defs in

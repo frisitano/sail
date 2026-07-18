@@ -171,6 +171,43 @@ uint64_t sail_int_get_ui(const sail_int op)
   return (uint64_t) op;
 }
 
+bool EQUAL(mach_uint)(const mach_uint op1, const mach_uint op2)
+{
+  return op1 == op2;
+}
+
+mach_uint CONVERT_OF(mach_uint, mach_int)(const mach_int op)
+{
+  if (op < 0) {
+    fprintf(stderr, "Sail C backend: negative integer cannot be represented as uint64_t\n");
+    exit(EXIT_FAILURE);
+  }
+  return (mach_uint) op;
+}
+
+mach_int CONVERT_OF(mach_int, mach_uint)(const mach_uint op)
+{
+  if (op > (mach_uint) INT64_MAX) {
+    fprintf(stderr, "Sail C backend: uint64_t value cannot be represented as int64_t\n");
+    exit(EXIT_FAILURE);
+  }
+  return (mach_int) op;
+}
+
+mach_uint CONVERT_OF(mach_uint, sail_int)(const sail_int op)
+{
+  if (op < 0 || (unsigned __int128) op > (unsigned __int128) UINT64_MAX) {
+    fprintf(stderr, "Sail C backend: integer value is outside the uint64_t domain\n");
+    exit(EXIT_FAILURE);
+  }
+  return (mach_uint) op;
+}
+
+sail_int CONVERT_OF(sail_int, mach_uint)(const mach_uint op)
+{
+  return (sail_int) op;
+}
+
 bool EQUAL(mach_int)(const mach_int op1, const mach_int op2)
 {
   return op1 == op2;
@@ -181,14 +218,23 @@ sail_int CREATE_OF(sail_int, mach_int)(const mach_int op)
   return (sail_int) op;
 }
 
+static mach_int checked_mach_int_of_sail_int(const sail_int op)
+{
+  if (op < (sail_int)INT64_MIN || op > (sail_int)INT64_MAX) {
+    fprintf(stderr, "Sail C backend: integer value is outside the int64_t domain\n");
+    exit(EXIT_FAILURE);
+  }
+  return (mach_int)op;
+}
+
 mach_int CREATE_OF(mach_int, sail_int)(const sail_int op)
 {
-  return (mach_int) op;
+  return checked_mach_int_of_sail_int(op);
 }
 
 mach_int CONVERT_OF(mach_int, sail_int)(const sail_int op)
 {
-  return (mach_int) op;
+  return checked_mach_int_of_sail_int(op);
 }
 
 sail_int CONVERT_OF(sail_int, mach_int)(const mach_int op)
@@ -487,6 +533,27 @@ sbits CONVERT_OF(sbits, lbits)(const lbits op, const bool direction)
   rop.len = op.len;
   rop.bits = mpz_get_ui(*op.bits);
   return rop;
+}
+
+void sail_lbits_to_u64_array(uint64_t *limbs, size_t limb_count, const lbits value)
+{
+  memset(limbs, 0, limb_count * sizeof(uint64_t));
+  if (limb_count == 0) return;
+
+  mpz_t truncated;
+  mpz_init(truncated);
+  mpz_fdiv_r_2exp(truncated, *value.bits, limb_count * 64);
+  size_t written = 0;
+  mpz_export(limbs, &written, -1, sizeof(uint64_t), 0, 0, truncated);
+  mpz_clear(truncated);
+}
+
+void sail_lbits_from_u64_array(lbits *result, const uint64_t *limbs,
+                               size_t limb_count, uint64_t len)
+{
+  result->len = len;
+  mpz_import(*result->bits, limb_count, -1, sizeof(uint64_t), 0, 0, limbs);
+  mpz_fdiv_r_2exp(*result->bits, *result->bits, len);
 }
 
 void UNDEFINED(lbits)(lbits *rop, const sail_int len, const fbits bit)

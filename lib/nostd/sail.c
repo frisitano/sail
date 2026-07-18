@@ -107,6 +107,71 @@ void concat_str(sail_string *stro, const_sail_string str1, const_sail_string str
 /* Sail integers                                                          */
 /* ********************************************************************** */
 
+mach_uint CONVERT_OF(mach_uint, mach_int)(const mach_int op)
+{
+     if (op < 0) {
+          sail_failure("Sail C backend: negative integer cannot be represented as uint64_t");
+          return 0;
+     }
+     return (mach_uint) op;
+}
+
+mach_int CONVERT_OF(mach_int, mach_uint)(const mach_uint op)
+{
+     if (op > (mach_uint) INT64_MAX) {
+          sail_failure("Sail C backend: uint64_t value cannot be represented as int64_t");
+          return -1;
+     }
+     return (mach_int) op;
+}
+
+#if defined(SAIL_INT64) || defined(SAIL_INT128)
+
+mach_uint CONVERT_OF(mach_uint, sail_int)(const sail_int op)
+{
+     if (op < 0
+#ifdef SAIL_INT128
+         || (unsigned __int128) op > (unsigned __int128) UINT64_MAX
+#endif
+     ) {
+          sail_failure("Sail C backend: integer value is outside the uint64_t domain");
+          return 0;
+     }
+     return (mach_uint) op;
+}
+
+SAIL_INT_FUNCTION(CONVERT_OF(sail_int, mach_uint), const mach_uint op)
+{
+#ifdef SAIL_INT64
+     if (op > (mach_uint) INT64_MAX) {
+          sail_failure("Sail C backend: uint64_t value cannot be represented by SAIL_INT64");
+          return 0;
+     }
+#endif
+     return (sail_int) op;
+}
+
+#else
+
+mach_uint CONVERT_OF(mach_uint, sail_int)(const sail_int op)
+{
+     if (mpz_sgn(op) < 0 || mpz_sizeinbase(op, 2) > 64) {
+          sail_failure("Sail C backend: integer value is outside the uint64_t domain");
+          return 0;
+     }
+     mach_uint result = 0;
+     size_t count = 0;
+     mpz_export(&result, &count, 1, sizeof(result), 0, 0, op);
+     return result;
+}
+
+void CONVERT_OF(sail_int, mach_uint)(sail_int *rop, const mach_uint op)
+{
+     mpz_import(*rop, 1, 1, sizeof(op), 0, 0, &op);
+}
+
+#endif
+
 sail_int CREATE_OF(sail_int, mach_int)(const mach_int op)
 {
      return (sail_int) op;
@@ -361,6 +426,31 @@ sbits CONVERT_OF(sbits, lbits)(const lbits op, const bool order)
 lbits CONVERT_OF(lbits, sbits)(const sbits op, const bool order)
 {
      return op;
+}
+
+void sail_lbits_to_u64_array(uint64_t *limbs, size_t limb_count, const lbits value)
+{
+     for (size_t i = 0; i < limb_count; i++) limbs[i] = 0;
+     if (limb_count == 0) return;
+     if (value.len > 64)
+          sail_failure("Sail C backend: SAIL_BITS64 cannot export a bitvector wider than 64 bits");
+     limbs[0] = value.len >= 64
+          ? value.bits
+          : value.bits & safe_rshift(UINT64_MAX, 64 - value.len);
+}
+
+void sail_lbits_from_u64_array(lbits *result, const uint64_t *limbs,
+                               size_t limb_count, uint64_t len)
+{
+     if (len > 64)
+          sail_failure("Sail C backend: SAIL_BITS64 cannot import a bitvector wider than 64 bits");
+     for (size_t i = 1; i < limb_count; i++) {
+          if (limbs[i] != 0)
+               sail_failure("Sail C backend: fixed-limb value does not fit in SAIL_BITS64");
+     }
+     result->len = len;
+     result->bits = limb_count == 0 ? 0 : limbs[0];
+     if (len < 64) result->bits &= safe_rshift(UINT64_MAX, 64 - len);
 }
 
 lbits UNDEFINED(lbits)(const sail_int len)

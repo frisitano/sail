@@ -216,8 +216,8 @@ module Make (Config : CONFIG) = struct
         let logic = sprintf "logic [%d:0]" (max_width - 1) in
         ksprintf simple_type "struct packed { logic [7:0] sb_size; %s sb_bits; }" logic
     | CT_lbits -> simple_type "sail_bits"
-    | CT_fint width when two_state -> ksprintf simple_type "bit [%d:0]" (width - 1)
-    | CT_fint width -> ksprintf simple_type "logic [%d:0]" (width - 1)
+    | (CT_fint width | CT_fuint width) when two_state -> ksprintf simple_type "bit [%d:0]" (width - 1)
+    | CT_fint width | CT_fuint width -> ksprintf simple_type "logic [%d:0]" (width - 1)
     | CT_lint -> ksprintf simple_type "logic [%d:0]" (Config.max_unknown_integer_width - 1)
     | CT_string -> simple_type (if Config.no_strings then "sail_unit" else "string")
     | CT_unit -> simple_type "sail_unit"

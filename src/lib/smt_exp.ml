@@ -1164,7 +1164,7 @@ module Counterexample (Config : COUNTEREXAMPLE_CONFIG) = struct
         | Atom "false" -> V_bool false
         | _ -> failwith ("Cannot parse sexpr as bool " ^ string_of_sexpr sexpr)
       )
-    | CT_fint width -> (
+    | CT_fint width | CT_fuint width -> (
         match parse_sexpr_int width sexpr with
         | Some value -> V_int value
         | None -> failwith ("Cannot parse sexpr as fixed-width integer: " ^ string_of_sexpr sexpr)

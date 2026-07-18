@@ -118,6 +118,7 @@ bool string_startswith(const_sail_string s, const_sail_string prefix);
 /* First, we define a type for machine-precision integers, int64_t */
 
 typedef int64_t mach_int;
+typedef uint64_t mach_uint;
 #define MACH_INT_MAX INT64_MAX
 #define MACH_INT_MIN INT64_MIN
 
@@ -125,6 +126,14 @@ static inline bool EQUAL(mach_int)(const mach_int a, const mach_int b)
 {
      return a == b;
 }
+
+static inline bool EQUAL(mach_uint)(const mach_uint a, const mach_uint b)
+{
+     return a == b;
+}
+
+mach_uint CONVERT_OF(mach_uint, mach_int)(const mach_int);
+mach_int CONVERT_OF(mach_int, mach_uint)(const mach_uint);
 
 /*
  * For arbitrary precision types, we define a type sail_int. Currently
@@ -170,6 +179,8 @@ mach_int CREATE_OF(mach_int, sail_int)(const sail_int);
 SAIL_INT_FUNCTION(CONVERT_OF(sail_int, mach_int), const mach_int);
 SAIL_INT_FUNCTION(CONVERT_OF(sail_int, sail_string), const_sail_string);
 mach_int CONVERT_OF(mach_int, sail_int)(const sail_int);
+SAIL_INT_FUNCTION(CONVERT_OF(sail_int, mach_uint), const mach_uint);
+mach_uint CONVERT_OF(mach_uint, sail_int)(const sail_int);
 
 /*
  * Comparison operators for integers
@@ -318,6 +329,11 @@ SAIL_BITS_FUNCTION(CONVERT_OF(lbits, fbits), const fbits, const uint64_t, const 
 fbits CONVERT_OF(fbits, lbits)(const lbits, const bool);
 SAIL_BITS_FUNCTION(CONVERT_OF(lbits, sbits), const sbits, const bool);
 sbits CONVERT_OF(sbits, lbits)(const lbits, const bool);
+
+/* Portable fixed-limb bridge used by native representations such as u256.
+ * Limbs are little-endian: limbs[0] contains the least-significant 64 bits. */
+void sail_lbits_to_u64_array(uint64_t *, size_t, const lbits);
+void sail_lbits_from_u64_array(lbits *, const uint64_t *, size_t, uint64_t);
 
 SAIL_BITS_FUNCTION(UNDEFINED(lbits), const sail_int);
 

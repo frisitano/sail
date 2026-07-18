@@ -69,6 +69,22 @@ def get_support_lib(subdir) -> str:
         step("lake build +Sail:c.o", cwd=lib_path)
         return f"../../support-lib"
 
+def test_source_tree(support_lib: str):
+    """Check that Lean modules preserve source directories and duplicate basenames."""
+    output_dir = "source_tree/out"
+    step(f"rm -rf {output_dir} || true")
+    step(
+        "'{}' source_tree/model.sail_project Right --lean --lean-source-root source_tree "
+        "--lean-output-dir source_tree -o out --lean-lib-path {}".format(sail, support_lib),
+        name="source_tree/model.sail_project",
+    )
+    step(f"test -f {output_dir}/Out/Left/Shared.lean", name="source_tree/model.sail_project")
+    step(f"test -f {output_dir}/Out/Right/Shared.lean", name="source_tree/model.sail_project")
+    step("lake update", cwd=output_dir, name="source_tree/model.sail_project")
+    step("lake build", cwd=output_dir, name="source_tree/model.sail_project")
+    step(f"rm -rf {output_dir}")
+    print_ok("source_tree/model.sail_project")
+
 def test_lean(subdir: str, skip_list = None, runnable: bool = False):
     """
     Run all Sail files available in the `subdir`.
@@ -79,6 +95,8 @@ def test_lean(subdir: str, skip_list = None, runnable: bool = False):
     support_lib = get_support_lib(subdir)
     print("...done!")
     banner(f'Testing lean target (sub-directory: {subdir})')
+    if subdir == 'lean' and (not args.test or 'source_tree' in args.test):
+        test_source_tree(support_lib)
     results = Results(subdir)
     for filenames in chunks(os.listdir(f'../{subdir}'), parallel()):
         tests = {}

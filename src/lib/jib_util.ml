@@ -186,6 +186,9 @@ let string_of_op = function
   | Bvxor -> "@bvxor"
   | Bvadd -> "@bvadd"
   | Bvsub -> "@bvsub"
+  | Bvshiftl -> "@bvshiftl"
+  | Bvshiftr -> "@bvshiftr"
+  | Bvarith_shiftr -> "@bvarith_shiftr"
   | Bvaccess -> "@bvaccess"
   | Ilt -> "@lt"
   | Igt -> "@gt"
@@ -193,6 +196,9 @@ let string_of_op = function
   | Igteq -> "@gteq"
   | Iadd -> "@iadd"
   | Isub -> "@isub"
+  | Imul -> "@imul"
+  | Idiv -> "@idiv"
+  | Imod -> "@imod"
   | Unsigned n -> "@unsigned::<" ^ string_of_int n ^ ">"
   | Signed n -> "@signed::<" ^ string_of_int n ^ ">"
   | Zero_extend n -> "@zero_extend::<" ^ string_of_int n ^ ">"
@@ -211,6 +217,7 @@ let string_of_op = function
 let rec string_of_ctyp = function
   | CT_lint -> "%i"
   | CT_fint n -> "%i" ^ string_of_int n
+  | CT_fuint n -> "%u" ^ string_of_int n
   | CT_float n -> "%f" ^ string_of_int n
   | CT_rounding_mode -> "%rounding_mode"
   | CT_lbits -> "%bv"
@@ -447,8 +454,9 @@ let iraw ?loc:(l = Parse_ast.Unknown) str = I_aux (I_raw str, (instr_number (), 
 let ijump l cval label = I_aux (I_jump (cval, label), (instr_number (), l))
 
 let rec map_ctyp f = function
-  | ( CT_lint | CT_fint _ | CT_constant _ | CT_lbits | CT_fbits _ | CT_sbits _ | CT_float _ | CT_rounding_mode | CT_unit
-    | CT_bool | CT_real | CT_string | CT_poly _ | CT_enum _ | CT_memory_writes | CT_json | CT_json_key ) as ctyp ->
+  | ( CT_lint | CT_fint _ | CT_fuint _ | CT_constant _ | CT_lbits | CT_fbits _ | CT_sbits _ | CT_float _
+    | CT_rounding_mode | CT_unit | CT_bool | CT_real | CT_string | CT_poly _ | CT_enum _ | CT_memory_writes | CT_json
+    | CT_json_key ) as ctyp ->
       f ctyp
   | CT_tup ctyps -> f (CT_tup (List.map (map_ctyp f) ctyps))
   | CT_ref ctyp -> f (CT_ref (map_ctyp f ctyp))
@@ -462,8 +470,9 @@ let rec ctyp_has pred ctyp =
   pred ctyp
   ||
   match ctyp with
-  | CT_lint | CT_fint _ | CT_constant _ | CT_lbits | CT_fbits _ | CT_sbits _ | CT_float _ | CT_rounding_mode | CT_unit
-  | CT_bool | CT_real | CT_string | CT_poly _ | CT_enum _ | CT_memory_writes | CT_json | CT_json_key ->
+  | CT_lint | CT_fint _ | CT_fuint _ | CT_constant _ | CT_lbits | CT_fbits _ | CT_sbits _ | CT_float _
+  | CT_rounding_mode | CT_unit | CT_bool | CT_real | CT_string | CT_poly _ | CT_enum _ | CT_memory_writes | CT_json
+  | CT_json_key ->
       false
   | CT_struct (_, ctyps) | CT_variant (_, ctyps) | CT_tup ctyps -> List.exists (ctyp_has pred) ctyps
   | CT_ref ctyp | CT_vector ctyp | CT_fvector (_, ctyp) | CT_list ctyp -> ctyp_has pred ctyp
@@ -475,6 +484,7 @@ let rec ctyp_equal ctyp1 ctyp2 =
   | CT_sbits m1, CT_sbits m2 -> m1 = m2
   | CT_fbits m1, CT_fbits m2 -> m1 = m2
   | CT_fint n, CT_fint m -> n = m
+  | CT_fuint n, CT_fuint m -> n = m
   | CT_float n, CT_float m -> n = m
   | CT_rounding_mode, CT_rounding_mode -> true
   | CT_constant n, CT_constant m -> Big_int.equal n m
@@ -504,6 +514,9 @@ let rec ctyp_compare ctyp1 ctyp2 =
   | CT_lint, CT_lint -> 0
   | CT_lint, _ -> 1
   | _, CT_lint -> -1
+  | CT_fuint n, CT_fuint m -> compare n m
+  | CT_fuint _, _ -> 1
+  | _, CT_fuint _ -> -1
   | CT_fint n, CT_fint m -> compare n m
   | CT_fint _, _ -> 1
   | _, CT_fint _ -> -1
@@ -601,6 +614,7 @@ let rec ctyp_suprema = function
   | CT_fbits _ -> CT_lbits
   | CT_sbits _ -> CT_lbits
   | CT_fint _ -> CT_lint
+  | CT_fuint _ -> CT_lint
   | CT_constant _ -> CT_lint
   | CT_unit -> CT_unit
   | CT_bool -> CT_bool
@@ -656,10 +670,16 @@ let rec ctyp_unify l ctyp1 ctyp2 =
   | CT_fbits n, CT_sbits m when n <= m -> KBindings.empty
   | CT_lint, CT_fint _ -> KBindings.empty
   | CT_fint _, CT_lint -> KBindings.empty
+  | CT_lint, CT_fuint _ -> KBindings.empty
+  | CT_fuint _, CT_lint -> KBindings.empty
   | CT_lint, CT_constant _ -> KBindings.empty
   | CT_constant _, CT_lint -> KBindings.empty
   | CT_fint _, CT_constant _ -> KBindings.empty
   | CT_constant _, CT_fint _ -> KBindings.empty
+  | CT_fuint _, CT_constant _ -> KBindings.empty
+  | CT_constant _, CT_fuint _ -> KBindings.empty
+  | CT_fint _, CT_fuint _ -> KBindings.empty
+  | CT_fuint _, CT_fint _ -> KBindings.empty
   | _, _ ->
       Reporting.unreachable l __POS__ ("Invalid ctyp unifiers " ^ string_of_ctyp ctyp1 ^ " and " ^ string_of_ctyp ctyp2)
 
@@ -669,8 +689,8 @@ let rec ctyp_ids = function
       IdSet.add id (List.fold_left (fun ids ctyp -> IdSet.union (ctyp_ids ctyp) ids) IdSet.empty ctyps)
   | CT_tup ctyps -> List.fold_left (fun ids ctyp -> IdSet.union (ctyp_ids ctyp) ids) IdSet.empty ctyps
   | CT_vector ctyp | CT_fvector (_, ctyp) | CT_list ctyp | CT_ref ctyp -> ctyp_ids ctyp
-  | CT_lint | CT_fint _ | CT_constant _ | CT_lbits | CT_fbits _ | CT_sbits _ | CT_unit | CT_bool | CT_real | CT_string
-  | CT_poly _ | CT_float _ | CT_rounding_mode | CT_memory_writes | CT_json | CT_json_key ->
+  | CT_lint | CT_fint _ | CT_fuint _ | CT_constant _ | CT_lbits | CT_fbits _ | CT_sbits _ | CT_unit | CT_bool | CT_real
+  | CT_string | CT_poly _ | CT_float _ | CT_rounding_mode | CT_memory_writes | CT_json | CT_json_key ->
       IdSet.empty
 
 let rec subst_poly substs = function
@@ -684,13 +704,13 @@ let rec subst_poly substs = function
   | CT_ref ctyp -> CT_ref (subst_poly substs ctyp)
   | CT_variant (id, ctyps) -> CT_variant (id, List.map (subst_poly substs) ctyps)
   | CT_struct (id, ctyps) -> CT_struct (id, List.map (subst_poly substs) ctyps)
-  | ( CT_lint | CT_fint _ | CT_constant _ | CT_unit | CT_bool | CT_string | CT_real | CT_lbits | CT_fbits _ | CT_sbits _
-    | CT_enum _ | CT_float _ | CT_rounding_mode | CT_memory_writes | CT_json | CT_json_key ) as ctyp ->
+  | ( CT_lint | CT_fint _ | CT_fuint _ | CT_constant _ | CT_unit | CT_bool | CT_string | CT_real | CT_lbits | CT_fbits _
+    | CT_sbits _ | CT_enum _ | CT_float _ | CT_rounding_mode | CT_memory_writes | CT_json | CT_json_key ) as ctyp ->
       ctyp
 
 let rec is_polymorphic = function
-  | CT_lint | CT_fint _ | CT_constant _ | CT_lbits | CT_fbits _ | CT_sbits _ | CT_unit | CT_bool | CT_real | CT_string
-  | CT_float _ | CT_rounding_mode | CT_memory_writes | CT_json | CT_json_key ->
+  | CT_lint | CT_fint _ | CT_fuint _ | CT_constant _ | CT_lbits | CT_fbits _ | CT_sbits _ | CT_unit | CT_bool | CT_real
+  | CT_string | CT_float _ | CT_rounding_mode | CT_memory_writes | CT_json | CT_json_key ->
       false
   | CT_enum _ -> false
   | CT_tup ctyps | CT_struct (_, ctyps) | CT_variant (_, ctyps) -> List.exists is_polymorphic ctyps
@@ -1091,10 +1111,11 @@ let rec infer_call op vs =
   | (Eq | Neq), _ -> CT_bool
   | Bvnot, [v] -> cval_ctyp v
   | Bvaccess, _ -> CT_fbits 1
-  | (Bvor | Bvand | Bvxor | Bvadd | Bvsub), [v; _] -> cval_ctyp v
+  | (Bvor | Bvand | Bvxor | Bvadd | Bvsub | Bvshiftl | Bvshiftr | Bvarith_shiftr), [v; _] -> cval_ctyp v
   | (Ilt | Igt | Ilteq | Igteq), _ -> CT_bool
-  | (Iadd | Isub), _ -> CT_fint 64
-  | (Unsigned n | Signed n), _ -> CT_fint n
+  | (Iadd | Isub | Imul | Idiv | Imod), [v; _] -> cval_ctyp v
+  | Unsigned n, _ -> CT_fuint n
+  | Signed n, _ -> CT_fint n
   | (Zero_extend n | Sign_extend n), [v] -> (
       match cval_ctyp v with
       | CT_fbits _ | CT_sbits _ -> CT_fbits n
@@ -1102,7 +1123,8 @@ let rec infer_call op vs =
     )
   | Slice n, [vec; _] -> (
       match cval_ctyp vec with
-      | CT_fbits _ | CT_sbits _ -> CT_fbits n
+      | CT_fbits _ | CT_sbits _ | CT_fuint _ -> CT_fbits n
+      | CT_struct (id, []) when string_of_id id = "__sail_c_repr_u256" -> CT_fbits n
       | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Invalid type for extract argument"
     )
   | Sslice n, [vec; _; _] -> (

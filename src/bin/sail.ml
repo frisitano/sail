@@ -353,8 +353,12 @@ let rec options =
         "<filename>:<line>:<variable> manually gives a case split for monomorphisation"
       );
       ( "-splice",
-        Arg.String (fun s -> opt_splice := s :: !opt_splice),
-        "<filename> add functions from file, replacing existing definitions where necessary"
+        Arg.String
+          (fun s ->
+            Type_check.opt_expand_valspec := false;
+            opt_splice := s :: !opt_splice
+          ),
+        "<filename> add functions and types from file, replacing existing definitions where necessary"
       );
       ( "-smt_solver",
         Arg.String (fun s -> Constraint.set_solver (String.trim s)),

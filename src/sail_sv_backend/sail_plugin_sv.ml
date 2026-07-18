@@ -372,6 +372,14 @@ module Verilog_config (C : JIB_CONFIG) : Jib_compile.CONFIG = struct
 
   let optimize_anf _ aexp = aexp
 
+  let ctyp_suprema = Jib_util.ctyp_suprema
+  let specialize_newtype_payload _ ctyp = ctyp
+  let representation_refines ~semantic:_ ~represented:_ = false
+  let preserve_aval_representation ~semantic:_ ~represented:_ = false
+  let propagate_newtype_payload_representation _ ~semantic:_ ~represented:_ = false
+  let specialize_call_result _ _ ctyp = ctyp
+  let specialize_call_destination _ _ _ ~semantic:_ ~represented:_ = false
+  let specialize_call_argument _ _ _ _ _ ~semantic:_ ~represented:_ = false
   let unroll_loops = Some 64
   let specialize_calls = false
   let make_call_precise ctx id _ _ = C.make_call_precise ctx id

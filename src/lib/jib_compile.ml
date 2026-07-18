@@ -242,6 +242,7 @@ let update_coverage_override_def def_annot ctx = update_coverage_override' ctx (
 let rec mangle_string_of_ctyp ctx = function
   | CT_lint -> "i"
   | CT_fint n -> "I" ^ string_of_int n
+  | CT_fuint n -> "U" ^ string_of_int n
   | CT_lbits -> "b"
   | CT_sbits n -> "S" ^ string_of_int n
   | CT_fbits n -> "B" ^ string_of_int n
@@ -277,6 +278,16 @@ let rec mangle_string_of_ctyp ctx = function
 
 module type CONFIG = sig
   val convert_typ : ctx -> typ -> ctyp
+  val ctyp_suprema : ctyp -> ctyp
+  val specialize_newtype_payload : id -> ctyp -> ctyp
+  val representation_refines : semantic:ctyp -> represented:ctyp -> bool
+  val preserve_aval_representation : semantic:ctyp -> represented:ctyp -> bool
+  val propagate_newtype_payload_representation : id -> semantic:ctyp -> represented:ctyp -> bool
+  val specialize_call_result : id -> ctyp list -> ctyp -> ctyp
+  val specialize_call_destination :
+    ctx -> id -> ctyp list -> semantic:ctyp -> represented:ctyp -> bool
+  val specialize_call_argument :
+    ctx -> id -> ctyp -> ctyp list -> int -> semantic:ctyp -> represented:ctyp -> bool
   val optimize_anf : ctx -> typ aexp -> typ aexp
   val unroll_loops : int option
   val make_call_precise : ctx -> id -> ctyp list -> ctyp -> bool
@@ -409,11 +420,18 @@ module Make (C : CONFIG) = struct
     | AV_cval (cval, typ) ->
         let ctyp = cval_ctyp cval in
         let ctyp' = ctyp_of_typ ctx typ in
-        if not (ctyp_equal ctyp ctyp') then (
-          let gs = ngensym () in
-          ([iinit l ctyp' gs cval], V_id (gs, ctyp'), [iclear ctyp' gs])
+        if ctyp_equal ctyp ctyp' then ([], cval, [])
+        else (
+          match (ctyp, ctyp') with
+          | _ when C.preserve_aval_representation ~semantic:ctyp' ~represented:ctyp ->
+              (* Structural POD values may stay native while ANF still carries
+                 their semantic Sail annotation. Checked integer refinements
+                 deliberately do not take this path. *)
+              ([], cval, [])
+          | _ ->
+              let gs = ngensym () in
+              ([iinit l ctyp' gs cval], V_id (gs, ctyp'), [iclear ctyp' gs])
         )
-        else ([], cval, [])
     | AV_id (Name (id, _), Enum typ) -> ([], V_member (id, ctyp_of_typ ctx typ), [])
     | AV_id (id, typ) -> (
         match get_variable_ctyp id ctx with
@@ -429,9 +447,24 @@ module Make (C : CONFIG) = struct
     | AV_ref (id, typ) -> ([], V_lit (VL_ref (string_of_id id), CT_ref (ctyp_of_typ ctx (lvar_typ typ))), [])
     | AV_lit (L_aux (L_string str, _), typ) -> ([], V_lit (VL_string (String.escaped str), ctyp_of_typ ctx typ), [])
     | AV_lit (L_aux (L_num n, _), typ) when C.ignore_64 -> ([], V_lit (VL_int n, ctyp_of_typ ctx typ), [])
-    | AV_lit (L_aux (L_num n, _), typ) when Big_int.less_equal (min_int 64) n && Big_int.less_equal n (max_int 64) ->
-        let gs = ngensym () in
-        ([iinit l CT_lint gs (V_lit (VL_int n, CT_fint 64))], V_id (gs, CT_lint), [iclear CT_lint gs])
+    | AV_lit (L_aux (L_num n, _), typ) when Big_int.less_equal (min_int 64) n && Big_int.less_equal n (max_int 64) -> (
+        (* Preserve the fixed representation already selected for a bounded
+           singleton literal.  Materializing every numeric literal as CT_lint
+           introduced a needless sail_int round trip when assigning literals
+           into bounded record fields and vectors. *)
+        match ctyp_of_typ ctx typ with
+        | CT_fuint width as ctyp
+          when Big_int.less_equal Big_int.zero n
+               && Big_int.less_equal n (Big_int.pred (Big_int.pow_int_positive 2 width)) ->
+            ([], V_lit (VL_int n, ctyp), [])
+        | CT_fint width as ctyp
+          when Big_int.less_equal (min_int width) n && Big_int.less_equal n (max_int width) ->
+            ([], V_lit (VL_int n, ctyp), [])
+        | CT_constant value as ctyp when Big_int.equal value n -> ([], V_lit (VL_int n, ctyp), [])
+        | _ ->
+            let gs = ngensym () in
+            ([iinit l CT_lint gs (V_lit (VL_int n, CT_fint 64))], V_id (gs, CT_lint), [iclear CT_lint gs])
+      )
     | AV_lit (L_aux (L_num n, _), typ) ->
         let gs = ngensym () in
         ( [iinit l CT_lint gs (V_lit (VL_string (Big_int.to_string n), CT_string))],
@@ -613,7 +646,8 @@ module Make (C : CONFIG) = struct
     | AV_list (avals, Typ_aux (typ, _)) ->
         let ctyp =
           match typ with
-          | Typ_app (id, [A_aux (A_typ typ, _)]) when string_of_id id = "list" -> ctyp_suprema (ctyp_of_typ ctx typ)
+          | Typ_app (id, [A_aux (A_typ typ, _)]) when string_of_id id = "list" ->
+              C.ctyp_suprema (ctyp_of_typ ctx typ)
           | _ -> raise (Reporting.err_general l "Invalid list type")
         in
         let gs = ngensym () in
@@ -633,7 +667,7 @@ module Make (C : CONFIG) = struct
       If called as [compile_funcall ~override_id:foo l ctx bar args], then we will compile as if we are calling [bar],
       but insert a call to [foo] in the IR. This is used for optimizations where we can generate a more efficient
       version of [foo] that doesn't exist in the original Sail. *)
-  let compile_funcall_with ?override_id l ctx id compile_arg args =
+  let compile_funcall_with ?override_id l ctx id compile_arg semantic_ctyp_of_arg args =
     let setup = ref [] in
     let cleanup = ref [] in
 
@@ -655,7 +689,19 @@ module Make (C : CONFIG) = struct
 
     let setup_arg ctyp arg =
       let arg_setup, cval, arg_cleanup = compile_arg arg in
-      instantiation := KBindings.union merge_unifiers (ctyp_unify l ctyp (cval_ctyp cval)) !instantiation;
+      let represented = cval_ctyp cval in
+      let semantic = semantic_ctyp_of_arg arg in
+      let unification_ctyp =
+        (* A backend representation may refine the instantiated argument type
+           even when the source argument itself has already been assigned that
+           representation.  This is notably the case for a statically-sized
+           bitvector passed to a polymorphic bitvector primitive: [semantic]
+           is the native representation, while [ctyp] is still [CT_lbits]. *)
+        if C.representation_refines ~semantic:ctyp ~represented then ctyp
+        else if C.representation_refines ~semantic ~represented then semantic
+        else represented
+      in
+      instantiation := KBindings.union merge_unifiers (ctyp_unify l ctyp unification_ctyp) !instantiation;
       setup := List.rev arg_setup @ !setup;
       cleanup := arg_cleanup @ !cleanup;
       cval
@@ -667,7 +713,12 @@ module Make (C : CONFIG) = struct
 
     ( List.rev !setup,
       (fun clexp ->
-        let instantiation = KBindings.union merge_unifiers (ctyp_unify l ret_ctyp (clexp_ctyp clexp)) !instantiation in
+        let represented = clexp_ctyp clexp in
+        let semantic = subst_poly !instantiation ret_ctyp in
+        let instantiation =
+          if C.representation_refines ~semantic ~represented then !instantiation
+          else KBindings.union merge_unifiers (ctyp_unify l ret_ctyp represented) !instantiation
+        in
         let ctyp_args = List.map (fun v -> KBindings.find v instantiation) params in
         ifuncall l clexp (call_id, ctyp_args) setup_args
       )
@@ -675,7 +726,10 @@ module Make (C : CONFIG) = struct
       !cleanup
     )
 
-  let compile_funcall ?override_id l ctx id args = compile_funcall_with ?override_id l ctx id (compile_aval l ctx) args
+  let compile_funcall ?override_id l ctx id args =
+    compile_funcall_with ?override_id l ctx id (compile_aval l ctx)
+      (fun arg -> ctyp_of_typ ctx (aval_typ arg))
+      args
 
   let compile_extern l ctx id args return_ctyp =
     let setup = ref [] in
@@ -771,7 +825,7 @@ module Make (C : CONFIG) = struct
                         (mk_id "sail_config_unwrap_abstract_bits", [])
                         [V_id (Abstract id, abstract_ctyp); V_id (json, CT_json)];
                     ]
-                | CT_lint | CT_fint _ ->
+                | CT_lint | CT_fint _ | CT_fuint _ ->
                     let len = ngensym () in
                     [
                       iinit l (CT_fint 64) len (V_id (Abstract id, abstract_ctyp));
@@ -797,6 +851,7 @@ module Make (C : CONFIG) = struct
       | CT_unit -> ([], (fun clexp -> icopy l clexp unit_cval), [])
       | CT_lint -> config_extract CT_lint json ~validate:("sail_config_is_int", []) ~extract:"sail_config_unwrap_int"
       | CT_fint _ -> config_extract CT_lint json ~validate:("sail_config_is_int", []) ~extract:"sail_config_unwrap_int"
+      | CT_fuint _ -> config_extract CT_lint json ~validate:("sail_config_is_int", []) ~extract:"sail_config_unwrap_int"
       | CT_lbits -> config_extract_bits CT_lbits json
       | CT_sbits _ -> config_extract_bits CT_lbits json
       | CT_fbits _ -> config_extract_bits CT_lbits json
@@ -849,7 +904,7 @@ module Make (C : CONFIG) = struct
                 in
                 let setup, call, cleanup = extract ctor_json ctyp in
                 let ctor_setup, ctor_call, ctor_cleanup =
-                  compile_funcall_with l ctx ctor_id (fun cval -> ([], cval, [])) [V_id (value, ctyp)]
+                  compile_funcall_with l ctx ctor_id (fun cval -> ([], cval, [])) cval_ctyp [V_id (value, ctyp)]
                 in
                 let extract =
                   [
@@ -1037,6 +1092,10 @@ module Make (C : CONFIG) = struct
   let rec compile_match ctx (AP_aux (apat_aux, { env; loc = l; _ })) cval on_failure =
     let ctx = { ctx with local_env = env } in
     let ctyp = cval_ctyp cval in
+    let binding_ctyp typ =
+      let semantic_ctyp = ctyp_of_typ ctx typ in
+      if C.representation_refines ~semantic:semantic_ctyp ~represented:ctyp then ctyp else semantic_ctyp
+    in
     match apat_aux with
     | AP_global (pid, typ) ->
         let global_ctyp = ctyp_of_typ ctx typ in
@@ -1047,11 +1106,11 @@ module Make (C : CONFIG) = struct
         | _ -> ([on_failure l (V_call (Neq, [V_member (pid, ctyp); cval]))], [], [], ctx)
       )
     | AP_id (pid, typ) ->
-        let id_ctyp = ctyp_of_typ ctx typ in
+        let id_ctyp = binding_ctyp typ in
         let ctx = { ctx with locals = NameMap.add pid (Immutable, id_ctyp) ctx.locals } in
         ([], [idecl l id_ctyp pid; icopy l (CL_id (pid, id_ctyp)) cval], [iclear id_ctyp pid], ctx)
     | AP_as (apat, id, typ) ->
-        let id_ctyp = ctyp_of_typ ctx typ in
+        let id_ctyp = binding_ctyp typ in
         let pre, instrs, cleanup, ctx = compile_match ctx apat cval on_failure in
         let ctx = { ctx with locals = NameMap.add id (Immutable, id_ctyp) ctx.locals } in
         (pre, instrs @ [idecl l id_ctyp id; icopy l (CL_id (id, id_ctyp)) cval], iclear id_ctyp id :: cleanup, ctx)
@@ -1197,11 +1256,61 @@ module Make (C : CONFIG) = struct
         let _, _, _, uannot = Util.last cases in
         Option.is_some (get_attribute "mapping_last" uannot)
 
+  let represented_aval_ctyp ctx aval =
+    match aval with
+    | AV_cval (cval, _) -> cval_ctyp cval
+    | AV_id (id, typ) -> (
+        match get_variable_ctyp id ctx with
+        | Some (_, ctyp) -> ctyp
+        | None -> ctyp_of_typ ctx (lvar_typ typ)
+      )
+    | _ -> ctyp_of_typ ctx (aval_typ aval)
+
+  let external_call_id ctx = function
+    | Sail_function id when ctx_is_extern id ctx -> Some (mk_id (ctx_get_extern id ctx))
+    | Pure_extern (id, _) | Extern (id, _) -> Some id
+    | _ -> None
+
+  let newtype_id_of_wrapper env wrapper_id =
+    match Env.union_constructor_info wrapper_id env with
+    | Some (_, _, newtype_id, _) when Env.is_newtype newtype_id env -> newtype_id
+    | _ -> wrapper_id
+
+  let rec demanded_newtype_representation env binding_id semantic = function
+    | AE_aux (AE_typ (body, _), _) -> demanded_newtype_representation env binding_id semantic body
+    | AE_aux (AE_app (Newtype_wrapper wrapper_id, [AV_id (body_id, _)], _), _)
+      when Name.compare binding_id body_id = 0 ->
+        let newtype_id = newtype_id_of_wrapper env wrapper_id in
+        let represented = C.specialize_newtype_payload newtype_id semantic in
+        if C.propagate_newtype_payload_representation newtype_id ~semantic ~represented then Some represented else None
+    | AE_aux (AE_app (Newtype_wrapper wrapper_id, [AV_cval (V_id (body_id, _), _)], _), _)
+      when Name.compare binding_id body_id = 0 ->
+        let newtype_id = newtype_id_of_wrapper env wrapper_id in
+        let represented = C.specialize_newtype_payload newtype_id semantic in
+        if C.propagate_newtype_payload_representation newtype_id ~semantic ~represented then Some represented else None
+    | _ -> None
+
   let rec compile_aexp ctx (AE_aux (aexp_aux, { env; loc = l; uannot })) =
     let ctx = { ctx with local_env = env } in
     match aexp_aux with
     | AE_let (mut, id, binding_typ, binding, (AE_aux (_, { env = body_env; _ }) as body), body_typ) ->
-        let binding_ctyp = ctyp_of_typ { ctx with local_env = body_env } binding_typ in
+        let semantic_binding_ctyp = ctyp_of_typ { ctx with local_env = body_env } binding_typ in
+        let binding_ctyp =
+          match demanded_newtype_representation body_env id semantic_binding_ctyp body with
+          | Some represented -> represented
+          | None -> (
+          match (semantic_binding_ctyp, binding) with
+          | semantic, AE_aux (AE_val aval, _) ->
+              let represented = represented_aval_ctyp ctx aval in
+              if C.representation_refines ~semantic ~represented then represented else semantic
+          | semantic, AE_aux (AE_app (call, args, _), _) -> (
+              match external_call_id ctx call with
+              | Some id -> C.specialize_call_result id (List.map (represented_aval_ctyp ctx) args) semantic
+              | None -> semantic
+            )
+          | _ -> semantic_binding_ctyp
+          )
+        in
         let setup, call, cleanup = compile_aexp ctx binding in
         let letb_setup, letb_cleanup =
           ( [idecl l binding_ctyp id; iblock1 (setup @ [call (CL_id (id, binding_ctyp))] @ cleanup)],
@@ -1801,11 +1910,13 @@ module Make (C : CONFIG) = struct
         ( Some (CTD_struct (id, params, Bindings.bindings ctors)),
           { ctx with records = Bindings.add id (params, ctors) ctx.records }
         )
-    | TD_variant (id, typq, tus, _) ->
+    | TD_variant (id, typq, tus, is_newtype) ->
         let compile_tu = function
-          | Tu_aux (Tu_ty_id (typ, id), _) ->
-              let ctx = { ctx with local_env = Env.add_typquant (id_loc id) typq ctx.local_env } in
-              (ctyp_of_typ ctx typ, id)
+          | Tu_aux (Tu_ty_id (typ, ctor_id), _) ->
+              let ctx = { ctx with local_env = Env.add_typquant (id_loc ctor_id) typq ctx.local_env } in
+              let ctyp = ctyp_of_typ ctx typ in
+              let ctyp = if is_newtype then C.specialize_newtype_payload id ctyp else ctyp in
+              (ctyp, ctor_id)
         in
         let tus =
           if string_of_id id = "exception" && C.assert_to_exception then
@@ -1945,29 +2056,39 @@ module Make (C : CONFIG) = struct
 
   let rec compile_arg_pat ctx label (P_aux (p_aux, (l, _)) as pat) ctyp =
     match p_aux with
-    | P_id id -> (name id, ([], []))
+    | P_id id -> (name id, ([], []), ctx)
     | P_wild ->
         let gs = ngensym () in
-        (gs, ([], []))
+        (gs, ([], []), ctx)
     | P_tuple [] | P_lit (L_aux (L_unit, _)) ->
         let gs = ngensym () in
-        (gs, ([], []))
+        (gs, ([], []), ctx)
     | P_var (pat, _) -> compile_arg_pat ctx label pat ctyp
     | P_typ (_, pat) -> compile_arg_pat ctx label pat ctyp
     | _ ->
         let apat = anf_pat pat in
         let gs = ngensym () in
-        let pre_destructure, destructure, cleanup, _ = compile_match ctx apat (V_id (gs, ctyp)) label in
-        (gs, (pre_destructure @ destructure, cleanup))
+        let pre_destructure, destructure, cleanup, ctx = compile_match ctx apat (V_id (gs, ctyp)) label in
+        (gs, (pre_destructure @ destructure, cleanup), ctx)
 
   let rec compile_arg_pats ctx label (P_aux (p_aux, (l, _)) as pat) ctyps =
     match p_aux with
     | P_typ (_, pat) -> compile_arg_pats ctx label pat ctyps
     | P_tuple pats when List.length pats = List.length ctyps ->
-        ([], List.map2 (fun pat ctyp -> compile_arg_pat ctx label pat ctyp) pats ctyps, [])
-    | _ when List.length ctyps = 1 -> ([], [compile_arg_pat ctx label pat (List.nth ctyps 0)], [])
+        let ctx, compiled_args =
+          List.fold_left2
+            (fun (ctx, compiled_args) pat ctyp ->
+              let arg_id, destructure, ctx = compile_arg_pat ctx label pat ctyp in
+              (ctx, (arg_id, destructure) :: compiled_args)
+            )
+            (ctx, []) pats ctyps
+        in
+        ([], List.rev compiled_args, [], ctx)
+    | _ when List.length ctyps = 1 ->
+        let arg_id, destructure, ctx = compile_arg_pat ctx label pat (List.nth ctyps 0) in
+        ([], [(arg_id, destructure)], [], ctx)
     | _ ->
-        let arg_id, (destructure, cleanup) = compile_arg_pat ctx label pat (CT_tup ctyps) in
+        let arg_id, (destructure, cleanup), ctx = compile_arg_pat ctx label pat (CT_tup ctyps) in
         let new_ids = List.map (fun ctyp -> (ngensym (), ctyp)) ctyps in
         ( destructure
           @ [idecl l (CT_tup ctyps) arg_id]
@@ -1975,7 +2096,8 @@ module Make (C : CONFIG) = struct
               (fun i (id, ctyp) -> icopy l (CL_tuple (CL_id (arg_id, CT_tup ctyps), i)) (V_id (id, ctyp)))
               new_ids,
           List.map (fun (id, _) -> (id, ([], []))) new_ids,
-          [iclear (CT_tup ctyps) arg_id] @ cleanup
+          [iclear (CT_tup ctyps) arg_id] @ cleanup,
+          ctx
         )
 
   let combine_destructure_cleanup xs = (List.concat (List.map fst xs), List.concat (List.rev (List.map snd xs)))
@@ -2208,7 +2330,7 @@ module Make (C : CONFIG) = struct
 
     let do_funcl_compilation () =
       (* Compile the function arguments as patterns. *)
-      let arg_setup, compiled_args, arg_cleanup =
+      let arg_setup, compiled_args, arg_cleanup, ctx =
         compile_arg_pats ctx (fun l b -> ijump l b fundef_label) pat arg_ctyps
       in
       let ctx =
@@ -2794,7 +2916,7 @@ module Make (C : CONFIG) = struct
               if string_of_id id = "sail_cons" then (
                 match args with
                 | [hd_arg; tl_arg] ->
-                    let ctyp_arg = ctyp_suprema (cval_ctyp hd_arg) in
+                    let ctyp_arg = C.ctyp_suprema (cval_ctyp hd_arg) in
                     if not (ctyp_equal (cval_ctyp hd_arg) ctyp_arg) then (
                       let gs = ngensym () in
                       let cast = [idecl l ctyp_arg gs; icopy l (CL_id (gs, ctyp_arg)) hd_arg] in
@@ -2815,7 +2937,13 @@ module Make (C : CONFIG) = struct
                     (* cons must have two arguments *)
                     Reporting.unreachable (id_loc id) __POS__ "Invalid cons call"
               )
-              else if not (ctyp_equal (clexp_ctyp clexp) ret_ctyp) then (
+              else if
+                not (ctyp_equal (clexp_ctyp clexp) ret_ctyp)
+                && not
+                     (C.specialize_call_destination ctx id (List.map cval_ctyp args) ~semantic:ret_ctyp
+                        ~represented:(clexp_ctyp clexp)
+                     )
+              then (
                 let gs = ngensym () in
                 let setup = [idecl l ret_ctyp gs] in
                 let new_clexp = CL_id (gs, ret_ctyp) in
@@ -2832,9 +2960,16 @@ module Make (C : CONFIG) = struct
                     Reporting.unreachable (id_loc id) __POS__
                       ("Function call found with incorrect arity: " ^ string_of_id id);
                   let casted_args =
-                    List.map2
-                      (fun arg param_ctyp ->
-                        if not (ctyp_equal (cval_ctyp arg) param_ctyp) then (
+                    List.mapi
+                      (fun index (arg, param_ctyp) ->
+                        let arg_ctyp = cval_ctyp arg in
+                        if
+                          not (ctyp_equal arg_ctyp param_ctyp)
+                          && not
+                               (C.specialize_call_argument ctx id (clexp_ctyp clexp)
+                                  (List.map cval_ctyp args) index ~semantic:param_ctyp ~represented:arg_ctyp
+                               )
+                        then (
                           let gs = ngensym () in
                           let cast = [idecl l param_ctyp gs; icopy l (CL_id (gs, param_ctyp)) arg] in
                           let cleanup = [iclear ~loc:l param_ctyp gs] in
@@ -2842,10 +2977,16 @@ module Make (C : CONFIG) = struct
                         )
                         else ([], arg, [])
                       )
-                      args param_ctyps
+                      (List.combine args param_ctyps)
                   in
                   let ret_setup, clexp, ret_cleanup =
-                    if not (ctyp_equal (clexp_ctyp clexp) ret_ctyp) then (
+                    if
+                      not (ctyp_equal (clexp_ctyp clexp) ret_ctyp)
+                      && not
+                           (C.specialize_call_destination ctx id (List.map cval_ctyp args) ~semantic:ret_ctyp
+                              ~represented:(clexp_ctyp clexp)
+                           )
+                    then (
                       let gs = ngensym () in
                       ( [idecl l ret_ctyp gs],
                         CL_id (gs, ret_ctyp),
@@ -2905,6 +3046,10 @@ module Make (C : CONFIG) = struct
           List.fold_left (fun ids (_, ctyp) -> IdSet.union (ctyp_ids ctyp) ids) IdSet.empty ctors
     in
 
+    let defined_type_ids =
+      List.fold_left (fun ids (ctdef, _) -> IdSet.add (ctdef_id ctdef) ids) IdSet.empty ctype_defs
+    in
+
     (* Create a reverse (i.e. from types to the types that are dependent
        upon them) id graph of dependencies between types *)
     let module IdGraph = Graph.Make (Id) in
@@ -2914,7 +3059,10 @@ module Make (C : CONFIG) = struct
           List.fold_left
             (fun g id -> IdGraph.add_edge id (ctdef_id ctdef) g)
             (IdGraph.add_edges (ctdef_id ctdef) [] g) (* Make sure even types with no dependencies are in graph *)
-            (IdSet.elements (ctdef_ids ctdef))
+            (* Backends may use opaque JIB type identifiers whose concrete
+               declarations are emitted by their code generator rather than
+               represented by a CTD definition. *)
+            (IdSet.elements (IdSet.inter defined_type_ids (ctdef_ids ctdef)))
         )
         IdGraph.empty ctype_defs
     in

@@ -260,9 +260,16 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
 
   let int_size = function
     | CT_constant n -> required_width n
-    | CT_fint sz -> sz
+    | CT_fint sz | CT_fuint sz -> sz
     | CT_lint -> lint_size
     | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Argument to int_size must be an integer type"
+
+  let resize_int ?(checked = true) ~into ctyp smt =
+    let from = int_size ctyp in
+    match ctyp with
+    | CT_fuint _ -> unsigned_size ~checked ~into ~from smt
+    | CT_constant _ | CT_fint _ | CT_lint -> signed_size ~checked ~into ~from smt
+    | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Argument to resize_int must be an integer type"
 
   let bv_size = function
     | CT_fbits sz | CT_sbits sz -> sz
@@ -290,7 +297,7 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
     | VL_bits bv, CT_fbits n -> unsigned_size ~into:n ~from:(List.length bv) (Bitvec_lit bv)
     | VL_bool b, _ -> return (Bool_lit b)
     | VL_int n, CT_constant m -> return (bvint (required_width n) n)
-    | VL_int n, CT_fint sz -> return (bvint sz n)
+    | VL_int n, (CT_fint sz | CT_fuint sz) -> return (bvint sz n)
     | VL_int n, CT_lint -> return (bvint Config.max_unknown_integer_width n)
     | VL_unit, _ -> return Unit
     | VL_string str, _ ->
@@ -305,7 +312,10 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
         Reporting.unreachable l __POS__
           ("Cannot translate literal to SMT: " ^ string_of_value vl ^ " : " ^ string_of_ctyp ctyp)
 
-  let smt_cval_call op args =
+  let smt_cval_call op arg_ctyps args =
+    let unsigned_integer_args =
+      match arg_ctyps with [] -> false | _ -> List.for_all (function CT_fuint _ -> true | _ -> false) arg_ctyps
+    in
     match (op, args) with
     | Bnot, [arg] -> Fn ("not", [arg])
     | Bor, [arg] -> arg
@@ -314,12 +324,15 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
     | Band, args -> smt_conj args
     | Eq, args -> Fn ("=", args)
     | Neq, args -> Fn ("not", [Fn ("=", args)])
-    | Ilt, [lhs; rhs] -> Fn ("bvslt", [lhs; rhs])
-    | Ilteq, [lhs; rhs] -> Fn ("bvsle", [lhs; rhs])
-    | Igt, [lhs; rhs] -> Fn ("bvsgt", [lhs; rhs])
-    | Igteq, [lhs; rhs] -> Fn ("bvsge", [lhs; rhs])
+    | Ilt, [lhs; rhs] -> Fn ((if unsigned_integer_args then "bvult" else "bvslt"), [lhs; rhs])
+    | Ilteq, [lhs; rhs] -> Fn ((if unsigned_integer_args then "bvule" else "bvsle"), [lhs; rhs])
+    | Igt, [lhs; rhs] -> Fn ((if unsigned_integer_args then "bvugt" else "bvsgt"), [lhs; rhs])
+    | Igteq, [lhs; rhs] -> Fn ((if unsigned_integer_args then "bvuge" else "bvsge"), [lhs; rhs])
     | Iadd, args -> Fn ("bvadd", args)
     | Isub, args -> Fn ("bvsub", args)
+    | Imul, args -> Fn ("bvmul", args)
+    | Idiv, args -> Fn ((if unsigned_integer_args then "bvudiv" else "bvsdiv"), args)
+    | Imod, args -> Fn ((if unsigned_integer_args then "bvurem" else "bvsrem"), args)
     | Bvnot, args -> Fn ("bvnot", args)
     | Bvor, args -> Fn ("bvor", args)
     | Bvand, args -> Fn ("bvand", args)
@@ -335,6 +348,7 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
     | Set_slice, _ -> failwith "set_slice"
     | Replicate _, _ -> failwith "replicate"
     | List_hd, [arg] -> Fn ("hd", [arg])
+    | (Unsigned _ | Signed _), [arg] -> arg
     | op, _ -> failwith (string_of_op op)
 
   let smt_conversion ~into:to_ctyp ~from:from_ctyp x =
@@ -342,9 +356,12 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
     | _, _ when ctyp_equal from_ctyp to_ctyp -> return x
     | _, CT_constant c -> return (bvint (required_width c) c)
     | CT_constant c, CT_fint sz -> return (bvint sz c)
+    | CT_constant c, CT_fuint sz -> return (bvint sz c)
     | CT_constant c, CT_lint -> return (bvint lint_size c)
     | CT_fint sz, CT_lint -> signed_size ~into:lint_size ~from:sz x
+    | CT_fuint sz, CT_lint -> unsigned_size ~into:lint_size ~from:sz x
     | CT_lint, CT_fint sz -> signed_size ~into:sz ~from:lint_size x
+    | CT_lint, CT_fuint sz -> signed_size ~into:sz ~from:lint_size x
     | CT_lint, CT_fbits n -> signed_size ~into:n ~from:lint_size x
     | CT_lint, CT_lbits ->
         let* x = signed_size ~into:lbits_size ~from:lint_size x in
@@ -352,9 +369,18 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
     | CT_fint n, CT_lbits ->
         let* x = signed_size ~into:lbits_size ~from:n x in
         return (Fn ("Bits", [bvint lbits_index (Big_int.of_int n); x]))
+    | CT_fuint n, CT_lbits ->
+        let* x = unsigned_size ~into:lbits_size ~from:n x in
+        return (Fn ("Bits", [bvint lbits_index (Big_int.of_int n); x]))
     | CT_fint n, CT_fint m -> signed_size ~into:m ~from:n x
+    | CT_fuint n, CT_fuint m -> unsigned_size ~into:m ~from:n x
+    | CT_fuint n, CT_fint m -> unsigned_size ~into:m ~from:n x
+    | CT_fint n, CT_fuint m -> signed_size ~into:m ~from:n x
     | CT_lbits, CT_fbits n -> unsigned_size ~into:n ~from:lbits_size (Fn ("contents", [x]))
     | CT_fbits n, CT_fbits m -> unsigned_size ~into:m ~from:n x
+    | CT_lbits, CT_fuint n -> unsigned_size ~into:n ~from:lbits_size (Fn ("contents", [x]))
+    | CT_fbits n, CT_fuint m -> unsigned_size ~into:m ~from:n x
+    | CT_fuint n, CT_fbits m -> unsigned_size ~into:m ~from:n x
     | CT_fbits n, CT_lbits ->
         let* x = unsigned_size ~into:lbits_size ~from:n x in
         return (Fn ("Bits", [bvint lbits_index (Big_int.of_int n); x]))
@@ -410,8 +436,9 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
                 let* offset_ext = unsigned_size ~into:sz ~from:(int_size (cval_ctyp offset)) offset_smt in
                 return (Extract (width - 1, 0, sz, bvlshr vec_smt offset_ext))
             | _ ->
+                let arg_ctyps = List.map cval_ctyp args in
                 let* args = mapM smt_cval args in
-                return (smt_cval_call op args)
+                return (smt_cval_call op arg_ctyps args)
           )
         | V_ctor_kind (union, (ctor, _)) ->
             let* union = smt_cval union in
@@ -450,7 +477,7 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
       )
 
   (* [bvzeint esz cval] (BitVector Zero Extend INTeger), takes a cval
-     which must be an integer type (either CT_fint, or CT_lint), and
+     which must be an integer type (CT_fint, CT_fuint, or CT_lint), and
      produces a bitvector which is either zero extended or truncated to
      exactly esz bits. *)
   let bvzeint esz cval =
@@ -465,7 +492,7 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
             else Extract (esz - 1, 0, sz, smt)
           )
 
-  let builtin_arith ?(fold = true) fn big_int_fn padding v1 v2 ret_ctyp =
+  let builtin_arith ?(fold = true) ?unsigned_fn fn big_int_fn padding v1 v2 ret_ctyp =
     match (cval_ctyp v1, cval_ctyp v2, ret_ctyp) with
     | _, _, CT_constant c -> return (bvint (required_width c) c)
     | CT_constant c1, CT_constant c2, _ when fold -> return (bvint (int_size ret_ctyp) (big_int_fn c1 c2))
@@ -475,19 +502,31 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
            then check we don't lose precision when going back after
            performing the operation. *)
         let ret_sz = int_size ret_ctyp in
+        let padded_sz = padding ret_sz in
         let* smt1 = smt_cval v1 in
         let* smt2 = smt_cval v2 in
-        let* padded_smt1 = signed_size ~into:(padding ret_sz) ~from:(int_size ctyp1) smt1 in
-        let* padded_smt2 = signed_size ~into:(padding ret_sz) ~from:(int_size ctyp2) smt2 in
-        signed_size ~into:ret_sz ~from:(padding ret_sz) (Fn (fn, [padded_smt1; padded_smt2]))
+        let* padded_smt1 = resize_int ~into:padded_sz ctyp1 smt1 in
+        let* padded_smt2 = resize_int ~into:padded_sz ctyp2 smt2 in
+        let fn =
+          match (ctyp1, ctyp2, ret_ctyp, unsigned_fn) with
+          | CT_fuint _, CT_fuint _, CT_fuint _, Some unsigned_fn -> unsigned_fn
+          | _ -> fn
+        in
+        let padded_ctyp = match ret_ctyp with CT_fuint _ -> CT_fuint padded_sz | _ -> CT_fint padded_sz in
+        resize_int ~into:ret_sz padded_ctyp (Fn (fn, [padded_smt1; padded_smt2]))
 
   let builtin_ediv_int v1 v2 ret_ctyp =
     match (cval_ctyp v1, cval_ctyp v2, ret_ctyp) with
     | _, _, CT_constant c -> return (bvint (required_width c) c)
+    | (CT_fuint _ as ctyp1), (CT_fuint _ as ctyp2), CT_fuint _ ->
+        let ret_sz = int_size ret_ctyp in
+        let* smt1 = bind (smt_cval v1) (resize_int ~into:ret_sz ctyp1) in
+        let* smt2 = bind (smt_cval v2) (resize_int ~into:ret_sz ctyp2) in
+        return (Fn ("bvudiv", [smt1; smt2]))
     | ctyp1, ctyp2, _ ->
         let ret_sz = int_size ret_ctyp in
-        let* smt1 = bind (smt_cval v1) (signed_size ~into:ret_sz ~from:(int_size ctyp1)) in
-        let* smt2 = bind (smt_cval v2) (signed_size ~into:ret_sz ~from:(int_size ctyp2)) in
+        let* smt1 = bind (smt_cval v1) (resize_int ~into:ret_sz ctyp1) in
+        let* smt2 = bind (smt_cval v2) (resize_int ~into:ret_sz ctyp2) in
         let negative_dividend = bvslt smt1 (bvzero ret_sz) in
         let negative_divisor = bvslt smt2 (bvzero ret_sz) in
         return
@@ -501,10 +540,15 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
   let builtin_emod_int v1 v2 ret_ctyp =
     match (cval_ctyp v1, cval_ctyp v2, ret_ctyp) with
     | _, _, CT_constant c -> return (bvint (required_width c) c)
+    | (CT_fuint _ as ctyp1), (CT_fuint _ as ctyp2), CT_fuint _ ->
+        let ret_sz = int_size ret_ctyp in
+        let* smt1 = bind (smt_cval v1) (resize_int ~into:ret_sz ctyp1) in
+        let* smt2 = bind (smt_cval v2) (resize_int ~into:ret_sz ctyp2) in
+        return (Fn ("bvurem", [smt1; smt2]))
     | ctyp1, ctyp2, _ ->
         let ret_sz = int_size ret_ctyp in
-        let* smt1 = bind (smt_cval v1) (signed_size ~into:ret_sz ~from:(int_size ctyp1)) in
-        let* smt2 = bind (smt_cval v2) (signed_size ~into:ret_sz ~from:(int_size ctyp2)) in
+        let* smt1 = bind (smt_cval v1) (resize_int ~into:ret_sz ctyp1) in
+        let* smt2 = bind (smt_cval v2) (resize_int ~into:ret_sz ctyp2) in
         let negative_dividend = bvslt smt1 (bvzero ret_sz) in
         let negative_divisor = bvslt smt2 (bvzero ret_sz) in
         return
@@ -525,7 +569,7 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
     | CT_constant c, _ -> return (bvint (int_size ret_ctyp) (Big_int.negate c))
     | ctyp, _ ->
         let open Sail2_values in
-        let* smt = bind (smt_cval v) (signed_size ~into:(int_size ret_ctyp) ~from:(int_size ctyp)) in
+        let* smt = bind (smt_cval v) (resize_int ~into:(int_size ret_ctyp) ctyp) in
         let* _ = overflow_check (Fn ("=", [smt; Bitvec_lit (B1 :: List.init (int_size ret_ctyp - 1) (fun _ -> B0))])) in
         return (Fn ("bvneg", [smt]))
 
@@ -533,6 +577,9 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
     match (cval_ctyp v, ret_ctyp) with
     | _, CT_constant c -> return (bvint (required_width c) c)
     | CT_constant c, _ -> return (bvint (int_size ret_ctyp) (Big_int.abs c))
+    | (CT_fuint _ as ctyp), _ ->
+        let* smt = smt_cval v in
+        resize_int ~into:(int_size ret_ctyp) ctyp smt
     | ctyp, _ ->
         let sz = int_size ctyp in
         let* smt = smt_cval v in
@@ -540,67 +587,58 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
         let* resized_neg = signed_size ~into:(int_size ret_ctyp) ~from:sz (bvneg smt) in
         return (Ite (Fn ("=", [Extract (sz - 1, sz - 1, sz, smt); bvone 1]), resized_neg, resized_pos))
 
-  let builtin_choose_int compare op v1 v2 ret_ctyp =
+  let builtin_choose_int signed_compare unsigned_compare op v1 v2 ret_ctyp =
     match (cval_ctyp v1, cval_ctyp v2) with
     | CT_constant n, CT_constant m -> return (bvint (int_size ret_ctyp) (op n m))
     | ctyp1, ctyp2 ->
-        let ret_sz = int_size ret_ctyp in
-        let* smt1 = bind (smt_cval v1) (signed_size ~into:ret_sz ~from:(int_size ctyp1)) in
-        let* smt2 = bind (smt_cval v2) (signed_size ~into:ret_sz ~from:(int_size ctyp2)) in
-        return (Ite (Fn (compare, [smt1; smt2]), smt1, smt2))
+        let both_unsigned = match (ctyp1, ctyp2) with CT_fuint _, CT_fuint _ -> true | _ -> false in
+        let comparison_sz =
+          if both_unsigned then max (int_size ctyp1) (int_size ctyp2)
+          else
+            max
+              (match ctyp1 with CT_fuint n -> n + 1 | _ -> int_size ctyp1)
+              (match ctyp2 with CT_fuint n -> n + 1 | _ -> int_size ctyp2)
+        in
+        let* smt1 = bind (smt_cval v1) (resize_int ~checked:false ~into:comparison_sz ctyp1) in
+        let* smt2 = bind (smt_cval v2) (resize_int ~checked:false ~into:comparison_sz ctyp2) in
+        let selected =
+          Ite (Fn ((if both_unsigned then unsigned_compare else signed_compare), [smt1; smt2]), smt1, smt2)
+        in
+        resize_int ~into:(int_size ret_ctyp)
+          (if both_unsigned then CT_fuint comparison_sz else CT_fint comparison_sz)
+          selected
 
-  let builtin_max_int = builtin_choose_int "bvsgt" max
-  let builtin_min_int = builtin_choose_int "bvslt" min
+  let builtin_max_int = builtin_choose_int "bvsgt" "bvugt" max
+  let builtin_min_int = builtin_choose_int "bvslt" "bvult" min
 
-  let builtin_tdiv_int = builtin_arith ~fold:false "bvsdiv" Sail2_values.tdiv_int (fun x -> x)
-  let builtin_tmod_int = builtin_arith ~fold:false "bvsrem" Sail2_values.tmod_int (fun x -> x)
+  let builtin_tdiv_int = builtin_arith ~fold:false ~unsigned_fn:"bvudiv" "bvsdiv" Sail2_values.tdiv_int (fun x -> x)
 
-  let int_comparison fn big_int_fn v1 v2 =
+  let builtin_tmod_int = builtin_arith ~fold:false ~unsigned_fn:"bvurem" "bvsrem" Sail2_values.tmod_int (fun x -> x)
+
+  let int_comparison signed_fn unsigned_fn big_int_fn v1 v2 =
     let* sv1 = smt_cval v1 in
     let* sv2 = smt_cval v2 in
     match (cval_ctyp v1, cval_ctyp v2) with
     | CT_constant c1, CT_constant c2 -> return (Bool_lit (big_int_fn c1 c2))
-    | CT_lint, CT_lint -> return (Fn (fn, [sv1; sv2]))
-    | CT_fint sz1, CT_fint sz2 ->
-        return
-          ( if sz1 == sz2 then Fn (fn, [sv1; sv2])
-            else if sz1 > sz2 then Fn (fn, [sv1; SignExtend (sz1, sz1 - sz2, sv2)])
-            else Fn (fn, [SignExtend (sz2, sz2 - sz1, sv1); sv2])
-          )
-    | CT_constant c, CT_fint sz ->
-        let constant_sz = required_width c in
-        if constant_sz <= sz then return (Fn (fn, [bvint sz c; sv2]))
-        else
-          let* sv2 = signed_size ~checked:false ~into:constant_sz ~from:sz sv2 in
-          return (Fn (fn, [bvint constant_sz c; sv2]))
-    | CT_fint sz, CT_constant c ->
-        let constant_sz = required_width c in
-        if constant_sz <= sz then return (Fn (fn, [sv1; bvint sz c]))
-        else
-          let* sv1 = signed_size ~checked:false ~into:constant_sz ~from:sz sv1 in
-          return (Fn (fn, [sv1; bvint constant_sz c]))
-    | CT_constant c, CT_lint ->
-        let constant_sz = required_width c in
-        if constant_sz <= lint_size then return (Fn (fn, [bvint lint_size c; sv2]))
-        else
-          let* sv2 = signed_size ~checked:false ~into:constant_sz ~from:lint_size sv2 in
-          return (Fn (fn, [bvint constant_sz c; sv2]))
-    | CT_lint, CT_constant c ->
-        let constant_sz = required_width c in
-        if constant_sz <= lint_size then return (Fn (fn, [sv1; bvint lint_size c]))
-        else
-          let* sv1 = signed_size ~checked:false ~into:constant_sz ~from:lint_size sv1 in
-          return (Fn (fn, [sv1; bvint constant_sz c]))
-    | CT_fint sz, CT_lint when sz < lint_size -> return (Fn (fn, [SignExtend (lint_size, lint_size - sz, sv1); sv2]))
-    | CT_lint, CT_fint sz when sz < lint_size -> return (Fn (fn, [sv1; SignExtend (lint_size, lint_size - sz, sv2)]))
-    | _, _ -> builtin_type_error fn [v1; v2] None
+    | ctyp1, ctyp2 ->
+        let both_unsigned = match (ctyp1, ctyp2) with CT_fuint _, CT_fuint _ -> true | _ -> false in
+        let comparison_sz =
+          if both_unsigned then max (int_size ctyp1) (int_size ctyp2)
+          else
+            max
+              (match ctyp1 with CT_fuint n -> n + 1 | _ -> int_size ctyp1)
+              (match ctyp2 with CT_fuint n -> n + 1 | _ -> int_size ctyp2)
+        in
+        let* sv1 = resize_int ~checked:false ~into:comparison_sz ctyp1 sv1 in
+        let* sv2 = resize_int ~checked:false ~into:comparison_sz ctyp2 sv2 in
+        return (Fn ((if both_unsigned then unsigned_fn else signed_fn), [sv1; sv2]))
 
-  let builtin_eq_int = int_comparison "=" Big_int.equal
+  let builtin_eq_int = int_comparison "=" "=" Big_int.equal
 
-  let builtin_lt = int_comparison "bvslt" Big_int.less
-  let builtin_lteq = int_comparison "bvsle" Big_int.less_equal
-  let builtin_gt = int_comparison "bvsgt" Big_int.greater
-  let builtin_gteq = int_comparison "bvsge" Big_int.greater_equal
+  let builtin_lt = int_comparison "bvslt" "bvult" Big_int.less
+  let builtin_lteq = int_comparison "bvsle" "bvule" Big_int.less_equal
+  let builtin_gt = int_comparison "bvsgt" "bvugt" Big_int.greater
+  let builtin_gteq = int_comparison "bvsge" "bvuge" Big_int.greater_equal
 
   let builtin_signed v ret_ctyp =
     let* sv = smt_cval v in
@@ -621,10 +659,12 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
   let builtin_unsigned v ret_ctyp =
     let* sv = smt_cval v in
     match (cval_ctyp v, ret_ctyp) with
+    | CT_fbits n, CT_fuint m -> unsigned_size ~into:m ~from:n sv
     | CT_fbits n, CT_fint m when m > n -> return (Fn ("concat", [bvzero (m - n); sv]))
     | CT_fbits n, CT_lint -> return (Fn ("concat", [bvzero (lint_size - n); sv]))
-    | CT_lbits, CT_lint -> signed_size ~into:lint_size ~from:lbits_size (Fn ("contents", [sv]))
-    | CT_lbits, CT_fint m -> signed_size ~into:m ~from:lbits_size (Fn ("contents", [sv]))
+    | CT_lbits, CT_lint -> unsigned_size ~into:lint_size ~from:lbits_size (Fn ("contents", [sv]))
+    | CT_lbits, CT_fint m -> unsigned_size ~into:m ~from:lbits_size (Fn ("contents", [sv]))
+    | CT_lbits, CT_fuint m -> unsigned_size ~into:m ~from:lbits_size (Fn ("contents", [sv]))
     | _, _ -> builtin_type_error "unsigned" [v] (Some ret_ctyp)
 
   let bvmask len =
@@ -678,7 +718,7 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
         let top = Big_int.pred (Big_int.add start len) in
         let* v1 = smt_cval v1 in
         return (Extract (Big_int.to_int top, Big_int.to_int start, sz, v1))
-    | CT_fbits sz, CT_fint _, CT_constant len, CT_fbits _ ->
+    | CT_fbits sz, (CT_fint _ | CT_fuint _), CT_constant len, CT_fbits _ ->
         let* shifted = builtin_shift "bvlshr" v1 v2 (cval_ctyp v1) in
         return (Extract (Big_int.to_int (Big_int.pred len), 0, sz, shifted))
     | ctyp1, ctyp2, _, CT_lbits ->
@@ -850,16 +890,16 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
     | CT_fbits n, CT_constant c, CT_fbits o ->
         assert (n = o);
         return (Fn (op, [smt1; bvint o c]))
-    | CT_fbits n, CT_fint m, CT_fbits o ->
+    | CT_fbits n, ((CT_fint _ | CT_fuint _) as int_ctyp), CT_fbits o ->
         assert (n = o);
-        let* smt2 = signed_size ~into:o ~from:m smt2 in
+        let* smt2 = resize_int ~into:o int_ctyp smt2 in
         return (Fn (op, [smt1; smt2]))
     | CT_fbits n, CT_lint, CT_fbits o ->
         assert (n = o);
         let* smt2 = signed_size ~into:o ~from:lint_size smt2 in
         return (Fn (op, [smt1; smt2]))
     | CT_lbits, v2_ctyp, CT_lbits ->
-        let* smt2 = signed_size ~into:lbits_size ~from:(int_size v2_ctyp) smt2 in
+        let* smt2 = resize_int ~into:lbits_size v2_ctyp smt2 in
         return (Fn ("Bits", [Fn ("len", [smt1]); Fn (op, [Fn ("contents", [smt1]); smt2])]))
     | _ -> builtin_type_error ("arith_bits_int " ^ op) [v1; v2] (Some ret_ctyp)
 
@@ -1454,7 +1494,8 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
         let* x = smt_cval x in
         let* y = smt_cval y in
         return (Fn ("=", [x; y]))
-    | (CT_constant _ | CT_fint _ | CT_lint), (CT_constant _ | CT_fint _ | CT_lint) -> builtin_eq_int x y
+    | (CT_constant _ | CT_fint _ | CT_fuint _ | CT_lint), (CT_constant _ | CT_fint _ | CT_fuint _ | CT_lint) ->
+        builtin_eq_int x y
     | CT_unit, CT_unit -> return (Bool_lit true)
     | CT_enum _, CT_enum _ ->
         let* x = smt_cval x in

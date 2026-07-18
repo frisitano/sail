@@ -82,8 +82,13 @@ bool string_startswith(const_sail_string s, const_sail_string prefix);
 /* ***** Sail integers ***** */
 
 typedef int64_t mach_int;
+typedef uint64_t mach_uint;
 
 bool EQUAL(mach_int)(const mach_int, const mach_int);
+bool EQUAL(mach_uint)(const mach_uint, const mach_uint);
+
+mach_uint CONVERT_OF(mach_uint, mach_int)(const mach_int);
+mach_int CONVERT_OF(mach_int, mach_uint)(const mach_uint);
 
 typedef __int128 sail_int;
 
@@ -101,6 +106,8 @@ mach_int CREATE_OF(mach_int, sail_int)(const sail_int);
 
 mach_int CONVERT_OF(mach_int, sail_int)(const sail_int);
 sail_int CONVERT_OF(sail_int, mach_int)(const mach_int);
+mach_uint CONVERT_OF(mach_uint, sail_int)(const sail_int);
+sail_int CONVERT_OF(sail_int, mach_uint)(const mach_uint);
 sail_int CONVERT_OF(sail_int, sail_string)(const_sail_string);
 
 /*
@@ -212,6 +219,11 @@ void CONVERT_OF(lbits, sbits)(lbits *, const sbits, const bool);
 
 sbits CONVERT_OF(sbits, fbits)(const fbits, const uint64_t, const bool);
 sbits CONVERT_OF(sbits, lbits)(const lbits, const bool);
+
+/* Portable fixed-limb bridge used by native representations such as u256.
+ * Limbs are little-endian: limbs[0] contains the least-significant 64 bits. */
+void sail_lbits_to_u64_array(uint64_t *, size_t, const lbits);
+void sail_lbits_from_u64_array(lbits *, const uint64_t *, size_t, uint64_t);
 
 void UNDEFINED(lbits)(lbits *, const sail_int len, const fbits bit);
 fbits UNDEFINED(fbits)(const unit);

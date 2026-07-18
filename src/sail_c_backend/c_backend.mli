@@ -108,6 +108,21 @@ module type CODEGEN_CONFIG = sig
 
   val preserve_types : Ast_compare.IdSet.t
 
+  (** Newtype or transparent-alias identifiers annotated with [$[c_repr uint64]]. *)
+  val c_repr_uint64 : Ast_compare.IdSet.t
+
+  (** Newtype or transparent-alias identifiers annotated with [$[c_repr int64]]. *)
+  val c_repr_int64 : Ast_compare.IdSet.t
+
+  (** Newtype or transparent-alias identifiers annotated with [$[c_repr u256]]. *)
+  val c_repr_u256 : Ast_compare.IdSet.t
+
+  (** Fixed byte-array representation lengths, keyed by annotated type. *)
+  val c_repr_fixed_bytes : int Ast_compare.Bindings.t
+
+  (** Preserve fixed integer representations through generic specialization. *)
+  val specialize_c : bool
+
   (** If set generate a C++ class for the model instead of global C functions/variables. *)
   val cpp : bool
 

@@ -104,6 +104,14 @@ let make_options prefix hide =
       Arg.Set Pretty_print_coq.opt_undef_axioms,
       "generate axioms for functions that are declared but not defined"
     );
+    ( Flag.create ~prefix ~hide "semantic_range_types",
+      Arg.Unit
+        (fun () ->
+          Pretty_print_coq.opt_semantic_range_types := true;
+          Type_check.opt_expand_valspec := false
+        ),
+      "preserve explicit range aliases as semantic wrapper records with separate validity predicates"
+    );
     (* Old debug form of option *)
     (Flag.create ~prefix ~hide:true ~debug:true "undef_axioms", Arg.Set Pretty_print_coq.opt_undef_axioms, "");
     ( Flag.create ~prefix ~hide "minimal_eq_dec",

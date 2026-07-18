@@ -4189,7 +4189,7 @@ let move_termination_measures env ast =
 
 (* Make recursive functions with a measure use the measure as an
    explicit recursion limit, enforced by an assertion. *)
-let rewrite_explicit_measure effect_info env ast =
+let rewrite_explicit_measure_with_fuel use_nat_fuel effect_info env ast =
   let effect_info = ref effect_info in
   let scan_function measures = function
     | FD_aux (FD_function (Rec_aux (Rec_measure (mpat, mexp), rl), topt, FCL_aux (FCL_funcl (id, _), _) :: _), ann) ->
@@ -4209,6 +4209,7 @@ let rewrite_explicit_measure effect_info env ast =
         Reporting.unreachable l __POS__ "Attempting to construct rec identifier for short-circuiting boolean"
   in
   let limit = mk_id "#reclimit" in
+  let limit_typ = if use_nat_fuel then nat_typ else int_typ in
   (* Add helper function with extra argument to spec *)
   let rewrite_spec (VS_aux (VS_val_spec (typsch, id, extern), ann) as vs) =
     match Bindings.find id measures with
@@ -4218,7 +4219,7 @@ let rewrite_explicit_measure effect_info env ast =
             [
               VS_aux
                 ( VS_val_spec
-                    ( TypSchm_aux (TypSchm_ts (tq, Typ_aux (Typ_fn (args @ [int_typ], res), typl)), tsl),
+                    ( TypSchm_aux (TypSchm_ts (tq, Typ_aux (Typ_fn (args @ [limit_typ], res), typl)), tsl),
                       rec_id id,
                       extern
                     ),
@@ -4231,7 +4232,7 @@ let rewrite_explicit_measure effect_info env ast =
       )
     | exception Not_found -> [vs]
   in
-  (* Add extra argument and assertion to each funcl, and rewrite recursive calls *)
+  (* Add an explicit recursion budget to each funcl and rewrite recursive calls. *)
   let rewrite_funcl recset (FCL_aux (FCL_funcl (id, pexp), fcl_ann)) =
     let loc = Parse_ast.Generated (fst fcl_ann).loc in
     let P_aux (pat, pann), guard, body, ann = destruct_pexp pexp in
@@ -4276,7 +4277,7 @@ let rewrite_explicit_measure effect_info env ast =
     let tick =
       E_aux
         ( E_app
-            ( mk_id "sub_int",
+            ( mk_id (if use_nat_fuel then "sub_nat" else "sub_int"),
               [
                 E_aux (E_id limit, (loc, empty_tannot));
                 E_aux (E_lit (L_aux (L_num (Big_int.of_int 1), loc)), (loc, empty_tannot));
@@ -4294,7 +4295,42 @@ let rewrite_explicit_measure effect_info env ast =
         }
         body
     in
-    let body = rebind (E_aux (E_block [assert_exp; body], (loc, empty_tannot))) in
+    let body =
+      if use_nat_fuel then
+        let is_empty =
+          E_aux
+            ( E_app
+                ( mk_id "eq_int",
+                  [
+                    E_aux (E_id limit, (loc, empty_tannot));
+                    E_aux (E_lit (L_aux (L_num Big_int.zero, loc)), (loc, empty_tannot));
+                  ]
+                ),
+              (loc, empty_tannot)
+            )
+        in
+        let fail =
+          E_aux
+            ( E_block
+                [
+                  E_aux
+                    ( E_assert
+                        ( E_aux (E_lit (L_aux (L_false, loc)), (loc, empty_tannot)),
+                          E_aux
+                            (E_lit (L_aux (L_string "recursion limit reached", loc)), (loc, empty_tannot))
+                        ),
+                      (loc, empty_tannot)
+                    );
+                  E_aux
+                    (E_exit (E_aux (E_lit (L_aux (L_unit, loc)), (loc, empty_tannot))), (loc, empty_tannot));
+                ],
+              (loc, empty_tannot)
+            )
+        in
+        E_aux (E_if (is_empty, fail, body), (loc, empty_tannot))
+      else E_aux (E_block [assert_exp; body], (loc, empty_tannot))
+    in
+    let body = rebind body in
     let new_id = rec_id id in
     effect_info := Effects.copy_function_effect id !effect_info new_id;
     FCL_aux (FCL_funcl (new_id, construct_pexp (P_aux (pat, pann), guard, body, ann)), fcl_ann)
@@ -4331,8 +4367,53 @@ let rewrite_explicit_measure effect_info env ast =
             in
             let wpats, wexps = List.split (List.mapi mk_wrap measure_pats) in
             let wpat = match wpats with [wpat] -> wpat | _ -> P_aux (P_tuple wpats, (loc, empty_tannot)) in
-            let measure_exp = E_aux (E_typ (int_typ, measure_exp), (loc, empty_tannot)) in
-            let wbody = E_aux (E_app (rec_id id, wexps @ [measure_exp]), (loc, empty_tannot)) in
+            let wbody =
+              if use_nat_fuel then
+                let measure_id = mk_id "#measure" in
+                let measure_value = E_aux (E_typ (int_typ, measure_exp), (loc, empty_tannot)) in
+                let measure_ref = E_aux (E_id measure_id, (loc, empty_tannot)) in
+                let is_negative =
+                  E_aux
+                    ( E_app
+                        ( mk_id "lt_int",
+                          [
+                            measure_ref;
+                            E_aux (E_lit (L_aux (L_num Big_int.zero, loc)), (loc, empty_tannot));
+                          ]
+                        ),
+                      (loc, empty_tannot)
+                    )
+                in
+                let fuel =
+                  E_aux
+                    ( E_app
+                        ( mk_id "add_atom",
+                          [
+                            measure_ref;
+                            E_aux
+                              (E_lit (L_aux (L_num (Big_int.of_int 1), loc)), (loc, empty_tannot));
+                          ]
+                        ),
+                      (loc, empty_tannot)
+                    )
+                in
+                let fail =
+                  E_aux
+                    (E_exit (E_aux (E_lit (L_aux (L_unit, loc)), (loc, empty_tannot))), (loc, empty_tannot))
+                in
+                let call = E_aux (E_app (rec_id id, wexps @ [fuel]), (loc, empty_tannot)) in
+                E_aux
+                  ( E_let
+                      ( P_aux (P_id measure_id, (loc, empty_tannot)),
+                        measure_value,
+                        E_aux (E_if (is_negative, fail, call), (loc, empty_tannot))
+                      ),
+                    (loc, empty_tannot)
+                  )
+              else
+                let measure_exp = E_aux (E_typ (int_typ, measure_exp), (loc, empty_tannot)) in
+                E_aux (E_app (rec_id id, wexps @ [measure_exp]), (loc, empty_tannot))
+            in
             let wrapper =
               FCL_aux
                 ( FCL_funcl (id, Pat_aux (Pat_exp (wpat, wbody), (loc, empty_tannot))),
@@ -4375,6 +4456,9 @@ let rewrite_explicit_measure effect_info env ast =
   in
   let defs = List.flatten (List.map rewrite_def ast.defs) in
   ({ ast with defs }, !effect_info, env)
+
+let rewrite_explicit_measure = rewrite_explicit_measure_with_fuel false
+let rewrite_explicit_measure_fuel = rewrite_explicit_measure_with_fuel true
 
 (* Add a dummy assert to loops for backends that require loops to be able to
    fail.  Note that the Coq backend will spot the assert and omit it. *)
@@ -4900,6 +4984,7 @@ let all_rewriters =
     ("minimise_recursive_functions", basic_rewriter minimise_recursive_functions);
     ("move_termination_measures", basic_rewriter move_termination_measures);
     ("rewrite_explicit_measure", base_rewriter rewrite_explicit_measure);
+    ("rewrite_explicit_measure_fuel", base_rewriter rewrite_explicit_measure_fuel);
     ("rewrite_loops_with_escape_effect", basic_rewriter rewrite_loops_with_escape_effect);
     ("simple_types", basic_rewriter rewrite_simple_types);
     ( "instantiate_outcomes",
