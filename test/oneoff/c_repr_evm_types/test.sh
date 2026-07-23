@@ -39,6 +39,13 @@ run_sail --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
   --c-preserve u256_low_byte \
   --c-preserve u256_middle_word \
   --c-preserve u256_to_nat \
+  --c-preserve b256_to_u256 \
+  --c-preserve u256_to_b256 \
+  --c-preserve address_to_word \
+  --c-preserve word_to_address \
+  --c-preserve address_alias_low_byte \
+  --c-preserve word_address_alias_low_byte \
+  --c-preserve word_low_byte \
   --c-preserve limb_unsigned \
   --c-preserve limb_signed \
   --c-preserve limb_shift_left \
@@ -72,6 +79,12 @@ grep -Fq 'uint64_t zu256_bit(sail_u256, uint64_t);' "$TMP_DIR/model.h"
 grep -Fq 'sail_fixed_bytes_20 zaddress_update(sail_fixed_bytes_20, uint64_t, uint64_t);' "$TMP_DIR/model.h"
 grep -Fq 'sail_fixed_bytes_32 zb256_fill(uint64_t);' "$TMP_DIR/model.h"
 grep -Fq 'sail_fixed_bytes_20 zbytes20_inc_update(sail_fixed_bytes_20, uint64_t, uint64_t);' "$TMP_DIR/model.h"
+grep -Fq 'sail_u256 zb256_to_u256(sail_fixed_bytes_32);' "$TMP_DIR/model.h"
+grep -Fq 'sail_fixed_bytes_32 zu256_to_b256(sail_u256);' "$TMP_DIR/model.h"
+grep -Fq 'sail_u256 zaddress_to_word(sail_fixed_bytes_20);' "$TMP_DIR/model.h"
+grep -Fq 'sail_fixed_bytes_20 zword_to_address(sail_u256);' "$TMP_DIR/model.h"
+grep -Fq 'uint64_t zaddress_alias_low_byte(sail_fixed_bytes_20);' "$TMP_DIR/model.h"
+grep -Fq 'uint64_t zword_address_alias_low_byte(sail_u256);' "$TMP_DIR/model.h"
 
 # Container width is structural. Only the bit start is dynamic; the slice width
 # is compiled into the selected helper/mask.
@@ -140,24 +153,43 @@ if grep -Eq 'sail_int|mpz_|CONVERT_OF' "$TMP_DIR/u256_from_lbits.body"; then
 fi
 assert_native_function u256_low_byte 'u256_extract_u64('
 assert_native_function u256_middle_word 'u256_extract_u64('
+assert_native_function b256_to_u256 'zfrom_bytes_le'
+assert_native_function u256_to_b256 'zto_bytes_le'
+assert_native_function address_to_word 'zfrom_bytes_le'
+assert_native_function word_to_address 'zto_bytes_le'
+assert_native_function address_alias_low_byte 'fast_unsigned_vector_access_fixed_bytes_20('
+assert_native_function word_address_alias_low_byte 'zaddress_alias_low_byte('
+assert_native_function word_low_byte 'u256_extract_u64('
+if grep -Fq 'u256_and(' "$TMP_DIR/word_to_address.body"; then
+  echo 'word_to_address masked bits that the fixed-byte conversion already drops' >&2
+  exit 1
+fi
+grep -Fq 'u256_from_fixed_bytes_20(zv)' "$TMP_DIR/model.c"
+grep -Fq 'fixed_bytes_20_from_u256(zb)' "$TMP_DIR/model.c"
+grep -Fq 'u256_from_fixed_bytes_32(zv)' "$TMP_DIR/model.c"
+grep -Fq 'fixed_bytes_32_from_u256(zb)' "$TMP_DIR/model.c"
 # This preserved function is the deliberate mixed-representation control.  It
 # proves that pruning native-only output does not remove bridges required by a
 # real generic result.
 extract_function u256_to_nat
-grep -Fq 'lbits_of_u256(' "$TMP_DIR/u256_to_nat.body"
-grep -Fq 'sail_unsigned' "$TMP_DIR/u256_to_nat.body"
+grep -Fq 'u256_unsigned(' "$TMP_DIR/u256_to_nat.body"
 grep -Fq 'sail_int' "$TMP_DIR/u256_to_nat.body"
+awk '/^static inline void u256_unsigned\(/,/^}/' \
+  "$TMP_DIR/model.c" > "$TMP_DIR/u256_unsigned.helper"
+grep -Fq 'sail_int_from_u64_array(result, value.limbs, 4);' \
+  "$TMP_DIR/u256_unsigned.helper"
+if grep -Eq '(^|[^[:alnum:]_])lbits([^[:alnum:]_]|$)|sail_unsigned' \
+    "$TMP_DIR/u256_unsigned.helper"; then
+  echo 'u256-to-integer conversion detoured through lbits' >&2
+  exit 1
+fi
 assert_native_function limb_unsigned '((uint64_t) zvalue)'
 assert_native_function limb_signed 'fast_signed(zvalue, 64)'
 assert_native_function limb_shift_left '? UINT64_C(0) : ((zvalue << zamount)'
 assert_native_function limb_shift_right 'safe_rshift(zvalue, zamount)'
 assert_native_function byte_arith_shift_right 'safe_rshift(zvalue, zamount)'
 assert_native_function address_equal 'eq_fixed_bytes_20('
-extract_function address_equal_vector
-if grep -Fq 'eq_fixed_bytes_20(' "$TMP_DIR/address_equal_vector.body"; then
-  echo 'mixed fixed-bytes/generic equality selected an incompatible native helper' >&2
-  exit 1
-fi
+assert_native_function address_equal_vector 'eq_fixed_bytes_20('
 assert_native_function address_byte 'fast_unsigned_vector_access_fixed_bytes_20('
 assert_native_function address_update 'fast_unsigned_vector_update_fixed_bytes_20('
 assert_native_function b160_equal 'eq_fixed_bytes_20('
@@ -176,6 +208,11 @@ run_sail --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
   --c-preserve u256_add \
   --c-preserve address_equal \
   --c-preserve b256_fill \
+  --c-preserve b256_to_u256 \
+  --c-preserve u256_to_b256 \
+  --c-preserve address_to_word \
+  --c-preserve word_to_address \
+  --c-preserve word_address_alias_low_byte \
   "$SOURCE" -o "$TMP_DIR/native_only"
 
 for generated_file in "$TMP_DIR/native_only.c" "$TMP_DIR/native_only.h"; do

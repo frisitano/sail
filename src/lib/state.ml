@@ -71,13 +71,14 @@ let regval_base_typ env typ =
 let has_default_order defs =
   List.exists (function DEF_aux (DEF_default (DT_aux (DT_order _, _)), _) -> true | _ -> false) defs
 
-let find_registers defs =
+let find_registers ?(expand = true) defs =
   List.fold_left
     (fun acc def ->
       match def with
       | DEF_aux (DEF_register (DEC_aux (DEC_reg (typ, id, opt_exp), (_, tannot))), _) ->
           let env = match destruct_tannot tannot with Some (env, _) -> env | _ -> Env.empty in
-          (Env.expand_synonyms env typ, id, Option.is_some opt_exp) :: acc
+          let typ = if expand then Env.expand_synonyms env typ else typ in
+          (typ, id, Option.is_some opt_exp) :: acc
       | _ -> acc
     )
     [] defs

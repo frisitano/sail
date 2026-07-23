@@ -22,8 +22,12 @@ grep -Fq 'CONVERT_OF(sail_int, mach_uint)' bounded_int_repr.c
 grep -Fq 'CONVERT_OF(sail_int, mach_int)' bounded_int_repr.c
 
 # Homogeneous gas operations and the full-width literal remain native.
-grep -Fq '= (zcost <= zremaining);' bounded_int_repr.c
-grep -Fq '= sail_checked_u64_sub(zremaining, zcost);' bounded_int_repr.c
+grep -Fq '= (!(zremaining < zcost));' bounded_int_repr.c
+grep -Fq '= (zremaining - zcost);' bounded_int_repr.c
+if grep -Eq 'sail_checked_(u64|i64)_(add|sub|mul|div|mod)' bounded_int_repr.c; then
+  echo "generated C contains checked fixed-width arithmetic" >&2
+  exit 1
+fi
 grep -Fq '= (zlhs < zrhs);' bounded_int_repr.c
 grep -Fq 'UINT64_C(18446744073709551615)' bounded_int_repr.c
 

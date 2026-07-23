@@ -13,6 +13,7 @@ from sailtest import *
 
 sail_dir = get_sail_dir()
 sail = get_sail()
+rocq_compile = get_rocq_compile()
 
 print("Sail is {}".format(sail))
 print("Sail dir is {}".format(sail_dir))
@@ -46,6 +47,7 @@ def test(name, dir, lib):
     results.expect_failure('outcome_impl_int.sail', 'Uses outcome in a way that\'t not yet supported')
     results.expect_failure('outcome_int.sail', 'Uses outcome in a way that\'t not yet supported')
     results.expect_failure('existential_parametric.sail', 'Dependent pairs example that we can\'t do yet')
+    results.expect_failure('wf_register_type.sail', 'Rocq backend requires a constant register width')
     if lib == 'bbv':
         results.expect_failure('sysreg.sail', 'Concurrency interface not currently supported on BBV')
         results.expect_failure('type_alias.sail', 'Concurrency interface not currently supported on BBV')
@@ -62,8 +64,8 @@ def test(name, dir, lib):
                 step('mkdir -p _build_{}'.format(basename))
                 step('\'{}\' --rocq --rocq-lib-style {} --rocq-undef-axioms --strict-bitvector --rocq-output-dir _build_{} -o out {}/{}'.format(sail, lib, basename, dir, filename))
                 os.chdir('_build_{}'.format(basename))
-                step('coqc out_types.v', name=basename)
-                step('coqc out.v', name=basename)
+                step('{} out_types.v'.format(rocq_compile), name=basename)
+                step('{} out.v'.format(rocq_compile), name=basename)
                 os.chdir('..')
                 step('rm -r _build_{}'.format(basename))
                 print_ok(filename)
@@ -94,4 +96,3 @@ xml += '</testsuites>\n'
 output = open('tests.xml', 'w')
 output.write(xml)
 output.close()
-

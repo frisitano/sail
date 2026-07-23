@@ -65,6 +65,11 @@ val optimize_aarch64_fast_struct : bool ref
     version compiled without said changes. *)
 val opt_memo_cache : bool ref
 
+(** Emit progress for fixed-integer representation inference and iterative
+    function-clone worklist processing. The C backend exposes this as
+    [--c-specialize-log]. *)
+val opt_debug_function_representations : bool ref
+
 (** {2 Jib context} *)
 
 (* For an abstract type like `type xlen : Int`, is it initialised?
@@ -72,6 +77,11 @@ val opt_memo_cache : bool ref
    No: `type xlen : Int`
 *)
 type abstract_type_initialised = Initialised | Uninitialised
+
+type generic_signature = {
+  generic_parameters : KidSet.t list;
+  generic_result : KidSet.t;
+}
 
 (** Dynamic context for compiling Sail to Jib. We need to pass a (global) typechecking environment given by checking the
     full AST. *)
@@ -82,6 +92,7 @@ type ctx = {
   variants : (kid list * ctyp Bindings.t) Bindings.t;
   abstracts : (ctyp * abstract_type_initialised) Bindings.t;
   valspecs : (string option * ctyp list * ctyp * uannot) Bindings.t;
+  generic_signatures : generic_signature Bindings.t;
   quants : ctyp KBindings.t;
   local_env : Env.t;
   tc_env : Env.t;
@@ -132,49 +143,81 @@ val enum_members : Ast.l -> ctx -> Ast.id -> IdSet.t
 module type CONFIG = sig
   val convert_typ : ctx -> typ -> ctyp
 
-  (** Choose the representation used when a concrete type becomes a generic
-      container argument. *)
+  (** Choose the representation used when a concrete type becomes a generic container argument. *)
   val ctyp_suprema : ctyp -> ctyp
 
   (** Optionally replace the compiled payload of a nominal newtype. *)
   val specialize_newtype_payload : id -> ctyp -> ctyp
 
-  (** Return true when [represented] is a backend-specific, lossless
-      representation of [semantic]. This keeps such values in their native
-      representation while compiling newtype destructuring and local
-      bindings, until a real semantic-type boundary requires conversion. *)
+  (** Return true when [represented] is a backend-specific, lossless representation of [semantic]. This keeps such
+      values in their native representation while compiling newtype destructuring and local bindings, until a real
+      semantic-type boundary requires conversion. *)
   val representation_refines : semantic:ctyp -> represented:ctyp -> bool
 
-  (** Return true when an ANF value carrying [semantic] may remain in
-      [represented] without crossing a checked conversion boundary. *)
+  (** Return true when a local Sail function should be cloned with [represented] in place of a [semantic] parameter.
+      Calls to the clone keep the narrower representation instead of inserting a conversion at the ordinary function
+      boundary. The clone is generated on demand from the original JIB body; external functions are never specialized
+      this way. *)
+  val specialize_function_argument_representation : semantic:ctyp -> represented:ctyp -> bool
+
+  (** Return true when a local Sail function should be cloned with [represented] in place of its [semantic] result. This
+      is the result counterpart of [specialize_function_argument_representation]. *)
+  val specialize_function_result_representation : semantic:ctyp -> represented:ctyp -> bool
+
+  (** Return true when a specialized parameter or result representation must be propagated through the cloned function
+      body. Numeric subtype specialization normally changes only the named parameter storage; structural representations
+      such as native wide bits and fixed byte vectors must replace the corresponding generic JIB type throughout the
+      clone. *)
+  val specialize_function_body_representation : semantic:ctyp -> represented:ctyp -> bool
+
+  (** Permit immutable top-level [int] bindings to use the exact finite
+      lifetime inferred from their initializer.  Bounded-only backends use
+      this for expressions such as [unsigned(0x...)]; ordinary backends retain
+      the semantic mathematical-integer representation. *)
+  val require_bounded_int : bool
+
+  val integer_representation_bounds : ctyp -> (Big_int.num * Big_int.num) option
+
+  (** Optionally replace a representation-specialized local function clone by a backend primitive. The source function
+      and its ordinary ABI remain canonical; this hook is considered only after a concrete represented parameter/result
+      signature has demanded a clone. *)
+  val specialized_function_external : id -> ctyp list -> ctyp -> id option
+
+  (** Return the compatibility view used while unifying a function argument.
+      This allows a semantic fixed vector and its backend representation to
+      meet at a call boundary before [make_calls_precise] inserts any required
+      adapter.  The argument itself retains [represented]. *)
+  val function_argument_unification_type : expected:ctyp -> represented:ctyp -> ctyp option
+
+  (** Return true when an argument whose typed source expression is [source] may cross an [expected] function boundary
+      through the backend's narrowing conversion machinery. This is separate from representation specialization:
+      [source] supplies the semantic proof that a larger storage representation fits [expected], whereas a narrower
+      native representation must select a cloned local function and remain narrow. *)
+  val function_argument_narrowing_allowed : expected:ctyp -> source:ctyp -> represented:ctyp -> bool
+
+  (** Return true when an ANF value carrying [semantic] may remain in [represented] without crossing a checked
+      conversion boundary. *)
   val preserve_aval_representation : semantic:ctyp -> represented:ctyp -> bool
 
-  (** Return true when a newtype constructor may demand [represented] directly
-      from its payload expression. This is deliberately stricter than
-      [representation_refines]: checked numeric newtypes must first evaluate
-      their mathematical Sail value and only then cross the checked packing
-      boundary. *)
+  (** Return true when a newtype constructor may demand [represented] directly from its payload expression. This is
+      deliberately stricter than [representation_refines]: checked numeric newtypes must first evaluate their
+      mathematical Sail value and only then cross the checked packing boundary. *)
   val propagate_newtype_payload_representation : id -> semantic:ctyp -> represented:ctyp -> bool
 
-  (** Preserve a backend-specific result representation across an external
-      operation when its represented arguments determine the result layout.
-      [id] is the external implementation name, not necessarily the Sail
-      source identifier. *)
+  (** Preserve a backend-specific result representation across an external operation when its represented arguments
+      determine the result layout. [id] is the external implementation name, not necessarily the Sail source identifier.
+  *)
   val specialize_call_result : id -> ctyp list -> ctyp -> ctyp
 
-  (** Return true only when the implementation of [id] can write its semantic
-      result directly into [represented]. This is intentionally narrower than
-      [representation_refines], because ordinary runtime functions still use
-      their declared Sail/GMP calling convention. *)
-  val specialize_call_destination :
-    ctx -> id -> ctyp list -> semantic:ctyp -> represented:ctyp -> bool
+  (** Return true only when the implementation of [id] can write its semantic result directly into [represented]. This
+      is intentionally narrower than [representation_refines], because ordinary runtime functions still use their
+      declared Sail/GMP calling convention. *)
+  val specialize_call_destination : ctx -> id -> ctyp list -> semantic:ctyp -> represented:ctyp -> bool
 
-  (** Keep an argument in a backend-specific representation when a specialized
-      result or another represented argument supplies the matching native
-      implementation. The list contains every argument's representation before
+  (** Keep an argument in a backend-specific representation when a specialized result or another represented argument
+      supplies the matching native implementation. The list contains every argument's representation before
       call-boundary conversions. *)
-  val specialize_call_argument :
-    ctx -> id -> ctyp -> ctyp list -> int -> semantic:ctyp -> represented:ctyp -> bool
+  val specialize_call_argument : ctx -> id -> ctyp -> ctyp list -> int -> semantic:ctyp -> represented:ctyp -> bool
 
   val optimize_anf : ctx -> typ aexp -> typ aexp
 

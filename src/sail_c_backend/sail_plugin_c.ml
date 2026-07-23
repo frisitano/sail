@@ -65,6 +65,7 @@ let opt_no_mangle = ref false
 let opt_no_rts = ref false
 let opt_preserve_types = ref IdSet.empty
 let opt_specialize_c = ref false
+let opt_require_bounded_int = ref false
 let opt_cpp_class_name = ref "Model"
 let opt_cpp_namespace = ref "model"
 let opt_cpp_derive_from = ref None
@@ -102,8 +103,16 @@ let c_options =
       "supply extra argument to every generated C/C++ function call"
     );
     ( Flag.create ~prefix:["c"] "specialize",
-      Arg.Set opt_specialize_c,
+      Arg.Tuple [Arg.Set opt_specialize_c; Arg.Set C_backend.optimize_primops],
       "enable C-only fixed integer representation specialization"
+    );
+    ( Flag.create ~prefix:["c"] "specialize_log",
+      Arg.Set Jib_compile.opt_debug_function_representations,
+      "log C representation inference and specialization worklist progress"
+    );
+    ( Flag.create ~prefix:["c"] "require_bounded_int",
+      Arg.Set opt_require_bounded_int,
+      "reject arbitrary-precision integers that need a finite semantic Sail bound"
     );
     ( Flag.create ~prefix:["c"] "preserve",
       Arg.String (fun str -> Specialize.add_initial_calls (IdSet.singleton (mk_id str))),
@@ -196,9 +205,9 @@ let c_cpp_rewrites (mode : c_backend_mode) =
     ("constant_fold", [String_arg target_name]);
   ]
 
-(* Find overrides (`$c_override` directive), reserved words
-   (`$c_reserved` directive, and extern functions), and validated C
-   representation annotations. *)
+(* Find overrides (`$target_name` and legacy `$c_override` directives),
+   reserved words (`$c_reserved` directive, and extern functions), and
+   validated C representation annotations. *)
 let collect_c_name_info ast (mode : c_backend_mode) =
   let target_name = string_of_mode mode in
   let open Ast in
@@ -223,18 +232,28 @@ let collect_c_name_info ast (mode : c_backend_mode) =
               raise
                 (Reporting.err_general repr_loc
                    (Printf.sprintf
-                      "C backend: unsupported representation %S in $[c_repr]; supported representations are %s"
-                      repr (String.concat ", " supported_c_repr)
+                      "C backend: unsupported representation %S in $[c_repr]; supported representations are %s" repr
+                      (String.concat ", " supported_c_repr)
                    )
                 );
             let collect_payload id payload kind =
+              let declared_payload = payload in
               let payload = Type_check.Env.expand_synonyms def_annot.env payload in
               let is_bits width = function
-                | Typ_aux
-                    ( Typ_app (bits_id, [A_aux (A_nexp (Nexp_aux (Nexp_constant n, _)), _)]), _
-                    )
+                | Typ_aux (Typ_app (bits_id, [A_aux (A_nexp (Nexp_aux (Nexp_constant n, _)), _)]), _)
                   when string_of_id bits_id = "bitvector" ->
                     Big_int.equal n (Big_int.of_int width)
+                | _ -> false
+              in
+              let is_unsigned_range width = function
+                | Typ_aux (Typ_app (range_id, [A_aux (A_nexp low, _); A_aux (A_nexp high, _)]), _)
+                  when string_of_id range_id = "range" -> (
+                    match (Type_check.big_int_of_nexp low, Type_check.big_int_of_nexp high) with
+                    | Some low, Some high ->
+                        Big_int.equal low Big_int.zero
+                        && Big_int.equal high (Big_int.pred (Big_int.pow_int_positive 2 width))
+                    | _ -> false
+                  )
                 | _ -> false
               in
               match (repr, payload) with
@@ -244,15 +263,10 @@ let collect_c_name_info ast (mode : c_backend_mode) =
                   c_repr_uint64 := IdSet.add id !c_repr_uint64
               | "int64", Typ_aux (Typ_id payload_id, _) when string_of_id payload_id = "int" ->
                   c_repr_int64 := IdSet.add id !c_repr_int64
-              | "u256", payload when is_bits 256 payload -> c_repr_u256 := IdSet.add id !c_repr_u256
-              | ( "fixed_bytes",
-                  Typ_aux
-                    ( Typ_app
-                        ( vector_id,
-                          [A_aux (A_nexp length, _); A_aux (A_typ elem_typ, _)]
-                        ),
-                      _
-                    ) )
+              | "u256", payload
+                when is_bits 256 payload || is_unsigned_range 256 declared_payload || is_unsigned_range 256 payload ->
+                  c_repr_u256 := IdSet.add id !c_repr_u256
+              | "fixed_bytes", Typ_aux (Typ_app (vector_id, [A_aux (A_nexp length, _); A_aux (A_typ elem_typ, _)]), _)
                 when string_of_id vector_id = "vector" -> (
                   let elem_typ = Type_check.Env.expand_synonyms def_annot.env elem_typ in
                   if not (is_bits 8 elem_typ) then
@@ -266,7 +280,7 @@ let collect_c_name_info ast (mode : c_backend_mode) =
                 )
               | "uint64", _ -> c_repr_error attr_loc "uint64 requires a mathematical int or nat payload"
               | "int64", _ -> c_repr_error attr_loc "int64 requires a mathematical int payload"
-              | "u256", _ -> c_repr_error attr_loc "u256 requires an exact bits(256) payload"
+              | "u256", _ -> c_repr_error attr_loc "u256 requires an exact bits(256) or range(0, 2^256 - 1) payload"
               | "fixed_bytes", _ ->
                   c_repr_error attr_loc
                     (Printf.sprintf "fixed_bytes requires a statically sized vector of byte elements as its %s" kind)
@@ -275,8 +289,7 @@ let collect_c_name_info ast (mode : c_backend_mode) =
             match def with
             | DEF_type (TD_aux (TD_variant (id, [], [Tu_aux (Tu_ty_id (payload, _), _)], true), _)) ->
                 collect_payload id payload "payload"
-            | DEF_type (TD_aux (TD_abbrev (id, [], A_aux (A_typ payload, _)), _)) ->
-                collect_payload id payload "alias"
+            | DEF_type (TD_aux (TD_abbrev (id, [], A_aux (A_typ payload, _)), _)) -> collect_payload id payload "alias"
             | DEF_type (TD_aux (TD_variant (_, _, _, false), _)) -> c_repr_error attr_loc "is only valid on a newtype"
             | DEF_type (TD_aux (TD_variant (_, _ :: _, _, true), _)) ->
                 c_repr_error attr_loc "does not yet support type parameters"
@@ -304,10 +317,23 @@ let collect_c_name_info ast (mode : c_backend_mode) =
           | Some (from, target) -> overrides := Name_generator.Overrides.add from target !overrides
           | None -> raise (Reporting.err_general def_annot.loc "Failed to interpret $c_override directive")
         )
+      | DEF_pragma ("target_name", Pragma_structured data) -> (
+          match Name_generator.parse_target_name data with
+          | Some (backend, (from, target)) when backend = target_name ->
+              overrides := Name_generator.Overrides.add from target !overrides
+          | Some _ -> ()
+          | None -> raise (Reporting.err_general def_annot.loc "Failed to interpret $target_name directive")
+        )
       | _ -> ()
     )
     ast.defs;
-  (!reserved, !overrides, !c_repr_uint64, !c_repr_int64, !c_repr_u256, !c_repr_fixed_bytes)
+  ( !reserved,
+    !overrides,
+    !c_repr_uint64,
+    !c_repr_int64,
+    !c_repr_u256,
+    !c_repr_fixed_bytes
+  )
 
 let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_sail_dir; _ } =
   let reserveds, overrides, c_repr_uint64, c_repr_int64, c_repr_u256, c_repr_fixed_bytes =
@@ -335,6 +361,7 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let c_repr_u256 = c_repr_u256
     let c_repr_fixed_bytes = c_repr_fixed_bytes
     let specialize_c = !opt_specialize_c
+    let require_bounded_int = !opt_require_bounded_int
 
     (* TODO: Convert `cpp` to use `c_backend_mode` instead of `bool`. *)
     let cpp = match mode with C -> false | Cpp -> true

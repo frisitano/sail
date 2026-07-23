@@ -5,11 +5,17 @@ $include <generic_equality.sail>
 
 type byte = bits(8)
 
+type word = range(0, 2 ^ 256 - 1)
+
 $[c_repr u256]
 newtype u256 = U256 : bits(256)
 
 $[c_repr fixed_bytes]
 newtype address = Address : vector(20, dec, byte)
+
+/* The EVM model uses a transparent alias rather than a nominal wrapper. */
+$[c_repr fixed_bytes]
+type address_alias = vector(20, dec, byte)
 
 $[c_repr fixed_bytes]
 newtype b160 = B160 : vector(20, dec, byte)
@@ -87,6 +93,51 @@ val u256_from_lbits : bits(160) -> u256
 
 function u256_from_lbits(value) = U256(sail_zero_extend(value, 256))
 
+/* Constant-width instances of the standard byte-vector conversions must keep
+   their native endpoint representations after polymorphic specialization. */
+val b256_to_u256 : b256 -> u256
+
+function b256_to_u256(B256(bytes)) = U256(from_bytes_le(32, bytes))
+
+val u256_to_b256 : u256 -> b256
+
+function u256_to_b256(U256(value)) = B256(to_bytes_le(32, value))
+
+val address_to_u256 : address -> u256
+
+function address_to_u256(Address(bytes)) = U256(sail_zero_extend(from_bytes_le(20, bytes), 256))
+
+val u256_to_address : u256 -> address
+
+function u256_to_address(U256(value)) = Address(to_bytes_le(20, value[159 .. 0]))
+
+/* The EVM word is a transparent range rather than a bits newtype.  These are
+   the address boundary shapes used by evm-sail: from_bytes_le is embedded in
+   the word range, while to_bytes_le consumes a proven low-160-bit slice. */
+val address_to_word : address -> word
+
+function address_to_word(Address(bytes)) = unsigned(from_bytes_le(20, bytes))
+
+val word_to_address : word -> address
+
+function word_to_address(value) = Address(to_bytes_le(20, get_slice_int(160, value, 0)))
+
+val address_alias_low_byte : address_alias -> byte
+
+function address_alias_low_byte(value) = value[0]
+
+/* Exercise an ordinary fixed-vector result directly at a represented alias
+   boundary.  No source conversion is needed: both values have the same Sail
+   type, while the specialized C call must retain the fixed-byte ABI. */
+val word_address_alias_low_byte : word -> byte
+
+function word_address_alias_low_byte(value) =
+  address_alias_low_byte(to_bytes_le(20, get_slice_int(160, value, 0)))
+
+val word_low_byte : word -> byte
+
+function word_low_byte(value) = get_slice_int(8, value, 0)
+
 val u256_low_byte : u256 -> byte
 
 function u256_low_byte(U256(value)) = value[7 .. 0]
@@ -129,8 +180,8 @@ val address_equal : (address, address) -> bool
 
 function address_equal(Address(left), Address(right)) = left == right
 
-/* A mixed represented/generic comparison must cross back to the generic
-   vector ABI instead of selecting the fixed-bytes equality helper. */
+/* An equal-width generic vector can share the represented fixed-byte ABI in
+   the specialized build; the ordinary backend retains Sail's vector ABI. */
 val address_equal_vector : (address, vector(20, dec, byte)) -> bool
 
 function address_equal_vector(Address(left), right) = left == right

@@ -338,6 +338,20 @@ let aexp_bindings aexp =
 
 let new_shadow = symbol_generator ()
 
+let source_name_of_name = function
+  | Name (id, _) -> Some (string_of_id id)
+  | Gen (_, _, _, source_name, _) -> source_name
+  | Abstract id -> Some (string_of_id id)
+  | Have_exception _ -> Some "have_exception"
+  | Current_exception _ -> Some "current_exception"
+  | Throw_location _ -> Some "throw_location"
+  | Channel (Chan_stdout, _) -> Some "stdout"
+  | Channel (Chan_stderr, _) -> Some "stderr"
+  | Memory_writes _ -> Some "memory_writes"
+  | Return _ -> Some "return"
+
+let shadow_name id = new_shadow ?source_name:(source_name_of_name id) ()
+
 let rec no_shadow ids (AE_aux (aexp, annot)) =
   let aexp =
     match aexp with
@@ -346,7 +360,7 @@ let rec no_shadow ids (AE_aux (aexp, annot)) =
     | AE_typ (aexp, typ) -> AE_typ (no_shadow ids aexp, typ)
     | AE_assign (alexp, aexp) -> AE_assign (alexp, no_shadow ids aexp)
     | AE_let (mut, id, typ1, aexp1, aexp2, typ2) when NameSet.mem id ids ->
-        let shadow_id = new_shadow () in
+        let shadow_id = shadow_name id in
         let aexp1 = no_shadow ids aexp1 in
         let ids = NameSet.add shadow_id ids in
         AE_let (mut, shadow_id, typ1, aexp1, no_shadow ids (aexp_rename id shadow_id aexp2), typ2)
@@ -362,7 +376,7 @@ let rec no_shadow ids (AE_aux (aexp, annot)) =
     | AE_try (aexp, apexps, typ) -> AE_try (no_shadow ids aexp, List.map (no_shadow_apexp ids) apexps, typ)
     | AE_struct_update (aval, avals, typ) -> AE_struct_update (aval, avals, typ)
     | AE_for (id, aexp1, aexp2, aexp3, order, aexp4) when NameSet.mem id ids ->
-        let shadow_id = new_shadow () in
+        let shadow_id = new_shadow ?source_name:(source_name_of_name id) () in
         let aexp1 = no_shadow ids aexp1 in
         let aexp2 = no_shadow ids aexp2 in
         let aexp3 = no_shadow ids aexp3 in
@@ -378,7 +392,9 @@ let rec no_shadow ids (AE_aux (aexp, annot)) =
 
 and no_shadow_apexp ids (apat, aexp1, aexp2, uannot) =
   let shadows = NameSet.inter (apat_bindings apat) ids in
-  let shadows = List.map (fun id -> (id, new_shadow ())) (NameSet.elements shadows) in
+  let shadows =
+    List.map (fun id -> (id, new_shadow ?source_name:(source_name_of_name id) ())) (NameSet.elements shadows)
+  in
   let rename aexp = List.fold_left (fun aexp (from_id, to_id) -> aexp_rename from_id to_id aexp) aexp shadows in
   let rename_apat apat = List.fold_left (fun apat (from_id, to_id) -> apat_rename from_id to_id apat) apat shadows in
   let ids = NameSet.union (apat_bindings apat) (NameSet.union ids (NameSet.of_list (List.map snd shadows))) in
@@ -702,7 +718,7 @@ let rec anf (E_aux (e_aux, (l, tannot)) as exp) =
         let wrap, alexp = anf_lexp env lexp in
         (wrap, AL_field (alexp, field_id))
     | LE_deref dexp ->
-        let gs = gensym () in
+        let gs = gensym ~source_name:"deref" ~source_type:(string_of_typ (typ_of dexp)) () in
         ((fun x -> mk_aexp (AE_let (Mutable, gs, typ_of dexp, anf dexp, x, unit_typ))), AL_addr (gs, typ_of dexp))
     | _ ->
         Reporting.unreachable l __POS__
@@ -711,14 +727,21 @@ let rec anf (E_aux (e_aux, (l, tannot)) as exp) =
 
   let to_aval (AE_aux (aexp_aux, { env; uannot; _ }) as aexp) =
     let mk_aexp (AE_aux (_, { loc = l; _ })) aexp = AE_aux (aexp, { env; loc = l; uannot }) in
+    let fresh ?(source_name = "result") typ = gensym ~source_name ~source_type:(string_of_typ typ) () in
     match aexp_aux with
     | AE_val v -> (v, fun x -> x)
     | AE_short_circuit (_, _, _) ->
-        let id = gensym () in
+        let id = fresh ~source_name:"condition" bool_typ in
         ( AV_id (id, Local (Immutable, bool_typ)),
           fun x -> mk_aexp x (AE_let (Immutable, id, bool_typ, aexp, x, typ_of exp))
         )
-    | AE_app (_, _, typ)
+    | AE_app (function_id, _, typ) ->
+        let source_name =
+          match function_id with
+          | Sail_function id | Newtype_wrapper id | Pure_extern (id, _) | Extern (id, _) -> string_of_id id ^ "_result"
+        in
+        let id = fresh ~source_name typ in
+        (AV_id (id, Local (Immutable, typ)), fun x -> mk_aexp x (AE_let (Immutable, id, typ, aexp, x, typ_of exp)))
     | AE_let (_, _, _, _, _, typ)
     | AE_return (_, typ)
     | AE_exit (_, typ)
@@ -730,10 +753,10 @@ let rec anf (E_aux (e_aux, (l, tannot)) as exp) =
     | AE_try (_, _, typ)
     | AE_struct_update (_, _, typ)
     | AE_block (_, _, typ) ->
-        let id = gensym () in
+        let id = fresh typ in
         (AV_id (id, Local (Immutable, typ)), fun x -> mk_aexp x (AE_let (Immutable, id, typ, aexp, x, typ_of exp)))
     | AE_assign _ | AE_for _ | AE_loop _ ->
-        let id = gensym () in
+        let id = fresh ~source_name:"unit_result" unit_typ in
         ( AV_id (id, Local (Immutable, unit_typ)),
           fun x -> mk_aexp x (AE_let (Immutable, id, unit_typ, aexp, x, typ_of exp))
         )

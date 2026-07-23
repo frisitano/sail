@@ -53,8 +53,10 @@ open Jib
 
 (** {1 Instruction construction functions, and Jib names} *)
 
-(** Create a generator that produces fresh names. *)
-val symbol_generator : unit -> unit -> name
+(** Create a generator that produces fresh names. Optional source metadata is carried through Jib for backends that want
+    to render generated values using a meaningful name or the source-level type that produced them. It is not part of
+    name identity. *)
+val symbol_generator : unit -> ?source_name:string -> ?source_type:string -> unit -> name
 
 val idecl : l -> ctyp -> name -> instr
 val istatic : l -> ctyp -> Value2.vl -> name * instr
@@ -63,6 +65,7 @@ val iinit : l -> ctyp -> name -> cval -> instr
 val ijson_key : l -> name -> string list -> instr
 val iif : l -> cval -> instr list -> instr list -> instr
 val ifuncall : l -> clexp -> id * ctyp list -> cval list -> instr
+val ifuncall_with_bounds : l -> callsite_bounds -> clexp -> id * ctyp list -> cval list -> instr
 val ifuncall_multi : l -> clexp list -> id * ctyp list -> cval list -> instr
 val iextern : ?return_ctyp:ctyp -> l -> clexp -> id * ctyp list -> cval list -> instr
 val icopy : l -> clexp -> cval -> instr

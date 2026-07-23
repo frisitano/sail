@@ -75,11 +75,15 @@ let opt_no_bitfield_expansion = ref false
 let opt_strict_var = ref false
 
 let orig_kid (Kid_aux (Var v, l) as kid) =
-  try
-    let i = String.rindex v '#' in
-    if i >= 3 && String.sub v 0 3 = "'fv" then Kid_aux (Var ("'" ^ String.sub v (i + 1) (String.length v - i - 1)), l)
-    else kid
-  with Not_found -> kid
+  let rec strip_fresh_prefix v =
+    if String.length v >= 3 && String.sub v 0 3 = "'fv" then
+      match String.index_from_opt v 3 '#' with
+      | Some i -> strip_fresh_prefix ("'" ^ String.sub v (i + 1) (String.length v - i - 1))
+      | None -> v
+    else v
+  in
+  let original = strip_fresh_prefix v in
+  if String.equal original v then kid else Kid_aux (Var original, l)
 
 (* Rewrite mangled names of type variables to the original names *)
 let rec orig_nexp (Nexp_aux (nexp, l)) =

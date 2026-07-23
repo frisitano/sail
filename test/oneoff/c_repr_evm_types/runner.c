@@ -81,6 +81,15 @@ int main(void) {
   sail_fixed_bytes_20 address = {{0}};
   address.bytes[0] = UINT8_C(0x11);
   address.bytes[19] = UINT8_C(0xaa);
+  const sail_u256 address_word = zaddress_to_word(address);
+  CHECK(u256_is(address_word, UINT64_C(0x11), 0, UINT64_C(0xaa000000), 0));
+  const sail_u256 address_word_with_high_bits = {
+      {address_word.limbs[0], address_word.limbs[1], address_word.limbs[2] | UINT64_C(0xfeed00000000),
+       UINT64_MAX}};
+  const sail_fixed_bytes_20 roundtrip_address = zword_to_address(address_word_with_high_bits);
+  CHECK(roundtrip_address.bytes[0] == UINT8_C(0x11));
+  CHECK(roundtrip_address.bytes[19] == UINT8_C(0xaa));
+  CHECK(zword_address_alias_low_byte(address_word_with_high_bits) == UINT64_C(0x11));
   CHECK(zaddress_equal(address, address));
   CHECK(zaddress_byte(address, 0) == UINT64_C(0x11));
   CHECK(zaddress_byte(address, 19) == UINT64_C(0xaa));
@@ -91,6 +100,12 @@ int main(void) {
 
   sail_fixed_bytes_32 hash = {{0}};
   hash.bytes[31] = UINT8_C(0xcc);
+  hash.bytes[0] = UINT8_C(0x22);
+  const sail_u256 hash_word = zb256_to_u256(hash);
+  CHECK(u256_is(hash_word, UINT64_C(0x22), 0, 0, UINT64_C(0xcc00000000000000)));
+  const sail_fixed_bytes_32 roundtrip_hash = zu256_to_b256(hash_word);
+  CHECK(roundtrip_hash.bytes[0] == UINT8_C(0x22));
+  CHECK(roundtrip_hash.bytes[31] == UINT8_C(0xcc));
   CHECK(zb256_equal(hash, hash));
 
   sail_fixed_bytes_48 b384 = {{0}};

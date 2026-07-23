@@ -59,8 +59,8 @@ let symbol_generator () =
   let gen_no = !generators in
   incr generators;
   let counter = ref 0 in
-  let gensym () =
-    let id = Gen (gen_no, !counter, -1) in
+  let gensym ?source_name ?source_type () =
+    let id = Gen (gen_no, !counter, -1, source_name, source_type) in
     incr counter;
     id
   in
@@ -70,7 +70,7 @@ module Name = struct
   type t = name
   let compare id1 id2 =
     match (id1, id2) with
-    | Gen (x1, x2, n), Gen (y1, y2, m) ->
+    | Gen (x1, x2, n, _, _), Gen (y1, y2, m, _, _) ->
         let c1 = Int.compare x1 y1 in
         if c1 = 0 then (
           let c2 = Int.compare x2 y2 in
@@ -83,6 +83,7 @@ module Name = struct
     | Abstract x, Abstract y -> Id.compare x y
     | Have_exception n, Have_exception m -> compare n m
     | Current_exception n, Current_exception m -> compare n m
+    | Throw_location n, Throw_location m -> compare n m
     | Return n, Return m -> compare n m
     | Memory_writes n, Memory_writes m -> compare n m
     | Channel (c1, n), Channel (c2, m) -> (
@@ -156,7 +157,7 @@ let instrs_rename from_name to_name = visit_instrs (new rename_visitor from_name
 let string_of_name ?deref_current_exception:(dce = false) ?(zencode = true) =
   let ssa_num n = if n = -1 then "" else "/" ^ string_of_int n in
   function
-  | Gen (v1, v2, n) ->
+  | Gen (v1, v2, n, _, _) ->
       let s = "%" ^ string_of_int v1 ^ "." ^ string_of_int v2 in
       (if zencode then Util.zencode_string s else s) ^ ssa_num n
   | Name (id, n) -> (if zencode then Util.zencode_string (string_of_id id) else string_of_id id) ^ ssa_num n
@@ -195,6 +196,11 @@ let string_of_op = function
   | Ilteq -> "@lteq"
   | Igteq -> "@gteq"
   | Iadd -> "@iadd"
+  | Proven_iadd -> "@proven_iadd"
+  | Proven_isub -> "@proven_isub"
+  | Proven_imul -> "@proven_imul"
+  | Proven_idiv -> "@proven_idiv"
+  | Proven_imod -> "@proven_imod"
   | Isub -> "@isub"
   | Imul -> "@imul"
   | Idiv -> "@idiv"
@@ -328,7 +334,7 @@ let rec doc_instr (I_aux (aux, _)) =
   | I_comment str -> twice space ^^ string "//" ^^ string str
   | I_throw cval -> ksprintf instr "throw %s" (string_of_cval cval)
   | I_return cval -> ksprintf instr "return %s" (string_of_cval cval)
-  | I_funcall (creturn, Call, uid, args) ->
+  | I_funcall (creturn, Call _, uid, args) ->
       ksprintf instr "%s = %s(%s)" (string_of_creturn creturn) (string_of_uid uid)
         (Util.string_of_list ", " string_of_cval args)
   | I_funcall (creturn, Extern _, uid, args) ->
@@ -411,9 +417,17 @@ let ijson_key l id parts = I_aux (I_init (CT_json_key, id, Init_json_key parts),
 
 let iif l cval then_instrs else_instrs = I_aux (I_if (cval, then_instrs, else_instrs), (instr_number (), l))
 
-let ifuncall l clexp id cvals = I_aux (I_funcall (CR_one clexp, Call, id, cvals), (instr_number (), l))
+let ifuncall_with_bounds l bounds clexp id cvals =
+  I_aux (I_funcall (CR_one clexp, Call bounds, id, cvals), (instr_number (), l))
 
-let ifuncall_multi l clexps id cvals = I_aux (I_funcall (CR_multi clexps, Call, id, cvals), (instr_number (), l))
+let ifuncall l clexp id cvals =
+  ifuncall_with_bounds l (List.map (fun _ -> None) cvals, None) clexp id cvals
+
+let ifuncall_multi l clexps id cvals =
+  I_aux
+    ( I_funcall (CR_multi clexps, Call (List.map (fun _ -> None) cvals, None), id, cvals),
+      (instr_number (), l)
+    )
 
 let iextern ?return_ctyp l clexp id cvals =
   let return_ctyp = match return_ctyp with None -> clexp_ctyp clexp | Some ctyp -> ctyp in
@@ -884,7 +898,7 @@ let map_creturn_ctyp f = function
 let map_init_ctyp f init =
   match init with Init_cval cval -> Init_cval (map_cval_ctyp f cval) | Init_static _ | Init_json_key _ -> init
 
-let map_extern_ctyp f = function Call -> Call | Extern ctyp -> Extern (f ctyp)
+let map_extern_ctyp f = function Call bounds -> Call bounds | Extern ctyp -> Extern (f ctyp)
 
 let rec map_instr_ctyp f (I_aux (instr, aux)) =
   let instr =
@@ -1113,7 +1127,8 @@ let rec infer_call op vs =
   | Bvaccess, _ -> CT_fbits 1
   | (Bvor | Bvand | Bvxor | Bvadd | Bvsub | Bvshiftl | Bvshiftr | Bvarith_shiftr), [v; _] -> cval_ctyp v
   | (Ilt | Igt | Ilteq | Igteq), _ -> CT_bool
-  | (Iadd | Isub | Imul | Idiv | Imod), [v; _] -> cval_ctyp v
+  | (Iadd | Proven_iadd | Proven_isub | Proven_imul | Proven_idiv | Proven_imod | Isub | Imul | Idiv | Imod), [v; _] ->
+      cval_ctyp v
   | Unsigned n, _ -> CT_fuint n
   | Signed n, _ -> CT_fint n
   | (Zero_extend n | Sign_extend n), [v] -> (

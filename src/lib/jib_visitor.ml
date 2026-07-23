@@ -181,7 +181,7 @@ let rec visit_instr vis outer_instr =
         let creturn' = visit_creturn vis creturn in
         let extern' =
           match extern with
-          | Call -> extern
+          | Call _ -> extern
           | Extern ret_ctyp ->
               let ret_ctyp' = visit_ctyp vis ret_ctyp in
               if ret_ctyp == ret_ctyp' then extern else Extern ret_ctyp'

@@ -123,6 +123,9 @@ module type CODEGEN_CONFIG = sig
   (** Preserve fixed integer representations through generic specialization. *)
   val specialize_c : bool
 
+  (** Reject generated C that still requires arbitrary-precision integers. *)
+  val require_bounded_int : bool
+
   (** If set generate a C++ class for the model instead of global C functions/variables. *)
   val cpp : bool
 

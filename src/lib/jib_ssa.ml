@@ -55,7 +55,7 @@ module IntMap = Map.Make (struct
 end)
 
 let ssa_name i = function
-  | Gen (v1, v2, _) -> Gen (v1, v2, i)
+  | Gen (v1, v2, _, source_name, source_type) -> Gen (v1, v2, i, source_name, source_type)
   | Name (id, _) -> Name (id, i)
   | Abstract id -> Abstract id
   | Have_exception _ -> Have_exception i
@@ -66,7 +66,7 @@ let ssa_name i = function
   | Return _ -> Return i
 
 let unssa_name = function
-  | Gen (v1, v2, n) -> (Gen (v1, v2, -1), n)
+  | Gen (v1, v2, n, source_name, source_type) -> (Gen (v1, v2, -1, source_name, source_type), n)
   | Name (id, n) -> (Name (id, -1), n)
   | Abstract id -> (Abstract id, -1)
   | Have_exception n -> (Have_exception (-1), n)

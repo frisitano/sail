@@ -374,18 +374,18 @@ overload vector_update_subrange = {update_subrange_bits}
 
 val sail_shiftleft = pure {
   lean: "_lean_shiftl",
-  _: "shiftl"} : forall 'n ('ord : Order).
-    (bitvector('n, 'ord), int) -> bitvector('n, 'ord)
+  _: "shiftl"} : forall 'n 'amount ('ord : Order).
+    (bitvector('n, 'ord), atom('amount)) -> bitvector('n, 'ord)
 
 val sail_shiftright = pure {
   lean: "_lean_shiftr",
-  _: "shiftr"} : forall 'n ('ord : Order).
-    (bitvector('n, 'ord), int) -> bitvector('n, 'ord)
+  _: "shiftr"} : forall 'n 'amount ('ord : Order).
+    (bitvector('n, 'ord), atom('amount)) -> bitvector('n, 'ord)
 
 val sail_arith_shiftright = pure {
   lean: "BitVec.sshiftRight",
-  _: "arith_shiftr"} : forall 'n ('ord : Order).
-    (bitvector('n, 'ord), int) -> bitvector('n, 'ord)
+  _: "arith_shiftr"} : forall 'n 'amount ('ord : Order).
+    (bitvector('n, 'ord), atom('amount)) -> bitvector('n, 'ord)
 
 val sail_zeros = pure {
   lean: "BitVec.zero",

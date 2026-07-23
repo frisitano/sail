@@ -61,6 +61,11 @@ open Anf
 
 let opt_memo_cache = ref false
 
+(* Representation specialization can be expensive on large models. Keep its
+   progress trace opt-in so ordinary backends remain quiet while allowing the
+   C backend to expose actionable worklist and bound progress. *)
+let opt_debug_function_representations = ref false
+
 let optimize_aarch64_fast_struct = ref false
 
 let ngensym = symbol_generator ()
@@ -89,11 +94,50 @@ type funwire = Arg of int | Ret | Invoke
 let max_int n = Big_int.pred (Big_int.pow_int_positive 2 (n - 1))
 let min_int n = Big_int.negate (Big_int.pow_int_positive 2 (n - 1))
 
+(* A foreach loop is mathematical-integer code in the Sail source.  Keep that
+   representation unless the source types prove both the loop values and the
+   final (post-body) cursor update fit in int64_t.  The latter matters because
+   an inclusive loop still computes [to + step] (or [to - step]) after its
+   final body execution. *)
+let foreach_int64_proven env from_typ to_typ step_typ ord =
+  let add_bounds (env, bounds) typ =
+    let typ = Env.expand_synonyms env typ in
+    match destruct_range Env.empty typ with
+    | Some (kids, constr, lower, upper) ->
+        let env = add_existential Parse_ast.Unknown (List.map (mk_kopt K_int) kids) constr env in
+        Some (env, (lower, upper) :: bounds)
+    | None -> None
+  in
+  match
+    Option.bind (add_bounds (env, []) from_typ) (fun state ->
+        Option.bind (add_bounds state to_typ) (fun state -> add_bounds state step_typ)
+    )
+  with
+  | Some (env, [(step_lower, step_upper); (to_lower, to_upper); (from_lower, from_upper)]) ->
+      let int64_min = nconstant (min_int 64) in
+      let int64_max = nconstant (max_int 64) in
+      let zero = nconstant Big_int.zero in
+      let fits (lower, upper) =
+        prove __POS__ env (nc_lteq int64_min lower) && prove __POS__ env (nc_lteq upper int64_max)
+      in
+      fits (from_lower, from_upper) && fits (to_lower, to_upper) && fits (step_lower, step_upper)
+      && prove __POS__ env (nc_lteq zero step_lower)
+      &&
+      (match ord with
+      | Ord_inc -> prove __POS__ env (nc_lteq (nexp_simp (nsum to_upper step_upper)) int64_max)
+      | Ord_dec -> prove __POS__ env (nc_lteq int64_min (nexp_simp (nminus to_lower step_upper))))
+  | _ -> false
+
 let is_ct_enum = function CT_enum _ -> true | _ -> false
 
 let iblock1 = function [instr] -> instr | instrs -> iblock instrs
 
 type abstract_type_initialised = Initialised | Uninitialised
+
+type generic_signature = {
+  generic_parameters : KidSet.t list;
+  generic_result : KidSet.t;
+}
 
 (** The context type contains two type-checking environments. ctx.local_env contains the closest typechecking
     environment, usually from the expression we are compiling, whereas ctx.tc_env is the global type checking
@@ -106,6 +150,7 @@ type ctx = {
   variants : (kid list * ctyp Bindings.t) Bindings.t;
   abstracts : (ctyp * abstract_type_initialised) Bindings.t;
   valspecs : (string option * ctyp list * ctyp * uannot) Bindings.t;
+  generic_signatures : generic_signature Bindings.t;
   quants : ctyp KBindings.t;
   local_env : Env.t;
   tc_env : Env.t;
@@ -171,6 +216,7 @@ let initial_ctx ?for_target env effect_info =
     variants = Bindings.empty;
     abstracts = Bindings.empty;
     valspecs = initial_valspecs;
+    generic_signatures = Bindings.empty;
     quants = KBindings.empty;
     local_env = env;
     tc_env = env;
@@ -281,13 +327,31 @@ module type CONFIG = sig
   val ctyp_suprema : ctyp -> ctyp
   val specialize_newtype_payload : id -> ctyp -> ctyp
   val representation_refines : semantic:ctyp -> represented:ctyp -> bool
+  val specialize_function_argument_representation : semantic:ctyp -> represented:ctyp -> bool
+
+  val specialize_function_result_representation : semantic:ctyp -> represented:ctyp -> bool
+
+  val specialize_function_body_representation : semantic:ctyp -> represented:ctyp -> bool
+
+  (** When the backend requires every reachable integer to have a finite
+      representation, an immutable top-level integer may use the exact bound
+      inferred from its initializer even when [unsigned(...)] gave the binding
+      the otherwise-unbounded semantic type [int]. *)
+  val require_bounded_int : bool
+
+  (** The mathematical interval represented by a concrete integer storage
+      type.  Representation specialization uses this to propagate call-site
+      bounds through every value written during a local variable's lifetime. *)
+  val integer_representation_bounds : ctyp -> (Big_int.num * Big_int.num) option
+
+  val specialized_function_external : id -> ctyp list -> ctyp -> id option
+  val function_argument_unification_type : expected:ctyp -> represented:ctyp -> ctyp option
+  val function_argument_narrowing_allowed : expected:ctyp -> source:ctyp -> represented:ctyp -> bool
   val preserve_aval_representation : semantic:ctyp -> represented:ctyp -> bool
   val propagate_newtype_payload_representation : id -> semantic:ctyp -> represented:ctyp -> bool
   val specialize_call_result : id -> ctyp list -> ctyp -> ctyp
-  val specialize_call_destination :
-    ctx -> id -> ctyp list -> semantic:ctyp -> represented:ctyp -> bool
-  val specialize_call_argument :
-    ctx -> id -> ctyp -> ctyp list -> int -> semantic:ctyp -> represented:ctyp -> bool
+  val specialize_call_destination : ctx -> id -> ctyp list -> semantic:ctyp -> represented:ctyp -> bool
+  val specialize_call_argument : ctx -> id -> ctyp -> ctyp list -> int -> semantic:ctyp -> represented:ctyp -> bool
   val optimize_anf : ctx -> typ aexp -> typ aexp
   val unroll_loops : int option
   val make_call_precise : ctx -> id -> ctyp list -> ctyp -> bool
@@ -326,6 +390,38 @@ let callgraph cdefs =
 
 module Make (C : CONFIG) = struct
   let ctyp_of_typ ctx typ = C.convert_typ ctx typ
+
+  let generic_signature quant arg_typs ret_typ =
+    let quantified =
+      quant_kopts quant
+      |> List.map kopt_kid
+      |> List.filter (fun kid -> not (is_kid_generated kid))
+      |> KidSet.of_list
+    in
+    let dependencies typ = KidSet.inter quantified (tyvars_of_typ typ) in
+    {
+      generic_parameters = List.map dependencies arg_typs;
+      generic_result = dependencies ret_typ;
+    }
+
+  let position_is_generic dependencies = not (KidSet.is_empty dependencies)
+
+  let concrete_specialization_error l id position semantic represented =
+    let position =
+      match position with
+      | `Argument index -> Printf.sprintf "argument %d" (index + 1)
+      | `Result -> "result"
+    in
+    raise
+      (Reporting.err_general l
+         (Printf.sprintf
+            "Function %s has a concrete Sail %s, but this call would specialize its C representation from %s to %s. \
+             Implicit representation specialization is only permitted for signature positions that depend on a \
+             quantified Sail variable. Quantify this position with appropriate semantic bounds, or add an explicit \
+             Sail conversion at the call site."
+            (string_of_id id) position (string_of_ctyp semantic) (string_of_ctyp represented)
+         )
+      )
 
   let rec chunkify n xs = match (Util.take n xs, Util.drop n xs) with xs, [] -> [xs] | xs, ys -> xs :: chunkify n ys
 
@@ -457,8 +553,7 @@ module Make (C : CONFIG) = struct
           when Big_int.less_equal Big_int.zero n
                && Big_int.less_equal n (Big_int.pred (Big_int.pow_int_positive 2 width)) ->
             ([], V_lit (VL_int n, ctyp), [])
-        | CT_fint width as ctyp
-          when Big_int.less_equal (min_int width) n && Big_int.less_equal n (max_int width) ->
+        | CT_fint width as ctyp when Big_int.less_equal (min_int width) n && Big_int.less_equal n (max_int width) ->
             ([], V_lit (VL_int n, ctyp), [])
         | CT_constant value as ctyp when Big_int.equal value n -> ([], V_lit (VL_int n, ctyp), [])
         | _ ->
@@ -646,8 +741,7 @@ module Make (C : CONFIG) = struct
     | AV_list (avals, Typ_aux (typ, _)) ->
         let ctyp =
           match typ with
-          | Typ_app (id, [A_aux (A_typ typ, _)]) when string_of_id id = "list" ->
-              C.ctyp_suprema (ctyp_of_typ ctx typ)
+          | Typ_app (id, [A_aux (A_typ typ, _)]) when string_of_id id = "list" -> C.ctyp_suprema (ctyp_of_typ ctx typ)
           | _ -> raise (Reporting.err_general l "Invalid list type")
         in
         let gs = ngensym () in
@@ -667,7 +761,102 @@ module Make (C : CONFIG) = struct
       If called as [compile_funcall ~override_id:foo l ctx bar args], then we will compile as if we are calling [bar],
       but insert a call to [foo] in the IR. This is used for optimizations where we can generate a more efficient
       version of [foo] that doesn't exist in the original Sail. *)
-  let compile_funcall_with ?override_id l ctx id compile_arg semantic_ctyp_of_arg args =
+  type partial_integer_interval = Big_int.num option * Big_int.num option
+
+  let tighter_integer_interval (left_lower, left_upper) (right_lower, right_upper) =
+    let tighter_lower =
+      match (left_lower, right_lower) with
+      | Some left, Some right -> Some (Big_int.max left right)
+      | Some bound, None | None, Some bound -> Some bound
+      | None, None -> None
+    in
+    let tighter_upper =
+      match (left_upper, right_upper) with
+      | Some left, Some right -> Some (Big_int.min left right)
+      | Some bound, None | None, Some bound -> Some bound
+      | None, None -> None
+    in
+    (tighter_lower, tighter_upper)
+
+  let wider_integer_interval (left_lower, left_upper) (right_lower, right_upper) =
+    let wider_lower =
+      match (left_lower, right_lower) with
+      | Some left, Some right -> Some (Big_int.min left right)
+      | _ -> None
+    in
+    let wider_upper =
+      match (left_upper, right_upper) with
+      | Some left, Some right -> Some (Big_int.max left right)
+      | _ -> None
+    in
+    (wider_lower, wider_upper)
+
+  let direct_integer_interval nexp constraints =
+    let constant = function Nexp_aux (Nexp_constant value, _) -> Some value | _ -> None in
+    let nexp_is_target candidate = nexp_identical (nexp_simp candidate) nexp in
+    let rec constraint_interval (NC_aux (constraint_aux, _)) =
+      match constraint_aux with
+      | NC_equal (A_aux (A_nexp left, _), A_aux (A_nexp right, _)) -> (
+          match (nexp_is_target left, constant right, nexp_is_target right, constant left) with
+          | true, Some value, _, _ | _, _, true, Some value -> (Some value, Some value)
+          | _ -> (None, None)
+        )
+      | NC_ge (left, right) -> (
+          match (nexp_is_target left, constant right, nexp_is_target right, constant left) with
+          | true, Some value, _, _ -> (Some value, None)
+          | _, _, true, Some value -> (None, Some value)
+          | _ -> (None, None)
+        )
+      | NC_gt (left, right) -> (
+          match (nexp_is_target left, constant right, nexp_is_target right, constant left) with
+          | true, Some value, _, _ -> (Some (Big_int.succ value), None)
+          | _, _, true, Some value -> (None, Some (Big_int.pred value))
+          | _ -> (None, None)
+        )
+      | NC_le (left, right) -> (
+          match (nexp_is_target left, constant right, nexp_is_target right, constant left) with
+          | true, Some value, _, _ -> (None, Some value)
+          | _, _, true, Some value -> (Some value, None)
+          | _ -> (None, None)
+        )
+      | NC_lt (left, right) -> (
+          match (nexp_is_target left, constant right, nexp_is_target right, constant left) with
+          | true, Some value, _, _ -> (None, Some (Big_int.pred value))
+          | _, _, true, Some value -> (Some (Big_int.succ value), None)
+          | _ -> (None, None)
+        )
+      | NC_set (candidate, values) when nexp_is_target candidate && values <> [] ->
+          ( Some (List.fold_left Big_int.min (List.hd values) (List.tl values)),
+            Some (List.fold_left Big_int.max (List.hd values) (List.tl values))
+          )
+      | NC_and (left, right) -> tighter_integer_interval (constraint_interval left) (constraint_interval right)
+      | NC_or (left, right) -> wider_integer_interval (constraint_interval left) (constraint_interval right)
+      | _ -> (None, None)
+    in
+    List.fold_left
+      (fun interval nc -> tighter_integer_interval interval (constraint_interval nc))
+      (None, None) constraints
+
+  let source_integer_interval env typ =
+    match destruct_range env typ with
+    | Some (kids, constr, lower, upper) ->
+        let env = add_existential Parse_ast.Unknown (List.map (mk_kopt K_int) kids) constr env in
+        let lower = nexp_simp lower in
+        let upper = nexp_simp upper in
+        let lower_bound =
+          match solve_unique env lower with
+          | Some lower -> Some lower
+          | None -> fst (direct_integer_interval lower (Env.get_constraints env))
+        in
+        let upper_bound =
+          match solve_unique env upper with
+          | Some upper -> Some upper
+          | None -> snd (direct_integer_interval upper (Env.get_constraints env))
+        in
+        Option.bind lower_bound (fun lower -> Option.map (fun upper -> (lower, upper)) upper_bound)
+    | None -> None
+
+  let compile_funcall_with ?override_id l ctx id compile_arg semantic_ctyp_of_arg semantic_interval_of_arg args =
     let setup = ref [] in
     let cleanup = ref [] in
 
@@ -677,9 +866,27 @@ module Make (C : CONFIG) = struct
          etc as functions in the IR. *)
       try Env.get_val_spec id ctx.local_env with Type_error.Type_error _ -> Env.get_val_spec id ctx.tc_env
     in
+    let source_quant, Typ_aux (source_fn_typ, _) =
+      (* [get_val_spec] freshens a callee's quantified variables against the
+         caller environment.  Those freshened names contain [#], just like
+         genuinely compiler-generated singleton variables, so they cannot be
+         used to decide whether the source signature authorizes representation
+         specialization.  Read the un-freshened binding solely for that
+         provenance decision; keep the freshened binding above for ordinary
+         call typing and unification. *)
+      try Env.get_val_spec_orig id ctx.local_env
+      with Type_error.Type_error _ -> Env.get_val_spec_orig id ctx.tc_env
+    in
     let params = quant_kopts quant |> List.filter is_typ_kopt |> List.map kopt_kid in
 
     let arg_typs, ret_typ = match fn_typ with Typ_fn (arg_typs, ret_typ) -> (arg_typs, ret_typ) | _ -> assert false in
+    let source_arg_typs, source_ret_typ =
+      match source_fn_typ with
+      | Typ_fn (arg_typs, ret_typ) -> (arg_typs, ret_typ)
+      | _ -> assert false
+    in
+    let generic_signature = generic_signature source_quant source_arg_typs source_ret_typ in
+    let is_extern = ctx_is_extern id ctx in
     let ctx' = { ctx with local_env = Env.add_typquant (id_loc id) quant ctx.local_env } in
     let arg_ctyps, ret_ctyp = (List.map (ctyp_of_typ ctx') arg_typs, ctyp_of_typ ctx' ret_typ) in
 
@@ -687,27 +894,55 @@ module Make (C : CONFIG) = struct
 
     let instantiation = ref KBindings.empty in
 
-    let setup_arg ctyp arg =
+    let merge_call_unifiers kid ctyp1 ctyp2 =
+      (* Polymorphic calls can observe both the semantic instantiation and a
+         narrower backend representation of that same type.  Keep the
+         semantic type as the polymorphic instantiation; the represented
+         argument remains narrow and is handled by the representation
+         specialization pass. *)
+      if C.specialize_function_argument_representation ~semantic:ctyp1 ~represented:ctyp2 then Some ctyp1
+      else if C.specialize_function_argument_representation ~semantic:ctyp2 ~represented:ctyp1 then Some ctyp2
+      else merge_unifiers kid ctyp1 ctyp2
+    in
+
+    let setup_arg index ctyp generic_dependencies arg =
       let arg_setup, cval, arg_cleanup = compile_arg arg in
       let represented = cval_ctyp cval in
       let semantic = semantic_ctyp_of_arg arg in
+      if
+        (not (ctyp_equal ctyp represented))
+        && C.specialize_function_argument_representation ~semantic:ctyp ~represented
+        && not is_extern
+        && not (position_is_generic generic_dependencies)
+      then concrete_specialization_error l id (`Argument index) ctyp represented;
       let unification_ctyp =
-        (* A backend representation may refine the instantiated argument type
-           even when the source argument itself has already been assigned that
-           representation.  This is notably the case for a statically-sized
-           bitvector passed to a polymorphic bitvector primitive: [semantic]
-           is the native representation, while [ctyp] is still [CT_lbits]. *)
-        if C.representation_refines ~semantic:ctyp ~represented then ctyp
-        else if C.representation_refines ~semantic ~represented then semantic
-        else represented
+        (* Compare function parameters through the backend's semantic view of
+           compatible representations.  The actual argument keeps
+           [represented]; call specialization or [make_calls_precise] handles
+           the representation boundary after unification. *)
+        match C.function_argument_unification_type ~expected:ctyp ~represented with
+        | Some semantic_representation -> semantic_representation
+        | None ->
+            if
+              C.representation_refines ~semantic:ctyp ~represented
+              || C.function_argument_narrowing_allowed ~expected:ctyp ~source:semantic ~represented
+            then ctyp
+            else if C.representation_refines ~semantic ~represented then semantic
+            else represented
       in
-      instantiation := KBindings.union merge_unifiers (ctyp_unify l ctyp unification_ctyp) !instantiation;
+      instantiation := KBindings.union merge_call_unifiers (ctyp_unify l ctyp unification_ctyp) !instantiation;
       setup := List.rev arg_setup @ !setup;
       cleanup := arg_cleanup @ !cleanup;
       cval
     in
 
-    let setup_args = List.map2 setup_arg arg_ctyps args in
+    let setup_args =
+      List.mapi
+        (fun index (ctyp, (generic_dependencies, arg)) -> setup_arg index ctyp generic_dependencies arg)
+        (List.combine arg_ctyps (List.combine generic_signature.generic_parameters args))
+    in
+    let argument_intervals = List.map semantic_interval_of_arg args in
+    let result_interval = source_integer_interval ctx'.local_env ret_typ in
 
     let call_id = Option.value ~default:id override_id in
 
@@ -715,12 +950,18 @@ module Make (C : CONFIG) = struct
       (fun clexp ->
         let represented = clexp_ctyp clexp in
         let semantic = subst_poly !instantiation ret_ctyp in
+        if
+          (not (ctyp_equal semantic represented))
+          && C.specialize_function_result_representation ~semantic ~represented
+          && not is_extern
+          && not (position_is_generic generic_signature.generic_result)
+        then concrete_specialization_error l id `Result semantic represented;
         let instantiation =
           if C.representation_refines ~semantic ~represented then !instantiation
-          else KBindings.union merge_unifiers (ctyp_unify l ret_ctyp represented) !instantiation
+          else KBindings.union merge_call_unifiers (ctyp_unify l ret_ctyp represented) !instantiation
         in
         let ctyp_args = List.map (fun v -> KBindings.find v instantiation) params in
-        ifuncall l clexp (call_id, ctyp_args) setup_args
+        ifuncall_with_bounds l (argument_intervals, result_interval) clexp (call_id, ctyp_args) setup_args
       )
       (* iblock1 (optimize_call l ctx clexp (id, KBindings.bindings unifiers |> List.map snd) setup_args arg_ctyps ret_ctyp) *),
       !cleanup
@@ -729,6 +970,7 @@ module Make (C : CONFIG) = struct
   let compile_funcall ?override_id l ctx id args =
     compile_funcall_with ?override_id l ctx id (compile_aval l ctx)
       (fun arg -> ctyp_of_typ ctx (aval_typ arg))
+      (fun arg -> source_integer_interval ctx.local_env (aval_typ arg))
       args
 
   let compile_extern l ctx id args return_ctyp =
@@ -744,7 +986,58 @@ module Make (C : CONFIG) = struct
 
     let setup_args = List.map setup_arg args in
 
-    (List.rev !setup, (fun clexp -> iextern ?return_ctyp l clexp (id, []) setup_args), !cleanup)
+    let proven_native_op =
+      match string_of_id id with
+      | "__sail_proven_native_add" -> Some Proven_iadd
+      | "__sail_proven_native_sub" -> Some Proven_isub
+      | "__sail_proven_native_mul" -> Some Proven_imul
+      | "__sail_proven_native_div" -> Some Proven_idiv
+      | "__sail_proven_native_mod" -> Some Proven_imod
+      | _ -> None
+    in
+    let compile_call clexp =
+      let operation_representation =
+        match (clexp_ctyp clexp, return_ctyp) with
+        | ((CT_fint width | CT_fuint width) as represented), _ when width <= 128 -> Some represented
+        | _, Some ((CT_fint width | CT_fuint width) as represented) when width <= 128 -> Some represented
+        | _ -> None
+      in
+      match (proven_native_op, operation_representation, setup_args) with
+      | Some op, Some represented, [left; right] ->
+          (* The ANF optimizer emits this marker only after proving that both
+             operands and the result fit [represented].  Promote before the
+             operation so mixed-width arithmetic has the selected lifetime
+             representation at the operation itself: assigning the result of
+             uint64_t subtraction to __int128 afterwards would be too late. *)
+          let promote cval =
+            if ctyp_equal (cval_ctyp cval) represented then ([], cval, [])
+            else (
+              let promoted = ngensym ~source_name:"integer_operand" ~source_type:(string_of_ctyp represented) () in
+              ( [idecl l represented promoted; icopy l (CL_id (promoted, represented)) cval],
+                V_id (promoted, represented),
+                [iclear represented promoted]
+              )
+            )
+          in
+          let left_setup, left, left_cleanup = promote left in
+          let right_setup, right, right_cleanup = promote right in
+          let operation = V_call (op, [left; right]) in
+          let operation_instrs =
+            if ctyp_equal (clexp_ctyp clexp) represented then [icopy l clexp operation]
+            else (
+              let result = ngensym ~source_name:"integer_result" ~source_type:(string_of_ctyp represented) () in
+              [
+                idecl l represented result;
+                icopy l (CL_id (result, represented)) operation;
+                icopy l clexp (V_id (result, represented));
+                iclear represented result;
+              ]
+            )
+          in
+          iblock (left_setup @ right_setup @ operation_instrs @ right_cleanup @ left_cleanup)
+      | _ -> iextern ?return_ctyp l clexp (id, []) setup_args
+    in
+    (List.rev !setup, compile_call, !cleanup)
 
   let select_abstract l ctx string_id f =
     let rec if_chain = function [] -> [] | [(_, e)] -> e | (i, t) :: e -> [iif l i t (if_chain e)] in
@@ -904,7 +1197,8 @@ module Make (C : CONFIG) = struct
                 in
                 let setup, call, cleanup = extract ctor_json ctyp in
                 let ctor_setup, ctor_call, ctor_cleanup =
-                  compile_funcall_with l ctx ctor_id (fun cval -> ([], cval, [])) cval_ctyp [V_id (value, ctyp)]
+                  compile_funcall_with l ctx ctor_id (fun cval -> ([], cval, [])) cval_ctyp (fun _ -> None)
+                    [V_id (value, ctyp)]
                 in
                 let extract =
                   [
@@ -1260,14 +1554,12 @@ module Make (C : CONFIG) = struct
     match aval with
     | AV_cval (cval, _) -> cval_ctyp cval
     | AV_id (id, typ) -> (
-        match get_variable_ctyp id ctx with
-        | Some (_, ctyp) -> ctyp
-        | None -> ctyp_of_typ ctx (lvar_typ typ)
+        match get_variable_ctyp id ctx with Some (_, ctyp) -> ctyp | None -> ctyp_of_typ ctx (lvar_typ typ)
       )
     | _ -> ctyp_of_typ ctx (aval_typ aval)
 
   let external_call_id ctx = function
-    | Sail_function id when ctx_is_extern id ctx -> Some (mk_id (ctx_get_extern id ctx))
+    | Sail_function id -> Some (if ctx_is_extern id ctx then mk_id (ctx_get_extern id ctx) else id)
     | Pure_extern (id, _) | Extern (id, _) -> Some id
     | _ -> None
 
@@ -1278,8 +1570,8 @@ module Make (C : CONFIG) = struct
 
   let rec demanded_newtype_representation env binding_id semantic = function
     | AE_aux (AE_typ (body, _), _) -> demanded_newtype_representation env binding_id semantic body
-    | AE_aux (AE_app (Newtype_wrapper wrapper_id, [AV_id (body_id, _)], _), _)
-      when Name.compare binding_id body_id = 0 ->
+    | AE_aux (AE_app (Newtype_wrapper wrapper_id, [AV_id (body_id, _)], _), _) when Name.compare binding_id body_id = 0
+      ->
         let newtype_id = newtype_id_of_wrapper env wrapper_id in
         let represented = C.specialize_newtype_payload newtype_id semantic in
         if C.propagate_newtype_payload_representation newtype_id ~semantic ~represented then Some represented else None
@@ -1296,20 +1588,24 @@ module Make (C : CONFIG) = struct
     | AE_let (mut, id, binding_typ, binding, (AE_aux (_, { env = body_env; _ }) as body), body_typ) ->
         let semantic_binding_ctyp = ctyp_of_typ { ctx with local_env = body_env } binding_typ in
         let binding_ctyp =
-          match demanded_newtype_representation body_env id semantic_binding_ctyp body with
-          | Some represented -> represented
-          | None -> (
-          match (semantic_binding_ctyp, binding) with
-          | semantic, AE_aux (AE_val aval, _) ->
-              let represented = represented_aval_ctyp ctx aval in
-              if C.representation_refines ~semantic ~represented then represented else semantic
-          | semantic, AE_aux (AE_app (call, args, _), _) -> (
-              match external_call_id ctx call with
-              | Some id -> C.specialize_call_result id (List.map (represented_aval_ctyp ctx) args) semantic
-              | None -> semantic
+          match mut with
+          | Mutable -> semantic_binding_ctyp
+          | Immutable -> (
+              match demanded_newtype_representation body_env id semantic_binding_ctyp body with
+              | Some represented -> represented
+              | None -> (
+                  match (semantic_binding_ctyp, binding) with
+                  | semantic, AE_aux (AE_val aval, _) ->
+                      let represented = represented_aval_ctyp ctx aval in
+                      if C.representation_refines ~semantic ~represented then represented else semantic
+                  | semantic, AE_aux (AE_app (call, args, _), _) -> (
+                      match external_call_id ctx call with
+                      | Some id -> C.specialize_call_result id (List.map (represented_aval_ctyp ctx) args) semantic
+                      | None -> semantic
+                    )
+                  | _ -> semantic_binding_ctyp
+                )
             )
-          | _ -> semantic_binding_ctyp
-          )
         in
         let setup, call, cleanup = compile_aexp ctx binding in
         let letb_setup, letb_cleanup =
@@ -1770,9 +2066,17 @@ module Make (C : CONFIG) = struct
           AE_aux (AE_val (AV_lit (L_aux (L_num loop_step, _), _)), _),
           Ord_aux (ord, _),
           body
-        )
+      )
       when Option.is_some C.unroll_loops ->
-        let ctx = { ctx with locals = NameMap.add loop_var (Immutable, CT_fint 64) ctx.locals } in
+        let literal_fits_int64 value =
+          Big_int.less_equal (min_int 64) value && Big_int.less_equal value (max_int 64)
+        in
+        let loop_ctyp =
+          if literal_fits_int64 loop_from && literal_fits_int64 loop_to && literal_fits_int64 loop_step then
+            CT_fint 64
+          else CT_lint
+        in
+        let ctx = { ctx with locals = NameMap.add loop_var (Immutable, loop_ctyp) ctx.locals } in
 
         let is_inc = match ord with Ord_inc -> true | Ord_dec -> false in
 
@@ -1781,7 +2085,7 @@ module Make (C : CONFIG) = struct
 
         let loop_iteration i =
           let loop_body () =
-            [icopy l (CL_id (loop_var, CT_fint 64)) (V_lit (VL_int i, CT_fint 64))]
+            [icopy l (CL_id (loop_var, loop_ctyp)) (V_lit (VL_int i, loop_ctyp))]
             @ body_setup
             @ [body_call (CL_id (body_gs, CT_unit))]
             @ body_cleanup
@@ -1795,13 +2099,17 @@ module Make (C : CONFIG) = struct
           match loop_iteration i with None -> List.rev acc | Some (next, instr) -> unroll (instr :: acc) next
         in
 
-        ( [idecl l (CT_fint 64) loop_var; idecl l CT_unit body_gs] @ unroll [] loop_from,
+        ( [idecl l loop_ctyp loop_var; idecl l CT_unit body_gs] @ unroll [] loop_from,
           (fun clexp -> icopy l clexp unit_cval),
           []
         )
     | AE_for (loop_var, loop_from, loop_to, loop_step, Ord_aux (ord, _), body) ->
-        (* We assume that all loop indices are safe to put in a CT_fint. *)
-        let ctx = { ctx with locals = NameMap.add loop_var (Immutable, CT_fint 64) ctx.locals } in
+        let loop_ctyp =
+          if foreach_int64_proven ctx.local_env (aexp_typ loop_from) (aexp_typ loop_to) (aexp_typ loop_step) ord then
+            CT_fint 64
+          else CT_lint
+        in
+        let ctx = { ctx with locals = NameMap.add loop_var (Immutable, loop_ctyp) ctx.locals } in
 
         let is_inc = match ord with Ord_inc -> true | Ord_dec -> false in
 
@@ -1813,7 +2121,7 @@ module Make (C : CONFIG) = struct
         let step_setup, step_call, step_cleanup = compile_aexp ctx loop_step in
         let step_gs = ngensym () in
         let variable_init gs setup call cleanup =
-          [idecl l (CT_fint 64) gs; iblock (setup @ [call (CL_id (gs, CT_fint 64))] @ cleanup)]
+          [idecl l loop_ctyp gs; iblock (setup @ [call (CL_id (gs, loop_ctyp))] @ cleanup)]
         in
 
         let loop_start_label = label "for_start_" in
@@ -1827,7 +2135,7 @@ module Make (C : CONFIG) = struct
               iblock
                 ([
                    ijump l
-                     (V_call ((if is_inc then Igt else Ilt), [V_id (loop_var, CT_fint 64); V_id (to_gs, CT_fint 64)]))
+                     (V_call ((if is_inc then Igt else Ilt), [V_id (loop_var, loop_ctyp); V_id (to_gs, loop_ctyp)]))
                      loop_end_label;
                  ]
                 @ body_setup
@@ -1835,9 +2143,15 @@ module Make (C : CONFIG) = struct
                 @ body_cleanup
                 @ [
                     icopy l
-                      (CL_id (loop_var, CT_fint 64))
+                      (CL_id (loop_var, loop_ctyp))
                       (V_call
-                         ((if is_inc then Iadd else Isub), [V_id (loop_var, CT_fint 64); V_id (step_gs, CT_fint 64)])
+                         ( (if ctyp_equal loop_ctyp (CT_fint 64) then
+                              if is_inc then Proven_iadd else Proven_isub
+                            else if is_inc then Iadd
+                            else Isub
+                           ),
+                           [V_id (loop_var, loop_ctyp); V_id (step_gs, loop_ctyp)]
+                         )
                       );
                   ]
                 @ continue ()
@@ -1865,8 +2179,8 @@ module Make (C : CONFIG) = struct
           @ [
               iblock
                 ([
-                   idecl l (CT_fint 64) loop_var;
-                   icopy l (CL_id (loop_var, CT_fint 64)) (V_id (from_gs, CT_fint 64));
+                   idecl l loop_ctyp loop_var;
+                   icopy l (CL_id (loop_var, loop_ctyp)) (V_id (from_gs, loop_ctyp));
                    idecl l CT_unit body_gs;
                  ]
                 @ body
@@ -2055,19 +2369,21 @@ module Make (C : CONFIG) = struct
     fix_exception_block ~return ctx instrs
 
   let rec compile_arg_pat ctx label (P_aux (p_aux, (l, _)) as pat) ctyp =
+    let source_type = string_of_typ (typ_of_pat pat) in
+    let destructured_arg_name () = match IdSet.elements (pat_ids pat) with [id] -> string_of_id id | _ -> "arg" in
     match p_aux with
     | P_id id -> (name id, ([], []), ctx)
     | P_wild ->
-        let gs = ngensym () in
+        let gs = ngensym ~source_name:"unused" ~source_type () in
         (gs, ([], []), ctx)
     | P_tuple [] | P_lit (L_aux (L_unit, _)) ->
-        let gs = ngensym () in
+        let gs = ngensym ~source_name:"unused" ~source_type () in
         (gs, ([], []), ctx)
     | P_var (pat, _) -> compile_arg_pat ctx label pat ctyp
     | P_typ (_, pat) -> compile_arg_pat ctx label pat ctyp
     | _ ->
         let apat = anf_pat pat in
-        let gs = ngensym () in
+        let gs = ngensym ~source_name:(destructured_arg_name ()) ~source_type () in
         let pre_destructure, destructure, cleanup, ctx = compile_match ctx apat (V_id (gs, ctyp)) label in
         (gs, (pre_destructure @ destructure, cleanup), ctx)
 
@@ -2089,7 +2405,11 @@ module Make (C : CONFIG) = struct
         ([], [(arg_id, destructure)], [], ctx)
     | _ ->
         let arg_id, (destructure, cleanup), ctx = compile_arg_pat ctx label pat (CT_tup ctyps) in
-        let new_ids = List.map (fun ctyp -> (ngensym (), ctyp)) ctyps in
+        let new_ids =
+          List.mapi
+            (fun i ctyp -> (ngensym ~source_name:("arg_" ^ string_of_int i) ~source_type:(string_of_ctyp ctyp) (), ctyp))
+            ctyps
+        in
         ( destructure
           @ [idecl l (CT_tup ctyps) arg_id]
           @ List.mapi
@@ -2155,16 +2475,15 @@ module Make (C : CONFIG) = struct
 
   (** This pass ensures that all variables created by I_decl have unique names *)
   let unique_names =
-    let unique_counter = ref 0 in
-    let unique_id () =
-      let id = mk_id ("u#" ^ string_of_int !unique_counter) in
-      incr unique_counter;
-      name id
+    let unique_id ctyp = function
+      | Name (id, _) -> ngensym ~source_name:(string_of_id id) ~source_type:(string_of_ctyp ctyp) ()
+      | Gen (_, _, _, source_name, source_type) -> ngensym ?source_name ?source_type ()
+      | _ -> ngensym ~source_name:"value" ~source_type:(string_of_ctyp ctyp) ()
     in
 
     let rec opt seen = function
       | I_aux (I_decl (ctyp, id), aux) :: instrs when NameSet.mem id seen ->
-          let id' = unique_id () in
+          let id' = unique_id ctyp id in
           let instrs', seen = opt seen instrs in
           (I_aux (I_decl (ctyp, id'), aux) :: instrs_rename id id' instrs', seen)
       | I_aux (I_decl (ctyp, id), aux) :: instrs ->
@@ -2350,7 +2669,7 @@ module Make (C : CONFIG) = struct
             let guard_aexp = C.optimize_anf ctx (no_shadow known_ids guard) in
             let guard_setup, guard_call, guard_cleanup = compile_aexp ctx guard_aexp in
             let guard_label = label "guard_" in
-            let gs = ngensym () in
+            let gs = ngensym ~source_name:"guard" ~source_type:(string_of_typ bool_typ) () in
             [
               iblock
                 ([idecl l CT_bool gs]
@@ -2468,12 +2787,14 @@ module Make (C : CONFIG) = struct
         let arg_typs, ret_typ =
           match fn_typ with Typ_fn (arg_typs, ret_typ) -> (arg_typs, ret_typ) | _ -> assert false
         in
+        let generic_signature = generic_signature quant arg_typs ret_typ in
         let ctx' = { ctx with local_env = Env.add_typquant (id_loc id) quant ctx.local_env } in
         let arg_ctyps, ret_ctyp = (List.map (ctyp_of_typ ctx') arg_typs, ctyp_of_typ ctx' ret_typ) in
         ( Compiled [CDEF_aux (CDEF_val (id, params, arg_ctyps, ret_ctyp, extern), def_annot)],
           {
             ctx with
             valspecs = Bindings.add id (extern, arg_ctyps, ret_ctyp, uannot_of_def_annot def_annot) ctx.valspecs;
+            generic_signatures = Bindings.add id generic_signature ctx.generic_signatures;
           }
         )
     | DEF_fundef (FD_aux (FD_function (_, _, [FCL_aux (FCL_funcl (id, pexp), _)]), _)) -> (
@@ -2499,7 +2820,7 @@ module Make (C : CONFIG) = struct
         let aexp = C.optimize_anf ctx (no_shadow (letbind_ids ctx) (anf exp)) in
         let setup, call, cleanup = compile_aexp ctx aexp in
         let apat = anf_pat ~global:true pat in
-        let gs = ngensym () in
+        let gs = ngensym ~source_name:"let_value" ~source_type:(string_of_typ (typ_of_pat pat)) () in
         let end_label = label "let_end_" in
         let pre_destructure, destructure, destructure_cleanup, _ =
           compile_match ctx apat (V_id (gs, ctyp)) (fun l b -> ijump l b end_label)
@@ -2628,14 +2949,23 @@ module Make (C : CONFIG) = struct
               (CTListSet.elements (Bindings.find id !monomorphic_calls))
           in
           let ctx =
+            let source_generic_signature = Bindings.find_opt id ctx.generic_signatures in
             List.fold_left
               (fun ctx cdef ->
                 match cdef with
-                | CDEF_aux (CDEF_val (id, _, param_ctyps, ret_ctyp, _), def_annot) ->
+                | CDEF_aux (CDEF_val (specialized_id, _, param_ctyps, ret_ctyp, _), def_annot) ->
+                    let generic_signatures =
+                      match source_generic_signature with
+                      | Some signature -> Bindings.add specialized_id signature ctx.generic_signatures
+                      | None -> ctx.generic_signatures
+                    in
                     {
                       ctx with
                       valspecs =
-                        Bindings.add id (extern, param_ctyps, ret_ctyp, uannot_of_def_annot def_annot) ctx.valspecs;
+                        Bindings.add specialized_id
+                          (extern, param_ctyps, ret_ctyp, uannot_of_def_annot def_annot)
+                          ctx.valspecs;
+                      generic_signatures;
                     }
                 | cdef -> ctx
               )
@@ -2700,6 +3030,1319 @@ module Make (C : CONFIG) = struct
     (* If we have removed all the polymorphic functions we are done, otherwise go again *)
     if IdSet.is_empty (IdSet.diff polymorphic_functions unreachable_polymorphic_functions) then (cdefs, ctx)
     else specialize_functions ~specialized_calls ctx cdefs
+
+  let string_of_integer_interval = function
+    | None -> "?"
+    | Some (lower, upper) -> Big_int.to_string lower ^ ".." ^ Big_int.to_string upper
+
+  let mangle_representation_id id ctx ctyps (argument_intervals, result_interval) =
+    let representation =
+      append_id id ("<repr:" ^ Util.string_of_list "," (mangle_string_of_ctyp ctx) ctyps ^ ">")
+    in
+    let interval_key =
+      Util.string_of_list "," string_of_integer_interval (argument_intervals @ [result_interval])
+      |> Digest.string |> Digest.to_hex
+    in
+    append_id representation ("<bounds:" ^ interval_key ^ ">")
+
+  type integer_lifetime = Lifetime_bottom | Lifetime_range of Big_int.num * Big_int.num | Lifetime_top
+
+  let integer_lifetime_equal left right =
+    match (left, right) with
+    | Lifetime_bottom, Lifetime_bottom | Lifetime_top, Lifetime_top -> true
+    | Lifetime_range (left_lower, left_upper), Lifetime_range (right_lower, right_upper) ->
+        Big_int.equal left_lower right_lower && Big_int.equal left_upper right_upper
+    | _ -> false
+
+  let join_integer_lifetime left right =
+    match (left, right) with
+    | Lifetime_top, _ | _, Lifetime_top -> Lifetime_top
+    | Lifetime_bottom, range | range, Lifetime_bottom -> range
+    | Lifetime_range (left_lower, left_upper), Lifetime_range (right_lower, right_upper) ->
+        Lifetime_range (Big_int.min left_lower right_lower, Big_int.max left_upper right_upper)
+
+  let integer_lifetime_binary operation left right =
+    match (left, right) with
+    | Lifetime_bottom, _ | _, Lifetime_bottom -> Lifetime_bottom
+    | Lifetime_top, _ | _, Lifetime_top -> Lifetime_top
+    | Lifetime_range (left_lower, left_upper), Lifetime_range (right_lower, right_upper) -> operation left_lower
+        left_upper right_lower right_upper
+
+  let lifetime_add =
+    integer_lifetime_binary (fun left_lower left_upper right_lower right_upper ->
+        Lifetime_range (Big_int.add left_lower right_lower, Big_int.add left_upper right_upper)
+    )
+
+  let lifetime_sub =
+    integer_lifetime_binary (fun left_lower left_upper right_lower right_upper ->
+        Lifetime_range (Big_int.sub left_lower right_upper, Big_int.sub left_upper right_lower)
+    )
+
+  let lifetime_mul =
+    integer_lifetime_binary (fun left_lower left_upper right_lower right_upper ->
+        let products =
+          [
+            Big_int.mul left_lower right_lower;
+            Big_int.mul left_lower right_upper;
+            Big_int.mul left_upper right_lower;
+            Big_int.mul left_upper right_upper;
+          ]
+        in
+        let lower = List.fold_left Big_int.min (List.hd products) (List.tl products) in
+        let upper = List.fold_left Big_int.max (List.hd products) (List.tl products) in
+        Lifetime_range (lower, upper)
+    )
+
+  let truncating_div numerator denominator =
+    let negative = Big_int.less numerator Big_int.zero <> Big_int.less denominator Big_int.zero in
+    let absolute value = if Big_int.less value Big_int.zero then Big_int.negate value else value in
+    let quotient = Big_int.div (absolute numerator) (absolute denominator) in
+    if negative then Big_int.negate quotient else quotient
+
+  let lifetime_div =
+    integer_lifetime_binary (fun left_lower left_upper right_lower right_upper ->
+        if Big_int.less_equal right_lower Big_int.zero && Big_int.less_equal Big_int.zero right_upper then Lifetime_top
+        else
+          let quotients =
+            [
+              truncating_div left_lower right_lower;
+              truncating_div left_lower right_upper;
+              truncating_div left_upper right_lower;
+              truncating_div left_upper right_upper;
+            ]
+          in
+          let lower = List.fold_left Big_int.min (List.hd quotients) (List.tl quotients) in
+          let upper = List.fold_left Big_int.max (List.hd quotients) (List.tl quotients) in
+          Lifetime_range (lower, upper)
+    )
+
+  let lifetime_mod =
+    integer_lifetime_binary (fun left_lower left_upper right_lower right_upper ->
+        if Big_int.less_equal right_lower Big_int.zero && Big_int.less_equal Big_int.zero right_upper then Lifetime_top
+        else
+          let absolute value = if Big_int.less value Big_int.zero then Big_int.negate value else value in
+          let maximum_divisor = Big_int.max (absolute right_lower) (absolute right_upper) in
+          let magnitude = Big_int.pred maximum_divisor in
+          if Big_int.less_equal Big_int.zero left_lower then
+            Lifetime_range (Big_int.zero, Big_int.min left_upper magnitude)
+          else if Big_int.less_equal left_upper Big_int.zero then
+            Lifetime_range (Big_int.max left_lower (Big_int.negate magnitude), Big_int.zero)
+          else Lifetime_range (Big_int.negate magnitude, magnitude)
+    )
+
+  let ctyp_integer_lifetime ctyp =
+    let unsigned_max width = Big_int.pred (Big_int.pow_int_positive 2 width) in
+    match C.integer_representation_bounds ctyp with
+    | Some (lower, upper) -> Lifetime_range (lower, upper)
+    | None -> (
+        match ctyp with
+        | CT_fbits width | CT_sbits width -> Lifetime_range (Big_int.zero, unsigned_max width)
+        | CT_constant value -> Lifetime_range (value, value)
+        | _ -> Lifetime_top
+      )
+
+  let represented_integer_lifetime ctx = function
+    | Lifetime_range (lower, upper) ->
+        let represented = C.convert_typ ctx (range_typ (nconstant lower) (nconstant upper)) in
+        if C.specialize_function_body_representation ~semantic:CT_lint ~represented then Some represented else None
+    | Lifetime_bottom | Lifetime_top -> None
+
+  let integer_lifetime_interval = function
+    | Lifetime_range (lower, upper) -> Some (lower, upper)
+    | Lifetime_bottom | Lifetime_top -> None
+
+  let rec cval_integer_lifetime ranges = function
+    | V_id (name, ctyp) -> (
+        match NameMap.find_opt name ranges with
+        | Some Lifetime_bottom | None -> ctyp_integer_lifetime ctyp
+        | Some range -> range
+      )
+    | V_lit (VL_int value, _) -> Lifetime_range (value, value)
+    | V_call (op, [left; right]) as call -> (
+        let left = cval_integer_lifetime ranges left in
+        let right = cval_integer_lifetime ranges right in
+        match op with
+        | Iadd | Proven_iadd -> lifetime_add left right
+        | Isub | Proven_isub -> lifetime_sub left right
+        | Imul | Proven_imul -> lifetime_mul left right
+        | Idiv | Proven_idiv -> lifetime_div left right
+        | Imod | Proven_imod -> lifetime_mod left right
+        | _ -> ctyp_integer_lifetime (cval_ctyp call)
+      )
+    | cval -> ctyp_integer_lifetime (cval_ctyp cval)
+
+  let integer_primitive_name ctx id =
+    let name =
+      match Bindings.find_opt id ctx.valspecs with
+      | Some (Some external_name, _, _, _) -> external_name
+      | _ -> string_of_id id
+    in
+    match name with
+    | "add_int" | "add_atom" | "__sail_proven_native_add" -> Some `Add
+    | "sub_int" | "sub_atom" | "__sail_proven_native_sub" -> Some `Sub
+    | "mult_int" | "mult_atom" | "__sail_proven_native_mul" -> Some `Mul
+    | "tdiv_int" | "tdiv_nat" | "__sail_proven_native_div" -> Some `Div
+    | "tmod_int" | "tmod_nat" | "__sail_proven_native_mod" -> Some `Mod
+    | _ -> None
+
+  let integer_comparison_name ctx id =
+    let name =
+      match Bindings.find_opt id ctx.valspecs with
+      | Some (Some external_name, _, _, _) -> external_name
+      | _ -> string_of_id id
+    in
+    match name with
+    | "eq_int" -> Some Eq
+    | "neq_int" -> Some Neq
+    | "lt" | "lt_int" -> Some Ilt
+    | "gt" | "gt_int" -> Some Igt
+    | "lteq" | "lteq_int" -> Some Ilteq
+    | "gteq" | "gteq_int" -> Some Igteq
+    | _ -> None
+
+  let constant_integer_comparison comparison left right =
+    match (left, right) with
+    | Lifetime_range (left_lower, left_upper), Lifetime_range (right_lower, right_upper) -> (
+        let singleton lower upper = Big_int.equal lower upper in
+        match comparison with
+        | Eq ->
+            if Big_int.less left_upper right_lower || Big_int.less right_upper left_lower then Some false
+            else if
+              singleton left_lower left_upper
+              && singleton right_lower right_upper
+              && Big_int.equal left_lower right_lower
+            then Some true
+            else None
+        | Neq ->
+            if Big_int.less left_upper right_lower || Big_int.less right_upper left_lower then Some true
+            else if
+              singleton left_lower left_upper
+              && singleton right_lower right_upper
+              && Big_int.equal left_lower right_lower
+            then Some false
+            else None
+        | Ilt ->
+            if Big_int.less left_upper right_lower then Some true
+            else if Big_int.greater_equal left_lower right_upper then Some false
+            else None
+        | Igt ->
+            if Big_int.greater left_lower right_upper then Some true
+            else if Big_int.less_equal left_upper right_lower then Some false
+            else None
+        | Ilteq ->
+            if Big_int.less_equal left_upper right_lower then Some true
+            else if Big_int.greater left_lower right_upper then Some false
+            else None
+        | Igteq ->
+            if Big_int.greater_equal left_lower right_upper then Some true
+            else if Big_int.less left_upper right_lower then Some false
+            else None
+        | _ -> None
+      )
+    | Lifetime_bottom, _ | _, Lifetime_bottom | Lifetime_top, _ | _, Lifetime_top -> None
+
+  let integer_primitive_operation_lifetime primitive =
+    match primitive with
+    | `Add -> lifetime_add
+    | `Sub -> lifetime_sub
+    | `Mul -> lifetime_mul
+    | `Div -> lifetime_div
+    | `Mod -> lifetime_mod
+
+  let integer_primitive_carrier_lifetime primitive left right =
+    let result = integer_primitive_operation_lifetime primitive left right in
+    join_integer_lifetime result (join_integer_lifetime left right)
+
+  let infer_integer_lifetimes ctx function_id params actual_ctyps actual_intervals body =
+    let ranges = ref NameMap.empty in
+    let writes = ref NameMap.empty in
+    let changed = ref false in
+    let widening_count = ref NameMap.empty in
+    let expanded_this_pass = ref NameSet.empty in
+    let is_register = function
+      | Name (id, _) -> Bindings.mem id ctx.registers
+      | _ -> false
+    in
+    let note_variable name ctyp =
+      if not (is_register name) then (
+        if not (NameMap.mem name !ranges) then (
+          ranges := NameMap.add name Lifetime_bottom !ranges
+        );
+        if not (NameMap.mem name !writes) then writes := NameMap.add name ctyp !writes
+      )
+    in
+    let rec collect_instr (I_aux (instr, _)) =
+      match instr with
+      | I_decl (ctyp, name) | I_init (ctyp, name, _) | I_reinit (ctyp, name, _) | I_reset (ctyp, name) ->
+          note_variable name ctyp
+      | I_copy (CL_id (name, ctyp), _) -> note_variable name ctyp
+      | I_funcall (CR_one (CL_id (name, ctyp)), _, _, _) -> note_variable name ctyp
+      | I_if (_, then_instrs, else_instrs) -> List.iter collect_instr then_instrs; List.iter collect_instr else_instrs
+      | I_block instrs | I_try_block instrs -> List.iter collect_instr instrs
+      | _ -> ()
+    in
+    List.iter collect_instr body;
+    List.iter2
+      (fun (param, ctyp) interval ->
+        note_variable param ctyp;
+        let lifetime =
+          match interval with Some (lower, upper) -> Lifetime_range (lower, upper) | None -> ctyp_integer_lifetime ctyp
+        in
+        ranges := NameMap.add param lifetime !ranges
+      )
+      (List.combine params actual_ctyps) actual_intervals;
+    let update name value =
+      if not (is_register name) then (
+        let prior =
+          match NameMap.find_opt name !ranges with
+          | Some prior -> prior
+          | None ->
+              Reporting.unreachable Parse_ast.Unknown __POS__
+                (Printf.sprintf "Integer lifetime analysis encountered uncollected variable %s in %s"
+                   (string_of_name name) (string_of_id function_id)
+                )
+        in
+        let joined = join_integer_lifetime prior value in
+        if not (integer_lifetime_equal prior joined) then (
+          (match prior with Lifetime_bottom -> () | _ -> expanded_this_pass := NameSet.add name !expanded_this_pass);
+          ranges := NameMap.add name joined !ranges;
+          changed := true
+        )
+      )
+    in
+    let update_clexp clexp value = match clexp with CL_id (name, _) -> update name value | _ -> () in
+    let primitive_lifetime primitive args =
+      match (primitive, List.map (cval_integer_lifetime !ranges) args) with
+      | `Add, [left; right] -> lifetime_add left right
+      | `Sub, [left; right] -> lifetime_sub left right
+      | `Mul, [left; right] -> lifetime_mul left right
+      | `Div, [left; right] -> lifetime_div left right
+      | `Mod, [left; right] -> lifetime_mod left right
+      | _ -> Lifetime_top
+    in
+    let assigned_integer_lifetime destination_ctyp value =
+      match (destination_ctyp, value) with
+      | CT_lint, V_lit (VL_string literal, CT_string) -> (
+          (* Large mathematical-integer literals are lowered through a decimal
+             string because the ordinary C runtime initializes [sail_int]
+             values with GMP.  Recover the source literal here so lifetime
+             specialization can select a proved fixed-width representation
+             before the backend emits that runtime initialization. *)
+          match Sail_lib.int_of_string_opt literal with
+          | Some value -> Lifetime_range (value, value)
+          | None -> Lifetime_top
+        )
+      | _ -> cval_integer_lifetime !ranges value
+    in
+    let rec analyze_instr (I_aux (instr, _)) =
+      match instr with
+      | I_init (ctyp, name, Init_cval value) | I_reinit (ctyp, name, value) ->
+          let lifetime = assigned_integer_lifetime ctyp value in
+          update name lifetime
+      | I_copy (clexp, value) ->
+          let lifetime = assigned_integer_lifetime (clexp_ctyp clexp) value in
+          update_clexp clexp lifetime
+      | I_funcall (CR_one clexp, Call (_, result_interval), (id, _), args) -> (
+          match integer_primitive_name ctx id with
+          | Some primitive -> update_clexp clexp (primitive_lifetime primitive args)
+          | None ->
+              update_clexp clexp
+                (match result_interval with
+                | Some (lower, upper) -> Lifetime_range (lower, upper)
+                | None -> ctyp_integer_lifetime (clexp_ctyp clexp)
+                )
+        )
+      | I_funcall (CR_one clexp, _, _, _) -> update_clexp clexp (ctyp_integer_lifetime (clexp_ctyp clexp))
+      | I_if (_, then_instrs, else_instrs) -> List.iter analyze_instr then_instrs; List.iter analyze_instr else_instrs
+      | I_block instrs | I_try_block instrs -> List.iter analyze_instr instrs
+      | _ -> ()
+    in
+    changed := true;
+    let pass = ref 0 in
+    while !changed do
+      incr pass;
+      changed := false;
+      expanded_this_pass := NameSet.empty;
+      List.iter analyze_instr body;
+      (* A loop-carried mathematical integer without a source-level ceiling can
+         otherwise grow by one arithmetic step on every whole-function pass.
+         That is neither a proof of a finite native representation nor a useful
+         fixed point.  Widen after a few genuine cross-pass expansions; values
+         whose dependent Sail types or call bounds provide a ceiling converge
+         before this point, while unresolved recurrences conservatively remain
+         [sail_int]. *)
+      NameSet.iter
+        (fun name ->
+          let count = Option.value ~default:0 (NameMap.find_opt name !widening_count) + 1 in
+          widening_count := NameMap.add name count !widening_count;
+          if count >= 4 then ranges := NameMap.add name Lifetime_top !ranges
+        )
+        !expanded_this_pass;
+      if
+        !opt_debug_function_representations
+        && (!pass <= 10 || !pass mod 100 = 0)
+      then
+        Printf.eprintf
+          "C representation specialization: lifetime function=%s pass=%d values=%d expanded=%d changed=%b\n%!"
+          (string_of_id function_id) !pass (NameMap.cardinal !ranges) (NameSet.cardinal !expanded_this_pass) !changed
+    done;
+    (!ranges, !writes)
+
+  class specialize_parameter_representations replacements semantic_ret_ctyp represented_ret_ctyp =
+    let representation_for = function
+      | Return _ -> Some represented_ret_ctyp
+      | name -> NameMap.find_opt name replacements
+    in
+    object
+      inherit empty_jib_visitor
+
+      method! vctyp _ = SkipChildren
+
+      method! vcval =
+        function
+        | V_id (name, _) as cval -> (
+            match representation_for name with
+            | Some represented -> ChangeTo (V_id (name, represented))
+            | None -> ChangeTo cval
+          )
+        | _ -> DoChildren
+
+      method! vclexp =
+        function
+        | CL_id (name, _) as clexp -> (
+            match representation_for name with
+            | Some represented -> ChangeTo (CL_id (name, represented))
+            | None -> ChangeTo clexp
+          )
+        | CL_rmw (read, write, _) as clexp -> (
+            match (representation_for read, representation_for write) with
+            | Some read_ctyp, Some write_ctyp when not (ctyp_equal read_ctyp write_ctyp) ->
+                Reporting.unreachable Parse_ast.Unknown __POS__
+                  "Read-modify-write names have different specialized representations"
+            | Some represented, _ | _, Some represented -> ChangeTo (CL_rmw (read, write, represented))
+            | None, None -> ChangeTo clexp
+          )
+        | _ -> DoChildren
+
+      method! vinstr =
+        function
+        | I_aux (I_undefined ctyp, aux) when ctyp_equal ctyp semantic_ret_ctyp ->
+            ChangeTo (I_aux (I_undefined represented_ret_ctyp, aux))
+        | I_aux (I_decl (_, name), aux) as instr -> (
+            match representation_for name with
+            | Some represented -> ChangeTo (I_aux (I_decl (represented, name), aux))
+            | None -> ChangeTo instr
+          )
+        | I_aux (I_init (_, name, init), aux) as instr -> (
+            match representation_for name with
+            | Some represented -> change_do_children (I_aux (I_init (represented, name, init), aux))
+            | None -> change_do_children instr
+          )
+        | I_aux (I_clear (_, name), aux) as instr -> (
+            match representation_for name with
+            | Some represented -> ChangeTo (I_aux (I_clear (represented, name), aux))
+            | None -> ChangeTo instr
+          )
+        | I_aux (I_reset (_, name), aux) as instr -> (
+            match representation_for name with
+            | Some represented -> ChangeTo (I_aux (I_reset (represented, name), aux))
+            | None -> ChangeTo instr
+          )
+        | I_aux (I_reinit (_, name, cval), aux) as instr -> (
+            match representation_for name with
+            | Some represented -> change_do_children (I_aux (I_reinit (represented, name, cval), aux))
+            | None -> change_do_children instr
+          )
+        | _ -> DoChildren
+    end
+
+  (* Keep native subtype representations across ordinary local function
+     boundaries by cloning only the signatures that are actually called.  A
+     clone is derived from the canonical JIB body, and calls discovered in the
+     clone enqueue further clones, so representation specialization propagates
+     transitively without duplicating Sail source. *)
+  let specialize_function_representations ctx cdefs =
+    let valspecs =
+      List.fold_left
+        (fun specs -> function
+          | CDEF_aux (CDEF_val (id, tyargs, param_ctyps, ret_ctyp, extern), def_annot) ->
+              Bindings.add id (tyargs, param_ctyps, ret_ctyp, extern, def_annot) specs
+          | _ -> specs
+          )
+        Bindings.empty cdefs
+    in
+    (* A representation-specific implementation may also match the canonical
+       function ABI exactly.  Such a function does not create a clone demand,
+       because none of its parameter or result representations differ.  Give
+       the backend the same single-source selection opportunity here that it
+       receives for generated representation clones below. *)
+    let cdefs =
+      List.map
+        (function
+          | CDEF_aux (CDEF_fundef (id, heap_return, params, _), fundef_annot) as cdef -> (
+              match Bindings.find_opt id valspecs with
+              | Some ([], param_ctyps, ret_ctyp, None, _) -> (
+                  match C.specialized_function_external id param_ctyps ret_ctyp with
+                  | Some external_id ->
+                      if List.compare_lengths params param_ctyps <> 0 then
+                        Reporting.unreachable (id_loc id) __POS__
+                          ("Function parameters do not match valspec for " ^ string_of_id id);
+                      let l = id_loc id in
+                      let args = List.map2 (fun param ctyp -> V_id (param, ctyp)) params param_ctyps in
+                      let call =
+                        match ifuncall l (CL_id (return, ret_ctyp)) (external_id, []) args with
+                        | I_aux (I_funcall (creturn, _, fn, call_args), aux) ->
+                            I_aux (I_funcall (creturn, Extern ret_ctyp, fn, call_args), aux)
+                        | _ -> assert false
+                      in
+                      CDEF_aux (CDEF_fundef (id, heap_return, params, [call; iend l]), fundef_annot)
+                  | None -> cdef
+                )
+              | _ -> cdef
+            )
+          | cdef -> cdef
+          )
+        cdefs
+    in
+    let fundefs =
+      List.fold_left
+        (fun fundefs -> function
+          | CDEF_aux (CDEF_fundef (id, heap_return, params, body), def_annot) ->
+              Bindings.add id (heap_return, params, body, def_annot) fundefs
+          | _ -> fundefs
+          )
+        Bindings.empty cdefs
+    in
+    let generic_signature_for id parameter_count =
+      match Bindings.find_opt id ctx.generic_signatures with
+      | Some signature when List.length signature.generic_parameters = parameter_count ->
+          signature
+      | Some _ ->
+          Reporting.unreachable (id_loc id) __POS__
+            ("Generic-signature arity mismatch for " ^ string_of_id id)
+      | None ->
+          {
+            generic_parameters = List.init parameter_count (fun _ -> KidSet.empty);
+            generic_result = KidSet.empty;
+          }
+    in
+    let function_body_representation_pairs param_ctyps ret_ctyp actual_ctyps actual_ret_ctyp =
+      let result_specializes_body =
+        (not (ctyp_equal ret_ctyp actual_ret_ctyp))
+        && C.specialize_function_body_representation ~semantic:ret_ctyp ~represented:actual_ret_ctyp
+      in
+      if result_specializes_body then
+        List.filter
+          (fun (semantic, represented) ->
+            (not (ctyp_equal semantic represented)) && C.specialize_function_body_representation ~semantic ~represented
+          )
+          (List.combine (param_ctyps @ [ret_ctyp]) (actual_ctyps @ [actual_ret_ctyp]))
+      else []
+    in
+    let specialization_is_eligible l id param_ctyps ret_ctyp actual_ctyps actual_ret_ctyp =
+      let generic_signature = generic_signature_for id (List.length param_ctyps) in
+      let body_representation_pairs =
+        function_body_representation_pairs param_ctyps ret_ctyp actual_ctyps actual_ret_ctyp
+      in
+      let has_body_specialization = body_representation_pairs <> [] in
+      let implicit_width_representation semantic represented =
+        has_body_specialization
+        && match (semantic, represented) with CT_lint, (CT_fint _ | CT_fuint _) -> true | _ -> false
+      in
+      let can_specialize_arguments =
+        List.mapi
+          (fun index (generic_dependencies, (semantic, represented)) ->
+            if ctyp_equal semantic represented then true
+            else if
+              C.specialize_function_argument_representation ~semantic ~represented
+              || implicit_width_representation semantic represented
+            then
+              if position_is_generic generic_dependencies then true
+              else concrete_specialization_error l id (`Argument index) semantic represented
+            else false
+          )
+          (List.combine generic_signature.generic_parameters (List.combine param_ctyps actual_ctyps))
+        |> List.for_all Fun.id
+      in
+      let can_specialize_result =
+        ctyp_equal ret_ctyp actual_ret_ctyp
+        ||
+        if C.specialize_function_result_representation ~semantic:ret_ctyp ~represented:actual_ret_ctyp then
+          if position_is_generic generic_signature.generic_result then true
+          else concrete_specialization_error l id `Result ret_ctyp actual_ret_ctyp
+        else false
+      in
+      let has_specialized_representation =
+        List.exists2
+          (fun semantic represented -> not (ctyp_equal semantic represented))
+          (param_ctyps @ [ret_ctyp]) (actual_ctyps @ [actual_ret_ctyp])
+      in
+      (* Generic positions are independent representation choices.  In
+         particular, a dependent result such as [range(1, len + 33)] may need
+         u128 when its generic [len] argument is u64.  Requiring every
+         occurrence of semantic [int] to share one C representation would
+         reject that proof-backed u64 -> u128 specialization. *)
+      has_specialized_representation && can_specialize_arguments && can_specialize_result
+    in
+    let infer_call_bounds lifetime_ranges result args ((prior_arguments, prior_result) as prior_bounds) =
+      match lifetime_ranges with
+      | None -> prior_bounds
+      | Some ranges ->
+          let argument_intervals =
+            if List.compare_lengths prior_arguments args = 0 then
+              List.map2
+                (fun prior argument ->
+                  match integer_lifetime_interval (cval_integer_lifetime ranges argument) with
+                  | Some _ as inferred -> inferred
+                  | None -> prior
+                )
+                prior_arguments args
+            else List.map (fun argument -> integer_lifetime_interval (cval_integer_lifetime ranges argument)) args
+          in
+          let result_interval =
+            match result with
+            | CL_id (name, ctyp) ->
+                let inferred =
+                  match NameMap.find_opt name ranges with
+                  | Some lifetime -> integer_lifetime_interval lifetime
+                  | None -> integer_lifetime_interval (ctyp_integer_lifetime ctyp)
+                in
+                (match inferred with Some _ -> inferred | None -> prior_result)
+            | _ -> prior_result
+          in
+          (argument_intervals, result_interval)
+    in
+    let normalize_call_bounds param_ctyps (argument_bounds, _) =
+      ( List.map2
+          (fun semantic bound -> if ctyp_equal semantic CT_lint then bound else None)
+          param_ctyps argument_bounds,
+        None
+      )
+    in
+    let module RepresentationDemandMap = Map.Make (struct
+      type t = ctyp list * (name * ctyp option) list * ctyp option list
+
+      let compare = Stdlib.compare
+    end)
+    in
+    let module RepresentationDemand = struct
+      type t = {
+        specialized_id : id;
+        actual_ctyps : ctyp list;
+        actual_ret_ctyp : ctyp;
+        bounds : callsite_bounds ref;
+        lifetime_ranges : integer_lifetime NameMap.t ref;
+        lifetime_writes : ctyp NameMap.t;
+        queued : bool ref;
+      }
+    end
+    in
+    let demanded = ref Bindings.empty in
+    let pending = Queue.create () in
+    let total_demands = ref 0 in
+    let processed_demands = ref 0 in
+    let debug_demands = !opt_debug_function_representations in
+    let started_at = Sys.time () in
+    let log_progress format =
+      Printf.ksprintf
+        (fun message ->
+          if debug_demands then
+            Printf.eprintf "C representation specialization: %s (%.2fs)\n%!" message (Sys.time () -. started_at)
+        )
+        format
+    in
+    let string_of_call_bounds (arguments, result) =
+      "args=[" ^ Util.string_of_list "," string_of_integer_interval arguments ^ "] result="
+      ^ string_of_integer_interval result
+    in
+    log_progress "start definitions=%d functions=%d" (List.length cdefs) (Bindings.cardinal fundefs);
+    if debug_demands then
+      Bindings.iter
+        (fun id signature ->
+          log_progress "generic-signature function=%s args=[%s] result=%b" (string_of_id id)
+            (Util.string_of_list ","
+               (fun dependencies -> string_of_bool (position_is_generic dependencies))
+               signature.generic_parameters
+            )
+            (position_is_generic signature.generic_result)
+        )
+        ctx.generic_signatures;
+    let max_specializations_per_function = 64 in
+    let analyze_demand id actual_ctyps (actual_intervals, _) =
+      let _, params, body, _ = Bindings.find id fundefs in
+      let lifetime_ranges, lifetime_writes =
+        infer_integer_lifetimes ctx id params actual_ctyps actual_intervals body
+      in
+      let value_representations =
+        NameMap.bindings lifetime_writes
+        |> List.filter_map (fun (name, semantic) ->
+               match semantic with
+               | CT_lint ->
+                   let represented =
+                     Option.bind (NameMap.find_opt name lifetime_ranges) (represented_integer_lifetime ctx)
+                   in
+                   Some (name, represented)
+               | _ -> None
+           )
+      in
+      let rec primitive_representations representations (I_aux (instr, _)) =
+        match instr with
+        | I_funcall (CR_one _, _, (primitive_id, _), [left; right]) -> (
+            match integer_primitive_name ctx primitive_id with
+            | Some primitive ->
+                let carrier =
+                  integer_primitive_carrier_lifetime primitive
+                    (cval_integer_lifetime lifetime_ranges left)
+                    (cval_integer_lifetime lifetime_ranges right)
+                in
+                represented_integer_lifetime ctx carrier :: representations
+            | None -> representations
+          )
+        | I_if (_, then_instrs, else_instrs) ->
+            List.fold_left primitive_representations
+              (List.fold_left primitive_representations representations then_instrs)
+              else_instrs
+        | I_block instrs | I_try_block instrs -> List.fold_left primitive_representations representations instrs
+        | _ -> representations
+      in
+      let primitive_representations = List.fold_left primitive_representations [] body |> List.rev in
+      (lifetime_ranges, lifetime_writes, value_representations, primitive_representations)
+    in
+    let merge_interval left right =
+      match (left, right) with
+      | Some (left_lower, left_upper), Some (right_lower, right_upper) ->
+          Some (Big_int.min left_lower right_lower, Big_int.max left_upper right_upper)
+      | None, _ | _, None -> None
+    in
+    let merge_call_bounds (left_arguments, left_result) (right_arguments, right_result) =
+      (List.map2 merge_interval left_arguments right_arguments, merge_interval left_result right_result)
+    in
+    let demand l id actual_ctyps actual_ret_ctyp bounds =
+      let signature_ctyps = actual_ctyps @ [actual_ret_ctyp] in
+      let lifetime_ranges, lifetime_writes, value_representations, primitive_representations =
+        analyze_demand id actual_ctyps bounds
+      in
+      let signature = (signature_ctyps, value_representations, primitive_representations) in
+      let prior = Option.value ~default:RepresentationDemandMap.empty (Bindings.find_opt id !demanded) in
+      match RepresentationDemandMap.find_opt signature prior with
+      | Some demand ->
+          let merged_bounds = merge_call_bounds !(demand.RepresentationDemand.bounds) bounds in
+          if Stdlib.compare merged_bounds !(demand.RepresentationDemand.bounds) <> 0 then (
+            let merged_ranges, _, merged_values, merged_primitives = analyze_demand id actual_ctyps merged_bounds in
+            if
+              Stdlib.compare merged_values value_representations <> 0
+              || Stdlib.compare merged_primitives primitive_representations <> 0
+            then
+              Reporting.unreachable l __POS__
+                (Printf.sprintf "Merged bounds changed the representation specialization for %s" (string_of_id id));
+            demand.RepresentationDemand.bounds := merged_bounds;
+            demand.RepresentationDemand.lifetime_ranges := merged_ranges;
+            if not !(demand.RepresentationDemand.queued) then (
+              demand.RepresentationDemand.queued := true;
+              Queue.add (id, signature) pending
+            )
+          );
+          demand.RepresentationDemand.specialized_id
+      | None ->
+          let specialized_id = mangle_representation_id id ctx signature_ctyps bounds in
+          incr total_demands;
+          let variants = RepresentationDemandMap.cardinal prior + 1 in
+          if !total_demands <= 20 || !total_demands mod 25 = 0 || variants >= 8 then
+            log_progress "demanded=%d queued=%d function=%s variants=%d %s" !total_demands
+              (Queue.length pending + 1) (string_of_id id) variants (string_of_call_bounds bounds);
+          if RepresentationDemandMap.cardinal prior >= max_specializations_per_function then
+            raise
+              (Reporting.err_general l
+                 (Printf.sprintf "Function %s requires more than %d C representation specializations" (string_of_id id)
+                    max_specializations_per_function
+                 )
+              );
+          let demand : RepresentationDemand.t =
+            {
+              specialized_id;
+              actual_ctyps;
+              actual_ret_ctyp;
+              bounds = ref bounds;
+              lifetime_ranges = ref lifetime_ranges;
+              lifetime_writes;
+              queued = ref true;
+            }
+          in
+          demanded := Bindings.add id (RepresentationDemandMap.add signature demand prior) !demanded;
+          Queue.add (id, signature) pending;
+          specialized_id
+    in
+    let rewrite_call ?lifetime_ranges ?current_specialization = function
+      | I_aux (I_funcall ((CR_one result as creturn), Call bounds, (id, []), args), (n, l)) as instr -> (
+          match (Bindings.find_opt id valspecs, Bindings.find_opt id fundefs) with
+          | Some ([], param_ctyps, ret_ctyp, None, _), Some _ when List.compare_lengths args param_ctyps = 0 ->
+              let bounds = infer_call_bounds lifetime_ranges result args bounds in
+              let actual_ctyps = List.map cval_ctyp args in
+              let actual_ret_ctyp = clexp_ctyp result in
+              let bounds = normalize_call_bounds param_ctyps bounds in
+              let eligible = specialization_is_eligible l id param_ctyps ret_ctyp actual_ctyps actual_ret_ctyp in
+              if eligible then (
+                let specialized_id =
+                  match current_specialization with
+                  | Some (current_id, current_specialized_id, current_ctyps, current_ret_ctyp)
+                    when Id.compare id current_id = 0 ->
+                      if
+                        List.compare_lengths actual_ctyps current_ctyps = 0
+                        && List.for_all2 ctyp_equal actual_ctyps current_ctyps
+                        && ctyp_equal actual_ret_ctyp current_ret_ctyp
+                      then current_specialized_id
+                      else demand l id actual_ctyps actual_ret_ctyp bounds
+                  | _ -> demand l id actual_ctyps actual_ret_ctyp bounds
+                in
+                I_aux (I_funcall (creturn, Call bounds, (specialized_id, []), args), (n, l))
+              )
+              else (
+                if
+                  debug_demands
+                  && List.exists2
+                       (fun semantic represented -> not (ctyp_equal semantic represented))
+                       (param_ctyps @ [ret_ctyp]) (actual_ctyps @ [actual_ret_ctyp])
+                then
+                  log_progress "ineligible function=%s semantic=[%s]->%s represented=[%s]->%s"
+                    (string_of_id id)
+                    (Util.string_of_list "," string_of_ctyp param_ctyps)
+                    (string_of_ctyp ret_ctyp)
+                    (Util.string_of_list "," string_of_ctyp actual_ctyps)
+                    (string_of_ctyp actual_ret_ctyp);
+                instr
+              )
+          | _ -> instr
+        )
+      | instr -> instr
+    in
+    let cdefs = List.rev_map (cdef_map_instr (rewrite_call ?lifetime_ranges:None)) cdefs |> List.rev in
+    let generated = ref Bindings.empty in
+    let specialized_ctx = ref ctx in
+    let remove_unused_literal_temporaries body =
+      let candidates = ref NameSet.empty in
+      List.iter
+        (iter_instr (function
+          | I_aux (I_init (_, name, Init_cval (V_lit _)), _) -> candidates := NameSet.add name !candidates
+          | _ -> ()
+          ))
+        body;
+      let has_disallowed_reference name =
+        let disallowed = ref false in
+        List.iter
+          (iter_instr (fun instr ->
+            match instr with
+            | I_aux (I_init (_, candidate, Init_cval (V_lit _)), _)
+            | I_aux (I_decl (_, candidate), _)
+            | I_aux (I_clear (_, candidate), _)
+              when Name.compare name candidate = 0 ->
+                ()
+            | _
+              when instr_references ~read:name ~direct:true instr
+                   || instr_references ~write:name ~direct:true instr ->
+                disallowed := true
+            | _ -> ()
+            ))
+          body;
+        !disallowed
+      in
+      let unused = NameSet.filter (fun name -> not (has_disallowed_reference name)) !candidates in
+      let rec rewrite instrs =
+        List.filter_map (fun (I_aux (instr, aux) as original) ->
+          match instr with
+          | I_init (_, name, Init_cval (V_lit _)) | I_decl (_, name) | I_clear (_, name)
+            when NameSet.mem name unused ->
+              None
+          | I_block instrs -> Some (I_aux (I_block (rewrite instrs), aux))
+          | I_try_block instrs -> Some (I_aux (I_try_block (rewrite instrs), aux))
+          | I_if (condition, then_instrs, else_instrs) ->
+              Some (I_aux (I_if (condition, rewrite then_instrs, rewrite else_instrs), aux))
+          | _ -> Some original
+          )
+          instrs
+      in
+      rewrite body
+    in
+    let specialize_integer_primitive lifetime_ranges = function
+      | I_aux (I_funcall (CR_one result, call, (id, tyargs), [left; right]), aux) as instr -> (
+          let primitive = integer_primitive_name ctx id in
+          let comparison = integer_comparison_name ctx id in
+          let left_lifetime = cval_integer_lifetime lifetime_ranges left in
+          let right_lifetime = cval_integer_lifetime lifetime_ranges right in
+          let carrier_lifetime =
+            match primitive with
+            | Some primitive -> integer_primitive_carrier_lifetime primitive left_lifetime right_lifetime
+            | None -> Lifetime_top
+          in
+          let comparison_carrier =
+            represented_integer_lifetime ctx (join_integer_lifetime left_lifetime right_lifetime)
+          in
+          let constant_comparison =
+            match comparison with
+            | Some comparison -> constant_integer_comparison comparison left_lifetime right_lifetime
+            | None -> None
+          in
+          let l = snd aux in
+          let promote carrier value =
+            if ctyp_equal (cval_ctyp value) carrier then ([], value, [])
+            else
+              match value with
+              | V_lit (VL_int literal, _) -> ([], V_lit (VL_int literal, carrier), [])
+              | _ ->
+                  let temporary = ngensym () in
+                  ( [idecl l carrier temporary; icopy l (CL_id (temporary, carrier)) value],
+                    V_id (temporary, carrier),
+                    [iclear ~loc:l carrier temporary]
+                  )
+          in
+          let exact_mixed_fixed_comparison left right =
+            match (cval_ctyp left, cval_ctyp right) with
+            | CT_fint left_width, CT_fint right_width -> left_width <> right_width
+            | CT_fuint left_width, CT_fuint right_width -> left_width <> right_width
+            | CT_fint signed_width, CT_fuint unsigned_width
+            | CT_fuint unsigned_width, CT_fint signed_width -> signed_width > unsigned_width
+            | _ -> false
+          in
+          match (comparison, constant_comparison, comparison_carrier) with
+          | Some _, Some value, _ -> I_aux (I_copy (result, V_lit (VL_bool value, CT_bool)), aux)
+          | Some op, None, Some _ when exact_mixed_fixed_comparison left right ->
+              I_aux (I_copy (result, V_call (op, [left; right])), aux)
+          | Some op, None, Some carrier ->
+              let left_setup, left, left_cleanup = promote carrier left in
+              let right_setup, right, right_cleanup = promote carrier right in
+              iblock
+                (left_setup @ right_setup
+                @ [I_aux (I_copy (result, V_call (op, [left; right])), aux)]
+                @ right_cleanup @ left_cleanup
+                )
+          | _ -> (
+          match (primitive, represented_integer_lifetime ctx carrier_lifetime, clexp_ctyp result) with
+          | Some _, Some _, CT_lint -> instr
+          | Some primitive, Some carrier, _ ->
+              let custom_unsigned_carrier =
+                match carrier with
+                | CT_fint _ | CT_fuint _ -> false
+                | _ -> (
+                    match C.integer_representation_bounds carrier with
+                    | Some (lower, _) -> Big_int.equal lower Big_int.zero
+                    | None -> false
+                  )
+              in
+              let as_native_unsigned = function
+                | value when (match cval_ctyp value with CT_fuint _ -> true | _ -> false) -> Some value
+                | V_lit (VL_int literal, _)
+                  when Big_int.less_equal Big_int.zero literal
+                       && Big_int.less_equal literal (Big_int.pred (Big_int.pow_int_positive 2 64)) ->
+                    Some (V_lit (VL_int literal, CT_fuint 64))
+                | _ -> None
+              in
+              let left, right =
+                match (primitive, as_native_unsigned left, ctyp_equal (cval_ctyp right) carrier) with
+                | (`Add | `Mul), Some left, true -> (right, left)
+                | _ -> (left, right)
+              in
+              let promote value =
+                if ctyp_equal (cval_ctyp value) carrier then ([], value, [])
+                else
+                  match value with
+                  | V_lit (VL_int literal, _) -> ([], V_lit (VL_int literal, carrier), [])
+                  | _ ->
+                      let temporary = ngensym () in
+                      ( [idecl l carrier temporary; icopy l (CL_id (temporary, carrier)) value],
+                        V_id (temporary, carrier),
+                        [iclear ~loc:l carrier temporary]
+                      )
+              in
+              let left_setup, left, left_cleanup = promote left in
+              let right_setup, right, right_cleanup =
+                if custom_unsigned_carrier then
+                  match as_native_unsigned right with Some right -> ([], right, []) | None -> promote right
+                else promote right
+              in
+              let op =
+                match (primitive, carrier) with
+                | `Add, (CT_fint _ | CT_fuint _) -> Proven_iadd
+                | `Sub, (CT_fint _ | CT_fuint _) -> Proven_isub
+                | `Mul, (CT_fint _ | CT_fuint _) -> Proven_imul
+                | `Div, (CT_fint _ | CT_fuint _) -> Proven_idiv
+                | `Mod, (CT_fint _ | CT_fuint _) -> Proven_imod
+                | `Add, _ -> Iadd
+                | `Sub, _ -> Isub
+                | `Mul, _ -> Imul
+                | `Div, _ -> Idiv
+                | `Mod, _ -> Imod
+              in
+              let operation = V_call (op, [left; right]) in
+              let operation_instrs =
+                if ctyp_equal (clexp_ctyp result) carrier then [I_aux (I_copy (result, operation), aux)]
+                else
+                  let temporary = ngensym ~source_name:"integer_result" ~source_type:(string_of_ctyp carrier) () in
+                  [
+                    idecl l carrier temporary;
+                    icopy l (CL_id (temporary, carrier)) operation;
+                    icopy l result (V_id (temporary, carrier));
+                    iclear ~loc:l carrier temporary;
+                  ]
+              in
+              iblock
+                (left_setup @ right_setup @ operation_instrs @ right_cleanup @ left_cleanup)
+          | _ -> instr
+          )
+        )
+      | instr -> instr
+    in
+    let restore_aggregate_field_representations =
+      object
+        inherit empty_jib_visitor
+
+        method! vcval cval =
+          match cval with
+          | V_field (base, field, _) ->
+              ChangeDoChildrenPost
+                ( cval,
+                  function
+                  | V_field (base, field, _) ->
+                      let _, field_ctyp = struct_fields (id_loc field) ctx (cval_ctyp base) in
+                      V_field (base, field, field_ctyp field)
+                  | cval -> cval
+                )
+          | _ -> DoChildren
+
+        method! vclexp clexp =
+          match clexp with
+          | CL_field (base, field, _) ->
+              ChangeDoChildrenPost
+                ( clexp,
+                  function
+                  | CL_field (base, field, _) ->
+                      let _, field_ctyp = struct_fields (id_loc field) ctx (clexp_ctyp base) in
+                      CL_field (base, field, field_ctyp field)
+                  | clexp -> clexp
+                )
+          | _ -> DoChildren
+      end
+    in
+    (* A canonical function body can already contain values whose complete
+       lifetime is finite even when the surrounding Sail helper deliberately
+       keeps a generic mathematical-integer signature.  This commonly occurs
+       when a native-width aggregate field is first bound to a local and then
+       passed to a generic helper.  Rewrite those proved finite locals before
+       discovering representation demands from the body's calls; otherwise
+       the call is inspected as [sail_int] and the fixed-width representation
+       is lost at precisely the function boundary specialization is intended
+       to preserve.
+
+       Parameters and the return register are intentionally protected here.
+       Their representations are part of the canonical ABI and may change
+       only in a demanded clone.  Recursive calls are likewise left alone in
+       the canonical body: once an external call demands a clone, that clone's
+       existing [current_specialization] handling gives its recursive edge a
+       stable target without recursively generating demands. *)
+    let specialize_original_function_body = function
+      | CDEF_aux (CDEF_fundef (id, heap_return, params, body), fundef_annot) as cdef -> (
+          match Bindings.find_opt id valspecs with
+          | Some ([], param_ctyps, ret_ctyp, None, _) when List.compare_lengths params param_ctyps = 0 ->
+              let parameter_intervals =
+                List.map (fun ctyp -> integer_lifetime_interval (ctyp_integer_lifetime ctyp)) param_ctyps
+              in
+              let lifetime_ranges, lifetime_writes =
+                infer_integer_lifetimes ctx id params param_ctyps parameter_intervals body
+              in
+              let protected = NameSet.of_list (return :: params) in
+              let replacements =
+                NameMap.fold
+                  (fun name semantic replacements ->
+                    if NameSet.mem name protected then replacements
+                    else
+                      match (semantic, NameMap.find_opt name lifetime_ranges) with
+                      | CT_lint, Some lifetime -> (
+                          match represented_integer_lifetime ctx lifetime with
+                          | Some represented -> NameMap.add name represented replacements
+                          | None -> replacements
+                        )
+                      | _ -> replacements
+                  )
+                  lifetime_writes NameMap.empty
+              in
+              let visitor = new specialize_parameter_representations replacements ret_ctyp ret_ctyp in
+              let rewrite_non_recursive_call = function
+                | I_aux (I_funcall (_, Call _, (callee, []), _), _) as instr when Id.compare id callee = 0 -> instr
+                | instr -> rewrite_call ~lifetime_ranges instr
+              in
+              let body =
+                List.map (visit_instr visitor) body
+                |> List.map (visit_instr restore_aggregate_field_representations)
+                |> List.map (map_instr (specialize_integer_primitive lifetime_ranges))
+                |> remove_unused_literal_temporaries
+                |> List.map (map_instr rewrite_non_recursive_call)
+              in
+              if not (NameMap.is_empty replacements) then
+                log_progress "specialized original body function=%s locals=%d" (string_of_id id)
+                  (NameMap.cardinal replacements);
+              CDEF_aux (CDEF_fundef (id, heap_return, params, body), fundef_annot)
+            | _ -> cdef
+        )
+      | cdef -> cdef
+    in
+    let cdefs = List.map specialize_original_function_body cdefs in
+    while not (Queue.is_empty pending) do
+      let id, signature = Queue.take pending in
+      let demand = RepresentationDemandMap.find signature (Bindings.find id !demanded) in
+      demand.RepresentationDemand.queued := false;
+      let specialized_id = demand.RepresentationDemand.specialized_id in
+      let actual_ctyps = demand.RepresentationDemand.actual_ctyps in
+      let actual_ret_ctyp = demand.RepresentationDemand.actual_ret_ctyp in
+      let lifetime_ranges = !(demand.RepresentationDemand.lifetime_ranges) in
+      let lifetime_writes = demand.RepresentationDemand.lifetime_writes in
+      incr processed_demands;
+      let clone_started_at = Sys.time () in
+      log_progress "processing=%d/%d queued=%d function=%s" !processed_demands !total_demands (Queue.length pending)
+        (string_of_id id);
+      match (Bindings.find id valspecs, Bindings.find id fundefs) with
+      | ([], param_ctyps, ret_ctyp, None, val_annot), (heap_return, params, body, fundef_annot) ->
+          if List.compare_lengths params actual_ctyps <> 0 then
+            Reporting.unreachable (id_loc id) __POS__ ("Function parameters do not match valspec for " ^ string_of_id id);
+          let replacements =
+            List.fold_left2
+              (fun replacements (param, semantic) represented ->
+                if ctyp_equal semantic represented then replacements else NameMap.add param represented replacements
+              )
+              NameMap.empty (List.combine params param_ctyps) actual_ctyps
+          in
+          log_progress "inferred function=%s values=%d elapsed=%.2fs" (string_of_id id)
+            (NameMap.cardinal lifetime_ranges) (Sys.time () -. clone_started_at);
+          let signature_owned = NameSet.of_list (return :: params) in
+          let replacements =
+            NameMap.fold
+              (fun name semantic replacements ->
+                if NameSet.mem name signature_owned then replacements
+                else
+                  match (semantic, NameMap.find_opt name lifetime_ranges) with
+                  | CT_lint, Some lifetime -> (
+                      match represented_integer_lifetime ctx lifetime with
+                      | Some represented ->
+                          log_progress "value function=%s name=%s lifetime=%s represented=%s"
+                            (string_of_id id) (string_of_name ~zencode:false name)
+                            (string_of_integer_interval (integer_lifetime_interval lifetime))
+                            (string_of_ctyp represented);
+                          NameMap.add name represented replacements
+                      | None ->
+                          log_progress "value function=%s name=%s lifetime=%s represented=unbounded"
+                            (string_of_id id) (string_of_name ~zencode:false name)
+                            (string_of_integer_interval (integer_lifetime_interval lifetime));
+                          replacements
+                    )
+                  | _ -> replacements
+              )
+              lifetime_writes replacements
+          in
+          let replacements =
+            if ctyp_equal ret_ctyp actual_ret_ctyp then replacements else NameMap.add return actual_ret_ctyp replacements
+          in
+          let visitor =
+            new specialize_parameter_representations replacements ret_ctyp actual_ret_ctyp
+          in
+          let body =
+            match C.specialized_function_external id actual_ctyps actual_ret_ctyp with
+            | Some external_id ->
+                let l = id_loc id in
+                let args = List.map2 (fun param ctyp -> V_id (param, ctyp)) params actual_ctyps in
+                let call =
+                  match ifuncall l (CL_id (return, actual_ret_ctyp)) (external_id, []) args with
+                  | I_aux (I_funcall (creturn, _, fn, call_args), aux) ->
+                      I_aux (I_funcall (creturn, Extern actual_ret_ctyp, fn, call_args), aux)
+                  | _ -> assert false
+                in
+                [call; iend l]
+            | None ->
+                List.map (visit_instr visitor) body
+                |> List.map (visit_instr restore_aggregate_field_representations)
+                |> List.map (map_instr (specialize_integer_primitive lifetime_ranges))
+                |> remove_unused_literal_temporaries
+                |> List.map
+                     (map_instr
+                        (rewrite_call ~lifetime_ranges
+                           ~current_specialization:(id, specialized_id, actual_ctyps, actual_ret_ctyp)
+                        )
+                     )
+          in
+          let specialized_val =
+            CDEF_aux (CDEF_val (specialized_id, [], actual_ctyps, actual_ret_ctyp, None), val_annot)
+          in
+          let specialized_fundef = CDEF_aux (CDEF_fundef (specialized_id, heap_return, params, body), fundef_annot) in
+          generated := Bindings.add specialized_id (specialized_val, specialized_fundef) !generated;
+          specialized_ctx :=
+            {
+              !specialized_ctx with
+              valspecs =
+                Bindings.add specialized_id
+                  (None, actual_ctyps, actual_ret_ctyp, uannot_of_def_annot val_annot)
+                  !specialized_ctx.valspecs;
+            };
+          log_progress "generated function=%s elapsed=%.2fs queued=%d" (string_of_id id)
+            (Sys.time () -. clone_started_at) (Queue.length pending)
+      | _ -> Reporting.unreachable (id_loc id) __POS__ "Invalid representation-specialization target"
+    done;
+    (* Top-level singleton [let] bindings are immutable, so their exact value
+       is also their complete lifetime and may select a native representation.
+       Preserve CT_lint bindings and initializer temporaries for ordinary
+       builds: an explicit unbounded result type remains the constant's storage
+       contract, even when this particular initializer happens to be small.
+       A backend that requires bounded integers may instead use the complete
+       immutable lifetime to represent an inferred [int] singleton natively.
+       Do not apply this to registers: their initializer is not their complete
+       lifecycle. *)
+    let specialize_top_level_let = function
+      | CDEF_aux (CDEF_let (index, bindings, body), def_annot) ->
+          let owner = match bindings with (id, _) :: _ -> id | [] -> mk_id "top_level_let" in
+          let lifetime_ranges, lifetime_writes = infer_integer_lifetimes ctx owner [] [] [] body in
+          let replacements =
+            NameMap.fold
+              (fun name semantic replacements ->
+                match (semantic, NameMap.find_opt name lifetime_ranges) with
+                | (CT_constant _ | CT_lint), Some lifetime
+                  when (not (ctyp_equal semantic CT_lint)) || C.require_bounded_int -> (
+                    match represented_integer_lifetime ctx lifetime with
+                    | Some represented ->
+                        log_progress "top-level-let value=%s semantic=%s lifetime=%s represented=%s"
+                          (string_of_name ~zencode:false name) (string_of_ctyp semantic)
+                          (string_of_integer_interval (integer_lifetime_interval lifetime))
+                          (string_of_ctyp represented);
+                        NameMap.add name represented replacements
+                    | None ->
+                        log_progress "top-level-let value=%s semantic=%s lifetime=%s represented=unbounded"
+                          (string_of_name ~zencode:false name) (string_of_ctyp semantic)
+                          (string_of_integer_interval (integer_lifetime_interval lifetime));
+                        replacements
+                  )
+                | _ -> replacements
+              )
+              lifetime_writes NameMap.empty
+          in
+          let represented_binding (id, ctyp) =
+            match NameMap.find_opt (name id) replacements with
+            | Some represented -> (id, represented)
+            | None -> (id, ctyp)
+          in
+          let visitor = new specialize_parameter_representations replacements CT_unit CT_unit in
+          let represent_assigned_literal represented = function
+            | V_lit (VL_int literal, CT_lint) as value -> (
+                match C.integer_representation_bounds represented with
+                | Some (lower, upper)
+                  when Big_int.less_equal lower literal && Big_int.less_equal literal upper ->
+                    V_lit (VL_int literal, represented)
+                | _ -> value
+              )
+            | value -> value
+          in
+          let specialize_literal_assignment = function
+            | I_aux (I_init (represented, name, Init_cval value), aux) ->
+                I_aux
+                  (I_init (represented, name, Init_cval (represent_assigned_literal represented value)), aux)
+            | I_aux (I_reinit (represented, name, value), aux) ->
+                I_aux (I_reinit (represented, name, represent_assigned_literal represented value), aux)
+            | I_aux (I_copy (destination, value), aux) ->
+                I_aux (I_copy (destination, represent_assigned_literal (clexp_ctyp destination) value), aux)
+            | instr -> instr
+          in
+          let body =
+            List.map (visit_instr visitor) body
+            |> List.map (visit_instr restore_aggregate_field_representations)
+            |> List.map (map_instr specialize_literal_assignment)
+            |> List.map (map_instr (specialize_integer_primitive lifetime_ranges))
+          in
+          CDEF_aux (CDEF_let (index, List.map represented_binding bindings, body), def_annot)
+      | cdef -> cdef
+    in
+    let cdefs = List.map specialize_top_level_let cdefs in
+    let resolve_generic_proven_arithmetic = function
+      | I_aux (I_funcall (creturn, call, (id, tyargs), args), aux)
+        when String.starts_with ~prefix:"__sail_proven_native_" (string_of_id id) ->
+          let ordinary =
+            match string_of_id id with
+            | "__sail_proven_native_add" -> "add_int"
+            | "__sail_proven_native_sub" -> "sub_int"
+            | "__sail_proven_native_mul" -> "mult_int"
+            | "__sail_proven_native_div" -> "tdiv_int"
+            | "__sail_proven_native_mod" -> "tmod_int"
+            | _ -> assert false
+          in
+          I_aux (I_funcall (creturn, call, (mk_id ordinary, tyargs), args), aux)
+      | instr -> instr
+    in
+    let cdefs = List.map (cdef_map_instr resolve_generic_proven_arithmetic) cdefs in
+    let generated =
+      Bindings.fold (fun _ (valspec, fundef) definitions -> fundef :: valspec :: definitions) !generated [] |> List.rev
+    in
+    log_progress "complete clones=%d generated-definitions=%d" !total_demands (List.length generated);
+    let cdefs = cdefs @ generated in
+    (* A demanded clone replaces calls to the generic body, but the original
+       definition was previously left in the output even when no reachable
+       caller remained.  Besides carrying dead GMP code, that defeats
+       [--c-require-bounded-int]: the deliberately generic implementation has
+       mathematical-integer parameters, whereas every reachable clone has a
+       proved concrete representation.
+
+       Recompute reachability after call rewriting and remove only demanded
+       originals that are no longer reachable.  Explicit compiler roots and
+       calls made from top-level initializer blocks remain roots, so an
+       exported or otherwise unspecialized generic implementation is kept. *)
+    let demanded_ids = Bindings.fold (fun id _ ids -> IdSet.add id ids) !demanded IdSet.empty in
+    let roots =
+      List.fold_left (fun roots id -> IdGraphNS.add id roots) IdGraphNS.empty (Specialize.get_initial_calls ())
+    in
+    let roots = ref roots in
+    let add_top_level_calls = function
+      | CDEF_aux
+          ( (CDEF_register (_, _, instrs) | CDEF_let (_, _, instrs) | CDEF_startup (_, instrs)
+            | CDEF_finish (_, instrs)),
+            _
+          ) ->
+          List.iter
+            (iter_instr (function
+              | I_aux (I_funcall (_, _, (call, _), _), _) -> roots := IdGraphNS.add call !roots
+              | _ -> ()
+              ))
+            instrs
+      | _ -> ()
+    in
+    List.iter add_top_level_calls cdefs;
+    let reachable = IdGraph.reachable !roots IdGraphNS.empty (callgraph cdefs) in
+    let removed = IdSet.filter (fun id -> not (IdGraphNS.mem id reachable)) demanded_ids in
+    if debug_demands then
+      List.iter
+        (function
+          | CDEF_aux (CDEF_fundef (caller, _, _, instrs), _)
+            when IdGraphNS.mem caller reachable ->
+              List.iter
+                (iter_instr (function
+                  | I_aux (I_funcall (_, call_kind, (callee, _), args), _)
+                    when IdSet.mem callee demanded_ids && not (IdSet.mem callee removed) ->
+                      let bounds =
+                        match call_kind with
+                        | Call bounds -> string_of_call_bounds bounds
+                        | Extern _ -> "extern"
+                      in
+                      log_progress "retained generic function=%s caller=%s ctypes=[%s] %s"
+                        (string_of_id callee) (string_of_id caller)
+                        (Util.string_of_list "," (fun argument -> string_of_ctyp (cval_ctyp argument)) args)
+                        bounds
+                  | _ -> ()
+                  ))
+                instrs
+          | _ -> ()
+          )
+        cdefs;
+    let cdefs =
+      List.filter
+        (function
+          | CDEF_aux (CDEF_fundef (id, _, _, _), _) when IdSet.mem id removed -> false
+          | CDEF_aux (CDEF_val (id, _, _, _, _), _) when IdSet.mem id removed -> false
+          | _ -> true
+          )
+        cdefs
+    in
+    IdSet.iter (fun id -> log_progress "removed unreachable generic function=%s" (string_of_id id)) removed;
+    (cdefs, !specialized_ctx)
 
   let contains_struct id cdef =
     cdef_has_ctyp (ctyp_has (function CT_struct (id', _) -> Id.compare id id' = 0 | _ -> false)) cdef
@@ -2938,7 +4581,7 @@ module Make (C : CONFIG) = struct
                     Reporting.unreachable (id_loc id) __POS__ "Invalid cons call"
               )
               else if
-                not (ctyp_equal (clexp_ctyp clexp) ret_ctyp)
+                (not (ctyp_equal (clexp_ctyp clexp) ret_ctyp))
                 && not
                      (C.specialize_call_destination ctx id (List.map cval_ctyp args) ~semantic:ret_ctyp
                         ~represented:(clexp_ctyp clexp)
@@ -2953,7 +4596,7 @@ module Make (C : CONFIG) = struct
                 @ cleanup @ tail
               )
               else instr :: tail
-          | Call -> (
+          | Call bounds -> (
               match get_function_typ id with
               | Some (param_ctyps, ret_ctyp) when C.make_call_precise ctx id param_ctyps ret_ctyp ->
                   if List.compare_lengths args param_ctyps <> 0 then
@@ -2964,10 +4607,10 @@ module Make (C : CONFIG) = struct
                       (fun index (arg, param_ctyp) ->
                         let arg_ctyp = cval_ctyp arg in
                         if
-                          not (ctyp_equal arg_ctyp param_ctyp)
+                          (not (ctyp_equal arg_ctyp param_ctyp))
                           && not
-                               (C.specialize_call_argument ctx id (clexp_ctyp clexp)
-                                  (List.map cval_ctyp args) index ~semantic:param_ctyp ~represented:arg_ctyp
+                               (C.specialize_call_argument ctx id (clexp_ctyp clexp) (List.map cval_ctyp args) index
+                                  ~semantic:param_ctyp ~represented:arg_ctyp
                                )
                         then (
                           let gs = ngensym () in
@@ -2981,7 +4624,7 @@ module Make (C : CONFIG) = struct
                   in
                   let ret_setup, clexp, ret_cleanup =
                     if
-                      not (ctyp_equal (clexp_ctyp clexp) ret_ctyp)
+                      (not (ctyp_equal (clexp_ctyp clexp) ret_ctyp))
                       && not
                            (C.specialize_call_destination ctx id (List.map cval_ctyp args) ~semantic:ret_ctyp
                               ~represented:(clexp_ctyp clexp)
@@ -3001,7 +4644,7 @@ module Make (C : CONFIG) = struct
                   [
                     iblock1
                       (casts @ ret_setup
-                      @ [I_aux (I_funcall (CR_one clexp, Call, (id, ctyp_args), args), aux)]
+                      @ [I_aux (I_funcall (CR_one clexp, Call bounds, (id, ctyp_args), args), aux)]
                       @ tail @ ret_cleanup @ cleanup
                       );
                   ]
@@ -3233,6 +4876,7 @@ module Make (C : CONFIG) = struct
       else (cdefs, ctx)
     in
     let cdefs, ctx = specialize_functions ctx cdefs in
+    let cdefs, ctx = specialize_function_representations ctx cdefs in
     let cdefs = sort_ctype_defs ctx true cdefs in
     let cdefs, ctx = specialize_variants ctx [] cdefs in
     let cdefs = make_calls_precise ctx cdefs in

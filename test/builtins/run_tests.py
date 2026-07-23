@@ -13,6 +13,7 @@ from sailtest import *
 
 sail_dir = get_sail_dir()
 sail = get_sail()
+rocq_compile = get_rocq_compile()
 targets = get_targets(['c', 'ocaml'])
 
 print("Sail is {}".format(sail))
@@ -114,8 +115,8 @@ def test_coq_builtins(name):
                 os.chdir('_coqbuild_{}'.format(basename))
 
                 # TODO: find bbv properly
-                step('coqc {}_types.v'.format(basename))
-                step('coqc {}.v'.format(basename))
+                step('{} {}_types.v'.format(rocq_compile, basename))
+                step('{} {}.v'.format(rocq_compile, basename))
                 step('coqtop -require-import {}_types -require-import {} -l test.v -batch | tee /dev/stderr | grep -q OK'.format(basename,basename))
 
                 os.chdir('..')

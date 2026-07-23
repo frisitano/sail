@@ -8,6 +8,93 @@ newtype checked_u64 = Checked_u64 : nat
 $[c_repr int64]
 newtype checked_i64 = Checked_i64 : int
 
+type u64_with_add_headroom = range(0, 2 ^ 64 - 33)
+type u64_at_least_95 = range(95, 2 ^ 64 - 1)
+type bounded_u64 = range(0, 2 ^ 64 - 1)
+type small_u64 = range(0, 100)
+type small_u64_product = range(0, 10000)
+type small_i64 = range(-100, 100)
+type small_i64_sum = range(-200, 200)
+type small_i64_product = range(-10000, 10000)
+type thirteen_u64 = range(13, 13)
+type five_u64 = range(5, 5)
+type minus_thirteen_i64 = range(-13, -13)
+type minus_five_i64 = range(-5, -5)
+type small_i128 = range(-(2 ^ 65), 2 ^ 65)
+type small_i128_sum = range(-(2 ^ 66), 2 ^ 66)
+type multiplicand_i128 = range(-(2 ^ 63), 2 ^ 63)
+type small_i128_product = range(-(2 ^ 126), 2 ^ 126)
+type thirteen_i128 = range(2 ^ 64 + 13, 2 ^ 64 + 13)
+type divisor_i128 = range(2 ^ 64 + 5, 2 ^ 64 + 5)
+
+val proven_u64_add_32 : u64_with_add_headroom -> bounded_u64
+
+function proven_u64_add_32(value) = value + 32
+
+val proven_u64_sub_95 : u64_at_least_95 -> bounded_u64
+
+function proven_u64_sub_95(value) = value - 95
+
+val proven_u64_mul : (small_u64, small_u64) -> small_u64_product
+
+function proven_u64_mul(left, right) = left * right
+
+val proven_u64_div : (thirteen_u64, five_u64) -> int
+
+function proven_u64_div(left, right) = tdiv_int(left, right)
+
+val proven_u64_mod : (thirteen_u64, five_u64) -> int
+
+function proven_u64_mod(left, right) = tmod_int(left, right)
+
+val proven_i64_add : (small_i64, small_i64) -> small_i64_sum
+
+function proven_i64_add(left, right) = left + right
+
+val proven_i64_sub : (small_i64, small_i64) -> small_i64_sum
+
+function proven_i64_sub(left, right) = left - right
+
+val proven_i64_mul : (small_i64, small_i64) -> small_i64_product
+
+function proven_i64_mul(left, right) = left * right
+
+val proven_i64_div : (minus_thirteen_i64, minus_five_i64) -> int
+
+function proven_i64_div(left, right) = tdiv_int(left, right)
+
+val proven_i64_mod : (minus_thirteen_i64, minus_five_i64) -> int
+
+function proven_i64_mod(left, right) = tmod_int(left, right)
+
+val proven_i128_add : (small_i128, small_i128) -> small_i128_sum
+
+function proven_i128_add(left, right) = left + right
+
+val proven_i128_sub : (small_i128, small_i128) -> small_i128_sum
+
+function proven_i128_sub(left, right) = left - right
+
+val proven_i128_mul : (multiplicand_i128, multiplicand_i128) -> small_i128_product
+
+function proven_i128_mul(left, right) = left * right
+
+val proven_i128_div : (thirteen_i128, divisor_i128) -> small_i128
+
+function proven_i128_div(left, right) = tdiv_nat(left, right)
+
+val proven_i128_mod : (thirteen_i128, divisor_i128) -> small_i128
+
+function proven_i128_mod(left, right) = tmod_nat(left, right)
+
+val mixed_i128_u64_lte : (small_i128, bounded_u64) -> bool
+
+function mixed_i128_u64_lte(left, right) = left <= right
+
+val mixed_u64_i128_lte : (bounded_u64, small_i128) -> bool
+
+function mixed_u64_i128_lte(left, right) = left <= right
+
 val checked_u64_add : (checked_u64, checked_u64) -> checked_u64
 
 function checked_u64_add(Checked_u64(left), Checked_u64(right)) -> checked_u64 =
@@ -38,6 +125,13 @@ val checked_u64_mod : (checked_u64, checked_u64) -> checked_u64
 
 function checked_u64_mod(Checked_u64(left), Checked_u64(right)) -> checked_u64 =
     if right == 0 then Checked_u64(0) else Checked_u64(tmod_int(left, right))
+
+/* Represented operands do not determine the representation of a wider
+   mathematical result.  In particular, this subtraction may be negative. */
+val signed_u64_difference : (checked_u64, checked_u64) -> int
+
+function signed_u64_difference(Checked_u64(left), Checked_u64(right)) -> int =
+    left - right
 
 val checked_i64_add : (checked_i64, checked_i64) -> checked_i64
 

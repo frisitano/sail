@@ -6,6 +6,7 @@ import datetime
 import argparse
 import signal
 import html
+import shlex
 
 def signal_handler(sig, frame):
     sys.exit(0)
@@ -81,6 +82,9 @@ def get_sail():
         return os.environ['SAIL']
     except KeyError:
         return 'sail'
+
+def get_rocq_compile():
+    return "{} c".format(shlex.quote(os.environ.get('ROCQ', 'rocq')))
 
 def parallel():
     if args.seq:

@@ -71,6 +71,7 @@ let pragma_set =
       "include_end";
       "sail_internal";
       "target_set";
+      "target_name";
       "non_exec";
     ]
   |> ref

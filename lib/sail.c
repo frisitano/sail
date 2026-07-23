@@ -734,6 +734,40 @@ void sail_lbits_from_u64_array(lbits *result, const uint64_t *limbs,
   mpz_fdiv_r_2exp(*result->bits, *result->bits, len);
 }
 
+void sail_int_to_u64_array(uint64_t *limbs, size_t limb_count,
+                           const sail_int value)
+{
+  memset(limbs, 0, limb_count * sizeof(uint64_t));
+  if (limb_count == 0) return;
+
+  mpz_t truncated;
+  mpz_init(truncated);
+  mpz_fdiv_r_2exp(truncated, value, limb_count * 64);
+  size_t written = 0;
+  mpz_export(limbs, &written, -1, sizeof(uint64_t), 0, 0, truncated);
+  mpz_clear(truncated);
+}
+
+void sail_int_from_u64_array(sail_int *result, const uint64_t *limbs,
+                             size_t limb_count)
+{
+  mpz_import(*result, limb_count, -1, sizeof(uint64_t), 0, 0, limbs);
+}
+
+void sail_int_from_twos_complement_u64_array(sail_int *result,
+                                             const uint64_t *limbs,
+                                             size_t limb_count)
+{
+  sail_int_from_u64_array(result, limbs, limb_count);
+  if (limb_count != 0 && (limbs[limb_count - 1] >> 63) != 0) {
+    mpz_t modulus;
+    mpz_init_set_ui(modulus, 1);
+    mpz_mul_2exp(modulus, modulus, limb_count * 64);
+    mpz_sub(*result, *result, modulus);
+    mpz_clear(modulus);
+  }
+}
+
 void UNDEFINED(lbits)(lbits *rop, const sail_int len)
 {
   zeros(rop, len);

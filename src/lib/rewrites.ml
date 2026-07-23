@@ -3130,7 +3130,10 @@ let rewrite_ast_remove_superfluous_letbinds env =
     | E_let (pat, exp1, exp2) | E_internal_plet (pat, exp1, exp2) -> (
         match (untyp_pat pat, uncast_exp exp1, uncast_exp exp2) with
         (* 'let x = EXP1 in x' can be replaced with 'EXP1' *)
-        | (P_aux (P_id id, _), _), _, (E_aux (E_id id', _), _) when Id.compare id id' = 0 -> exp1
+        | (P_aux (P_id id, _), _), _, (E_aux (E_id id', _), _)
+          when Id.compare id id' = 0
+               && Type_check.alpha_equivalent (env_of_annot annot) (typ_of_annot annot) (typ_of exp1) ->
+            exp1
         (* "let _ = () in exp" can be replaced with exp *)
         | (P_aux (P_wild, _), _), (E_aux (E_lit (L_aux (L_unit, _)), _), _), _ -> exp2
         (* "let x = EXP1 in return x" can be replaced with 'return (EXP1)', at
@@ -4296,7 +4299,7 @@ let rewrite_explicit_measure_with_fuel use_nat_fuel effect_info env ast =
         body
     in
     let body =
-      if use_nat_fuel then
+      if use_nat_fuel then (
         let is_empty =
           E_aux
             ( E_app
@@ -4316,18 +4319,17 @@ let rewrite_explicit_measure_with_fuel use_nat_fuel effect_info env ast =
                   E_aux
                     ( E_assert
                         ( E_aux (E_lit (L_aux (L_false, loc)), (loc, empty_tannot)),
-                          E_aux
-                            (E_lit (L_aux (L_string "recursion limit reached", loc)), (loc, empty_tannot))
+                          E_aux (E_lit (L_aux (L_string "recursion limit reached", loc)), (loc, empty_tannot))
                         ),
                       (loc, empty_tannot)
                     );
-                  E_aux
-                    (E_exit (E_aux (E_lit (L_aux (L_unit, loc)), (loc, empty_tannot))), (loc, empty_tannot));
+                  E_aux (E_exit (E_aux (E_lit (L_aux (L_unit, loc)), (loc, empty_tannot))), (loc, empty_tannot));
                 ],
               (loc, empty_tannot)
             )
         in
         E_aux (E_if (is_empty, fail, body), (loc, empty_tannot))
+      )
       else E_aux (E_block [assert_exp; body], (loc, empty_tannot))
     in
     let body = rebind body in
@@ -4368,7 +4370,7 @@ let rewrite_explicit_measure_with_fuel use_nat_fuel effect_info env ast =
             let wpats, wexps = List.split (List.mapi mk_wrap measure_pats) in
             let wpat = match wpats with [wpat] -> wpat | _ -> P_aux (P_tuple wpats, (loc, empty_tannot)) in
             let wbody =
-              if use_nat_fuel then
+              if use_nat_fuel then (
                 let measure_id = mk_id "#measure" in
                 let measure_value = E_aux (E_typ (int_typ, measure_exp), (loc, empty_tannot)) in
                 let measure_ref = E_aux (E_id measure_id, (loc, empty_tannot)) in
@@ -4376,10 +4378,7 @@ let rewrite_explicit_measure_with_fuel use_nat_fuel effect_info env ast =
                   E_aux
                     ( E_app
                         ( mk_id "lt_int",
-                          [
-                            measure_ref;
-                            E_aux (E_lit (L_aux (L_num Big_int.zero, loc)), (loc, empty_tannot));
-                          ]
+                          [measure_ref; E_aux (E_lit (L_aux (L_num Big_int.zero, loc)), (loc, empty_tannot))]
                         ),
                       (loc, empty_tannot)
                     )
@@ -4388,18 +4387,13 @@ let rewrite_explicit_measure_with_fuel use_nat_fuel effect_info env ast =
                   E_aux
                     ( E_app
                         ( mk_id "add_atom",
-                          [
-                            measure_ref;
-                            E_aux
-                              (E_lit (L_aux (L_num (Big_int.of_int 1), loc)), (loc, empty_tannot));
-                          ]
+                          [measure_ref; E_aux (E_lit (L_aux (L_num (Big_int.of_int 1), loc)), (loc, empty_tannot))]
                         ),
                       (loc, empty_tannot)
                     )
                 in
                 let fail =
-                  E_aux
-                    (E_exit (E_aux (E_lit (L_aux (L_unit, loc)), (loc, empty_tannot))), (loc, empty_tannot))
+                  E_aux (E_exit (E_aux (E_lit (L_aux (L_unit, loc)), (loc, empty_tannot))), (loc, empty_tannot))
                 in
                 let call = E_aux (E_app (rec_id id, wexps @ [fuel]), (loc, empty_tannot)) in
                 E_aux
@@ -4410,9 +4404,11 @@ let rewrite_explicit_measure_with_fuel use_nat_fuel effect_info env ast =
                       ),
                     (loc, empty_tannot)
                   )
-              else
+              )
+              else (
                 let measure_exp = E_aux (E_typ (int_typ, measure_exp), (loc, empty_tannot)) in
                 E_aux (E_app (rec_id id, wexps @ [measure_exp]), (loc, empty_tannot))
+              )
             in
             let wrapper =
               FCL_aux
@@ -4448,7 +4444,10 @@ let rewrite_explicit_measure_with_fuel use_nat_fuel effect_info env ast =
         let fd, extra = rewrite_function (IdSet.singleton (id_of_fundef fd)) fd in
         List.map (fun f -> DEF_aux (DEF_fundef f, def_annot)) (fd :: extra)
     | DEF_aux (DEF_internal_mutrec fds, def_annot) as d ->
-        let recset = ids_of_def d in
+        (* Only measured functions receive a #rec# helper.  Internal mutual
+           groups may also contain structurally recursive functions; rewriting
+           calls to those functions would target helpers that do not exist. *)
+        let recset = IdSet.filter (fun id -> Bindings.mem id measures) (ids_of_def d) in
         let fds, extras = List.split (List.map (rewrite_function recset) fds) in
         let extras = List.concat extras in
         DEF_aux (DEF_internal_mutrec fds, def_annot) :: List.map (fun f -> DEF_aux (DEF_fundef f, def_annot)) extras

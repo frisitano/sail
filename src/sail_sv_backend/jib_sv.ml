@@ -71,7 +71,11 @@ let ngensym = symbol_generator ()
 
 let symgen_asrt = symbol_generator ()
 let ngen_asrt () =
-  let n = match symgen_asrt () with Gen (_, n, _) -> n | _ -> failwith "symgen_asrt should return a Gen(int, _, _)" in
+  let n =
+    match symgen_asrt () with
+    | Gen (_, n, _, _, _) -> n
+    | _ -> failwith "symgen_asrt should return a generated Jib name"
+  in
   name @@ mk_id @@ Printf.sprintf "asrt_cond_%d" n
 
 let natural_name_compare variable_locations n1 n2 =
@@ -299,7 +303,7 @@ module Make (Config : CONFIG) = struct
   let pp_name_string =
     let ssa_num n = if n = -1 then "" else "_" ^ string_of_int n in
     function
-    | Gen (v1, v2, n) -> pp_id_string (mk_id (sprintf "%d.%d" v1 v2)) ^ ssa_num n
+    | Gen (v1, v2, n, _, _) -> pp_id_string (mk_id (sprintf "%d.%d" v1 v2)) ^ ssa_num n
     | Name (id, n) -> pp_id_string id ^ ssa_num n
     | Abstract id -> pp_id_string id
     | Have_exception n -> "sail_have_exception" ^ ssa_num n
@@ -864,7 +868,7 @@ module Make (Config : CONFIG) = struct
         let updates, lexp = svir_clexp l ctx clexp in
         wrap (with_updates l updates (SVS_assign (lexp, value)))
     | I_funcall (creturn, extern_info, (id, _), args) ->
-        let preserve_name = match extern_info with Extern _ -> true | Call -> false in
+        let preserve_name = match extern_info with Extern _ -> true | Call _ -> false in
         if ctx_is_extern id ctx then (
           let name = ctx_get_extern id ctx in
           extern_generate l ctx creturn id name args

@@ -85,6 +85,36 @@ There are several Sail options that affect the C output:
 
 * `--c-no-main` Do not generate a `main()` function.
 
+* `--c-specialize` preserve proof-backed fixed integer representations across
+    C function boundaries and specialize local function bodies as required.
+
+* `--c-specialize-log` report representation demands, semantic argument
+    bounds, iterative worklist depth, and elapsed compiler time while
+    `--c-specialize` runs.
+
+* `--c-require-bounded-int` reject generated definitions that still require
+    arbitrary-precision `sail_int`. The diagnostic identifies the owning Sail
+    definition so its parameter, result, local value, or container element can
+    be given a finite semantic bound. Use this only for targets that require an
+    entirely fixed-width integer model.
+
+The structured `$target_name` directive can override a source identifier's
+generated spelling for one backend. The C backend currently supports it with
+`backend = "c"`; directives for other backends are ignored. For example:
+
+[source,sail]
+----
+$target_name {
+  backend = "c",
+  id = CREATE,
+  target = "opcode_CREATE"
+}
+----
+
+This is useful with `--c-no-mangle` when an otherwise readable Sail identifier
+collides with a C runtime or FFI identifier. The existing C-specific
+`$c_override` directive remains supported.
+
 <<<
 === SystemVerilog compilation (Experimental)
 

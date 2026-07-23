@@ -13,6 +13,7 @@ from sailtest import *
 
 sail_dir = get_sail_dir()
 sail = get_sail()
+rocq_compile = get_rocq_compile()
 targets = get_targets(['c', 'cpp', 'interpreter', 'ocaml', 'partial'])
 
 print("Sail is {}".format(sail))
@@ -250,8 +251,8 @@ def test_rocq(name):
                 step('./mk_rocq_main.sh {} {}'.format(basename, basename.capitalize()))
                 os.chdir('_rocqbuild_{}'.format(basename))
 
-                step('coqc {}_types.v'.format(basename))
-                step('coqc {}.v'.format(basename))
+                step('{} {}_types.v'.format(rocq_compile, basename))
+                step('{} {}.v'.format(rocq_compile, basename))
                 step('coqtop -require-import {}_types -require-import {} -l main.v -batch | tee /dev/stderr | grep -q OK'.format(basename,basename), expected_status = 1 if basename.startswith('fail') else 0)
                 filter_command = '''ocaml ../rocq_output_filter.ml < '''
                 step('''{} output.out | diff - ../{}.expect'''.format(filter_command, basename, basename))

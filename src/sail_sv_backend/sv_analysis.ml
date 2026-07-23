@@ -118,7 +118,7 @@ class footprint_visitor ctx registers (footprint : direct_footprint) : jib_visit
           let name = string_of_id id in
           if name = "sail_assert" then footprint.contains_assert <- true;
           DoChildren
-      | I_aux (I_funcall (_, Call, (id, _), args), (l, _)) ->
+      | I_aux (I_funcall (_, Call _, (id, _), args), (l, _)) ->
           let open Util.Option_monad in
           if ctx_is_extern id ctx then (
             let name = ctx_get_extern id ctx in

@@ -29,22 +29,27 @@ grep -Fq 'uint64_t zreverse_index(uint64_t);' c_repr_nat_newtype.h
 grep -Fq 'bool zoperation_is_zzero(struct zrepresented_operation);' c_repr_nat_newtype.h
 grep -Fq 'bool zboxed_index_is_zzero(struct zindex_box);' c_repr_nat_newtype.h
 grep -Fq 'bool zboxed_index_differs(struct zindex_box, uint64_t);' c_repr_nat_newtype.h
-grep -Fq 'uint64_t zvector_read(zz5vecz8z5bv8z9, uint64_t);' c_repr_nat_newtype.h
-grep -Fq 'void zvector_write(zz5vecz8z5bv8z9 *rop, zz5vecz8z5bv8z9, uint64_t, uint64_t);' c_repr_nat_newtype.h
+grep -Fq 'uint64_t zvector_read(sail_fixed_bytes_4, uint64_t);' c_repr_nat_newtype.h
+grep -Fq 'sail_fixed_bytes_4 zvector_write(sail_fixed_bytes_4, uint64_t, uint64_t);' c_repr_nat_newtype.h
 grep -Fq 'uint64_t zpack_gas(sail_int);' c_repr_nat_newtype.h
 grep -Fq 'void zunpack_gas(sail_int *rop, uint64_t);' c_repr_nat_newtype.h
 
-# Operators on represented payloads lower directly to native C.
-grep -Fq 'sail_checked_u64_add(zvalue, UINT64_C(1))' c_repr_nat_newtype.c
-grep -Fq 'sail_checked_u64_add(zleft, zright)' c_repr_nat_newtype.c
-grep -Fq 'sail_checked_u64_sub(zleft, zright)' c_repr_nat_newtype.c
-grep -Fq 'sail_checked_u64_mul(zleft, zright)' c_repr_nat_newtype.c
-grep -Fq 'sail_checked_u64_div(zleft, zright)' c_repr_nat_newtype.c
-grep -Fq 'sail_checked_u64_mod(zleft, zright)' c_repr_nat_newtype.c
+# A representation annotation controls storage and ABI shape; it is not a
+# proof that an unbounded nat operation fits.  Unproved arithmetic remains
+# mathematical and narrows only at the explicit represented boundary.
+if grep -Eq 'sail_checked_(u64|i64)_(add|sub|mul|div|mod)' c_repr_nat_newtype.c; then
+  echo "generated C contains checked fixed-width arithmetic" >&2
+  exit 1
+fi
+grep -Fq 'add_int' c_repr_nat_newtype.c
+grep -Fq 'sub_int' c_repr_nat_newtype.c
+grep -Fq 'mult_int' c_repr_nat_newtype.c
+grep -Fq 'tdiv_int' c_repr_nat_newtype.c
+grep -Fq 'tmod_int' c_repr_nat_newtype.c
 
-# Native payload arithmetic must not detour through sail_int before being
-# wrapped back into the annotated newtype.
-for function_name in zincrement zadd zsubtract zmultiply zdivide zremainder zlow_byte zto_limb zreverse_index zoperation_is_zzero zboxed_index_is_zzero zboxed_index_differs; do
+# Proven bounded arithmetic, comparisons, bit extraction, and fixed-vector
+# indexing stay entirely in their native representations.
+for function_name in zlow_byte zto_limb zreverse_index zoperation_is_zzero zboxed_index_is_zzero zboxed_index_differs; do
   awk -v function_name="$function_name" '
     $0 ~ "^(uint64_t|bool) " function_name "\\(" { in_function = 1 }
     in_function && /sail_int/ { found_runtime = 1 }
@@ -52,7 +57,7 @@ for function_name in zincrement zadd zsubtract zmultiply zdivide zremainder zlow
     END { if (!in_function) exit 2 }
   ' c_repr_nat_newtype.c
 done
-grep -Fq 'sail_checked_u64_sub(UINT64_C(31), zindex)' c_repr_nat_newtype.c
+grep -Fq '(UINT64_C(31) - zindex)' c_repr_nat_newtype.c
 grep -Fq 'safe_rshift(zvalue, UINT64_C(0))' c_repr_nat_newtype.c
 for function_name in zvector_read zvector_write; do
   awk -v function_name="$function_name" '
@@ -62,17 +67,13 @@ for function_name in zvector_read zvector_write; do
     END { if (!in_function) exit 2 }
   ' c_repr_nat_newtype.c
 done
-grep -Fq 'fast_unsigned_vector_access_zz5vecz8z5bv8z9(zvalues, zindex)' c_repr_nat_newtype.c
-grep -Fq 'fast_unsigned_vector_update_zz5vecz8z5bv8z9(' c_repr_nat_newtype.c
+grep -Fq 'fast_unsigned_vector_access_fixed_bytes_4(zvalues, zindex)' c_repr_nat_newtype.c
+grep -Fq 'fast_unsigned_vector_update_fixed_bytes_4(' c_repr_nat_newtype.c
 grep -Fq '(zleft < zright)' c_repr_nat_newtype.c
 grep -Fq '(zleft == zright)' c_repr_nat_newtype.c
 grep -Fq ' != zexpected);' c_repr_nat_newtype.c
-if grep -Eq '(add_int|sub_int|mult_int|tdiv_int|tmod_int)\(' c_repr_nat_newtype.c; then
-  echo "represented nat operators unexpectedly used the mathematical integer runtime" >&2
-  exit 1
-fi
-
-# Crossings to and from an ordinary mathematical nat remain explicit and checked.
+# Crossings to and from an ordinary mathematical nat remain explicit and
+# range-validated; this is conversion checking, not checked arithmetic.
 grep -Fq 'CONVERT_OF(mach_uint, sail_int)' c_repr_nat_newtype.c
 grep -Fq 'CONVERT_OF(sail_int, mach_uint)' c_repr_nat_newtype.c
 grep -Fq 'UINT64_C(18446744073709551615)' c_repr_nat_newtype.c

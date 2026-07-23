@@ -174,6 +174,22 @@ val tdiv_int = pure {
   _: "tdiv_int"
 } : (int, int) -> int
 
+/*! Truncating division specialized to a non-negative dividend and positive
+ * divisor.  Singleton operands determine the exact natural-number result. */
+val tdiv_nat = pure {
+  smt: "div",
+  ocaml: "quotient",
+  interpreter: "quotient",
+  lem: "integerDiv",
+  c: "tdiv_int",
+  cpp: "tdiv_int",
+  systemverilog: "tdiv_int",
+  coq: "Z.quot",
+  lean: "Nat.div",
+  _: "tdiv_int"
+} : forall 'n 'm, 'n >= 0 & 'm >= 1.
+    (int('n), int('m)) -> int(div('n, 'm))
+
 /*! Remainder for truncating division (has sign of dividend) */
 val _tmod_int = pure {
   coq: "Z.rem",
@@ -191,7 +207,39 @@ val _tmod_int_positive = pure {
   _: "tmod_int"
 } : forall 'n, 'n >= 1. (int, int('n)) -> nat
 
-overload tmod_int = {_tmod_int_positive, _tmod_int}
+/*! Remainder specialized to a non-negative dividend and positive divisor.
+ * Singleton operands determine the exact natural-number result. */
+val tmod_nat = pure {
+  smt: "mod",
+  ocaml: "modulus",
+  interpreter: "modulus",
+  lem: "integerMod",
+  c: "tmod_int",
+  cpp: "tmod_int",
+  systemverilog: "tmod_int",
+  coq: "Z.rem",
+  lean: "Nat.mod",
+  _: "tmod_int"
+} : forall 'n 'm, 'n >= 0 & 'm >= 1.
+    (int('n), int('m)) -> int(mod('n, 'm))
+
+overload tmod_int = {tmod_nat, _tmod_int_positive, _tmod_int}
+
+/*! Euclidean remainder specialized to a positive divisor.  Unlike truncating
+ * remainder, this is non-negative even when the dividend is negative. */
+val emod_positive = pure {
+  smt: "mod",
+  ocaml: "modulus",
+  interpreter: "modulus",
+  lem: "integerMod",
+  c: "emod_int",
+  cpp: "emod_int",
+  systemverilog: "emod_int",
+  coq: "Z.modulo",
+  lean: "Int.emod",
+  _: "emod_int"
+} : forall 'n 'm, 'm >= 1.
+    (int('n), int('m)) -> {'r, 0 <= 'r < 'm. int('r)}
 
 $c_reserved fdiv_int
 

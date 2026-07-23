@@ -58,7 +58,19 @@ open Value2
 
 type iannot = int * Parse_ast.l
 
+(* Preserve the semantic interval of each actual argument and result across
+   the ANF-to-JIB boundary.  C representations alone are insufficient here:
+   two values can both lower to uint64_t while having materially different
+   source bounds. *)
+type integer_interval = Nat_big_num.num * Nat_big_num.num
+type callsite_bounds = integer_interval option list * integer_interval option
+
 }}
+
+metavar callsite_bounds ::=
+  {{ phantom }}
+  {{ ocaml callsite_bounds }}
+  {{ lem unit }}
 
 grammar
 
@@ -67,7 +79,7 @@ chan :: 'Chan_' ::=
   | stderr :: :: stderr
 
 name :: '' ::=
-  | nat0 nat1 nat2        :: :: gen
+  | nat0 nat1 nat2 mstring0 mstring1 :: :: gen
   | id nat                :: :: name
   | abstract id           :: :: abstract
   | have_exception nat    :: :: have_exception
@@ -99,6 +111,14 @@ op :: '' ::=
   | gt                :: :: igt
   | gteq              :: :: igteq
   | add               :: :: iadd
+% Integer arithmetic whose dependent result type proves that the value fits the
+% selected native representation. Backends may emit the underlying machine
+% operation without a redundant runtime overflow check.
+  | proven_add        :: :: proven_iadd
+  | proven_sub        :: :: proven_isub
+  | proven_mul        :: :: proven_imul
+  | proven_div        :: :: proven_idiv
+  | proven_mod        :: :: proven_imod
   | sub               :: :: isub
   | mul               :: :: imul
   | div               :: :: idiv
@@ -237,7 +257,7 @@ init :: 'Init_' ::=
 % special runtime functions used by the C backend, or used to implement
 % type specific peephole optimisations etc.
 funtype :: '' ::=
-  | call        :: :: call
+  | callsite_bounds call :: :: call
   | extern ctyp :: :: extern
 
 instr :: 'I_' ::=

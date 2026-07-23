@@ -327,6 +327,9 @@ sbits CONVERT_OF(sbits, lbits)(const lbits, const bool);
  * Limbs are little-endian: limbs[0] contains the least-significant 64 bits. */
 void sail_lbits_to_u64_array(uint64_t *, size_t, const lbits);
 void sail_lbits_from_u64_array(lbits *, const uint64_t *, size_t, uint64_t);
+void sail_int_to_u64_array(uint64_t *, size_t, const sail_int);
+void sail_int_from_u64_array(sail_int *, const uint64_t *, size_t);
+void sail_int_from_twos_complement_u64_array(sail_int *, const uint64_t *, size_t);
 
 void UNDEFINED(lbits)(lbits *, const sail_int len);
 fbits UNDEFINED(fbits)(const unit);

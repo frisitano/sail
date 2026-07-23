@@ -86,7 +86,7 @@ module Make_optimizer (S : Sequence) = struct
     type t = Jib.name
     let equal x y = Name.compare x y = 0
     let hash = function
-      | Gen (v1, v2, n) -> Hashtbl.hash (0, (v1, v2, n))
+      | Gen (v1, v2, n, _, _) -> Hashtbl.hash (0, (v1, v2, n))
       | Name (Id_aux (aux, _), n) -> Hashtbl.hash (1, (aux, n))
       | Abstract (Id_aux (aux, _)) -> Hashtbl.hash (2, aux)
       | Have_exception n -> Hashtbl.hash (3, n)
@@ -525,7 +525,7 @@ module Make (Config : CONFIG) = struct
     let open Type_check in
     match aux with
     | I_funcall (CR_one (CL_id (id, ret_ctyp)), extern_info, (function_id, _), args) ->
-        let extern = match extern_info with Extern _ -> true | Call -> false in
+        let extern = match extern_info with Extern _ -> true | Call _ -> false in
         if ctx_is_extern function_id ctx then (
           let name = ctx_get_extern function_id ctx in
           if name = "sail_assume" then (
@@ -964,7 +964,7 @@ module Make (Config : CONFIG) = struct
 
       method! vinstr =
         function
-        | I_aux (I_funcall (CR_one (CL_addr (CL_id (id, ctyp))), Call, function_id, args), (_, l)) -> (
+        | I_aux (I_funcall (CR_one (CL_addr (CL_id (id, ctyp))), Call _, function_id, args), (_, l)) -> (
             match ctyp with
             | CT_ref reg_ctyp -> (
                 match CTMap.find_opt reg_ctyp Config.register_map with
@@ -989,7 +989,7 @@ module Make (Config : CONFIG) = struct
                 raise
                   (Reporting.err_general l "Register reference assignment must take a register reference as an argument")
           )
-        | I_aux (I_funcall (CR_one clexp, Call, function_id, [reg_ref]), (_, l)) as instr -> (
+        | I_aux (I_funcall (CR_one clexp, Call _, function_id, [reg_ref]), (_, l)) as instr -> (
             let open Type_check in
             match
               if Env.is_extern (fst function_id) env "smt" then Some (Env.get_extern (fst function_id) env "smt")
@@ -1286,6 +1286,14 @@ end) : Jib_compile.CONFIG = struct
   let ctyp_suprema = Jib_util.ctyp_suprema
   let specialize_newtype_payload _ ctyp = ctyp
   let representation_refines ~semantic:_ ~represented:_ = false
+  let specialize_function_argument_representation ~semantic:_ ~represented:_ = false
+  let specialize_function_result_representation ~semantic:_ ~represented:_ = false
+  let specialize_function_body_representation ~semantic:_ ~represented:_ = false
+  let require_bounded_int = false
+  let integer_representation_bounds _ = None
+  let specialized_function_external _ _ _ = None
+  let function_argument_unification_type ~expected:_ ~represented:_ = None
+  let function_argument_narrowing_allowed ~expected:_ ~source:_ ~represented:_ = false
   let preserve_aval_representation ~semantic:_ ~represented:_ = false
   let propagate_newtype_payload_representation _ ~semantic:_ ~represented:_ = false
   let specialize_call_result _ _ ctyp = ctyp
