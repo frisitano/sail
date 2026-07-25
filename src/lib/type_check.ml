@@ -576,7 +576,12 @@ let rec unify_typ l env goals (Typ_aux (aux1, _) as typ1) (Typ_aux (aux2, _) as 
   | Typ_id id1, Typ_id id2 when Id.compare id1 (mk_id "string") = 0 && Id.compare id2 (mk_id "string_literal") = 0 ->
       KBindings.empty
   | Typ_tuple typs1, Typ_tuple typs2 when List.length typs1 = List.length typs2 ->
-      List.fold_left (merge_uvars env l) KBindings.empty (List.map2 (unify_typ l env goals) typs1 typs2)
+      List.fold_left2
+        (fun unifiers typ1 typ2 ->
+          let typ1 = KBindings.fold (fun kid arg typ -> typ_subst kid arg typ) unifiers typ1 in
+          merge_uvars env l unifiers (unify_typ l env goals typ1 typ2)
+        )
+        KBindings.empty typs1 typs2
   | Typ_fn (arg_typs1, ret_typ1), Typ_fn (arg_typs2, ret_typ2) when List.length arg_typs1 = List.length arg_typs2 ->
       merge_uvars env l
         (List.fold_left (merge_uvars env l) KBindings.empty (List.map2 (unify_typ l env goals) arg_typs1 arg_typs2))

@@ -78,6 +78,8 @@ let opt_lean_source_root : string option ref = ref None
 
 let opt_lean_import_files : string list ref = ref []
 
+let opt_lean_specialization_file : string option ref = ref None
+
 let opt_lean_noncomputable : bool ref = ref false
 
 let opt_lean_real_numbers : bool ref = ref false
@@ -148,6 +150,10 @@ let lean_options =
       Arg.String (fun file -> opt_lean_import_files := file :: !opt_lean_import_files),
       "import this file in the generated model"
     );
+    ( Flag.create ~prefix:["lean"] ~arg:"file" "specialization_file",
+      Arg.String (fun file -> opt_lean_specialization_file := Some file),
+      "replace the default Lean runtime specialization module with this file"
+    );
     ( Flag.create ~prefix:["lean"] ~arg:"func-name" "noncomputable_function",
       Arg.String
         Pretty_print_lean.(fun fn -> opt_noncomputable_functions := IdSet.add (mk_id fn) !opt_noncomputable_functions),
@@ -157,14 +163,43 @@ let lean_options =
       Arg.String Pretty_print_lean.(fun fn -> opt_partial_functions := IdSet.add (mk_id fn) !opt_partial_functions),
       "disable the totality check for this function"
     );
+    ( Flag.create ~prefix:["lean"] "explicit_measures",
+      Arg.Unit (fun () -> opt_explicit_measures := true),
+      "compile explicit termination measures to structurally decreasing fuel"
+    );
     ( Flag.create ~prefix:["lean"] "semantic_range_types",
       Arg.Unit
         (fun () ->
           Pretty_print_lean.opt_semantic_range_types := true;
           opt_explicit_measures := true;
           Type_check.opt_expand_valspec := false
-        ),
+      ),
       "preserve explicit range aliases as nominal executable types with separate validity predicates"
+    );
+    ( Flag.create ~prefix:["lean"] "prop_dependent_types",
+      Arg.Unit
+        (fun () ->
+          Pretty_print_lean.opt_infer_prop_dependent_types := true;
+          Type_check.opt_expand_valspec := false
+        ),
+      "infer recoverably indexed records and existential aliases as runtime carriers with erased Prop refinements"
+    );
+    ( Flag.create ~prefix:["lean"] ~arg:"record:alias" "prop_dependent_type",
+      Arg.String
+        Pretty_print_lean.(
+          fun specification ->
+            Type_check.opt_expand_valspec := false;
+            match String.split_on_char ':' specification with
+            | [record; alias] when record <> "" && alias <> "" ->
+                opt_prop_dependent_types := (record, alias) :: !opt_prop_dependent_types
+            | _ ->
+                raise
+                  (Arg.Bad
+                     "--lean-prop-dependent-type expects a proof-refined record and its existential alias as \
+                      RECORD:ALIAS"
+                  )
+        ),
+      "lower one recoverably indexed record and existential alias to a runtime carrier plus erased Prop refinement"
     );
     ( Flag.create ~prefix:["lean"] ~arg:"func-name" "non_beq_type",
       Arg.String Pretty_print_lean.(fun fn -> non_beq_types := IdSet.add (mk_id fn) !non_beq_types),
@@ -403,7 +438,12 @@ let start_lean_output interface_v (out_name : string) (import_names : string lis
     else "/src/sail_lean_backend/Sail/FakeReal.lean"
   in
   opt_lean_import_files := (sail_dir ^ real_numbers_file) :: !opt_lean_import_files;
-  opt_lean_import_files := (sail_dir ^ "/src/sail_lean_backend/Sail/Specialization.lean") :: !opt_lean_import_files;
+  let specialization_file =
+    match !opt_lean_specialization_file with
+    | Some file -> file
+    | None -> sail_dir ^ "/src/sail_lean_backend/Sail/Specialization.lean"
+  in
+  opt_lean_import_files := specialization_file :: !opt_lean_import_files;
   List.iter
     (fun filename ->
       let filepath = Filename.concat lean_src_dir (file_to_module filename) in

@@ -121,6 +121,8 @@ let rec id_of_regtyp builtins (Typ_aux (t, l) as typ) =
       in
       if IdSet.mem id builtins && not (is_bitvector_typ typ) then id
       else append_id id (String.concat "_" ("" :: List.map name_arg args))
+  | Typ_exist (_, _, Typ_aux (Typ_app (id, _), _)) -> id
+  | Typ_exist (_, _, typ) -> id_of_regtyp builtins typ
   | _ -> raise (Reporting.err_typ l ("Unsupported register type " ^ string_of_typ typ))
 
 let regstate_field typ = append_id (id_of_regtyp IdSet.empty typ) "_reg"
