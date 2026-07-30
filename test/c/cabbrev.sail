@@ -9,16 +9,9 @@ $option --c-include includes/pair_fn.h
 
 type my_pair = (range(0, 64), range(0, 64))
 
-$target_name {
-  backend = "c",
+$c_override {
   id = my_pair,
   target = "my_pair_in_c"
-}
-
-$target_name {
-  backend = "lean",
-  id = my_pair,
-  target = "my_pair_in_lean"
 }
 
 // The fact that tuple fields are named this is a bit of an

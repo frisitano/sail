@@ -46,9 +46,6 @@
 
 val parse_override : (string * Ast.attribute_data) list -> ((string * string * string) * string) option
 
-(** Parse a backend-specific [$target_name] directive. *)
-val parse_target_name : (string * Ast.attribute_data) list -> (string * ((string * string * string) * string)) option
-
 module Overrides : sig
   include Map.S with type key = string * string * string
 end
