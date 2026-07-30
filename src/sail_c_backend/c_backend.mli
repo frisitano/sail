@@ -126,6 +126,10 @@ module type CODEGEN_CONFIG = sig
   (** Reject generated C that still requires arbitrary-precision integers. *)
   val require_bounded_int : bool
 
+  (** Optional backend-neutral representation-specialization plan outputs. *)
+  val specialization_plan_json : string option
+  val specialization_plan_human : string option
+
   (** If set generate a C++ class for the model instead of global C functions/variables. *)
   val cpp : bool
 

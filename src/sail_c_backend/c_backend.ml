@@ -2404,6 +2404,8 @@ module type CODEGEN_CONFIG = sig
   val c_repr_fixed_bytes : int Bindings.t
   val specialize_c : bool
   val require_bounded_int : bool
+  val specialization_plan_json : string option
+  val specialization_plan_human : string option
   val cpp : bool
   val cpp_class_name : string
   val cpp_namespace : string
@@ -6920,6 +6922,21 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       emit_generic_sail_int_helpers := (not Config.specialize_c) || has_sail_int;
       emit_generic_lbits_helpers := (not Config.specialize_c) || has_lbits;
 
+      let specialization_plan =
+        if Option.is_some Config.specialization_plan_json || Option.is_some Config.specialization_plan_human then
+          Some
+            (Specialization_plan.create ~compiler_name:"Sail" ~compiler_version:"0.20.2"
+               ~compiler_revision:None
+               ~input_locations:(List.map (fun (DEF_aux (_, annot)) -> annot.loc) ast.defs)
+               !Jib_compile.representation_specializations
+            )
+        else None
+      in
+      (match (Config.specialization_plan_json, specialization_plan) with
+      | Some path, Some plan -> Specialization_plan.write_json path plan
+      | _ -> ()
+      );
+
       generated := IdSet.empty;
       readable_ctyp_names := CTMap.empty;
       readable_ctyp_names_used := Util.StringSet.empty;
@@ -7139,6 +7156,11 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           ^^ model_test ^^ hlhl ^^ actual_main ^^ hardline ^^ separate hardline extern_cpp_end ^^ hardline
           )
       in
+
+      (match (Config.specialization_plan_human, specialization_plan) with
+      | Some path, Some plan -> Specialization_plan.write_human ~backend_symbol:sgen_function_id path plan
+      | _ -> ()
+      );
 
       log_phase "complete header-bytes=%d implementation-bytes=%d" (String.length header) (String.length impl);
       (header, impl)
