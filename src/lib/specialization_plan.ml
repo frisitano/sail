@@ -128,10 +128,12 @@ let obligation clone_identity kind subject status evidence =
       ("evidence", `String evidence);
     ]
 
-let create ~compiler_name ~compiler_version ~compiler_revision ~input_locations traces =
+let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~input_locations traces =
   let configuration_identity =
     digest_string "configuration"
-      "specialization-plan-schema=1.0.0;representation-policy=c-specialize-v1;backend-symbols=excluded"
+      ("specialization-plan-schema=1.0.0;representation-policy=c-specialize-v1;backend-symbols=excluded;"
+     ^ configuration
+      )
   in
   let clones =
     List.map
@@ -185,10 +187,12 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~input_locations 
       trace.conversions
       |> List.map (fun (source, destination) -> (string_of_ctyp source, string_of_ctyp destination))
       |> unique_sorted Stdlib.compare
-      |> List.mapi (fun index (source, destination) ->
+      |> List.map (fun (source, destination) ->
           `Assoc
             [
-              ("id", `String (digest_string "conversion" (clone.clone_identity ^ "\x1f" ^ string_of_int index)));
+              ( "id",
+                `String (digest_string "conversion" (String.concat "\x1f" [clone.clone_identity; source; destination]))
+              );
               ("source_type", `String source);
               ("destination_type", `String destination);
               ("reason", `String "typed JIB assignment boundary");
@@ -215,10 +219,21 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~input_locations 
           )
       )
       |> unique_sorted Stdlib.compare
-      |> List.mapi (fun index (callee_identity, source_name, type_arguments, result, is_extern) ->
+      |> List.map (fun (callee_identity, source_name, type_arguments, result, is_extern) ->
+          let subject =
+            String.concat "\x1f"
+              [
+                clone.clone_identity;
+                callee_identity;
+                source_name;
+                String.concat "," type_arguments;
+                result;
+                string_of_bool is_extern;
+              ]
+          in
           `Assoc
             [
-              ("id", `String (digest_string "call" (clone.clone_identity ^ "\x1f" ^ string_of_int index)));
+              ("id", `String (digest_string "call" subject));
               ("callee", `String callee_identity);
               ("source_name", `String source_name);
               ("type_arguments", json_strings type_arguments);

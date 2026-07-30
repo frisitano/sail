@@ -6923,13 +6923,32 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       emit_generic_lbits_helpers := (not Config.specialize_c) || has_lbits;
 
       let specialization_plan =
-        if Option.is_some Config.specialization_plan_json || Option.is_some Config.specialization_plan_human then
+        if Option.is_some Config.specialization_plan_json || Option.is_some Config.specialization_plan_human then (
+          let ids ids = IdSet.elements ids |> List.map string_of_id |> String.concat "," in
+          let fixed_bytes =
+            Bindings.bindings Config.c_repr_fixed_bytes
+            |> List.map (fun (id, length) -> string_of_id id ^ ":" ^ string_of_int length)
+            |> String.concat ","
+          in
+          let configuration =
+            String.concat ";"
+              [
+                "specialize_c=" ^ string_of_bool Config.specialize_c;
+                "require_bounded_int=" ^ string_of_bool Config.require_bounded_int;
+                "preserved_calls=" ^ ids (IdSet.of_list (Specialize.get_initial_calls ()));
+                "c_repr_uint64=" ^ ids Config.c_repr_uint64;
+                "c_repr_int64=" ^ ids Config.c_repr_int64;
+                "c_repr_u256=" ^ ids Config.c_repr_u256;
+                "c_repr_fixed_bytes=" ^ fixed_bytes;
+              ]
+          in
           Some
-            (Specialization_plan.create ~compiler_name:"Sail" ~compiler_version:"0.20.2"
-               ~compiler_revision:None
+            (Specialization_plan.create ~compiler_name:"Sail" ~compiler_version:"0.20.2" ~compiler_revision:None
+               ~configuration
                ~input_locations:(List.map (fun (DEF_aux (_, annot)) -> annot.loc) ast.defs)
                !Jib_compile.representation_specializations
             )
+        )
         else None
       in
       (match (Config.specialization_plan_json, specialization_plan) with

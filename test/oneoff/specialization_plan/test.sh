@@ -11,7 +11,7 @@ TMP_ROOT=${AGENT_TMPDIR:-"$ROOT/.agent-tmp"}
 mkdir -p "$TMP_ROOT"
 TMP_DIR=$(mktemp -d "$TMP_ROOT/specialization_plan.XXXXXX")
 trap 'rm -rf "$TMP_DIR"' EXIT
-mkdir -p "$TMP_DIR/with" "$TMP_DIR/repeated" "$TMP_DIR/readable" "$TMP_DIR/without"
+mkdir -p "$TMP_DIR/with" "$TMP_DIR/repeated" "$TMP_DIR/readable" "$TMP_DIR/configured" "$TMP_DIR/without"
 
 if [ -n "${SAIL_PLUGIN:-}" ]; then
   set -- -plugin "$SAIL_PLUGIN"
@@ -51,6 +51,14 @@ cmp "$TMP_DIR/plan-a.json" "$TMP_DIR/plan-readable.json"
 grep -Fq 'Sail source name:' "$TMP_DIR/plan-readable.md"
 grep -Fq 'Generated clone name:' "$TMP_DIR/plan-readable.md"
 grep -Fq 'Emitted backend symbol:' "$TMP_DIR/plan-readable.md"
+
+# Effective representation-specialization settings contribute to configuration
+# identity even when they happen not to change this model's clone set.
+compile_core "$TMP_DIR/configured/model" "$@" --c-require-bounded-int \
+  --c-specialization-plan "$TMP_DIR/plan-configured.json"
+test \
+  "$(jq -r '.configuration.id' "$TMP_DIR/plan-a.json")" != \
+  "$(jq -r '.configuration.id' "$TMP_DIR/plan-configured.json")"
 
 # With emission disabled, generated C and headers are unchanged.
 compile_core "$TMP_DIR/without/model" "$@"

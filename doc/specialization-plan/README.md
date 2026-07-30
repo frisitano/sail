@@ -35,7 +35,7 @@ Every identity is a domain-separated digest:
 - a clone identity hashes the source identity, represented signature, and
   normalized inferred bounds;
 - conversion, call-edge, and obligation identities hash their owning clone and
-  canonical subject.
+  canonical subject, never an output-list position.
 
 Display order, generated JIB names, C name mangling, and transient compiler
 symbols are excluded from these preimages. The machine plan therefore does not
@@ -68,9 +68,10 @@ record ordering by stable ID. Identical compiler version, configuration,
 inputs, and specialization decisions produce byte-identical JSON.
 
 The configuration identity covers the versioned representation-specialization
-policy. Input-local representation annotations are covered by the input
-digests, while backend naming/output flags are deliberately excluded because
-they cannot affect proof identity.
+policy, bounded-integer enforcement, preserved specialization roots, and the
+effective per-type representation settings. Input-local representation
+annotations are also covered by the input digests. Backend naming and output
+paths are deliberately excluded because they cannot affect proof identity.
 
 ## Obligations
 
