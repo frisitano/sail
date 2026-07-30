@@ -68,6 +68,8 @@ let opt_specialize_c = ref false
 let opt_require_bounded_int = ref false
 let opt_specialization_plan_json = ref None
 let opt_specialization_plan_human = ref None
+let opt_specialization_obligations_lean = ref None
+let opt_specialization_obligations_coq = ref None
 let opt_cpp_class_name = ref "Model"
 let opt_cpp_namespace = ref "model"
 let opt_cpp_derive_from = ref None
@@ -123,6 +125,14 @@ let c_options =
     ( Flag.create ~prefix:["c"] ~arg:"filename" "specialization_plan_human",
       Arg.String (fun path -> opt_specialization_plan_human := Some path),
       "write a human-readable specialization report with descriptive C symbols"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"filename" "specialization_obligations_lean",
+      Arg.String (fun path -> opt_specialization_obligations_lean := Some path),
+      "write native Lean refinement-obligation definitions"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"filename" "specialization_obligations_coq",
+      Arg.String (fun path -> opt_specialization_obligations_coq := Some path),
+      "write native Coq refinement-obligation definitions"
     );
     ( Flag.create ~prefix:["c"] "preserve",
       Arg.String (fun str -> Specialize.add_initial_calls (IdSet.singleton (mk_id str))),
@@ -374,6 +384,8 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let require_bounded_int = !opt_require_bounded_int
     let specialization_plan_json = !opt_specialization_plan_json
     let specialization_plan_human = !opt_specialization_plan_human
+    let specialization_obligations_lean = !opt_specialization_obligations_lean
+    let specialization_obligations_coq = !opt_specialization_obligations_coq
 
     (* TODO: Convert `cpp` to use `c_backend_mode` instead of `bool`. *)
     let cpp = match mode with C -> false | Cpp -> true
@@ -391,12 +403,16 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     Reporting.warn "Deprecated" Parse_ast.Unknown "--static is deprecated and no longer has any effect";
 
   if
-    (Option.is_some !opt_specialization_plan_json || Option.is_some !opt_specialization_plan_human)
+    (Option.is_some !opt_specialization_plan_json
+    || Option.is_some !opt_specialization_plan_human
+    || Option.is_some !opt_specialization_obligations_lean
+    || Option.is_some !opt_specialization_obligations_coq
+    )
     && not !opt_specialize_c
   then
     raise
       (Reporting.err_general Parse_ast.Unknown
-         "C backend: specialization-plan output requires --c-specialize"
+         "C backend: specialization output requires --c-specialize"
       );
 
   let out_file = Option.value out_file ~default:"out" in

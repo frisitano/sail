@@ -2406,6 +2406,8 @@ module type CODEGEN_CONFIG = sig
   val require_bounded_int : bool
   val specialization_plan_json : string option
   val specialization_plan_human : string option
+  val specialization_obligations_lean : string option
+  val specialization_obligations_coq : string option
   val cpp : bool
   val cpp_class_name : string
   val cpp_namespace : string
@@ -6923,7 +6925,12 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       emit_generic_lbits_helpers := (not Config.specialize_c) || has_lbits;
 
       let specialization_plan =
-        if Option.is_some Config.specialization_plan_json || Option.is_some Config.specialization_plan_human then (
+        if
+          Option.is_some Config.specialization_plan_json
+          || Option.is_some Config.specialization_plan_human
+          || Option.is_some Config.specialization_obligations_lean
+          || Option.is_some Config.specialization_obligations_coq
+        then (
           let ids ids = IdSet.elements ids |> List.map string_of_id |> String.concat "," in
           let fixed_bytes =
             Bindings.bindings Config.c_repr_fixed_bytes
@@ -6953,6 +6960,14 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       in
       (match (Config.specialization_plan_json, specialization_plan) with
       | Some path, Some plan -> Specialization_plan.write_json path plan
+      | _ -> ()
+      );
+      (match (Config.specialization_obligations_lean, specialization_plan) with
+      | Some path, Some plan -> Specialization_plan.write_lean path plan
+      | _ -> ()
+      );
+      (match (Config.specialization_obligations_coq, specialization_plan) with
+      | Some path, Some plan -> Specialization_plan.write_coq path plan
       | _ -> ()
       );
 
