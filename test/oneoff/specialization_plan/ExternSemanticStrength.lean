@@ -43,3 +43,24 @@ theorem completeRequiresExternCallRepresentation :
   obtain ⟨_, _, callRepresentation, _, _⟩ :=
     complete.proof_4e81ef1ad207ac8ec4288e2a2826812a [] () trivial
   exact callRepresentation
+
+def missingExternExecution : Semantics :=
+  { emptyExternDownstream with
+    callArgumentsRepresent := fun _ _ _ => True }
+
+theorem externRequiresExternExecution :
+    ¬ obligation_4e81ef1ad207ac8ec4288e2a2826812a missingExternExecution := by
+  intro obligation
+  obtain ⟨_, _, _, externExecution, _⟩ := obligation [] () trivial
+  exact externExecution
+
+def missingExternOutcomeRefinement : Semantics :=
+  { missingExternExecution with
+    externEval := fun _ _ _ => True
+    outcomesRefine := fun _ _ => False }
+
+theorem externRequiresOutcomeRefinement :
+    ¬ obligation_4e81ef1ad207ac8ec4288e2a2826812a missingExternOutcomeRefinement := by
+  intro obligation
+  obtain ⟨_, _, _, _, refinement⟩ := obligation [] () trivial
+  exact refinement

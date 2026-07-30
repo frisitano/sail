@@ -94,6 +94,54 @@ Proof.
   exact call_representation.
 Qed.
 
+Definition call_observation
+    (jib_call_holds outcomes_refine : Prop) : Semantics :=
+  {| sem_value := unit;
+     sem_outcome := unit;
+     sem_arguments_well_typed := fun _ _ => True;
+     sem_represented_values_valid := fun _ _ => True;
+     sem_value_well_typed := fun _ _ => True;
+     sem_represented_value_valid := fun _ _ => True;
+     sem_value_satisfies_bound := fun _ _ => True;
+     sem_arguments_represent := fun _ _ _ _ => True;
+     sem_represents := fun _ _ _ _ => True;
+     sem_sail_eval := fun _ _ _ => True;
+     sem_jib_eval := fun _ _ _ => True;
+     sem_conversion_eval := fun _ _ _ _ _ => True;
+     sem_call_arguments_represent := fun _ _ _ => True;
+     sem_sail_call := fun _ _ _ _ => True;
+     sem_jib_call := fun _ _ _ _ _ => jib_call_holds;
+     sem_extern_eval := fun _ _ _ => True;
+     sem_sail_reachable := fun _ _ => True;
+     sem_bounds_hold := fun _ _ => True;
+     sem_outcomes_refine := fun _ _ => outcomes_refine;
+     sem_exceptions_equivalent := fun _ _ => True;
+     sem_lifetime_compatible := fun _ _ _ => True |}.
+
+Definition missing_jib_call : Semantics := call_observation False True.
+
+Theorem call_requires_jib_call :
+  ~ obligation_508c5455ec087c4a8e55a60c0b16c5ed missing_jib_call.
+Proof.
+  intro obligation.
+  destruct (obligation [] tt I)
+    as [represented_args [jib_outcome [_ [jib_call _]]]].
+  exact jib_call.
+Qed.
+
+Definition missing_call_outcome_refinement : Semantics :=
+  call_observation True False.
+
+Theorem call_requires_outcome_refinement :
+  ~ obligation_508c5455ec087c4a8e55a60c0b16c5ed
+      missing_call_outcome_refinement.
+Proof.
+  intro obligation.
+  destruct (obligation [] tt I)
+    as [represented_args [jib_outcome [_ [_ refinement]]]].
+  exact refinement.
+Qed.
+
 Definition split_outcome_conditions : Semantics :=
   {| sem_value := unit;
      sem_outcome := bool;

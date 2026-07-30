@@ -59,6 +59,27 @@ theorem completeRequiresCallRepresentation :
     complete.proof_508c5455ec087c4a8e55a60c0b16c5ed [] () trivial
   exact callRepresentation
 
+def missingJibCall : Semantics :=
+  { missingCallRepresentation with
+    callArgumentsRepresent := fun _ _ _ => True }
+
+theorem callRequiresJibCall :
+    ¬ obligation_508c5455ec087c4a8e55a60c0b16c5ed missingJibCall := by
+  intro obligation
+  obtain ⟨_, _, _, jibCall, _⟩ := obligation [] () trivial
+  exact jibCall
+
+def missingCallOutcomeRefinement : Semantics :=
+  { missingJibCall with
+    jibCall := fun _ _ _ _ _ => True
+    outcomesRefine := fun _ _ => False }
+
+theorem callRequiresOutcomeRefinement :
+    ¬ obligation_508c5455ec087c4a8e55a60c0b16c5ed missingCallOutcomeRefinement := by
+  intro obligation
+  obtain ⟨_, _, _, _, refinement⟩ := obligation [] () trivial
+  exact refinement
+
 def splitOutcomeConditions : Semantics where
   Value := Unit
   Outcome := Bool
