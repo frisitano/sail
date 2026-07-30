@@ -56,16 +56,21 @@ Plan emission is optional and has no effect when disabled:
 sail -c --c-specialize \
   --c-specialization-plan model.specialization.json \
   --c-specialization-plan-human model.specialization.md \
+  --c-specialization-obligations-lean SpecializationObligations.lean \
+  --c-specialization-obligations-coq SpecializationObligations.v \
   model.sail -o model
 ```
 
-Requesting either output without `--c-specialize` is an error. Machine JSON is
-written after specialization and final bounded-integer auditing, before C name
-generation. The human report is written after backend symbols are assigned.
+Requesting any specialization output without `--c-specialize` is an error.
+Machine JSON and native Lean/Coq definitions are written after specialization
+and final bounded-integer auditing, before C name generation. The human report
+is written after backend symbols are assigned.
 
 Canonical output uses UTF-8 JSON, fixed object-field order, and lexicographic
 record ordering by stable ID. Identical compiler version, configuration,
 inputs, and specialization decisions produce byte-identical JSON.
+Lean and Coq definitions use the same typed, backend-neutral OCaml obligation
+representation as the JSON renderer and are likewise byte-identical.
 
 The configuration identity covers the versioned representation-specialization
 policy, bounded-integer enforcement, preserved specialization roots, and the
@@ -92,12 +97,37 @@ Each clone contains all required obligation classes:
 evidence. An extern-free clone records `extern_refinement` as `not_applicable`
 so completeness remains mechanically checkable.
 
-## Independent checking and comparison
+## Native Lean and Coq definitions
+
+The native files declare:
+
+- an abstract semantic interface for typed Sail evaluation, specialized JIB
+  evaluation, representation relations, conversions, calls, reachability,
+  exception behavior, and ownership/lifetime behavior;
+- one proposition per applicable stable obligation ID;
+- metadata for every obligation, including `not_applicable` entries; and
+- a `Complete` structure/record collecting every applicable proposition.
+
+The generated files contain definitions only. They contain no proofs, `sorry`,
+`Admitted`, axioms, SMT queries, or solver certificates. Keep implementations
+of the semantic interface and proofs of `Complete` in separate user-owned
+files: regeneration overwrites the definitions file named on the command line.
+
+The trust boundary is explicit. Sail and the generated semantic-interface
+declarations are untrusted statement producers. A downstream proof must
+instantiate that interface with independently reviewed typed Sail and
+specialized JIB/representation semantics, then prove the generated
+propositions. Compiling a generated file checks syntax and typing; it does not
+establish refinement by itself. Stable IDs connect those propositions to the
+JSON audit artifact without relying on JIB display names or C symbols.
+
+## Optional independent checking and comparison
 
 `tools/specialization_plan_checker.py` does not link against Sail. It rejects
 malformed JSON, unsupported versions, duplicate or non-canonical IDs, dangling
 references, incomplete unresolved indexes, invalid statuses, and missing
-obligation classes.
+obligation classes. It remains useful for audits and comparisons, but it is not
+part of normal compiler emission of Lean or Coq.
 
 ```sh
 python3 tools/specialization_plan_checker.py model.specialization.json
@@ -120,10 +150,10 @@ The implementation intentionally has a narrow overlap surface:
 
 - `src/lib/jib_compile.ml` records provenance at the point a demanded clone is
   finalized;
-- `src/lib/specialization_plan.ml` owns identity, ordering, JSON, and human
-  rendering;
+- `src/lib/specialization_plan.ml` owns the shared typed obligation
+  representation, identity, ordering, and all JSON/human/Lean/Coq rendering;
 - `src/sail_c_backend/c_backend.ml` chooses the safe emission points;
-- `src/sail_c_backend/sail_plugin_c.ml` owns the two optional CLI flags.
+- `src/sail_c_backend/sail_plugin_c.ml` owns the optional CLI flags.
 
 The cleanup task may edit C naming, `--c-no-mangle`, `$target_name`, or the same
 backend files. Resolve conflicts by preserving this boundary: never add backend

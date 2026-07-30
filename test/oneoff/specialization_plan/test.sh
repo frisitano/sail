@@ -6,6 +6,7 @@ TEST_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 ROOT=$(CDPATH= cd -- "$TEST_DIR/../../.." && pwd)
 SAIL=${SAIL:-sail}
 LEAN=${LEAN:-lean}
+COQC=${COQC:-coqc}
 TMP_ROOT=${AGENT_TMPDIR:-"$ROOT/.agent-tmp"}
 
 mkdir -p "$TMP_ROOT"
@@ -36,12 +37,44 @@ compile_core() {
 # backend-name policies.
 compile_core "$TMP_DIR/with/model" "$@" \
   --c-specialization-plan "$TMP_DIR/plan-a.json" \
-  --c-specialization-plan-human "$TMP_DIR/plan-a.md"
+  --c-specialization-plan-human "$TMP_DIR/plan-a.md" \
+  --c-specialization-obligations-lean "$TMP_DIR/SpecializationObligationsA.lean" \
+  --c-specialization-obligations-coq "$TMP_DIR/SpecializationObligationsA.v"
 
 # Repeated compilation must be byte-identical.
 compile_core "$TMP_DIR/repeated/model" "$@" \
-  --c-specialization-plan "$TMP_DIR/plan-b.json"
+  --c-specialization-plan "$TMP_DIR/plan-b.json" \
+  --c-specialization-obligations-lean "$TMP_DIR/SpecializationObligationsB.lean" \
+  --c-specialization-obligations-coq "$TMP_DIR/SpecializationObligationsB.v"
 cmp "$TMP_DIR/plan-a.json" "$TMP_DIR/plan-b.json"
+cmp "$TMP_DIR/SpecializationObligationsA.lean" "$TMP_DIR/SpecializationObligationsB.lean"
+cmp "$TMP_DIR/SpecializationObligationsA.v" "$TMP_DIR/SpecializationObligationsB.v"
+
+# Native outputs contain definitions and a completeness record, but never
+# compiler-supplied proof shortcuts. Both files compile independently.
+if grep -Eq '(^|[^[:alnum:]_])(sorry|axiom|Admitted)([^[:alnum:]_]|$)' \
+  "$TMP_DIR/SpecializationObligationsA.lean" "$TMP_DIR/SpecializationObligationsA.v"
+then
+  echo 'native specialization obligations contain a forbidden proof shortcut' >&2
+  exit 1
+fi
+grep -Fq 'structure Complete' "$TMP_DIR/SpecializationObligationsA.lean"
+grep -Fq 'Record Complete' "$TMP_DIR/SpecializationObligationsA.v"
+"$LEAN" "$TMP_DIR/SpecializationObligationsA.lean"
+"$COQC" "$TMP_DIR/SpecializationObligationsA.v"
+
+python3 - \
+  "$TMP_DIR/SpecializationObligationsA.lean" \
+  "$TMP_DIR/SpecializationObligationsA.v" \
+  > "$TMP_DIR/native-obligation-digests.txt" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+for name, path in zip(("lean", "coq"), sys.argv[1:]):
+    print(name, hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest())
+PY
+cmp "$TEST_DIR/expected-native-obligation-digests.txt" "$TMP_DIR/native-obligation-digests.txt"
 
 # C naming is descriptive only and may not perturb the machine plan.
 compile_core "$TMP_DIR/readable/model" "$@" --c-no-mangle \
@@ -88,10 +121,16 @@ cmp "$TEST_DIR/ProofFixture.lean" "$TMP_DIR/ProofFixture.lean"
 "$SAIL" "$@" --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
   --c-preserve bounded_foreign_bridge \
   --c-specialization-plan "$TMP_DIR/extern.json" \
+  --c-specialization-obligations-lean "$TMP_DIR/ExternObligations.lean" \
+  --c-specialization-obligations-coq "$TMP_DIR/ExternObligations.v" \
   "$TEST_DIR/extern_model.sail" -o "$TMP_DIR/extern"
 python3 "$ROOT/tools/specialization_plan_checker.py" "$TMP_DIR/extern.json"
 test "$(jq '.unresolved_obligations | length' "$TMP_DIR/extern.json")" -eq 1
 test "$(jq '[.clones[].extern_contracts[]] | length' "$TMP_DIR/extern.json")" -eq 1
+grep -Fq 'S.externEval' "$TMP_DIR/ExternObligations.lean"
+grep -Fq 'sem_extern_eval S' "$TMP_DIR/ExternObligations.v"
+"$LEAN" "$TMP_DIR/ExternObligations.lean"
+"$COQC" "$TMP_DIR/ExternObligations.v"
 
 # Comparison is stable-ID based and reports no semantic change for an
 # identical plan.
@@ -148,11 +187,11 @@ done
 
 # Output flags are intentionally unavailable without specialization.
 if "$SAIL" "$@" --no-color -c --c-no-main \
-  --c-specialization-plan "$TMP_DIR/disabled.json" \
+  --c-specialization-obligations-lean "$TMP_DIR/disabled.lean" \
   "$TEST_DIR/extern_model.sail" -o "$TMP_DIR/disabled" \
   2>"$TMP_DIR/disabled.err"
 then
-  echo 'specialization plan was emitted without --c-specialize' >&2
+  echo 'specialization obligations were emitted without --c-specialize' >&2
   exit 1
 fi
-grep -Fq 'specialization-plan output requires --c-specialize' "$TMP_DIR/disabled.err"
+grep -Fq 'specialization output requires --c-specialize' "$TMP_DIR/disabled.err"

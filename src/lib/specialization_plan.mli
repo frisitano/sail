@@ -15,6 +15,9 @@ val create :
 
 val write_json : string -> t -> unit
 
+val write_lean : string -> t -> unit
+val write_coq : string -> t -> unit
+
 (** The backend-symbol callback is used only for the non-authoritative human report. Backend symbols are deliberately
     absent from the machine plan and all proof identities. *)
 val write_human : backend_symbol:(Ast.id -> string) -> string -> t -> unit
