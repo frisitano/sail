@@ -553,12 +553,6 @@ let obligation_name obligation = "obligation_" ^ digest_suffix obligation.obliga
 let applicable obligation =
   match obligation.status with Not_applicable -> false | Reconstructible | Requires_proof | Unresolved -> true
 
-let lean_list render values = "[" ^ String.concat ", " (List.map render values) ^ "]"
-let lean_strings = lean_list quoted
-
-let coq_list render values = "[" ^ String.concat "; " (List.map render values) ^ "]"
-let coq_strings = coq_list coq_quoted
-
 let argument_choices clone =
   List.filter (fun choice -> not (String.equal choice.position "result")) clone.representation_choices
 
@@ -568,24 +562,58 @@ let inferred_argument_bounds clone =
   argument_choices clone
   |> List.filter_map (fun choice -> Option.map (fun bound -> (choice.position, bound)) choice.inferred_bound)
 
-let lean_bounds bounds = lean_list (fun (position, bound) -> "(" ^ quoted position ^ ", " ^ quoted bound ^ ")") bounds
+type proof_sort = Proof_value | Proof_values | Proof_outcome
 
-let coq_bounds bounds =
-  coq_list (fun (position, bound) -> "(" ^ coq_quoted position ^ ", " ^ coq_quoted bound ^ ")") bounds
+type proof_binder = { binder_name : string; binder_sort : proof_sort }
 
-let lean_conjunction propositions =
-  match propositions with
-  | [] -> "True"
-  | [proposition] -> proposition
-  | propositions -> String.concat " ∧\n    " (List.map (fun proposition -> "(" ^ proposition ^ ")") propositions)
+type proof_term =
+  | Variable of string
+  | String_literal of string
+  | String_list_literal of string list
+  | Bound_list_literal of (string * string) list
 
-let coq_conjunction propositions =
-  match propositions with
-  | [] -> "True"
-  | [proposition] -> proposition
-  | propositions -> String.concat " /\\\n    " (List.map (fun proposition -> "(" ^ proposition ^ ")") propositions)
+type proof_relation =
+  | Arguments_well_typed
+  | Represented_values_valid
+  | Value_well_typed
+  | Represented_value_valid
+  | Value_satisfies_bound
+  | Arguments_represent
+  | Represents
+  | Sail_eval
+  | Jib_eval
+  | Conversion_eval
+  | Call_arguments_represent
+  | Sail_call
+  | Jib_call
+  | Extern_eval
+  | Sail_reachable
+  | Bounds_hold
+  | Outcomes_refine
+  | Exceptions_equivalent
+  | Lifetime_compatible
 
-let lean_obligation_proposition clone obligation =
+type proposition =
+  | Truth
+  | Relation of proof_relation * proof_term list
+  | Implication of proposition * proposition
+  | Conjunction of proposition list
+  | Universal of proof_binder list * proposition
+  | Existential of proof_binder list * proposition
+
+let variable name = Variable name
+let string_literal value = String_literal value
+let string_list_literal values = String_list_literal values
+let relation name arguments = Relation (name, arguments)
+let conjunction propositions = Conjunction propositions
+let universally binders proposition = Universal (binders, proposition)
+let existentially binders proposition = Existential (binders, proposition)
+let implies premises conclusion = List.fold_right (fun premise body -> Implication (premise, body)) premises conclusion
+let value name = { binder_name = name; binder_sort = Proof_value }
+let values name = { binder_name = name; binder_sort = Proof_values }
+let outcome name = { binder_name = name; binder_sort = Proof_outcome }
+
+let obligation_proposition clone obligation =
   let base = clone.base in
   let trace = base.trace in
   let semantic_types = List.map string_of_ctyp trace.semantic_parameters in
@@ -594,212 +622,290 @@ let lean_obligation_proposition clone obligation =
   let represented_result = string_of_ctyp trace.represented_result in
   let argument_bounds = inferred_argument_bounds clone in
   let result_bound = (result_choice clone).inferred_bound in
+  let semantic_args = variable "semanticArgs" in
+  let represented_args = variable "representedArgs" in
+  let sail_outcome = variable "sailOutcome" in
+  let jib_outcome = variable "jibOutcome" in
+  let arguments_represent =
+    relation Arguments_represent
+      [string_list_literal semantic_types; string_list_literal represented_types; semantic_args; represented_args]
+  in
+  let sail_eval = relation Sail_eval [string_literal base.source_identity; semantic_args; sail_outcome] in
+  let jib_eval = relation Jib_eval [string_literal base.clone_identity; represented_args; jib_outcome] in
+  let outcomes_refine = relation Outcomes_refine [sail_outcome; jib_outcome] in
+  let forward_eval extra_outcome_requirements =
+    universally
+      [values "semanticArgs"; values "representedArgs"; outcome "sailOutcome"]
+      (implies [arguments_represent; sail_eval]
+         (existentially [outcome "jibOutcome"] (conjunction (jib_eval :: outcomes_refine :: extra_outcome_requirements)))
+      )
+  in
   match obligation.kind with
   | Representation_adequacy ->
-      let result_bound_requirement =
+      let result_bound_requirements =
         match result_bound with
-        | None -> ""
-        | Some bound -> "\n      S.valueSatisfiesBound " ^ quoted bound ^ " semanticResult →"
+        | None -> []
+        | Some bound -> [relation Value_satisfies_bound [string_literal bound; variable "semanticResult"]]
       in
-      Printf.sprintf
-        "(∀ semanticArgs,\n\
-        \      S.argumentsWellTyped %s semanticArgs →\n\
-        \      S.boundsHold %s semanticArgs →\n\
-        \      ∃ representedArgs,\n\
-        \        S.argumentsRepresent %s %s semanticArgs representedArgs ∧\n\
-        \        S.representedValuesValid %s representedArgs) ∧\n\
-        \  (∀ semanticResult,\n\
-        \      S.valueWellTyped %s semanticResult →%s\n\
-        \      ∃ representedResult,\n\
-        \        S.represents %s %s semanticResult representedResult ∧\n\
-        \        S.representedValueValid %s representedResult)"
-        (lean_strings semantic_types) (lean_bounds argument_bounds) (lean_strings semantic_types)
-        (lean_strings represented_types) (lean_strings represented_types) (quoted semantic_result)
-        result_bound_requirement (quoted semantic_result) (quoted represented_result) (quoted represented_result)
-  | Operation_refinement ->
-      Printf.sprintf
-        "∀ semanticArgs representedArgs sailOutcome jibOutcome,\n\
-        \    S.argumentsRepresent %s %s semanticArgs representedArgs →\n\
-        \    S.sailEval %s semanticArgs sailOutcome →\n\
-        \    S.jibEval %s representedArgs jibOutcome →\n\
-        \    S.outcomesRefine sailOutcome jibOutcome"
-        (lean_strings semantic_types) (lean_strings represented_types) (quoted base.source_identity)
-        (quoted base.clone_identity)
+      conjunction
+        [
+          universally
+            [values "semanticArgs"]
+            (implies
+               [
+                 relation Arguments_well_typed [string_list_literal semantic_types; semantic_args];
+                 relation Bounds_hold [Bound_list_literal argument_bounds; semantic_args];
+               ]
+               (existentially
+                  [values "representedArgs"]
+                  (conjunction
+                     [
+                       arguments_represent;
+                       relation Represented_values_valid [string_list_literal represented_types; represented_args];
+                     ]
+                  )
+               )
+            );
+          universally
+            [value "semanticResult"]
+            (implies
+               (relation Value_well_typed [string_literal semantic_result; variable "semanticResult"]
+               :: result_bound_requirements
+               )
+               (existentially
+                  [value "representedResult"]
+                  (conjunction
+                     [
+                       relation Represents
+                         [
+                           string_literal semantic_result;
+                           string_literal represented_result;
+                           variable "semanticResult";
+                           variable "representedResult";
+                         ];
+                       relation Represented_value_valid
+                         [string_literal represented_result; variable "representedResult"];
+                     ]
+                  )
+               )
+            );
+        ]
+  | Operation_refinement -> forward_eval []
   | Conversion_correctness ->
       clone.conversions
       |> List.map (fun conversion ->
-          Printf.sprintf
-            "∀ semanticValue representedValue,\n\
-            \      S.conversionEval %s %s %s semanticValue representedValue →\n\
-            \      S.represents %s %s semanticValue representedValue"
-            (quoted conversion.conversion_id) (quoted conversion.source_type) (quoted conversion.destination_type)
-            (quoted conversion.source_type) (quoted conversion.destination_type)
+          universally
+            [value "semanticValue"]
+            (implies
+               [relation Value_well_typed [string_literal conversion.source_type; variable "semanticValue"]]
+               (existentially
+                  [value "representedValue"]
+                  (conjunction
+                     [
+                       relation Conversion_eval
+                         [
+                           string_literal conversion.conversion_id;
+                           string_literal conversion.source_type;
+                           string_literal conversion.destination_type;
+                           variable "semanticValue";
+                           variable "representedValue";
+                         ];
+                       relation Represents
+                         [
+                           string_literal conversion.source_type;
+                           string_literal conversion.destination_type;
+                           variable "semanticValue";
+                           variable "representedValue";
+                         ];
+                       relation Represented_value_valid
+                         [string_literal conversion.destination_type; variable "representedValue"];
+                     ]
+                  )
+               )
+            )
       )
-      |> lean_conjunction
+      |> conjunction
   | Call_compatibility ->
       clone.calls
       |> List.map (fun call ->
-          Printf.sprintf
-            "∀ semanticArgs representedArgs sailOutcome jibOutcome,\n\
-            \      S.callArgumentsRepresent %s semanticArgs representedArgs →\n\
-            \      S.sailCall %s %s semanticArgs sailOutcome →\n\
-            \      S.jibCall %s %s %s representedArgs jibOutcome →\n\
-            \      S.outcomesRefine sailOutcome jibOutcome"
-            (quoted call.call_id) (quoted base.source_identity) (quoted call.call_id) (quoted base.clone_identity)
-            (quoted call.call_id) (quoted call.callee_identity)
+          universally
+            [values "semanticArgs"; values "representedArgs"; outcome "sailOutcome"]
+            (implies
+               [
+                 relation Call_arguments_represent [string_literal call.call_id; semantic_args; represented_args];
+                 relation Sail_call
+                   [string_literal base.source_identity; string_literal call.call_id; semantic_args; sail_outcome];
+               ]
+               (existentially
+                  [outcome "jibOutcome"]
+                  (conjunction
+                     [
+                       relation Jib_call
+                         [
+                           string_literal base.clone_identity;
+                           string_literal call.call_id;
+                           string_literal call.callee_identity;
+                           represented_args;
+                           jib_outcome;
+                         ];
+                       outcomes_refine;
+                     ]
+                  )
+               )
+            )
       )
-      |> lean_conjunction
+      |> conjunction
   | Path_condition_soundness ->
-      Printf.sprintf
-        "∀ semanticArgs representedArgs,\n\
-        \    S.argumentsRepresent %s %s semanticArgs representedArgs →\n\
-        \    S.sailReachable %s semanticArgs →\n\
-        \    S.jibReachable %s representedArgs →\n\
-        \    S.boundsHold %s semanticArgs"
-        (lean_strings semantic_types) (lean_strings represented_types) (quoted base.source_identity)
-        (quoted base.clone_identity) (lean_bounds argument_bounds)
-  | Exception_equivalence ->
-      Printf.sprintf
-        "∀ semanticArgs representedArgs sailOutcome jibOutcome,\n\
-        \    S.argumentsRepresent %s %s semanticArgs representedArgs →\n\
-        \    S.sailEval %s semanticArgs sailOutcome →\n\
-        \    S.jibEval %s representedArgs jibOutcome →\n\
-        \    S.exceptionsEquivalent sailOutcome jibOutcome"
-        (lean_strings semantic_types) (lean_strings represented_types) (quoted base.source_identity)
-        (quoted base.clone_identity)
+      universally
+        [values "semanticArgs"]
+        (implies
+           [
+             relation Arguments_well_typed [string_list_literal semantic_types; semantic_args];
+             relation Sail_reachable [string_literal base.source_identity; semantic_args];
+           ]
+           (relation Bounds_hold [Bound_list_literal argument_bounds; semantic_args])
+        )
+  | Exception_equivalence -> forward_eval [relation Exceptions_equivalent [sail_outcome; jib_outcome]]
   | Extern_refinement ->
       clone.calls
       |> List.filter (fun call -> call.is_extern)
       |> List.map (fun call ->
-          Printf.sprintf
-            "∀ semanticArgs representedArgs sailOutcome externOutcome,\n\
-            \      S.callArgumentsRepresent %s semanticArgs representedArgs →\n\
-            \      S.sailCall %s %s semanticArgs sailOutcome →\n\
-            \      S.externEval %s representedArgs externOutcome →\n\
-            \      S.outcomesRefine sailOutcome externOutcome"
-            (quoted call.call_id) (quoted base.source_identity) (quoted call.call_id) (quoted call.callee_identity)
+          universally
+            [values "semanticArgs"; values "representedArgs"; outcome "sailOutcome"]
+            (implies
+               [
+                 relation Call_arguments_represent [string_literal call.call_id; semantic_args; represented_args];
+                 relation Sail_call
+                   [string_literal base.source_identity; string_literal call.call_id; semantic_args; sail_outcome];
+               ]
+               (existentially
+                  [outcome "externOutcome"]
+                  (conjunction
+                     [
+                       relation Extern_eval
+                         [string_literal call.callee_identity; represented_args; variable "externOutcome"];
+                       relation Outcomes_refine [sail_outcome; variable "externOutcome"];
+                     ]
+                  )
+               )
+            )
       )
-      |> lean_conjunction
+      |> conjunction
   | Ownership_lifetime ->
-      Printf.sprintf
-        "∀ semanticArgs representedArgs sailOutcome jibOutcome,\n\
-        \    S.argumentsRepresent %s %s semanticArgs representedArgs →\n\
-        \    S.sailEval %s semanticArgs sailOutcome →\n\
-        \    S.jibEval %s representedArgs jibOutcome →\n\
-        \    S.lifetimeCompatible %s representedArgs jibOutcome ∧\n\
-        \    S.outcomesRefine sailOutcome jibOutcome"
-        (lean_strings semantic_types) (lean_strings represented_types) (quoted base.source_identity)
-        (quoted base.clone_identity) (quoted base.clone_identity)
+      forward_eval [relation Lifetime_compatible [string_literal base.clone_identity; represented_args; jib_outcome]]
 
-let coq_obligation_proposition clone obligation =
-  let base = clone.base in
-  let trace = base.trace in
-  let semantic_types = List.map string_of_ctyp trace.semantic_parameters in
-  let represented_types = List.map string_of_ctyp trace.represented_parameters in
-  let semantic_result = string_of_ctyp trace.semantic_result in
-  let represented_result = string_of_ctyp trace.represented_result in
-  let argument_bounds = inferred_argument_bounds clone in
-  let result_bound = (result_choice clone).inferred_bound in
-  match obligation.kind with
-  | Representation_adequacy ->
-      let result_bound_requirement =
-        match result_bound with
-        | None -> ""
-        | Some bound -> "\n      sem_value_satisfies_bound S " ^ coq_quoted bound ^ " semanticResult ->"
+let lean_list render values = "[" ^ String.concat ", " (List.map render values) ^ "]"
+let coq_list render values = "[" ^ String.concat "; " (List.map render values) ^ "]"
+
+let lean_relation_name = function
+  | Arguments_well_typed -> "argumentsWellTyped"
+  | Represented_values_valid -> "representedValuesValid"
+  | Value_well_typed -> "valueWellTyped"
+  | Represented_value_valid -> "representedValueValid"
+  | Value_satisfies_bound -> "valueSatisfiesBound"
+  | Arguments_represent -> "argumentsRepresent"
+  | Represents -> "represents"
+  | Sail_eval -> "sailEval"
+  | Jib_eval -> "jibEval"
+  | Conversion_eval -> "conversionEval"
+  | Call_arguments_represent -> "callArgumentsRepresent"
+  | Sail_call -> "sailCall"
+  | Jib_call -> "jibCall"
+  | Extern_eval -> "externEval"
+  | Sail_reachable -> "sailReachable"
+  | Bounds_hold -> "boundsHold"
+  | Outcomes_refine -> "outcomesRefine"
+  | Exceptions_equivalent -> "exceptionsEquivalent"
+  | Lifetime_compatible -> "lifetimeCompatible"
+
+let coq_relation_name = function
+  | Arguments_well_typed -> "sem_arguments_well_typed"
+  | Represented_values_valid -> "sem_represented_values_valid"
+  | Value_well_typed -> "sem_value_well_typed"
+  | Represented_value_valid -> "sem_represented_value_valid"
+  | Value_satisfies_bound -> "sem_value_satisfies_bound"
+  | Arguments_represent -> "sem_arguments_represent"
+  | Represents -> "sem_represents"
+  | Sail_eval -> "sem_sail_eval"
+  | Jib_eval -> "sem_jib_eval"
+  | Conversion_eval -> "sem_conversion_eval"
+  | Call_arguments_represent -> "sem_call_arguments_represent"
+  | Sail_call -> "sem_sail_call"
+  | Jib_call -> "sem_jib_call"
+  | Extern_eval -> "sem_extern_eval"
+  | Sail_reachable -> "sem_sail_reachable"
+  | Bounds_hold -> "sem_bounds_hold"
+  | Outcomes_refine -> "sem_outcomes_refine"
+  | Exceptions_equivalent -> "sem_exceptions_equivalent"
+  | Lifetime_compatible -> "sem_lifetime_compatible"
+
+let lean_sort = function Proof_value -> "S.Value" | Proof_values -> "List S.Value" | Proof_outcome -> "S.Outcome"
+
+let coq_sort = function
+  | Proof_value -> "sem_value S"
+  | Proof_values -> "list (sem_value S)"
+  | Proof_outcome -> "sem_outcome S"
+
+let render_lean_term = function
+  | Variable name -> name
+  | String_literal value -> quoted value
+  | String_list_literal values -> lean_list quoted values
+  | Bound_list_literal bounds ->
+      lean_list (fun (position, bound) -> "(" ^ quoted position ^ ", " ^ quoted bound ^ ")") bounds
+
+let render_coq_term = function
+  | Variable name -> name
+  | String_literal value -> coq_quoted value
+  | String_list_literal values -> coq_list coq_quoted values
+  | Bound_list_literal bounds ->
+      coq_list (fun (position, bound) -> "(" ^ coq_quoted position ^ ", " ^ coq_quoted bound ^ ")") bounds
+
+let rec render_lean_proposition = function
+  | Truth -> "True"
+  | Relation (name, arguments) ->
+      "S." ^ lean_relation_name name ^ " " ^ String.concat " " (List.map render_lean_term arguments)
+  | Implication (premise, conclusion) ->
+      "(" ^ render_lean_proposition premise ^ " → " ^ render_lean_proposition conclusion ^ ")"
+  | Conjunction [] -> "True"
+  | Conjunction [proposition] -> render_lean_proposition proposition
+  | Conjunction propositions -> "(" ^ String.concat " ∧ " (List.map render_lean_proposition propositions) ^ ")"
+  | Universal (binders, proposition) ->
+      let binders =
+        binders
+        |> List.map (fun binder -> "(" ^ binder.binder_name ^ " : " ^ lean_sort binder.binder_sort ^ ")")
+        |> String.concat " "
       in
-      Printf.sprintf
-        "(forall semanticArgs,\n\
-        \      sem_arguments_well_typed S %s semanticArgs ->\n\
-        \      sem_bounds_hold S %s semanticArgs ->\n\
-        \      exists representedArgs,\n\
-        \        sem_arguments_represent S %s %s semanticArgs representedArgs /\\\n\
-        \        sem_represented_values_valid S %s representedArgs) /\\\n\
-        \  (forall semanticResult,\n\
-        \      sem_value_well_typed S %s semanticResult ->%s\n\
-        \      exists representedResult,\n\
-        \        sem_represents S %s %s semanticResult representedResult /\\\n\
-        \        sem_represented_value_valid S %s representedResult)"
-        (coq_strings semantic_types) (coq_bounds argument_bounds) (coq_strings semantic_types)
-        (coq_strings represented_types) (coq_strings represented_types) (coq_quoted semantic_result)
-        result_bound_requirement (coq_quoted semantic_result) (coq_quoted represented_result)
-        (coq_quoted represented_result)
-  | Operation_refinement ->
-      Printf.sprintf
-        "forall semanticArgs representedArgs sailOutcome jibOutcome,\n\
-        \    sem_arguments_represent S %s %s semanticArgs representedArgs ->\n\
-        \    sem_sail_eval S %s semanticArgs sailOutcome ->\n\
-        \    sem_jib_eval S %s representedArgs jibOutcome ->\n\
-        \    sem_outcomes_refine S sailOutcome jibOutcome"
-        (coq_strings semantic_types) (coq_strings represented_types) (coq_quoted base.source_identity)
-        (coq_quoted base.clone_identity)
-  | Conversion_correctness ->
-      clone.conversions
-      |> List.map (fun conversion ->
-          Printf.sprintf
-            "forall semanticValue representedValue,\n\
-            \      sem_conversion_eval S %s %s %s semanticValue representedValue ->\n\
-            \      sem_represents S %s %s semanticValue representedValue"
-            (coq_quoted conversion.conversion_id) (coq_quoted conversion.source_type)
-            (coq_quoted conversion.destination_type)
-            (coq_quoted conversion.source_type)
-            (coq_quoted conversion.destination_type)
-      )
-      |> coq_conjunction
-  | Call_compatibility ->
-      clone.calls
-      |> List.map (fun call ->
-          Printf.sprintf
-            "forall semanticArgs representedArgs sailOutcome jibOutcome,\n\
-            \      sem_call_arguments_represent S %s semanticArgs representedArgs ->\n\
-            \      sem_sail_call S %s %s semanticArgs sailOutcome ->\n\
-            \      sem_jib_call S %s %s %s representedArgs jibOutcome ->\n\
-            \      sem_outcomes_refine S sailOutcome jibOutcome"
-            (coq_quoted call.call_id) (coq_quoted base.source_identity) (coq_quoted call.call_id)
-            (coq_quoted base.clone_identity) (coq_quoted call.call_id) (coq_quoted call.callee_identity)
-      )
-      |> coq_conjunction
-  | Path_condition_soundness ->
-      Printf.sprintf
-        "forall semanticArgs representedArgs,\n\
-        \    sem_arguments_represent S %s %s semanticArgs representedArgs ->\n\
-        \    sem_sail_reachable S %s semanticArgs ->\n\
-        \    sem_jib_reachable S %s representedArgs ->\n\
-        \    sem_bounds_hold S %s semanticArgs"
-        (coq_strings semantic_types) (coq_strings represented_types) (coq_quoted base.source_identity)
-        (coq_quoted base.clone_identity) (coq_bounds argument_bounds)
-  | Exception_equivalence ->
-      Printf.sprintf
-        "forall semanticArgs representedArgs sailOutcome jibOutcome,\n\
-        \    sem_arguments_represent S %s %s semanticArgs representedArgs ->\n\
-        \    sem_sail_eval S %s semanticArgs sailOutcome ->\n\
-        \    sem_jib_eval S %s representedArgs jibOutcome ->\n\
-        \    sem_exceptions_equivalent S sailOutcome jibOutcome"
-        (coq_strings semantic_types) (coq_strings represented_types) (coq_quoted base.source_identity)
-        (coq_quoted base.clone_identity)
-  | Extern_refinement ->
-      clone.calls
-      |> List.filter (fun call -> call.is_extern)
-      |> List.map (fun call ->
-          Printf.sprintf
-            "forall semanticArgs representedArgs sailOutcome externOutcome,\n\
-            \      sem_call_arguments_represent S %s semanticArgs representedArgs ->\n\
-            \      sem_sail_call S %s %s semanticArgs sailOutcome ->\n\
-            \      sem_extern_eval S %s representedArgs externOutcome ->\n\
-            \      sem_outcomes_refine S sailOutcome externOutcome"
-            (coq_quoted call.call_id) (coq_quoted base.source_identity) (coq_quoted call.call_id)
-            (coq_quoted call.callee_identity)
-      )
-      |> coq_conjunction
-  | Ownership_lifetime ->
-      Printf.sprintf
-        "forall semanticArgs representedArgs sailOutcome jibOutcome,\n\
-        \    sem_arguments_represent S %s %s semanticArgs representedArgs ->\n\
-        \    sem_sail_eval S %s semanticArgs sailOutcome ->\n\
-        \    sem_jib_eval S %s representedArgs jibOutcome ->\n\
-        \    sem_lifetime_compatible S %s representedArgs jibOutcome /\\\n\
-        \    sem_outcomes_refine S sailOutcome jibOutcome"
-        (coq_strings semantic_types) (coq_strings represented_types) (coq_quoted base.source_identity)
-        (coq_quoted base.clone_identity) (coq_quoted base.clone_identity)
+      "(∀ " ^ binders ^ ", " ^ render_lean_proposition proposition ^ ")"
+  | Existential (binders, proposition) ->
+      let binders =
+        binders
+        |> List.map (fun binder -> "(" ^ binder.binder_name ^ " : " ^ lean_sort binder.binder_sort ^ ")")
+        |> String.concat " "
+      in
+      "(∃ " ^ binders ^ ", " ^ render_lean_proposition proposition ^ ")"
+
+let rec render_coq_proposition = function
+  | Truth -> "True"
+  | Relation (name, arguments) -> coq_relation_name name ^ " S " ^ String.concat " " (List.map render_coq_term arguments)
+  | Implication (premise, conclusion) ->
+      "(" ^ render_coq_proposition premise ^ " -> " ^ render_coq_proposition conclusion ^ ")"
+  | Conjunction [] -> "True"
+  | Conjunction [proposition] -> render_coq_proposition proposition
+  | Conjunction propositions -> "(" ^ String.concat " /\\ " (List.map render_coq_proposition propositions) ^ ")"
+  | Universal (binders, proposition) ->
+      let binders =
+        binders
+        |> List.map (fun binder -> "(" ^ binder.binder_name ^ " : " ^ coq_sort binder.binder_sort ^ ")")
+        |> String.concat " "
+      in
+      "(forall " ^ binders ^ ", " ^ render_coq_proposition proposition ^ ")"
+  | Existential (binders, proposition) ->
+      let binders =
+        binders
+        |> List.map (fun binder -> "(" ^ binder.binder_name ^ " : " ^ coq_sort binder.binder_sort ^ ")")
+        |> String.concat " "
+      in
+      "(exists " ^ binders ^ ", " ^ render_coq_proposition proposition ^ ")"
 
 let iter_obligations plan callback =
   List.iter (fun clone -> List.iter (fun obligation -> callback clone obligation) clone.obligations) plan.clones
@@ -830,7 +936,6 @@ let write_lean path plan =
   line "  jibCall : String → String → String → List Value → Outcome → Prop";
   line "  externEval : String → List Value → Outcome → Prop";
   line "  sailReachable : String → List Value → Prop";
-  line "  jibReachable : String → List Value → Prop";
   line "  boundsHold : List (String × String) → List Value → Prop";
   line "  outcomesRefine : Outcome → Outcome → Prop";
   line "  exceptionsEquivalent : Outcome → Outcome → Prop";
@@ -847,7 +952,7 @@ let write_lean path plan =
   iter_obligations plan (fun clone obligation ->
       if applicable obligation then (
         line "def %s (S : Semantics) : Prop :=" (obligation_name obligation);
-        line "  %s" (lean_obligation_proposition clone obligation);
+        line "  %s" (render_lean_proposition (obligation_proposition clone obligation));
         line ""
       )
   );
@@ -915,7 +1020,6 @@ let write_coq path plan =
   line "  sem_jib_call : string -> string -> string -> list sem_value -> sem_outcome -> Prop;";
   line "  sem_extern_eval : string -> list sem_value -> sem_outcome -> Prop;";
   line "  sem_sail_reachable : string -> list sem_value -> Prop;";
-  line "  sem_jib_reachable : string -> list sem_value -> Prop;";
   line "  sem_bounds_hold : list (string * string) -> list sem_value -> Prop;";
   line "  sem_outcomes_refine : sem_outcome -> sem_outcome -> Prop;";
   line "  sem_exceptions_equivalent : sem_outcome -> sem_outcome -> Prop;";
@@ -934,7 +1038,7 @@ let write_coq path plan =
   iter_obligations plan (fun clone obligation ->
       if applicable obligation then (
         line "Definition %s (S : Semantics) : Prop :=" (obligation_name obligation);
-        line "  %s." (coq_obligation_proposition clone obligation);
+        line "  %s." (render_coq_proposition (obligation_proposition clone obligation));
         line ""
       )
   );

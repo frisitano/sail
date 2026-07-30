@@ -52,7 +52,7 @@ cmp "$TMP_DIR/SpecializationObligationsA.v" "$TMP_DIR/SpecializationObligationsB
 
 # Native outputs contain definitions and a completeness record, but never
 # compiler-supplied proof shortcuts. Both files compile independently.
-if grep -Eq '(^|[^[:alnum:]_])(sorry|axiom|Admitted)([^[:alnum:]_]|$)' \
+if grep -Eiq '(^|[^[:alnum:]_])(sorry|axiom|admitted)([^[:alnum:]_]|$)' \
   "$TMP_DIR/SpecializationObligationsA.lean" "$TMP_DIR/SpecializationObligationsA.v"
 then
   echo 'native specialization obligations contain a forbidden proof shortcut' >&2
@@ -60,8 +60,12 @@ then
 fi
 grep -Fq 'structure Complete' "$TMP_DIR/SpecializationObligationsA.lean"
 grep -Fq 'Record Complete' "$TMP_DIR/SpecializationObligationsA.v"
-"$LEAN" "$TMP_DIR/SpecializationObligationsA.lean"
-"$COQC" "$TMP_DIR/SpecializationObligationsA.v"
+"$LEAN" -o "$TMP_DIR/SpecializationObligationsA.olean" "$TMP_DIR/SpecializationObligationsA.lean"
+cp "$TEST_DIR/SemanticStrength.lean" "$TMP_DIR/SemanticStrength.lean"
+LEAN_PATH="$TMP_DIR" "$LEAN" "$TMP_DIR/SemanticStrength.lean"
+"$COQC" -Q "$TMP_DIR" "" "$TMP_DIR/SpecializationObligationsA.v"
+cp "$TEST_DIR/SemanticStrength.v" "$TMP_DIR/SemanticStrength.v"
+"$COQC" -Q "$TMP_DIR" "" "$TMP_DIR/SemanticStrength.v"
 
 python3 - \
   "$TMP_DIR/SpecializationObligationsA.lean" \
@@ -129,8 +133,12 @@ test "$(jq '.unresolved_obligations | length' "$TMP_DIR/extern.json")" -eq 1
 test "$(jq '[.clones[].extern_contracts[]] | length' "$TMP_DIR/extern.json")" -eq 1
 grep -Fq 'S.externEval' "$TMP_DIR/ExternObligations.lean"
 grep -Fq 'sem_extern_eval S' "$TMP_DIR/ExternObligations.v"
-"$LEAN" "$TMP_DIR/ExternObligations.lean"
-"$COQC" "$TMP_DIR/ExternObligations.v"
+"$LEAN" -o "$TMP_DIR/ExternObligations.olean" "$TMP_DIR/ExternObligations.lean"
+cp "$TEST_DIR/ExternSemanticStrength.lean" "$TMP_DIR/ExternSemanticStrength.lean"
+LEAN_PATH="$TMP_DIR" "$LEAN" "$TMP_DIR/ExternSemanticStrength.lean"
+"$COQC" -Q "$TMP_DIR" "" "$TMP_DIR/ExternObligations.v"
+cp "$TEST_DIR/ExternSemanticStrength.v" "$TMP_DIR/ExternSemanticStrength.v"
+"$COQC" -Q "$TMP_DIR" "" "$TMP_DIR/ExternSemanticStrength.v"
 
 # Comparison is stable-ID based and reports no semantic change for an
 # identical plan.

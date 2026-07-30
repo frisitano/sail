@@ -69,8 +69,11 @@ is written after backend symbols are assigned.
 Canonical output uses UTF-8 JSON, fixed object-field order, and lexicographic
 record ordering by stable ID. Identical compiler version, configuration,
 inputs, and specialization decisions produce byte-identical JSON.
-Lean and Coq definitions use the same typed, backend-neutral OCaml obligation
-representation as the JSON renderer and are likewise byte-identical.
+Lean and Coq definitions are rendered from the same backend-neutral OCaml
+proposition tree. Quantifiers, implication, conjunction, existential witnesses,
+relation applications, and literals are constructed once; only their concrete
+Lean/Coq syntax differs. The generated files are likewise byte-identical across
+repeated compilations.
 
 The configuration identity covers the versioned representation-specialization
 policy, bounded-integer enforcement, preserved specialization roots, and the
@@ -97,6 +100,20 @@ Each clone contains all required obligation classes:
 evidence. An extern-free clone records `extern_refinement` as `not_applicable`
 so completeness remains mechanically checkable.
 
+Operational obligations are forward-simulation statements. Given represented
+arguments and an applicable Sail execution, call, or extern interaction, they
+require an existential specialized-JIB (or extern) outcome together with the
+appropriate refinement, exception, and lifetime relations. Conversion
+obligations likewise require a represented result for every well-typed source
+value. Consequently, empty downstream execution relations cannot satisfy
+`Complete` merely by vacuity.
+
+Path-condition soundness is deliberately source-only: source argument
+well-typedness and source reachability imply the inferred bounds. It does not
+assume that represented arguments already exist or that specialized JIB
+execution is reachable; representation adequacy consumes those independently
+established bounds.
+
 ## Native Lean and Coq definitions
 
 The native files declare:
@@ -120,6 +137,14 @@ specialized JIB/representation semantics, then prove the generated
 propositions. Compiling a generated file checks syntax and typing; it does not
 establish refinement by itself. Stable IDs connect those propositions to the
 JSON audit artifact without relying on JIB display names or C symbols.
+
+The focused regression suite also compiles separate Lean and Rocq consumers
+whose source semantics can execute while every specialized execution, call,
+conversion, and extern relation is empty. Those consumers prove that the
+relevant obligations—and therefore `Complete`—are impossible. A second
+consumer makes representation false and source bounds false while retaining
+source well-typedness and reachability, ensuring the path-bound obligation
+cannot regain a downstream premise.
 
 ## Optional independent checking and comparison
 
