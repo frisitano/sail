@@ -53,10 +53,14 @@ if sed -n '/^sail_u256 zadd_widen_128(/,/^}/p' "$OUT.c" | grep -Fq sail_int; the
 fi
 
 # Storage representations do not change mathematical integer semantics. Two
-# u256 operands can sum to 257 bits, so this operation must remain arbitrary
-# precision rather than silently becoming modular u256 arithmetic.
-sed -n '/^void zadd_widen_256(/,/^}/p' "$OUT.c" > "$TMP_DIR/add_widen_256.c"
-grep -Fq 'add_int(' "$TMP_DIR/add_widen_256.c"
+# u256 operands can sum to 257 bits, so this operation must widen to the native
+# u320 representation rather than silently becoming modular u256 arithmetic.
+sed -n '/^sail_u320 zadd_widen_256(/,/^}/p' "$OUT.c" > "$TMP_DIR/add_widen_256.c"
+grep -Fq 'u320_add_widen(zleft, zright)' "$TMP_DIR/add_widen_256.c"
+if grep -Fq 'sail_int' "$TMP_DIR/add_widen_256.c"; then
+  echo '257-bit mathematical addition retained sail_int' >&2
+  exit 1
+fi
 if grep -Fq 'u256_add(' "$TMP_DIR/add_widen_256.c"; then
   echo '257-bit mathematical addition was silently lowered as modular u256' >&2
   exit 1

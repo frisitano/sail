@@ -190,8 +190,10 @@ let infer_def_direct_effects asserts_termination def =
   ignore (rewrite_ast_defs { rewriters_base with rewrite_exp = rw_exp; rewrite_pat = (fun _ -> fold_pat pat_alg) } [def]);
 
   ( match def with
-  | DEF_aux (DEF_val (VS_aux (VS_val_spec (_, id, Some { pure = false; _ }), _)), _) ->
-      effects := EffectSet.add External !effects
+  | DEF_aux (DEF_val (VS_aux (VS_val_spec (_, id, Some { pure = false; _ }), _)), def_annot) ->
+      effects := EffectSet.add External !effects;
+      if Option.is_some (get_def_attribute "c_throws" def_annot) then
+        effects := EffectSet.add Throw !effects
   | DEF_aux (DEF_fundef (FD_aux (FD_function (_, _, funcls), (l, _))), def_annot) -> (
       match funcls_info funcls with
       | Some (id, typ, env) ->

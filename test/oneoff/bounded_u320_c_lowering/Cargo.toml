@@ -1,0 +1,9 @@
+[package]
+name = "bounded-u320-c-lowering-test"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libloading = "0.8.9"
+ruint = "1.19.0"

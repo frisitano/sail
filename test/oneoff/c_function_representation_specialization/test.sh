@@ -75,16 +75,21 @@ for function_name in top_add middle_add; do
   fi
 done
 
-# A full-width caller keeps the canonical u256/u256 body alive.  Its explicit
-# modulo-2^256 source semantics select wrapping u256 addition without ever
-# materialising the otherwise 257-bit mathematical sum.
+# A full-width caller keeps the canonical u256/u256 body alive. Its explicit
+# modulo-2^256 source semantics compute the exact 257-bit sum in native u320,
+# then narrow only at the explicit modulo operation.
 grep -Fq 'sail_u256 zleaf_add(sail_u256, sail_u256);' "$TMP_DIR/model.h"
 awk '
   /^sail_u256 zleaf_add\(sail_u256 zleft, sail_u256 zright\)/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/full_width_leaf_add.c"
-grep -Fq 'u256_add(zleft, zright)' "$TMP_DIR/full_width_leaf_add.c"
+grep -Fq 'u320_add_widen(zleft, zright)' "$TMP_DIR/full_width_leaf_add.c"
+grep -Fq 'u320_mod(' "$TMP_DIR/full_width_leaf_add.c"
+if grep -Fq 'u256_add(zleft, zright)' "$TMP_DIR/full_width_leaf_add.c"; then
+  echo '257-bit mathematical sum was prematurely lowered as modular u256' >&2
+  exit 1
+fi
 if grep -Fq 'sail_int' "$TMP_DIR/full_width_leaf_add.c"; then
   echo 'modulo-2^256 full-width addition fell back to sail_int' >&2
   exit 1

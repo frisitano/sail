@@ -378,6 +378,7 @@ module Verilog_config (C : JIB_CONFIG) : Jib_compile.CONFIG = struct
   let specialize_function_argument_representation ~semantic:_ ~represented:_ = false
   let specialize_function_result_representation ~semantic:_ ~represented:_ = false
   let specialize_function_body_representation ~semantic:_ ~represented:_ = false
+  let specialize_c = false
   let require_bounded_int = false
   let integer_representation_bounds _ = None
   let specialized_function_external _ _ _ = None

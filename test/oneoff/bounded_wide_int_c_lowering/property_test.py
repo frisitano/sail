@@ -16,6 +16,10 @@ class U256(ctypes.Structure):
     _fields_ = [("limbs", ctypes.c_uint64 * 4)]
 
 
+class U320(ctypes.Structure):
+    _fields_ = [("limbs", ctypes.c_uint64 * 5)]
+
+
 def u128(value):
     return U128((ctypes.c_uint64 * 2)(value & MASK64, (value >> 64) & MASK64))
 
@@ -33,6 +37,7 @@ lib = ctypes.CDLL(os.environ["MODEL_LIB"])
 for name, arguments, result in [
     ("zadd_widen_128", [U128, U128], U256),
     ("zmul_widen_128", [U128, U128], U256),
+    ("zadd_widen_256", [U256, U256], U320),
     ("zadd_256_128", [U256, U128], U256),
     ("zmul_256_128", [U256, U128], U256),
     ("zsub_256_128", [U256, U128], U256),
@@ -60,6 +65,10 @@ for left in edge128:
         assert integer(lib.zmul_widen_128(u128(left), u128(right))) == left * right
 
 for left in edge256:
+    for right in edge256:
+        assert integer(lib.zadd_widen_256(u256(left), u256(right))) == left + right
+
+for left in edge256:
     for right in edge128:
         assert integer(lib.zadd_256_128(u256(left), u128(right))) == (left + right) & MASK256
         assert integer(lib.zmul_256_128(u256(left), u128(right))) == (left * right) & MASK256
@@ -82,10 +91,12 @@ for _ in range(10000):
     left128 = rng.getrandbits(128)
     right128 = rng.getrandbits(128)
     left256 = rng.getrandbits(256)
+    right256 = rng.getrandbits(256)
     divisor = rng.getrandbits(128) or 1
     divisor256 = rng.getrandbits(256) or 1
     assert integer(lib.zadd_widen_128(u128(left128), u128(right128))) == left128 + right128
     assert integer(lib.zmul_widen_128(u128(left128), u128(right128))) == left128 * right128
+    assert integer(lib.zadd_widen_256(u256(left256), u256(right256))) == left256 + right256
     assert integer(lib.zadd_256_128(u256(left256), u128(right128))) == (left256 + right128) & MASK256
     assert integer(lib.zmul_256_128(u256(left256), u128(right128))) == (left256 * right128) & MASK256
     if left256 >= right128:

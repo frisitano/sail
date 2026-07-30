@@ -96,14 +96,18 @@ let max_uint n = Big_int.pred (Big_int.pow_int_positive 2 n)
    continue to see bits(256) and vector(N, byte), while C gets POD value types. *)
 let c_repr_u128_id = mk_id "__sail_c_repr_u128"
 let c_repr_u256_id = mk_id "__sail_c_repr_u256"
+let c_repr_u320_id = mk_id "__sail_c_repr_u320"
 let c_repr_fixed_bytes_id = mk_id "__sail_c_repr_fixed_bytes"
 let c_repr_u128_ctyp = CT_struct (c_repr_u128_id, [])
 let c_repr_u256_ctyp = CT_struct (c_repr_u256_id, [])
+let c_repr_u320_ctyp = CT_struct (c_repr_u320_id, [])
 let c_repr_fixed_bytes_ctyp n = CT_struct (c_repr_fixed_bytes_id, [CT_constant (Big_int.of_int n)])
 
 let is_c_repr_u128 = function CT_struct (id, []) -> Id.compare id c_repr_u128_id = 0 | _ -> false
 
 let is_c_repr_u256 = function CT_struct (id, []) -> Id.compare id c_repr_u256_id = 0 | _ -> false
+
+let is_c_repr_u320 = function CT_struct (id, []) -> Id.compare id c_repr_u320_id = 0 | _ -> false
 
 let c_repr_fixed_bytes_length = function
   | CT_struct (id, [CT_constant n]) when Id.compare id c_repr_fixed_bytes_id = 0 -> (
@@ -112,7 +116,8 @@ let c_repr_fixed_bytes_length = function
   | _ -> None
 
 let is_c_repr_fixed_bytes ctyp = Option.is_some (c_repr_fixed_bytes_length ctyp)
-let is_c_repr_value ctyp = is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_fixed_bytes ctyp
+let is_c_repr_value ctyp =
+  is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_u320 ctyp || is_c_repr_fixed_bytes ctyp
 
 let rec ctyp_suprema_for_c specialize = function
   | ctyp when specialize && is_c_repr_value ctyp -> ctyp
@@ -181,6 +186,8 @@ let literal_to_fragment ctyp (L_aux (l_aux, _)) =
   match l_aux with
   | L_num n -> (
       match ctyp with
+      | ctyp when is_c_repr_u320 ctyp && Big_int.less_equal Big_int.zero n && Big_int.less_equal n (max_uint 320) ->
+          Some (V_lit (VL_int n, ctyp))
       | ctyp when is_c_repr_u256 ctyp && Big_int.less_equal Big_int.zero n && Big_int.less_equal n (max_uint 256) ->
           Some (V_lit (VL_int n, ctyp))
       | ctyp when is_c_repr_u128 ctyp && Big_int.less_equal Big_int.zero n && Big_int.less_equal n (max_uint 128) ->
@@ -288,6 +295,7 @@ module C_config (Opts : sig
   val specialize_c : bool
   val require_bounded_int : bool
 end) : CONFIG = struct
+  let specialize_c = Opts.specialize_c
   let require_bounded_int = Opts.require_bounded_int
 
   (* Representation annotations are C-only and may sit behind one or more
@@ -355,10 +363,17 @@ end) : CONFIG = struct
   let representation_refines ~semantic ~represented =
     match (semantic, represented) with
     | CT_lint, (CT_fint _ | CT_fuint _) -> true
-    | CT_lint, represented when is_c_repr_u128 represented || is_c_repr_u256 represented -> true
+    | CT_lint, represented
+      when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
+        true
     | CT_lbits, represented when is_c_repr_u256 represented -> true
-    | semantic, CT_fuint _ when is_c_repr_u128 semantic || is_c_repr_u256 semantic -> true
-    | semantic, represented when is_c_repr_u256 semantic && is_c_repr_u128 represented -> true
+    | semantic, CT_fuint _
+      when is_c_repr_u128 semantic || is_c_repr_u256 semantic || is_c_repr_u320 semantic ->
+        true
+    | semantic, represented
+      when (is_c_repr_u256 semantic && is_c_repr_u128 represented)
+           || (is_c_repr_u320 semantic && (is_c_repr_u128 represented || is_c_repr_u256 represented)) ->
+        true
     | (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), represented when is_c_repr_fixed_bytes represented -> true
     | _ -> false
 
@@ -379,9 +394,16 @@ end) : CONFIG = struct
     (specializes_narrow_fixed_integer_argument ~semantic ~represented
     || match (semantic, represented) with
     | CT_lint, (CT_fint _ | CT_fuint _) -> true
-    | CT_lint, represented when is_c_repr_u128 represented || is_c_repr_u256 represented -> true
-    | semantic, CT_fuint _ when is_c_repr_u128 semantic || is_c_repr_u256 semantic -> true
-    | semantic, represented when is_c_repr_u256 semantic && is_c_repr_u128 represented -> true
+    | CT_lint, represented
+      when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
+        true
+    | semantic, CT_fuint _
+      when is_c_repr_u128 semantic || is_c_repr_u256 semantic || is_c_repr_u320 semantic ->
+        true
+    | semantic, represented
+      when (is_c_repr_u256 semantic && is_c_repr_u128 represented)
+           || (is_c_repr_u320 semantic && (is_c_repr_u128 represented || is_c_repr_u256 represented)) ->
+        true
     | CT_lbits, represented when is_c_repr_u256 represented -> true
     | (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), represented when is_c_repr_fixed_bytes represented -> true
     | _ -> false)
@@ -391,7 +413,9 @@ end) : CONFIG = struct
     &&
     match (semantic, represented) with
     | CT_lint, (CT_fint _ | CT_fuint _) -> true
-    | CT_lint, represented when is_c_repr_u128 represented || is_c_repr_u256 represented -> true
+    | CT_lint, represented
+      when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
+        true
     | CT_lbits, represented when is_c_repr_u256 represented -> true
     | (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), represented when is_c_repr_fixed_bytes represented -> true
     | _ -> false
@@ -403,6 +427,7 @@ end) : CONFIG = struct
     | CT_fint width -> Some (min_int width, max_int width)
     | ctyp when is_c_repr_u128 ctyp -> Some (Big_int.zero, max_uint 128)
     | ctyp when is_c_repr_u256 ctyp -> Some (Big_int.zero, max_uint 256)
+    | ctyp when is_c_repr_u320 ctyp -> Some (Big_int.zero, max_uint 320)
     | CT_constant value -> Some (value, value)
     | _ -> None
 
@@ -443,8 +468,12 @@ end) : CONFIG = struct
 
   let function_argument_narrowing_allowed ~expected ~source ~represented =
     ctyp_equal expected source
-    && (((is_c_repr_u128 expected || is_c_repr_u256 expected) && ctyp_equal represented CT_lint)
-       || match expected with CT_fuint _ -> is_c_repr_u128 represented || is_c_repr_u256 represented | _ -> false
+    && (((is_c_repr_u128 expected || is_c_repr_u256 expected || is_c_repr_u320 expected)
+         && ctyp_equal represented CT_lint)
+       ||
+       match expected with
+       | CT_fuint _ -> is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented
+       | _ -> false
        )
 
   (* Flow typing can refine a local integer to a range whose preferred native
@@ -458,7 +487,10 @@ end) : CONFIG = struct
     match (semantic, represented) with
     | (CT_fint semantic_width | CT_fuint semantic_width), (CT_fint represented_width | CT_fuint represented_width) ->
         semantic_width = represented_width
-    | semantic, represented when is_c_repr_u128 semantic && is_c_repr_u256 represented -> true
+    | semantic, represented
+      when (is_c_repr_u128 semantic && (is_c_repr_u256 represented || is_c_repr_u320 represented))
+           || (is_c_repr_u256 semantic && is_c_repr_u320 represented) ->
+        true
     | _ -> false
 
   let preserve_aval_representation ~semantic ~represented =
@@ -466,7 +498,7 @@ end) : CONFIG = struct
     | CT_lint -> (
         match represented with
         | CT_fint _ | CT_fuint _ -> true
-        | represented -> is_c_repr_u128 represented || is_c_repr_u256 represented
+        | represented -> is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented
       )
     | CT_lbits -> is_c_repr_u256 represented
     | CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8) -> is_c_repr_fixed_bytes represented
@@ -645,6 +677,9 @@ end) : CONFIG = struct
             | Nexp_aux (Nexp_constant n, _), Nexp_aux (Nexp_constant m, _)
               when Opts.specialize_c && Big_int.less_equal Big_int.zero n && Big_int.less_equal m (max_uint 256) ->
                 c_repr_u256_ctyp
+            | Nexp_aux (Nexp_constant n, _), Nexp_aux (Nexp_constant m, _)
+              when Opts.specialize_c && Big_int.less_equal Big_int.zero n && Big_int.less_equal m (max_uint 320) ->
+                c_repr_u320_ctyp
             | n, m ->
                 if
                   prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
@@ -669,6 +704,11 @@ end) : CONFIG = struct
                   && prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
                   && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_uint 256)))
                 then c_repr_u256_ctyp
+                else if
+                  Opts.specialize_c
+                  && prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
+                  && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_uint 320)))
+                then c_repr_u320_ctyp
                 else CT_lint
           )
       )
@@ -1031,6 +1071,8 @@ end) : CONFIG = struct
                 fits (nconstant Big_int.zero) (nconstant (max_uint 128))
             | represented when is_c_repr_u256 represented ->
                 fits (nconstant Big_int.zero) (nconstant (max_uint 256))
+            | represented when is_c_repr_u320 represented ->
+                fits (nconstant Big_int.zero) (nconstant (max_uint 320))
             | _ -> false
           )
         | None -> false
@@ -1069,7 +1111,8 @@ end) : CONFIG = struct
               semantic_integer_excludes (min_int width) left
               || semantic_integer_excludes (Big_int.of_int (-1)) right
           | CT_fuint _ -> true
-          | represented when is_c_repr_u128 represented || is_c_repr_u256 represented -> true
+          | represented when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
+              true
           | _ -> false
           )
       | _ -> false
@@ -1176,6 +1219,17 @@ end) : CONFIG = struct
           Some (V_lit (VL_int value, CT_fuint 64))
       | _ -> None
     in
+    let align_u320_integers left right =
+      let left_ctyp = cval_ctyp left in
+      let right_ctyp = cval_ctyp right in
+      match (is_c_repr_u320 left_ctyp, is_c_repr_u320 right_ctyp) with
+      | true, true -> Some (left, right)
+      | true, false when is_c_repr_u128 right_ctyp || is_c_repr_u256 right_ctyp -> Some (left, right)
+      | false, true when is_c_repr_u128 left_ctyp || is_c_repr_u256 left_ctyp -> Some (left, right)
+      | true, false -> Option.map (fun right -> (left, right)) (as_native_u64 right)
+      | false, true -> Option.map (fun left -> (left, right)) (as_native_u64 left)
+      | false, false -> None
+    in
     let align_u256_integers left right =
       let left_ctyp = cval_ctyp left in
       let right_ctyp = cval_ctyp right in
@@ -1235,32 +1289,78 @@ end) : CONFIG = struct
             )
       | _ -> None
     in
+    let widening_u320_binary op left right =
+      let stem =
+        match op with Iadd -> Some "u320_add_widen" | Imul -> Some "u320_mul_widen" | _ -> None
+      in
+      match stem with
+      | Some stem
+        when (match (cval_ctyp left, cval_ctyp right) with
+             | left, right ->
+                 (is_c_repr_u320 left || is_c_repr_u256 left || is_c_repr_u128 left
+                 || match left with CT_fuint _ -> true | _ -> false)
+                 && (is_c_repr_u320 right || is_c_repr_u256 right || is_c_repr_u128 right
+                    || match right with CT_fuint _ -> true | _ -> false)) ->
+          let semantic_typ index = aval_typ (List.nth semantic_args index) in
+          Some
+            (AE_app
+               ( Pure_extern (mk_id stem, Some typ),
+                 [AV_cval (left, semantic_typ 0); AV_cval (right, semantic_typ 1)],
+                 typ
+               )
+            )
+      | _ -> None
+    in
     let native_integer_binary_or_no_change ?(commutative = false) op left right =
       let operation_fits represented =
         match op with
         | Eq | Neq | Ilt | Igt | Ilteq | Igteq -> true
+        | Iadd | Isub | Imul | Idiv | Imod when is_c_repr_u320 represented ->
+            is_c_repr_u320 (convert_typ ctx typ)
         | Iadd | Isub | Imul | Idiv | Imod -> proven_native_op represented op
         | _ -> false
       in
-      match if is_c_repr_u256 (convert_typ ctx typ) then widening_u256_binary op left right else None with
+      match if is_c_repr_u320 (convert_typ ctx typ) then widening_u320_binary op left right else None with
       | Some widened -> widened
       | None -> (
-          match align_u256_integers left right with
-          | Some (left, right) when operation_fits c_repr_u256_ctyp ->
+          match align_u320_integers left right with
+          | Some (left, right)
+            when (match op with
+                 | Idiv | Imod -> is_c_repr_u320 (cval_ctyp left)
+                 | _ -> operation_fits c_repr_u320_ctyp) ->
               let left, right =
-                if commutative && not (is_c_repr_u256 (cval_ctyp left)) then (right, left) else (left, right)
+                if commutative && not (is_c_repr_u320 (cval_ctyp left)) then (right, left) else (left, right)
               in
-              AE_val (AV_cval (V_call (op, [left; right]), typ))
+              if op = Imod && match cval_ctyp right with CT_fuint _ -> true | _ -> false then
+                let semantic_typ index = aval_typ (List.nth semantic_args index) in
+                AE_app
+                  ( Pure_extern (mk_id "u320_mod_u64", Some typ),
+                    [AV_cval (left, semantic_typ 0); AV_cval (right, semantic_typ 1)],
+                    typ
+                  )
+              else AE_val (AV_cval (V_call (op, [left; right]), typ))
           | Some _ | None -> (
-              match align_u128_integers left right with
-              | Some (left, right) when operation_fits c_repr_u128_ctyp ->
-                  let left, right =
-                    if commutative && not (is_c_repr_u128 (cval_ctyp left)) then (right, left) else (left, right)
-                  in
-                  AE_val (AV_cval (V_call (op, [left; right]), typ))
-              | (Some _ | None) when is_c_repr_u128 (convert_typ ctx typ) ->
-                  Option.value (widening_u128_binary op left right) ~default:no_change
-              | Some _ | None -> native_binary_or_no_change op left right
+              match if is_c_repr_u256 (convert_typ ctx typ) then widening_u256_binary op left right else None with
+              | Some widened -> widened
+              | None -> (
+                  match align_u256_integers left right with
+                  | Some (left, right) when operation_fits c_repr_u256_ctyp ->
+                      let left, right =
+                        if commutative && not (is_c_repr_u256 (cval_ctyp left)) then (right, left) else (left, right)
+                      in
+                      AE_val (AV_cval (V_call (op, [left; right]), typ))
+                  | Some _ | None -> (
+                      match align_u128_integers left right with
+                      | Some (left, right) when operation_fits c_repr_u128_ctyp ->
+                          let left, right =
+                            if commutative && not (is_c_repr_u128 (cval_ctyp left)) then (right, left) else (left, right)
+                          in
+                          AE_val (AV_cval (V_call (op, [left; right]), typ))
+                      | (Some _ | None) when is_c_repr_u128 (convert_typ ctx typ) ->
+                          Option.value (widening_u128_binary op left right) ~default:no_change
+                      | Some _ | None -> native_binary_or_no_change op left right
+                    )
+                )
             )
         )
     in
@@ -1352,6 +1452,7 @@ end) : CONFIG = struct
     | "sail_unsigned", [AV_cval (value, _)] -> (
         match cval_ctyp value with
         | CT_fbits _ -> AE_val (AV_cval (V_call (Unsigned 64, [value]), typ))
+        | ctyp when is_c_repr_u320 ctyp -> AE_val (AV_cval (value, typ))
         | ctyp when is_c_repr_u256 ctyp -> AE_val (AV_cval (value, typ))
         | _ -> no_change
       )
@@ -1915,7 +2016,8 @@ let drop_redundant_to_bytes_mask =
     | I_aux (I_copy (clexp, V_call (Bvand, [source; mask])), aux) :: instrs when mask_covers_native_source mask source
       ->
         I_aux (I_copy (clexp, source), aux) :: rewrite instrs
-    | (I_aux (I_decl (ctyp, id), _) as instr) :: instrs when is_c_repr_u256 ctyp ->
+    | (I_aux (I_decl (ctyp, id), _) as instr) :: instrs
+      when is_c_repr_u256 ctyp || is_c_repr_u320 ctyp ->
         let instrs = rewrite instrs in
         if List.exists (fun next -> NameSet.mem id (instr_ids ~direct:false next)) instrs then instr :: instrs
         else instrs
@@ -1952,6 +2054,7 @@ let fold_power_of_two_modular_arithmetic =
     | CT_fuint width -> Some width
     | ctyp when is_c_repr_u128 ctyp -> Some 128
     | ctyp when is_c_repr_u256 ctyp -> Some 256
+    | ctyp when is_c_repr_u320 ctyp -> Some 320
     | _ -> None
   in
   let unsigned_fits width ctyp =
@@ -2078,6 +2181,21 @@ let fold_power_of_two_modular_arithmetic =
         ( I_init
             ( CT_lint,
               modulus,
+              Init_cval (V_lit (VL_int modulus_literal, _))
+            ),
+          _
+        ) ->
+        Some (modulus, Big_int.to_string modulus_literal)
+    | I_aux
+        ( I_reinit
+            (CT_lint, modulus, V_lit (VL_int modulus_literal, _)),
+          _
+        ) ->
+        Some (modulus, Big_int.to_string modulus_literal)
+    | I_aux
+        ( I_init
+            ( CT_lint,
+              modulus,
               Init_cval (V_lit (VL_string modulus_literal, CT_string))
             ),
           _
@@ -2124,6 +2242,42 @@ let fold_power_of_two_modular_arithmetic =
       )
     | _ -> None
   in
+  let fold_embedded_modulus sum addition reduction =
+    let fold modulus_initializer_instr reduction =
+        match modulus_initializer modulus_initializer_instr with
+        | Some (modulus, _) ->
+            let reduction =
+              match List.rev reduction with
+              | I_aux (I_clear (CT_lint, modulus_clear), _) :: reduction
+                when same_name modulus modulus_clear ->
+                  List.rev reduction
+              | _ -> reduction
+            in
+            fold_candidate sum addition modulus_initializer_instr reduction
+        | None -> None
+    in
+    match reduction with
+    | I_aux ((I_decl (CT_lint, modulus) | I_reset (CT_lint, modulus)), aux)
+      :: I_aux
+           ( I_copy
+               ( CL_id (modulus_copy, CT_lint),
+                 (V_lit (VL_int _, _) as modulus_literal)
+               ),
+             _
+           )
+      :: reduction
+      when same_name modulus modulus_copy ->
+        fold
+          (I_aux
+             ( I_init
+                 (CT_lint, modulus, Init_cval modulus_literal),
+               aux
+             )
+          )
+          reduction
+    | modulus_initializer_instr :: reduction -> fold modulus_initializer_instr reduction
+    | [] -> None
+  in
   let modular_arithmetic = function
     | [
      I_aux ((I_decl (CT_lint, sum) | I_reset (CT_lint, sum)), _);
@@ -2146,6 +2300,14 @@ let fold_power_of_two_modular_arithmetic =
             fold_candidate sum addition modulus_initializer_instr reduction
         | _ -> None
       )
+    | [
+     I_aux ((I_decl (CT_lint, sum) | I_reset (CT_lint, sum)), _);
+     I_aux (I_block addition, _);
+     I_aux (I_block reduction, _);
+     I_aux (I_clear (CT_lint, sum_clear), _);
+    ]
+      when same_name sum sum_clear ->
+        fold_embedded_modulus sum addition reduction
     | _ -> None
   in
   let rec rewrite instrs =
@@ -2419,6 +2581,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let readable_ctyp_names_used = ref Util.StringSet.empty
 
   let rec readable_ctyp_stem = function
+    | ctyp when is_c_repr_u320 ctyp -> "u320"
     | ctyp when is_c_repr_u256 ctyp -> "u256"
     | ctyp when is_c_repr_fixed_bytes ctyp ->
         "fixed_bytes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_length ctyp))
@@ -2467,6 +2630,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let rec sgen_ctyp = function
     | ctyp when is_c_repr_u128 ctyp -> "sail_u128"
     | ctyp when is_c_repr_u256 ctyp -> "sail_u256"
+    | ctyp when is_c_repr_u320 ctyp -> "sail_u320"
     | ctyp when is_c_repr_fixed_bytes ctyp ->
         "sail_fixed_bytes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_length ctyp))
     | CT_unit -> "unit"
@@ -2498,6 +2662,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let rec sgen_ctyp_name = function
     | ctyp when is_c_repr_u128 ctyp -> "u128"
     | ctyp when is_c_repr_u256 ctyp -> "u256"
+    | ctyp when is_c_repr_u320 ctyp -> "u320"
     | ctyp when is_c_repr_fixed_bytes ctyp ->
         "fixed_bytes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_length ctyp))
     | CT_unit -> "unit"
@@ -2570,6 +2735,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     ^ Big_int.to_string (limb 64) ^ "), UINT64_C(" ^ Big_int.to_string (limb 128)
     ^ "), UINT64_C(" ^ Big_int.to_string (limb 192) ^ ")}})"
 
+  let sgen_u320_int value =
+    let mask = max_uint 64 in
+    let limb shift = Big_int.shift_right value shift |> fun value -> Big_int.bitwise_and value mask in
+    "((sail_u320){{UINT64_C(" ^ Big_int.to_string (limb 0) ^ "), UINT64_C("
+    ^ Big_int.to_string (limb 64) ^ "), UINT64_C(" ^ Big_int.to_string (limb 128)
+    ^ "), UINT64_C(" ^ Big_int.to_string (limb 192) ^ "), UINT64_C("
+    ^ Big_int.to_string (limb 256) ^ ")}})"
+
   let sgen_i128_int value =
     let unsigned_i128 value =
       let mask = max_uint 64 in
@@ -2589,6 +2762,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | VL_bits bs -> "UINT64_C(" ^ Sail2_values.show_bitlist bs ^ ")"
     | VL_int i -> (
         match ctyp with
+        | ctyp when is_c_repr_u320 ctyp -> sgen_u320_int i
         | ctyp when is_c_repr_u256 ctyp -> sgen_u256_int i
         | ctyp when is_c_repr_u128 ctyp -> sgen_u128_int i
         | CT_fuint _ -> "UINT64_C(" ^ Big_int.to_string i ^ ")"
@@ -2620,6 +2794,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | V_tuple _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Cannot generate C value for a tuple literal"
 
   and sgen_call op cvals =
+    let u320_of value =
+      match cval_ctyp value with
+      | ctyp when is_c_repr_u320 ctyp -> sgen_cval value
+      | ctyp when is_c_repr_u256 ctyp -> sprintf "u320_of_u256(%s)" (sgen_cval value)
+      | ctyp when is_c_repr_u128 ctyp -> sprintf "u320_of_u128(%s)" (sgen_cval value)
+      | CT_fuint _ -> sprintf "u320_of_u64(%s)" (sgen_cval value)
+      | ctyp -> failwith ("Cannot widen " ^ string_of_ctyp ctyp ^ " to sail_u320")
+    in
     match (op, cvals) with
     | Bnot, [v] -> "!(" ^ sgen_cval v ^ ")"
     | Band, vs -> "(" ^ Util.string_of_list " && " sgen_cval vs ^ ")"
@@ -2630,6 +2812,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | Eq, [v1; v2] -> (
         match (cval_ctyp v1, cval_ctyp v2) with
         | CT_sbits _, _ -> sprintf "eq_sbits(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | left, right when is_c_repr_u320 left || is_c_repr_u320 right ->
+            sprintf "eq_u320(%s, %s)" (u320_of v1) (u320_of v2)
         | left, right when is_c_repr_u256 left && is_c_repr_u128 right ->
             sprintf "u256_eq_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
         | left, right when is_c_repr_u128 left && is_c_repr_u256 right ->
@@ -2645,6 +2829,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | Neq, [v1; v2] -> (
         match (cval_ctyp v1, cval_ctyp v2) with
         | CT_sbits _, _ -> sprintf "neq_sbits(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | left, right when is_c_repr_u320 left || is_c_repr_u320 right ->
+            sprintf "(!eq_u320(%s, %s))" (u320_of v1) (u320_of v2)
         | left, right when is_c_repr_u256 left && is_c_repr_u128 right ->
             sprintf "(!u256_eq_u128(%s, %s))" (sgen_cval v1) (sgen_cval v2)
         | left, right when is_c_repr_u128 left && is_c_repr_u256 right ->
@@ -2657,6 +2843,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             sprintf "(!eq_%s(%s, %s))" (sgen_ctyp_name ctyp) (sgen_cval v1) (sgen_cval v2)
         | _ -> sprintf "(%s != %s)" (sgen_cval v1) (sgen_cval v2)
       )
+    | Ilt, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) || is_c_repr_u320 (cval_ctyp v2) ->
+        sprintf "u320_lt(%s, %s)" (u320_of v1) (u320_of v2)
     | Ilt, [v1; v2] when is_c_repr_u256 (cval_ctyp v1) && is_c_repr_u128 (cval_ctyp v2) ->
         sprintf "u256_lt_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
     | Ilt, [v1; v2] when is_c_repr_u128 (cval_ctyp v1) && is_c_repr_u256 (cval_ctyp v2) ->
@@ -2677,6 +2865,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | Igteq, [v1; v2] -> sprintf "(!%s)" (sgen_call Ilt [v1; v2])
     | Iadd, [v1; v2] -> (
         match (cval_ctyp v1, cval_ctyp v2) with
+        | left, right when is_c_repr_u320 left || is_c_repr_u320 right ->
+            sprintf "u320_add(%s, %s)" (u320_of v1) (u320_of v2)
         | left, right when is_c_repr_u256 left && is_c_repr_u128 right ->
             sprintf "u256_add_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
         | left, right when is_c_repr_u128 left && is_c_repr_u256 right ->
@@ -2721,6 +2911,16 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       )
     | Isub, [v1; v2] -> (
         match (cval_ctyp v1, cval_ctyp v2) with
+        | left, right when is_c_repr_u320 left && is_c_repr_u320 right ->
+            sprintf "u320_sub(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | left, right when is_c_repr_u320 left ->
+            sprintf "u320_sub(%s, %s)" (sgen_cval v1) (u320_of v2)
+        | left, right when is_c_repr_u256 left && is_c_repr_u320 right ->
+            sprintf "u256_sub_u320(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | left, right when is_c_repr_u128 left && is_c_repr_u320 right ->
+            sprintf "u128_sub_u320(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | CT_fuint _, right when is_c_repr_u320 right ->
+            sprintf "u64_sub_u320(%s, %s)" (sgen_cval v1) (sgen_cval v2)
         | left, right when is_c_repr_u256 left && is_c_repr_u128 right ->
             sprintf "u256_sub_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
         | left, right when is_c_repr_u128 left && is_c_repr_u256 right ->
@@ -2740,6 +2940,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                  (sgen_cval v2) (string_of_ctyp (cval_ctyp v2)))
         | _ -> sprintf "(%s - %s)" (sgen_cval v1) (sgen_cval v2)
       )
+    | Imul, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) || is_c_repr_u320 (cval_ctyp v2) ->
+        sprintf "u320_mul(%s, %s)" (u320_of v1) (u320_of v2)
     | Imul, [v1; v2] when is_c_repr_u256 (cval_ctyp v1) && is_c_repr_u128 (cval_ctyp v2) ->
         sprintf "u256_mul_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
     | Imul, [v1; v2] when is_c_repr_u128 (cval_ctyp v1) && is_c_repr_u256 (cval_ctyp v2) ->
@@ -2759,6 +2961,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                  (sgen_cval v2) (string_of_ctyp (cval_ctyp v2)))
         | _ -> sprintf "(%s * %s)" (sgen_cval v1) (sgen_cval v2)
       )
+    | Idiv, [v1; v2]
+      when is_c_repr_u320 (cval_ctyp v1)
+           && (match cval_ctyp v2 with CT_fuint _ -> true | _ -> false) ->
+        sprintf "u320_div_u64(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+    | Idiv, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) ->
+        sprintf "u320_div(%s, %s)" (sgen_cval v1) (u320_of v2)
     | Idiv, [v1; v2] when is_c_repr_u256 (cval_ctyp v1) && is_c_repr_u128 (cval_ctyp v2) ->
         sprintf "u256_div_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
     | Idiv, [v1; v2] when is_c_repr_u128 (cval_ctyp v1) && is_c_repr_u256 (cval_ctyp v2) ->
@@ -2778,6 +2986,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                  (sgen_cval v2) (string_of_ctyp (cval_ctyp v2)))
         | _ -> sprintf "(%s / %s)" (sgen_cval v1) (sgen_cval v2)
       )
+    | Imod, [v1; v2]
+      when is_c_repr_u320 (cval_ctyp v1)
+           && (match cval_ctyp v2 with CT_fuint _ -> true | _ -> false) ->
+        sprintf "u320_mod_u64(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+    | Imod, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) ->
+        sprintf "u320_mod(%s, %s)" (sgen_cval v1) (u320_of v2)
     | Imod, [v1; v2] when is_c_repr_u256 (cval_ctyp v1) && is_c_repr_u128 (cval_ctyp v2) ->
         sprintf "u256_mod_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
     | Imod, [v1; v2] when is_c_repr_u128 (cval_ctyp v1) && is_c_repr_u256 (cval_ctyp v2) ->
@@ -2891,6 +3105,9 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & safe_rshift(%s, %s))" len (sgen_cval vec) (sgen_cval start)
         | CT_sbits _ ->
             sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & (%s.bits >> %s))" len (sgen_cval vec) (sgen_cval start)
+        | ctyp when is_c_repr_u128 ctyp ->
+            let extracted = sprintf "u128_extract_u64(%s, (uint64_t)(%s))" (sgen_cval vec) (sgen_cval start) in
+            if len = 64 then extracted else sprintf "(%s & %s)" (sgen_mask len) extracted
         | ctyp when is_c_repr_u256 ctyp ->
             let extracted = sprintf "u256_extract_u64(%s, (uint64_t)(%s))" (sgen_cval vec) (sgen_cval start) in
             if len = 64 then extracted else sprintf "(%s & %s)" (sgen_mask len) extracted
@@ -3033,6 +3250,22 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
            proved refinement conversion, not a truncating host cast guessed
            from the source storage representation. *)
         ksprintf string "  %s = (%s)(%s);" (sgen_clexp_pure l clexp) (sgen_ctyp ctyp_to) (sgen_cval cval)
+    | CT_lint, from_typ when is_c_repr_u320 from_typ ->
+        ksprintf string "  u320_unsigned(%s, %s);" (sgen_clexp l clexp) (sgen_cval cval)
+    | to_typ, CT_lint when is_c_repr_u320 to_typ ->
+        ksprintf string "  %s = u320_of_sail_int(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+    | to_typ, CT_fuint _ when is_c_repr_u320 to_typ ->
+        ksprintf string "  %s = u320_of_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+    | to_typ, from_typ when is_c_repr_u320 to_typ && is_c_repr_u128 from_typ ->
+        ksprintf string "  %s = u320_of_u128(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+    | to_typ, from_typ when is_c_repr_u320 to_typ && is_c_repr_u256 from_typ ->
+        ksprintf string "  %s = u320_of_u256(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+    | CT_fuint _, from_typ when is_c_repr_u320 from_typ ->
+        ksprintf string "  %s = u320_to_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+    | to_typ, from_typ when is_c_repr_u256 to_typ && is_c_repr_u320 from_typ ->
+        ksprintf string "  %s = u256_of_u320(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+    | to_typ, from_typ when is_c_repr_u128 to_typ && is_c_repr_u320 from_typ ->
+        ksprintf string "  %s = u128_of_u320(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, CT_lbits when is_c_repr_u256 to_typ ->
         ksprintf string "  %s = u256_of_lbits(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | CT_lbits, from_typ when is_c_repr_u256 from_typ ->
@@ -3064,6 +3297,9 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         ksprintf string "  %s = u256_to_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, CT_fuint _ when is_c_repr_u128 to_typ ->
         ksprintf string "  %s = u128_of_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+    | to_typ, CT_fint width when is_c_repr_u128 to_typ && width > 64 ->
+        ksprintf string "  %s = ((sail_u128){{(uint64_t)(%s), (uint64_t)(((unsigned __int128)(%s)) >> 64)}});"
+          (sgen_clexp_pure l clexp) (sgen_cval cval) (sgen_cval cval)
     | to_typ, CT_lint when is_c_repr_u128 to_typ ->
         ksprintf string "  %s = u128_of_sail_int(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | CT_fuint _, from_typ when is_c_repr_u128 from_typ ->
@@ -3470,6 +3706,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | I_undefined ctyp ->
         let rec codegen_exn_return ctyp =
           match ctyp with
+          | ctyp when is_c_repr_u320 ctyp -> ("u320_zero()", [])
           | ctyp when is_c_repr_u256 ctyp -> ("u256_zero()", [])
           | ctyp when is_c_repr_fixed_bytes ctyp -> (sprintf "%s_zero()" (sgen_ctyp_name ctyp), [])
           | CT_unit -> ("UNIT", [])
@@ -3484,6 +3721,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           | CT_bool -> ("false", [])
           | CT_enum _ -> (sprintf "((%s)0)" (sgen_ctyp ctyp), [])
           | ctyp when is_c_repr_u128 ctyp -> ("u128_zero()", [])
+          | ctyp when is_c_repr_u320 ctyp -> ("u320_zero()", [])
           | ctyp when is_c_repr_u256 ctyp -> ("u256_zero()", [])
           | CT_tup ctyps when is_stack_ctyp ctx ctyp ->
               let gs = ngensym () in
@@ -3878,6 +4116,15 @@ static inline uint64_t u128_to_u64(const sail_u128 value) {
     sail_native_conversion_failure("integer value is outside the uint64_t domain");
   }
   return value.limbs[0];
+}
+
+static inline uint64_t u128_extract_u64(const sail_u128 value, const uint64_t start) {
+  if (start >= UINT64_C(128)) return UINT64_C(0);
+  const size_t limb = (size_t)(start >> 6);
+  const unsigned offset = (unsigned)(start & UINT64_C(63));
+  uint64_t result = value.limbs[limb] >> offset;
+  if (offset != 0 && limb + 1 < 2) result |= value.limbs[limb + 1] << (64 - offset);
+  return result;
 }
 
 static inline bool eq_u128(const sail_u128 lhs, const sail_u128 rhs) {
@@ -4933,6 +5180,533 @@ static inline sail_u256 u256_of_sail_int(const sail_int value) {
       [TypeDeclaration typedef; StaticFunctionDefinition helpers]
     )
 
+  let codegen_u320 () =
+    if IdSet.mem c_repr_u320_id !generated then []
+    else (
+      generated := IdSet.add c_repr_u320_id !generated;
+      let typedef =
+        string
+          {|
+#ifndef SAIL_U128_DEFINED
+#define SAIL_U128_DEFINED
+typedef struct { uint64_t limbs[2]; } sail_u128;
+#endif
+
+#ifndef SAIL_U256_DEFINED
+#define SAIL_U256_DEFINED
+typedef struct { uint64_t limbs[4]; } sail_u256;
+#endif
+
+#ifndef SAIL_U320_DEFINED
+#define SAIL_U320_DEFINED
+typedef struct { uint64_t limbs[5]; } sail_u320;
+#endif
+|}
+      in
+      let base_helpers =
+        string
+          {|
+static inline sail_u320 u320_zero(void) {
+  sail_u320 result = {{0}};
+  return result;
+}
+
+static inline sail_u320 u320_of_u64(const uint64_t value) {
+  sail_u320 result = {{value, UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(0)}};
+  return result;
+}
+
+static inline sail_u320 u320_of_u128(const sail_u128 value) {
+  sail_u320 result = {{
+      value.limbs[0], value.limbs[1], UINT64_C(0), UINT64_C(0), UINT64_C(0)}};
+  return result;
+}
+
+static inline sail_u320 u320_of_u256(const sail_u256 value) {
+  sail_u320 result = {{
+      value.limbs[0], value.limbs[1], value.limbs[2], value.limbs[3],
+      UINT64_C(0)}};
+  return result;
+}
+
+static inline uint64_t u320_to_u64(const sail_u320 value) {
+  if ((value.limbs[1] | value.limbs[2] | value.limbs[3] | value.limbs[4])
+      != UINT64_C(0)) {
+    sail_native_conversion_failure("integer value is outside the uint64_t domain");
+  }
+  return value.limbs[0];
+}
+
+static inline sail_u128 u128_of_u320(const sail_u320 value) {
+  if ((value.limbs[2] | value.limbs[3] | value.limbs[4]) != UINT64_C(0)) {
+    sail_native_conversion_failure("integer value is outside the uint128_t domain");
+  }
+  sail_u128 result = {{value.limbs[0], value.limbs[1]}};
+  return result;
+}
+
+static inline sail_u256 u256_of_u320(const sail_u320 value) {
+  if (value.limbs[4] != UINT64_C(0)) {
+    sail_native_conversion_failure("integer value is outside the uint256_t domain");
+  }
+  sail_u256 result = {{
+      value.limbs[0], value.limbs[1], value.limbs[2], value.limbs[3]}};
+  return result;
+}
+
+static inline bool eq_u320(const sail_u320 lhs, const sail_u320 rhs) {
+  for (size_t i = 0; i < 5; ++i) {
+    if (lhs.limbs[i] != rhs.limbs[i]) return false;
+  }
+  return true;
+}
+
+static inline bool u320_lt(const sail_u320 lhs, const sail_u320 rhs) {
+  for (size_t i = 5; i-- > 0;) {
+    if (lhs.limbs[i] != rhs.limbs[i]) return lhs.limbs[i] < rhs.limbs[i];
+  }
+  return false;
+}
+
+static inline sail_u320 u320_add(const sail_u320 lhs, const sail_u320 rhs) {
+  sail_u320 result;
+  uint64_t carry = UINT64_C(0);
+  for (size_t i = 0; i < 5; ++i) {
+    const unsigned __int128 sum =
+        (unsigned __int128)lhs.limbs[i] + rhs.limbs[i] + carry;
+    result.limbs[i] = (uint64_t)sum;
+    carry = (uint64_t)(sum >> 64);
+  }
+  return result;
+}
+
+static inline sail_u320 u320_sub(const sail_u320 lhs, const sail_u320 rhs) {
+  sail_u320 result;
+  uint64_t borrow = UINT64_C(0);
+  for (size_t i = 0; i < 5; ++i) {
+    const uint64_t partial = lhs.limbs[i] - rhs.limbs[i];
+    const uint64_t borrow1 = lhs.limbs[i] < rhs.limbs[i];
+    result.limbs[i] = partial - borrow;
+    const uint64_t borrow2 = partial < borrow;
+    borrow = borrow1 | borrow2;
+  }
+  return result;
+}
+
+static inline sail_u320 u320_mul(const sail_u320 lhs, const sail_u320 rhs) {
+  sail_u320 result = {{0}};
+  for (size_t i = 0; i < 5; ++i) {
+    unsigned __int128 carry = 0;
+    for (size_t j = 0; i + j < 5; ++j) {
+      const size_t k = i + j;
+      const unsigned __int128 sum =
+          (unsigned __int128)lhs.limbs[i] * rhs.limbs[j]
+          + result.limbs[k] + carry;
+      result.limbs[k] = (uint64_t)sum;
+      carry = sum >> 64;
+    }
+  }
+  return result;
+}
+
+static inline sail_u320 u320_identity(const sail_u320 value) {
+  return value;
+}
+
+static inline sail_u320 u320_add_scalar(
+    const sail_u320 lhs, const uint64_t rhs) {
+  sail_u320 result = lhs;
+  unsigned __int128 sum = (unsigned __int128)result.limbs[0] + rhs;
+  result.limbs[0] = (uint64_t)sum;
+  uint64_t carry = (uint64_t)(sum >> 64);
+  for (size_t i = 1; i < 5 && carry != UINT64_C(0); ++i) {
+    sum = (unsigned __int128)result.limbs[i] + carry;
+    result.limbs[i] = (uint64_t)sum;
+    carry = (uint64_t)(sum >> 64);
+  }
+  return result;
+}
+
+static inline sail_u320 u320_mul_scalar(
+    const sail_u320 lhs, const uint64_t rhs) {
+  sail_u320 result;
+  unsigned __int128 carry = 0;
+  for (size_t i = 0; i < 5; ++i) {
+    const unsigned __int128 product =
+        (unsigned __int128)lhs.limbs[i] * rhs + carry;
+    result.limbs[i] = (uint64_t)product;
+    carry = product >> 64;
+  }
+  return result;
+}
+
+/*
+ * Select the widening conversion after specialization has fixed the final C
+ * parameter type.  The specialization pass may narrow a function parameter
+ * after arithmetic analysis, so baking the pre-specialization operand types
+ * into a helper name would make the generated call stale.
+ */
+#define U320_SELECT_RHS(stem, rhs) \
+  _Generic((rhs), \
+      sail_u320: stem##_u320, \
+      sail_u256: stem##_u256, \
+      sail_u128: stem##_u128, \
+      default: stem##_u64)
+
+#define U320_SELECT_BINARY(operation, lhs, rhs) \
+  _Generic((lhs), \
+      sail_u320: U320_SELECT_RHS(u320_##operation##_u320, rhs), \
+      sail_u256: U320_SELECT_RHS(u320_##operation##_u256, rhs), \
+      sail_u128: U320_SELECT_RHS(u320_##operation##_u128, rhs), \
+      default: U320_SELECT_RHS(u320_##operation##_u64, rhs))
+
+#define u320_add_widen(lhs, rhs) \
+  U320_SELECT_BINARY(add, lhs, rhs)((lhs), (rhs))
+
+#define u320_mul_widen(lhs, rhs) \
+  U320_SELECT_BINARY(mul, lhs, rhs)((lhs), (rhs))
+
+static inline sail_u320 u320_add_u320_u320(
+    const sail_u320 lhs, const sail_u320 rhs) {
+  return u320_add(lhs, rhs);
+}
+
+static inline sail_u320 u320_add_u320_u256(
+    const sail_u320 lhs, const sail_u256 rhs) {
+  return u320_add(lhs, u320_of_u256(rhs));
+}
+
+static inline sail_u320 u320_add_u320_u128(
+    const sail_u320 lhs, const sail_u128 rhs) {
+  return u320_add(lhs, u320_of_u128(rhs));
+}
+
+static inline sail_u320 u320_add_u320_u64(
+    const sail_u320 lhs, const uint64_t rhs) {
+  return u320_add_scalar(lhs, rhs);
+}
+
+static inline sail_u320 u320_add_u256_u320(
+    const sail_u256 lhs, const sail_u320 rhs) {
+  return u320_add(rhs, u320_of_u256(lhs));
+}
+
+static inline sail_u320 u320_add_u256_u256(
+    const sail_u256 lhs, const sail_u256 rhs) {
+  return u320_add(u320_of_u256(lhs), u320_of_u256(rhs));
+}
+
+static inline sail_u320 u320_add_u256_u128(
+    const sail_u256 lhs, const sail_u128 rhs) {
+  return u320_add(u320_of_u256(lhs), u320_of_u128(rhs));
+}
+
+static inline sail_u320 u320_add_u128_u256(
+    const sail_u128 lhs, const sail_u256 rhs) {
+  return u320_add_u256_u128(rhs, lhs);
+}
+
+static inline sail_u320 u320_add_u256_u64(
+    const sail_u256 lhs, const uint64_t rhs) {
+  return u320_add_scalar(u320_of_u256(lhs), rhs);
+}
+
+static inline sail_u320 u320_add_u64_u256(
+    const uint64_t lhs, const sail_u256 rhs) {
+  return u320_add_u256_u64(rhs, lhs);
+}
+
+static inline sail_u320 u320_add_u128_u128(
+    const sail_u128 lhs, const sail_u128 rhs) {
+  return u320_add(u320_of_u128(lhs), u320_of_u128(rhs));
+}
+
+static inline sail_u320 u320_add_u128_u320(
+    const sail_u128 lhs, const sail_u320 rhs) {
+  return u320_add(rhs, u320_of_u128(lhs));
+}
+
+static inline sail_u320 u320_add_u128_u64(
+    const sail_u128 lhs, const uint64_t rhs) {
+  return u320_add_scalar(u320_of_u128(lhs), rhs);
+}
+
+static inline sail_u320 u320_add_u64_u128(
+    const uint64_t lhs, const sail_u128 rhs) {
+  return u320_add_u128_u64(rhs, lhs);
+}
+
+static inline sail_u320 u320_add_u64_u64(
+    const uint64_t lhs, const uint64_t rhs) {
+  return u320_add_scalar(u320_of_u64(lhs), rhs);
+}
+
+static inline sail_u320 u320_add_u64_u320(
+    const uint64_t lhs, const sail_u320 rhs) {
+  return u320_add_scalar(rhs, lhs);
+}
+
+static inline sail_u320 u320_mul_u320_u320(
+    const sail_u320 lhs, const sail_u320 rhs) {
+  return u320_mul(lhs, rhs);
+}
+
+static inline sail_u320 u320_mul_u320_u256(
+    const sail_u320 lhs, const sail_u256 rhs) {
+  return u320_mul(lhs, u320_of_u256(rhs));
+}
+
+static inline sail_u320 u320_mul_u320_u128(
+    const sail_u320 lhs, const sail_u128 rhs) {
+  return u320_mul(lhs, u320_of_u128(rhs));
+}
+
+static inline sail_u320 u320_mul_u320_u64(
+    const sail_u320 lhs, const uint64_t rhs) {
+  return u320_mul_scalar(lhs, rhs);
+}
+
+static inline sail_u320 u320_mul_u256_u320(
+    const sail_u256 lhs, const sail_u320 rhs) {
+  return u320_mul(rhs, u320_of_u256(lhs));
+}
+
+static inline sail_u320 u320_mul_u256_u256(
+    const sail_u256 lhs, const sail_u256 rhs) {
+  return u320_mul(u320_of_u256(lhs), u320_of_u256(rhs));
+}
+
+static inline sail_u320 u320_mul_u256_u128(
+    const sail_u256 lhs, const sail_u128 rhs) {
+  return u320_mul(u320_of_u256(lhs), u320_of_u128(rhs));
+}
+
+static inline sail_u320 u320_mul_u128_u256(
+    const sail_u128 lhs, const sail_u256 rhs) {
+  return u320_mul_u256_u128(rhs, lhs);
+}
+
+static inline sail_u320 u320_mul_u256_u64(
+    const sail_u256 lhs, const uint64_t rhs) {
+  return u320_mul_scalar(u320_of_u256(lhs), rhs);
+}
+
+static inline sail_u320 u320_mul_u64_u256(
+    const uint64_t lhs, const sail_u256 rhs) {
+  return u320_mul_u256_u64(rhs, lhs);
+}
+
+static inline sail_u320 u320_mul_u128_u128(
+    const sail_u128 lhs, const sail_u128 rhs) {
+  return u320_mul(u320_of_u128(lhs), u320_of_u128(rhs));
+}
+
+static inline sail_u320 u320_mul_u128_u320(
+    const sail_u128 lhs, const sail_u320 rhs) {
+  return u320_mul(rhs, u320_of_u128(lhs));
+}
+
+static inline sail_u320 u320_mul_u128_u64(
+    const sail_u128 lhs, const uint64_t rhs) {
+  return u320_mul_scalar(u320_of_u128(lhs), rhs);
+}
+
+static inline sail_u320 u320_mul_u64_u128(
+    const uint64_t lhs, const sail_u128 rhs) {
+  return u320_mul_u128_u64(rhs, lhs);
+}
+
+static inline sail_u320 u320_mul_u64_u64(
+    const uint64_t lhs, const uint64_t rhs) {
+  return u320_mul_scalar(u320_of_u64(lhs), rhs);
+}
+
+static inline sail_u320 u320_mul_u64_u320(
+    const uint64_t lhs, const sail_u320 rhs) {
+  return u320_mul_scalar(rhs, lhs);
+}
+
+static inline sail_u256 u256_sub_u320(
+    const sail_u256 lhs, const sail_u320 rhs) {
+  return u256_of_u320(u320_sub(u320_of_u256(lhs), rhs));
+}
+
+static inline sail_u128 u128_sub_u320(
+    const sail_u128 lhs, const sail_u320 rhs) {
+  return u128_of_u320(u320_sub(u320_of_u128(lhs), rhs));
+}
+
+static inline uint64_t u64_sub_u320(
+    const uint64_t lhs, const sail_u320 rhs) {
+  return u320_to_u64(u320_sub(u320_of_u64(lhs), rhs));
+}
+
+/* Base-2^64 long division for the common five-by-one-limb shape. */
+static inline void u320_divrem_u64(
+    const sail_u320 dividend,
+    const uint64_t divisor,
+    sail_u320 *quotient,
+    uint64_t *remainder) {
+  sail_u320 q = {{0}};
+  uint64_t rem = UINT64_C(0);
+  for (size_t i = 5; i-- > 0;) {
+    const unsigned __int128 partial =
+        ((unsigned __int128)rem << 64) | dividend.limbs[i];
+    q.limbs[i] = (uint64_t)(partial / divisor);
+    rem = (uint64_t)(partial % divisor);
+  }
+  if (quotient != NULL) *quotient = q;
+  if (remainder != NULL) *remainder = rem;
+}
+
+static inline sail_u320 u320_div_u64(
+    const sail_u320 dividend, const uint64_t divisor) {
+  sail_u320 result;
+  u320_divrem_u64(dividend, divisor, &result, NULL);
+  return result;
+}
+
+static inline uint64_t u320_mod_u64(
+    const sail_u320 dividend, const uint64_t divisor) {
+  uint64_t result;
+  u320_divrem_u64(dividend, divisor, NULL, &result);
+  return result;
+}
+
+static inline bool u320_is_zero(const sail_u320 value) {
+  return (value.limbs[0] | value.limbs[1] | value.limbs[2]
+          | value.limbs[3] | value.limbs[4]) == UINT64_C(0);
+}
+
+static inline bool u320_power_of_two_shift(
+    const sail_u320 value, uint32_t *shift) {
+  uint32_t found = UINT32_MAX;
+  for (uint32_t i = 0; i < 5; ++i) {
+    const uint64_t limb = value.limbs[i];
+    if (limb == UINT64_C(0)) continue;
+    if ((limb & (limb - UINT64_C(1))) != UINT64_C(0) || found != UINT32_MAX) {
+      return false;
+    }
+    found = i * 64U + (uint32_t)__builtin_ctzll(limb);
+  }
+  if (found == UINT32_MAX) return false;
+  *shift = found;
+  return true;
+}
+
+static inline sail_u320 u320_shr(const sail_u320 value, const uint32_t shift) {
+  sail_u320 result = {{0}};
+  if (shift >= 320U) return result;
+  const uint32_t words = shift / 64U;
+  const uint32_t bits = shift % 64U;
+  for (uint32_t out = 0; out + words < 5U; ++out) {
+    const uint32_t in = out + words;
+    result.limbs[out] = value.limbs[in] >> bits;
+    if (bits != 0U && in + 1U < 5U) {
+      result.limbs[out] |= value.limbs[in + 1U] << (64U - bits);
+    }
+  }
+  return result;
+}
+
+static inline sail_u320 u320_mod_power_of_two(
+    const sail_u320 value, const uint32_t shift) {
+  if (shift >= 320U) return value;
+  sail_u320 result = value;
+  const uint32_t word = shift / 64U;
+  const uint32_t bits = shift % 64U;
+  if (bits == 0U) {
+    for (uint32_t i = word; i < 5U; ++i) result.limbs[i] = UINT64_C(0);
+  } else {
+    result.limbs[word] &= (UINT64_C(1) << bits) - UINT64_C(1);
+    for (uint32_t i = word + 1U; i < 5U; ++i) {
+      result.limbs[i] = UINT64_C(0);
+    }
+  }
+  return result;
+}
+
+/* The general fallback is a fixed-width restoring division.  The generated
+ * EVM recurrence takes the one-limb fast path at runtime; the fallback keeps
+ * the representation complete for other proved U320 expressions. */
+static inline void u320_divrem(
+    const sail_u320 dividend,
+    const sail_u320 divisor,
+    sail_u320 *quotient,
+    sail_u320 *remainder) {
+  if (u320_is_zero(divisor)) {
+    sail_native_conversion_failure("division by zero");
+  }
+  if ((divisor.limbs[1] | divisor.limbs[2]
+       | divisor.limbs[3] | divisor.limbs[4]) == UINT64_C(0)) {
+    sail_u320 q;
+    uint64_t r;
+    u320_divrem_u64(dividend, divisor.limbs[0], &q, &r);
+    if (quotient != NULL) *quotient = q;
+    if (remainder != NULL) *remainder = u320_of_u64(r);
+    return;
+  }
+  uint32_t shift;
+  if (u320_power_of_two_shift(divisor, &shift)) {
+    if (quotient != NULL) *quotient = u320_shr(dividend, shift);
+    if (remainder != NULL) *remainder = u320_mod_power_of_two(dividend, shift);
+    return;
+  }
+
+  sail_u320 q = {{0}};
+  sail_u320 rem = {{0}};
+  for (uint32_t bit = 320U; bit-- > 0U;) {
+    const uint64_t carry = rem.limbs[4] >> 63;
+    for (uint32_t i = 4U; i > 0U; --i) {
+      rem.limbs[i] = (rem.limbs[i] << 1) | (rem.limbs[i - 1U] >> 63);
+    }
+    rem.limbs[0] =
+        (rem.limbs[0] << 1)
+        | ((dividend.limbs[bit / 64U] >> (bit % 64U)) & UINT64_C(1));
+    if (carry != UINT64_C(0) || !u320_lt(rem, divisor)) {
+      rem = u320_sub(rem, divisor);
+      q.limbs[bit / 64U] |= UINT64_C(1) << (bit % 64U);
+    }
+  }
+  if (quotient != NULL) *quotient = q;
+  if (remainder != NULL) *remainder = rem;
+}
+
+static inline sail_u320 u320_div(
+    const sail_u320 dividend, const sail_u320 divisor) {
+  sail_u320 result;
+  u320_divrem(dividend, divisor, &result, NULL);
+  return result;
+}
+
+static inline sail_u320 u320_mod(
+    const sail_u320 dividend, const sail_u320 divisor) {
+  sail_u320 result;
+  u320_divrem(dividend, divisor, NULL, &result);
+  return result;
+}
+|}
+      in
+      let generic_sail_int_helpers =
+        string
+          {|
+static inline sail_u320 u320_of_sail_int(const sail_int value) {
+  sail_u320 result = {{0}};
+  sail_int_to_u64_array(result.limbs, 5, value);
+  return result;
+}
+
+static inline void u320_unsigned(sail_int *result, const sail_u320 value) {
+  sail_int_from_u64_array(result, value.limbs, 5);
+}
+|}
+      in
+      let helpers =
+        base_helpers ^^ if !emit_generic_sail_int_helpers then generic_sail_int_helpers else empty
+      in
+      [TypeDeclaration typedef; StaticFunctionDefinition helpers]
+    )
+
   let codegen_fixed_bytes length =
     let id = mk_id ("__sail_c_repr_fixed_bytes_" ^ string_of_int length) in
     if IdSet.mem id !generated then []
@@ -5652,6 +6426,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     | CTG_native_int_conversion_failure
     | CTG_u128
     | CTG_u256
+    | CTG_u320
     | CTG_fixed_bytes of int
     | CTG_tup of ctyp list
     | CTG_list of ctyp
@@ -5661,6 +6436,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     | CT_fint _ | CT_fuint _ -> [CTG_native_int_conversion_failure]
     | ctyp when is_c_repr_u128 ctyp -> [CTG_native_int_conversion_failure; CTG_u128]
     | ctyp when is_c_repr_u256 ctyp -> [CTG_native_int_conversion_failure; CTG_u256]
+    | ctyp when is_c_repr_u320 ctyp -> [CTG_native_int_conversion_failure; CTG_u320]
     | ctyp when is_c_repr_fixed_bytes ctyp -> [CTG_fixed_bytes (Option.get (c_repr_fixed_bytes_length ctyp))]
     | CT_tup ctyps -> List.concat (List.map ctyp_dependencies ctyps) @ [CTG_tup ctyps]
     | CT_list ctyp -> ctyp_dependencies ctyp @ [CTG_list ctyp]
@@ -5677,6 +6453,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     | CTG_native_int_conversion_failure -> codegen_native_int_conversion_failure ()
     | CTG_u128 -> codegen_u128 ()
     | CTG_u256 -> codegen_u256 ()
+    | CTG_u320 -> codegen_u320 ()
     | CTG_fixed_bytes length -> codegen_fixed_bytes length
     | CTG_vector ctyp -> codegen_vector ctx ctyp
     | CTG_tup ctyps -> codegen_tup ctx ctyps

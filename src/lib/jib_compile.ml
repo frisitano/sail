@@ -333,10 +333,15 @@ module type CONFIG = sig
 
   val specialize_function_body_representation : semantic:ctyp -> represented:ctyp -> bool
 
-  (** When the backend requires every reachable integer to have a finite
-      representation, an immutable top-level integer may use the exact bound
-      inferred from its initializer even when [unsigned(...)] gave the binding
-      the otherwise-unbounded semantic type [int]. *)
+  (** When backend specialization is enabled, an immutable top-level integer
+      may use the exact bound inferred from its initializer even when
+      [unsigned(...)] gave the binding the otherwise-unbounded semantic type
+      [int]. *)
+  val specialize_c : bool
+
+  (** Whether the backend should reject any arbitrary-precision integers that
+      remain after specialization. This is an audit only: it must not select
+      representations or otherwise change lowering. *)
   val require_bounded_int : bool
 
   (** The mathematical interval represented by a concrete integer storage
@@ -542,29 +547,27 @@ module Make (C : CONFIG) = struct
       )
     | AV_ref (id, typ) -> ([], V_lit (VL_ref (string_of_id id), CT_ref (ctyp_of_typ ctx (lvar_typ typ))), [])
     | AV_lit (L_aux (L_string str, _), typ) -> ([], V_lit (VL_string (String.escaped str), ctyp_of_typ ctx typ), [])
-    | AV_lit (L_aux (L_num n, _), typ) when C.ignore_64 -> ([], V_lit (VL_int n, ctyp_of_typ ctx typ), [])
-    | AV_lit (L_aux (L_num n, _), typ) when Big_int.less_equal (min_int 64) n && Big_int.less_equal n (max_int 64) -> (
-        (* Preserve the fixed representation already selected for a bounded
-           singleton literal.  Materializing every numeric literal as CT_lint
-           introduced a needless sail_int round trip when assigning literals
-           into bounded record fields and vectors. *)
-        match ctyp_of_typ ctx typ with
-        | CT_fuint width as ctyp
-          when Big_int.less_equal Big_int.zero n
-               && Big_int.less_equal n (Big_int.pred (Big_int.pow_int_positive 2 width)) ->
-            ([], V_lit (VL_int n, ctyp), [])
-        | CT_fint width as ctyp when Big_int.less_equal (min_int width) n && Big_int.less_equal n (max_int width) ->
-            ([], V_lit (VL_int n, ctyp), [])
-        | CT_constant value as ctyp when Big_int.equal value n -> ([], V_lit (VL_int n, ctyp), [])
-        | _ ->
-            let gs = ngensym () in
-            ([iinit l CT_lint gs (V_lit (VL_int n, CT_fint 64))], V_id (gs, CT_lint), [iclear CT_lint gs])
-      )
     | AV_lit (L_aux (L_num n, _), typ) ->
-        let gs = ngensym () in
-        ( [iinit l CT_lint gs (V_lit (VL_string (Big_int.to_string n), CT_string))],
-          V_id (gs, CT_lint),
-          [iclear CT_lint gs]
+        let ctyp = ctyp_of_typ ctx typ in
+        if C.ignore_64 then ([], V_lit (VL_int n, ctyp), [])
+        else (
+          match C.integer_representation_bounds ctyp with
+          | Some (lower, upper) when Big_int.less_equal lower n && Big_int.less_equal n upper ->
+              (* Preserve any fixed representation already selected for a
+                 bounded literal, including unsigned values above INT64_MAX
+                 and custom wide integers.  Falling through to the managed
+                 string conversion here would require a nonexistent
+                 string-to-native conversion and discard the proven bound. *)
+              ([], V_lit (VL_int n, ctyp), [])
+          | _ when Big_int.less_equal (min_int 64) n && Big_int.less_equal n (max_int 64) ->
+              let gs = ngensym () in
+              ([iinit l CT_lint gs (V_lit (VL_int n, CT_fint 64))], V_id (gs, CT_lint), [iclear CT_lint gs])
+          | _ ->
+              let gs = ngensym () in
+              ( [iinit l CT_lint gs (V_lit (VL_string (Big_int.to_string n), CT_string))],
+                V_id (gs, CT_lint),
+                [iclear CT_lint gs]
+              )
         )
     | AV_lit (L_aux (((L_hex _ | L_bin _) as l_aux), _), _) ->
         let bitlist =
@@ -957,7 +960,10 @@ module Make (C : CONFIG) = struct
           && not (position_is_generic generic_signature.generic_result)
         then concrete_specialization_error l id `Result semantic represented;
         let instantiation =
-          if C.representation_refines ~semantic ~represented then !instantiation
+          if
+            C.representation_refines ~semantic ~represented
+            || C.representation_refines ~semantic:represented ~represented:semantic
+          then !instantiation
           else KBindings.union merge_call_unifiers (ctyp_unify l ret_ctyp represented) !instantiation
         in
         let ctyp_args = List.map (fun v -> KBindings.find v instantiation) params in
@@ -4187,10 +4193,11 @@ module Make (C : CONFIG) = struct
        Preserve CT_lint bindings and initializer temporaries for ordinary
        builds: an explicit unbounded result type remains the constant's storage
        contract, even when this particular initializer happens to be small.
-       A backend that requires bounded integers may instead use the complete
-       immutable lifetime to represent an inferred [int] singleton natively.
+       A specializing backend may instead use the complete immutable lifetime
+       to represent an inferred [int] singleton natively.
        Do not apply this to registers: their initializer is not their complete
        lifecycle. *)
+    let top_level_representations = ref NameMap.empty in
     let specialize_top_level_let = function
       | CDEF_aux (CDEF_let (index, bindings, body), def_annot) ->
           let owner = match bindings with (id, _) :: _ -> id | [] -> mk_id "top_level_let" in
@@ -4200,7 +4207,7 @@ module Make (C : CONFIG) = struct
               (fun name semantic replacements ->
                 match (semantic, NameMap.find_opt name lifetime_ranges) with
                 | (CT_constant _ | CT_lint), Some lifetime
-                  when (not (ctyp_equal semantic CT_lint)) || C.require_bounded_int -> (
+                  when (not (ctyp_equal semantic CT_lint)) || C.specialize_c -> (
                     match represented_integer_lifetime ctx lifetime with
                     | Some represented ->
                         log_progress "top-level-let value=%s semantic=%s lifetime=%s represented=%s"
@@ -4218,6 +4225,10 @@ module Make (C : CONFIG) = struct
               )
               lifetime_writes NameMap.empty
           in
+          top_level_representations :=
+            NameMap.fold
+              (fun name represented replacements -> NameMap.add name represented replacements)
+              replacements !top_level_representations;
           let represented_binding (id, ctyp) =
             match NameMap.find_opt (name id) replacements with
             | Some represented -> (id, represented)
@@ -4254,6 +4265,51 @@ module Make (C : CONFIG) = struct
       | cdef -> cdef
     in
     let cdefs = List.map specialize_top_level_let cdefs in
+    (* Rewriting a top-level immutable binding's storage is only half of the
+       representation change. References compiled before this pass still
+       carry the binding's semantic [CT_lint] annotation. Propagate the proved
+       representation through those references so ordinary copy lowering can
+       add a conversion only at a genuinely managed consumer boundary. Without
+       this pass a specializing non-strict build emits, for example, a
+       [COPY(sail_int)] whose source is a native [uint64_t]. *)
+    let top_level_representation_visitor =
+      object
+        inherit empty_jib_visitor
+
+        method! vctyp _ = SkipChildren
+
+        method! vcval =
+          function
+          | V_id (name, _) as cval -> (
+              match NameMap.find_opt name !top_level_representations with
+              | Some represented -> ChangeTo (V_id (name, represented))
+              | None -> ChangeTo cval
+            )
+          | _ -> DoChildren
+
+        method! vclexp =
+          function
+          | CL_id (name, _) as clexp -> (
+              match NameMap.find_opt name !top_level_representations with
+              | Some represented -> ChangeTo (CL_id (name, represented))
+              | None -> ChangeTo clexp
+            )
+          | CL_rmw (read, write, _) as clexp -> (
+              match
+                ( NameMap.find_opt read !top_level_representations,
+                  NameMap.find_opt write !top_level_representations
+                )
+              with
+              | Some read_ctyp, Some write_ctyp when not (ctyp_equal read_ctyp write_ctyp) ->
+                  Reporting.unreachable Parse_ast.Unknown __POS__
+                    "Read-modify-write names have different top-level representations"
+              | Some represented, _ | _, Some represented ->
+                  ChangeTo (CL_rmw (read, write, represented))
+              | None, None -> ChangeTo clexp
+            )
+          | _ -> DoChildren
+      end
+    in
     let resolve_generic_proven_arithmetic = function
       | I_aux (I_funcall (creturn, call, (id, tyargs), args), aux)
         when String.starts_with ~prefix:"__sail_proven_native_" (string_of_id id) ->
@@ -4274,7 +4330,7 @@ module Make (C : CONFIG) = struct
       Bindings.fold (fun _ (valspec, fundef) definitions -> fundef :: valspec :: definitions) !generated [] |> List.rev
     in
     log_progress "complete clones=%d generated-definitions=%d" !total_demands (List.length generated);
-    let cdefs = cdefs @ generated in
+    let cdefs = visit_cdefs top_level_representation_visitor (cdefs @ generated) in
     (* A demanded clone replaces calls to the generic body, but the original
        definition was previously left in the output even when no reachable
        caller remained.  Besides carrying dead GMP code, that defeats

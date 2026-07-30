@@ -171,9 +171,13 @@ module type CONFIG = sig
   val specialize_function_body_representation : semantic:ctyp -> represented:ctyp -> bool
 
   (** Permit immutable top-level [int] bindings to use the exact finite
-      lifetime inferred from their initializer.  Bounded-only backends use
-      this for expressions such as [unsigned(0x...)]; ordinary backends retain
-      the semantic mathematical-integer representation. *)
+      lifetime inferred from their initializer. Specializing backends use this
+      for expressions such as [unsigned(0x...)]; ordinary backends retain the
+      semantic mathematical-integer representation. *)
+  val specialize_c : bool
+
+  (** Reject arbitrary-precision integers that remain after specialization.
+      This is an audit only and must not affect representation selection. *)
   val require_bounded_int : bool
 
   val integer_representation_bounds : ctyp -> (Big_int.num * Big_int.num) option

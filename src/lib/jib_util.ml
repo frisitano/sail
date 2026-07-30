@@ -1139,7 +1139,9 @@ let rec infer_call op vs =
   | Slice n, [vec; _] -> (
       match cval_ctyp vec with
       | CT_fbits _ | CT_sbits _ | CT_fuint _ -> CT_fbits n
-      | CT_struct (id, []) when string_of_id id = "__sail_c_repr_u256" -> CT_fbits n
+      | CT_struct (id, [])
+        when string_of_id id = "__sail_c_repr_u128" || string_of_id id = "__sail_c_repr_u256" ->
+          CT_fbits n
       | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Invalid type for extract argument"
     )
   | Sslice n, [vec; _; _] -> (
