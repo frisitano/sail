@@ -36,6 +36,12 @@ printf "==========================================\n"
 ./ocaml/run_tests.py || returncode=1
 
 printf "\n==========================================\n"
+printf "Python backend tests\n"
+printf "==========================================\n"
+
+./python/run_tests.py || returncode=1
+
+printf "\n==========================================\n"
 printf "Floating point tests\n"
 printf "==========================================\n"
 

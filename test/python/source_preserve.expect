@@ -1,0 +1,51 @@
+@dataclass(slots=True)
+class Pair:
+    left: int
+    right: Annotated[Bits, BitWidth(8)]
+
+class MaybeByte:
+    pass
+
+@dataclass(frozen=True, slots=True)
+class NoByte(MaybeByte):
+    value: None = None
+
+@dataclass(frozen=True, slots=True)
+class SomeByte(MaybeByte):
+    value: Annotated[Bits, BitWidth(8)]
+
+class Traffic(Enum):
+    Stop = auto()
+    Ready = auto()
+    Go = auto()
+
+def sum_bits(x: Annotated[Bits, BitWidth(8)], y: Annotated[Bits, BitWidth(8)]) -> Annotated[Bits, BitWidth(8)]:
+    return ((x) + (y))
+
+def update_pair(pair: Pair, left: int, right: Annotated[Bits, BitWidth(8)]) -> Pair:
+    return replace(deepcopy(pair), left=left, right=right)
+
+def pair_pattern_score(pair: Pair) -> int:
+    match pair:
+        case Pair(left=left, right=_sail_bits_pattern_N) if _sail_bits_pattern_N == Bits(8, 0b00000000):
+            return left
+        case Pair(left=left, right=right):
+            return (int(left) + int((right).signed()))
+        case _:
+            raise SailMatchFailure("no Sail match clause applied")
+
+def head_or(items: list[int], fallback: int) -> int:
+    match items:
+        case [head, *_]:
+            return head
+        case []:
+            return fallback
+
+def first_at_least(limit: natural, threshold: natural) -> natural:
+    try:
+        for i in sail_range(0, limit, 1, True):
+            if (int(i) >= int(threshold)):
+                raise SailReturn(i)
+        return Uint(limit)
+    except SailReturn as _sail_return:
+        return Uint(_sail_return.value)

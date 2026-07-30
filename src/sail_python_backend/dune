@@ -1,0 +1,35 @@
+(executable
+ (name sail_plugin_python)
+ (modes
+  (native plugin)
+  (byte plugin))
+ (libraries libsail))
+
+(rule
+ (targets python_runtime_embedded.ml)
+ (deps sail_runtime.py)
+ (action
+  (with-stdout-to
+   %{targets}
+   (progn
+    (echo "let source = {py|")
+    (cat %{dep:sail_runtime.py})
+    (echo "|py}")))))
+
+(install
+ (section
+  (site
+   (libsail plugins)))
+ (package sail_python_backend)
+ (files sail_plugin_python.cmxs sail_plugin_python.cma))
+
+(install
+ (section lib)
+ (package sail_python_backend)
+ (files sail_runtime.py))
+
+(install
+ (section doc)
+ (package sail_python_backend)
+ (files
+  (README.md as python-backend.md)))

@@ -1,0 +1,63 @@
+:rewrites interpreter
+:output result
+sum_int(2, 3)
+:run
+sum_int(1000000000000000000000000000000, 7)
+:run
+sum_bits(0xff, 0x01)
+:run
+sum_bits(0xfe, 0x05)
+:run
+shift_left(0x81, 1)
+:run
+shift_right(0x81, 1)
+:run
+shift_right_arithmetic(0x81, 1)
+:run
+concat_bits(0xa, 0x5)
+:run
+low_nibble(0xab)
+:run
+signed_byte(0xff)
+:run
+add_integer_to_byte(0xff, 2)
+:run
+high_nibble(0xab)
+:run
+byte_leading_zeros(0x0f)
+:run
+byte_trailing_zeros(0x30)
+:run
+choose(true, 17, 99)
+:run
+triangular(4)
+:run
+vector_pick([0x10, 0x20, 0x30, 0x40])
+:run
+record_update_score()
+:run
+traffic_score(Ready)
+:run
+guarded_score(12)
+:run
+guarded_score(4)
+:run
+head_or([|7, 8|], 99)
+:run
+head_or([||], 99)
+:run
+count_while(4)
+:run
+count_until(3)
+:run
+first_at_least(10, 4)
+:run
+require_nonnegative(6)
+:run
+catches_exception()
+:run
+bump_counter(3)
+:run
+bump_counter(4)
+:run
+:quit
