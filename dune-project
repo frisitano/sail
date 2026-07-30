@@ -74,6 +74,12 @@ http://www.cl.cam.ac.uk/~pes20/sail/.
     (libsail (= :version))))
 
 (package
+  (name sail_python_backend)
+  (synopsis "Sail to Python translation")
+  (depends
+    (libsail (= :version))))
+
+(package
   (name sail_smt_backend)
   (synopsis "Sail to SMT translation")
   (depends
@@ -142,6 +148,7 @@ http://www.cl.cam.ac.uk/~pes20/sail/.
     (sail_maker (and (= :version) :build))
     (sail_ocaml_backend (and (= :version) :post))
     (sail_c_backend (and (= :version) :post))
+    (sail_python_backend (and (= :version) :post))
     (sail_smt_backend (and (= :version) :post))
     (sail_sv_backend (and (= :version) :post))
     (sail_lem_backend (and (= :version) :post))

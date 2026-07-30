@@ -1,0 +1,21 @@
+(rule
+ (alias python-runtest)
+ (deps
+  basic.sail
+  dependent_records.sail
+  ethereum_types.sail
+  extern_contract.py
+  oracle.expect
+  oracle.isail
+  run_tests.py
+  split/lib/helpers.sail
+  split/main.sail
+  source.expect
+  source_preserve.expect
+  ../../src/sail_python_backend/sail_plugin_python.cmxs
+  ../../src/sail_python_backend/sail_runtime.py)
+ (action
+  (setenv
+   SAIL_DIR
+   %{workspace_root}
+   (run python3 %{dep:run_tests.py} --sail %{exe:../../src/bin/sail.exe}))))

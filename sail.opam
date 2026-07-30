@@ -35,6 +35,7 @@ depends: [
   "sail_maker" {= version & build}
   "sail_ocaml_backend" {= version & post}
   "sail_c_backend" {= version & post}
+  "sail_python_backend" {= version & post}
   "sail_smt_backend" {= version & post}
   "sail_sv_backend" {= version & post}
   "sail_lem_backend" {= version & post}
