@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0.0",
+  "clone_sources": [
+    "generic_encoded_length",
+    "recursive_once"
+  ],
+  "recursive_clone_count": 1,
+  "conversion_count": 1,
+  "inferred_bounds": [
+    "0..18446744073709551615"
+  ],
+  "obligation_count": 16,
+  "required_obligation_kinds": [
+    "call_compatibility",
+    "conversion_correctness",
+    "exception_equivalence",
+    "extern_refinement",
+    "operation_refinement",
+    "ownership_lifetime",
+    "path_condition_soundness",
+    "representation_adequacy"
+  ],
+  "unresolved_count": 0
+}

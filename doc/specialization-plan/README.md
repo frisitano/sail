@@ -1,0 +1,131 @@
+# Sail Specialization Plan
+
+The specialization plan is a versioned, backend-neutral record of the
+representation choices made while Sail lowers a typed definition to specialized
+JIB clones. It exists so an independent checker or proof assistant can
+reconstruct refinement obligations without trusting the compiler-generated C
+names.
+
+## Contract
+
+- Purpose: record the source identity, semantic and represented signatures,
+  inferred bounds, conversions, call edges, extern contracts, assumptions,
+  diagnostics, and proof obligations for each representation clone.
+- Trust model: the compiler is an untrusted producer. The structural checker is
+  also untrusted convenience code. A proof consumer validates references and
+  reconstructs semantic obligations from the machine plan.
+- Consumers: structural validation, Lean/Coq adapters, regression tests, and
+  human review.
+- Schema: `1.0.0`, identified by
+  `https://sail-lang.org/schemas/specialization-plan/v1`.
+- Non-goals: certifying the compiler, making JIB display names or C symbols
+  stable, or proving an extern implementation without an independent contract.
+
+The normative machine schema is [schema-v1.json](schema-v1.json). The human
+report is deliberately non-normative.
+
+## Stable identity and provenance
+
+Every identity is a domain-separated digest:
+
+- an input identity hashes the bytes of each source file contributing to the
+  typed AST (the recorded path is descriptive);
+- a source identity hashes the Sail name, semantic signature, input identity,
+  and numeric source span (not the invocation path);
+- a clone identity hashes the source identity, represented signature, and
+  normalized inferred bounds;
+- conversion, call-edge, and obligation identities hash their owning clone and
+  canonical subject.
+
+Display order, generated JIB names, C name mangling, and transient compiler
+symbols are excluded from these preimages. The machine plan therefore does not
+change under `--c-no-mangle`. The human report shows three distinct fields:
+Sail source name, generated clone name, and emitted backend symbol. The latter
+is descriptive and never a proof reference.
+
+Version 1 uses MD5 because OCaml's standard library makes that digest available
+without adding a compiler dependency. It is used for deterministic identity,
+not adversarial integrity. The algorithm and domain are explicit in every ID,
+so a future schema can migrate to SHA-256 without ambiguous references.
+
+## Emission
+
+Plan emission is optional and has no effect when disabled:
+
+```sh
+sail -c --c-specialize \
+  --c-specialization-plan model.specialization.json \
+  --c-specialization-plan-human model.specialization.md \
+  model.sail -o model
+```
+
+Requesting either output without `--c-specialize` is an error. Machine JSON is
+written after specialization and final bounded-integer auditing, before C name
+generation. The human report is written after backend symbols are assigned.
+
+Canonical output uses UTF-8 JSON, fixed object-field order, and lexicographic
+record ordering by stable ID. Identical compiler version, configuration,
+inputs, and specialization decisions produce byte-identical JSON.
+
+The configuration identity covers the versioned representation-specialization
+policy. Input-local representation annotations are covered by the input
+digests, while backend naming/output flags are deliberately excluded because
+they cannot affect proof identity.
+
+## Obligations
+
+Each clone contains all required obligation classes:
+
+- representation adequacy;
+- operation refinement;
+- conversion correctness;
+- call compatibility;
+- path-condition soundness;
+- exception equivalence;
+- extern refinement;
+- ownership/lifetime compatibility.
+
+`reconstructible` means structural evidence is present in the plan.
+`requires_proof` means a proof consumer must discharge the semantic statement.
+`unresolved` is indexed at the plan root and must be addressed by independent
+evidence. An extern-free clone records `extern_refinement` as `not_applicable`
+so completeness remains mechanically checkable.
+
+## Independent checking and comparison
+
+`tools/specialization_plan_checker.py` does not link against Sail. It rejects
+malformed JSON, unsupported versions, duplicate or non-canonical IDs, dangling
+references, incomplete unresolved indexes, invalid statuses, and missing
+obligation classes.
+
+```sh
+python3 tools/specialization_plan_checker.py model.specialization.json
+python3 tools/specialization_plan_checker.py model.specialization.json \
+  --emit-lean ProofFixture.lean
+python3 tools/specialization_plan_checker.py new.json \
+  --compare old.json --comparison-output comparison.md
+```
+
+The comparison report uses stable clone IDs, so renaming a C symbol does not
+look like a semantic specialization change. The Lean adapter embeds the plan
+digest, representative clone identity, and aggregate counts. It also extracts
+an unsigned inferred-bound witness and discharges the corresponding
+representation-adequacy inequality, demonstrating proof-level consumption
+rather than JSON parsing alone.
+
+## Compiler integration and merge notes
+
+The implementation intentionally has a narrow overlap surface:
+
+- `src/lib/jib_compile.ml` records provenance at the point a demanded clone is
+  finalized;
+- `src/lib/specialization_plan.ml` owns identity, ordering, JSON, and human
+  rendering;
+- `src/sail_c_backend/c_backend.ml` chooses the safe emission points;
+- `src/sail_c_backend/sail_plugin_c.ml` owns the two optional CLI flags.
+
+The cleanup task may edit C naming, `--c-no-mangle`, `$target_name`, or the same
+backend files. Resolve conflicts by preserving this boundary: never add backend
+symbols to machine-plan identities, keep human symbols descriptive, and retain
+emission after specialization but before/after naming as documented above.
+No compiler behavior should depend on either output path.

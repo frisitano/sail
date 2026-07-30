@@ -66,6 +66,24 @@ let opt_memo_cache = ref false
    C backend to expose actionable worklist and bound progress. *)
 let opt_debug_function_representations = ref false
 
+type representation_specialization = {
+  source_id : id;
+  specialized_id : id;
+  source_location : Ast.l;
+  semantic_parameters : ctyp list;
+  represented_parameters : ctyp list;
+  semantic_result : ctyp;
+  represented_result : ctyp;
+  argument_bounds : (Big_int.num * Big_int.num) option list;
+  result_bound : (Big_int.num * Big_int.num) option;
+  calls : (id * ctyp list * ctyp * bool) list;
+  conversions : (ctyp * ctyp) list;
+  recursive : bool;
+}
+
+let representation_specializations = ref []
+let reset_representation_specializations () = representation_specializations := []
+
 let optimize_aarch64_fast_struct = ref false
 
 let ngensym = symbol_generator ()
@@ -4175,6 +4193,51 @@ module Make (C : CONFIG) = struct
             CDEF_aux (CDEF_val (specialized_id, [], actual_ctyps, actual_ret_ctyp, None), val_annot)
           in
           let specialized_fundef = CDEF_aux (CDEF_fundef (specialized_id, heap_return, params, body), fundef_annot) in
+          let calls = ref [] in
+          let conversions = ref [] in
+          List.iter
+            (iter_instr (function
+              | I_aux (I_funcall (creturn, call_kind, (callee, ctyps), _), _) ->
+                  calls :=
+                    ( callee,
+                      ctyps,
+                      creturn_ctyp creturn,
+                      ctx_is_extern callee ctx
+                      || match call_kind with Extern _ -> true | Call _ -> false
+                    )
+                    :: !calls
+              | I_aux (I_copy (destination, value), _) ->
+                  let source = cval_ctyp value in
+                  let destination = clexp_ctyp destination in
+                  if not (ctyp_equal source destination) then conversions := (source, destination) :: !conversions
+              | _ -> ()
+              ))
+            body;
+          let argument_bounds, result_bound = !(demand.RepresentationDemand.bounds) in
+          let trace =
+            {
+              source_id = id;
+              specialized_id;
+              source_location = fundef_annot.loc;
+              semantic_parameters = param_ctyps;
+              represented_parameters = actual_ctyps;
+              semantic_result = ret_ctyp;
+              represented_result = actual_ret_ctyp;
+              argument_bounds;
+              result_bound;
+              calls = List.rev !calls;
+              conversions = List.rev !conversions;
+              recursive =
+                List.exists
+                  (fun (callee, _, _, is_extern) -> (not is_extern) && Id.compare callee specialized_id = 0)
+                  !calls;
+            }
+          in
+          representation_specializations :=
+            trace
+            :: List.filter
+                 (fun prior -> Id.compare prior.specialized_id specialized_id <> 0)
+                 !representation_specializations;
           generated := Bindings.add specialized_id (specialized_val, specialized_fundef) !generated;
           specialized_ctx :=
             {
@@ -4859,6 +4922,7 @@ module Make (C : CONFIG) = struct
     | [] -> List.rev acc
 
   let compile_ast ctx ast =
+    reset_representation_specializations ();
     let module G = Graph.Make (Callgraph.Node) in
     let g = Callgraph.graph_of_ast ast in
     let module NodeSet = Set.Make (Callgraph.Node) in

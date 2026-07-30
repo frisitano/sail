@@ -70,6 +70,27 @@ val opt_memo_cache : bool ref
     [--c-specialize-log]. *)
 val opt_debug_function_representations : bool ref
 
+(** Backend-neutral provenance captured when representation-specialized
+    function clones are generated. Names are diagnostic only; consumers use
+    the content-derived identities emitted by [Specialization_plan]. *)
+type representation_specialization = {
+  source_id : id;
+  specialized_id : id;
+  source_location : Ast.l;
+  semantic_parameters : ctyp list;
+  represented_parameters : ctyp list;
+  semantic_result : ctyp;
+  represented_result : ctyp;
+  argument_bounds : (Big_int.num * Big_int.num) option list;
+  result_bound : (Big_int.num * Big_int.num) option;
+  calls : (id * ctyp list * ctyp * bool) list;
+  conversions : (ctyp * ctyp) list;
+  recursive : bool;
+}
+
+val representation_specializations : representation_specialization list ref
+val reset_representation_specializations : unit -> unit
+
 (** {2 Jib context} *)
 
 (* For an abstract type like `type xlen : Int`, is it initialised?

@@ -1,0 +1,543 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sail-lang.org/schemas/specialization-plan/v1",
+  "title": "Sail representation-specialization plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "trust_model",
+    "consumers",
+    "non_goals",
+    "producer",
+    "configuration",
+    "inputs",
+    "clones",
+    "assumptions",
+    "unresolved_obligations",
+    "diagnostics",
+    "canonicalization"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://sail-lang.org/schemas/specialization-plan/v1"
+    },
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1
+    },
+    "trust_model": {
+      "$ref": "#/$defs/trust_model"
+    },
+    "consumers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "non_goals": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "producer": {
+      "$ref": "#/$defs/producer"
+    },
+    "configuration": {
+      "$ref": "#/$defs/configuration"
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/input"
+      }
+    },
+    "clones": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/clone"
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/assumption"
+      }
+    },
+    "unresolved_obligations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/obligation_id"
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      }
+    },
+    "canonicalization": {
+      "$ref": "#/$defs/canonicalization"
+    }
+  },
+  "$defs": {
+    "domain_id": {
+      "type": "string",
+      "pattern": "^[a-z_]+:md5:[0-9a-f]{32}$"
+    },
+    "input_id": {
+      "type": "string",
+      "pattern": "^md5:[0-9a-f]{32}$"
+    },
+    "source_id": {
+      "type": "string",
+      "pattern": "^source:md5:[0-9a-f]{32}$"
+    },
+    "clone_id": {
+      "type": "string",
+      "pattern": "^clone:md5:[0-9a-f]{32}$"
+    },
+    "obligation_id": {
+      "type": "string",
+      "pattern": "^obligation:md5:[0-9a-f]{32}$"
+    },
+    "trust_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "producer_trusted",
+        "checker_trusted",
+        "proof_consumer_reconstructs_obligations",
+        "backend_symbols_authoritative"
+      ],
+      "properties": {
+        "producer_trusted": {
+          "const": false
+        },
+        "checker_trusted": {
+          "const": false
+        },
+        "proof_consumer_reconstructs_obligations": {
+          "const": true
+        },
+        "backend_symbols_authoritative": {
+          "const": false
+        }
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "revision"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "representation_policy",
+        "backend_symbol_policy"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^configuration:md5:[0-9a-f]{32}$"
+        },
+        "representation_policy": {
+          "const": "c-specialize-v1"
+        },
+        "backend_symbol_policy": {
+          "const": "excluded-from-machine-plan"
+        }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "path"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/input_id"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "span"
+      ],
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/input_id"
+        },
+        "span": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "parameters",
+        "result"
+      ],
+      "properties": {
+        "parameters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "result": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "representation_choice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "position",
+        "semantic_type",
+        "represented_type",
+        "inferred_bound",
+        "conversion"
+      ],
+      "properties": {
+        "position": {
+          "type": "string",
+          "pattern": "^(argument:[0-9]+|result)$"
+        },
+        "semantic_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "represented_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inferred_bound": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^-?[0-9]+\\.\\.-?[0-9]+$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "conversion": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "conversion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source_type",
+        "destination_type",
+        "reason"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^conversion:md5:[0-9a-f]{32}$"
+        },
+        "source_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "destination_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "call_edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "callee",
+        "source_name",
+        "type_arguments",
+        "result_type",
+        "extern"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^call:md5:[0-9a-f]{32}$"
+        },
+        "callee": {
+          "$ref": "#/$defs/domain_id"
+        },
+        "source_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type_arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "result_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "extern": {
+          "type": "boolean"
+        }
+      }
+    },
+    "obligation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "subject",
+        "status",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/obligation_id"
+        },
+        "kind": {
+          "enum": [
+            "representation_adequacy",
+            "operation_refinement",
+            "conversion_correctness",
+            "call_compatibility",
+            "path_condition_soundness",
+            "exception_equivalence",
+            "extern_refinement",
+            "ownership_lifetime"
+          ]
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "reconstructible",
+            "requires_proof",
+            "unresolved",
+            "not_applicable",
+            "discharged"
+          ]
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "clone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source",
+        "source_name",
+        "clone_name",
+        "location",
+        "semantic_signature",
+        "represented_signature",
+        "clone_key",
+        "representation_choices",
+        "conversions",
+        "call_edges",
+        "extern_contracts",
+        "recursive",
+        "obligations"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/clone_id"
+        },
+        "source": {
+          "$ref": "#/$defs/source_id"
+        },
+        "source_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "clone_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "location": {
+          "$ref": "#/$defs/location"
+        },
+        "semantic_signature": {
+          "$ref": "#/$defs/signature"
+        },
+        "represented_signature": {
+          "$ref": "#/$defs/signature"
+        },
+        "clone_key": {
+          "$ref": "#/$defs/clone_id"
+        },
+        "representation_choices": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/representation_choice"
+          }
+        },
+        "conversions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/conversion"
+          }
+        },
+        "call_edges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/call_edge"
+          }
+        },
+        "extern_contracts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "recursive": {
+          "type": "boolean"
+        },
+        "obligations": {
+          "type": "array",
+          "minItems": 8,
+          "items": {
+            "$ref": "#/$defs/obligation"
+          }
+        }
+      }
+    },
+    "assumption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "text"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^assumption:md5:[0-9a-f]{32}$"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "severity",
+        "message"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^diagnostic:md5:[0-9a-f]{32}$"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "canonicalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "encoding",
+        "ordering",
+        "identity_hash"
+      ],
+      "properties": {
+        "encoding": {
+          "const": "UTF-8 JSON"
+        },
+        "ordering": {
+          "type": "string",
+          "minLength": 1
+        },
+        "identity_hash": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
