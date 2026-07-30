@@ -13,9 +13,9 @@ def emptyExternDownstream : Semantics where
   argumentsRepresent := fun _ _ _ _ => True
   represents := fun _ _ _ _ => True
   sailEval := fun _ _ _ => True
-  jibEval := fun _ _ _ => False
-  conversionEval := fun _ _ _ _ _ => False
-  callArgumentsRepresent := fun _ _ _ => True
+  jibEval := fun _ _ _ => True
+  conversionEval := fun _ _ _ _ _ => True
+  callArgumentsRepresent := fun _ _ _ => False
   sailCall := fun _ _ _ _ => True
   jibCall := fun _ _ _ _ _ => False
   externEval := fun _ _ _ => False
@@ -28,11 +28,18 @@ def emptyExternDownstream : Semantics where
 theorem externRequiresExecution :
     ¬ obligation_4e81ef1ad207ac8ec4288e2a2826812a emptyExternDownstream := by
   intro obligation
-  obtain ⟨_, externExecution, _⟩ := obligation [] [] () trivial trivial
-  exact externExecution
+  obtain ⟨_, _, callRepresentation, _, _⟩ := obligation [] () trivial
+  exact callRepresentation
 
 theorem externCallRequiresJibExecution :
     ¬ obligation_957a1e45102c495c424852247c6bd899 emptyExternDownstream := by
   intro obligation
-  obtain ⟨_, jibCall, _⟩ := obligation [] [] () trivial trivial
-  exact jibCall
+  obtain ⟨_, _, callRepresentation, _, _⟩ := obligation [] () trivial
+  exact callRepresentation
+
+theorem completeRequiresExternCallRepresentation :
+    ¬ Complete emptyExternDownstream := by
+  intro complete
+  obtain ⟨_, _, callRepresentation, _, _⟩ :=
+    complete.proof_4e81ef1ad207ac8ec4288e2a2826812a [] () trivial
+  exact callRepresentation

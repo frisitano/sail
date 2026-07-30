@@ -101,12 +101,18 @@ evidence. An extern-free clone records `extern_refinement` as `not_applicable`
 so completeness remains mechanically checkable.
 
 Operational obligations are forward-simulation statements. Given represented
-arguments and an applicable Sail execution, call, or extern interaction, they
-require an existential specialized-JIB (or extern) outcome together with the
-appropriate refinement, exception, and lifetime relations. Conversion
-obligations likewise require a represented result for every well-typed source
-value. Consequently, empty downstream execution relations cannot satisfy
-`Complete` merely by vacuity.
+arguments and a Sail function execution, they require an existential
+specialized-JIB outcome together with the refinement relation. Given a Sail call
+or extern interaction, the call and extern obligations themselves require
+existential represented arguments plus a specialized-JIB or extern outcome;
+call-argument representation is not a caller-supplied premise. Exception and
+ownership/lifetime obligations are universal safety statements over every
+represented Sail/JIB execution pair whose outcomes refine, so both properties
+apply to the same execution witnesses established by operation refinement.
+Conversion obligations likewise require a represented result for every
+well-typed source value. Consequently, missing representations, empty
+downstream execution relations, or incompatible side-condition witnesses cannot
+satisfy `Complete` merely by vacuity.
 
 Path-condition soundness is deliberately source-only: source argument
 well-typedness and source reachability imply the inferred bounds. It does not

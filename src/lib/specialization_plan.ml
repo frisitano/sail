@@ -633,12 +633,17 @@ let obligation_proposition clone obligation =
   let sail_eval = relation Sail_eval [string_literal base.source_identity; semantic_args; sail_outcome] in
   let jib_eval = relation Jib_eval [string_literal base.clone_identity; represented_args; jib_outcome] in
   let outcomes_refine = relation Outcomes_refine [sail_outcome; jib_outcome] in
-  let forward_eval extra_outcome_requirements =
+  let forward_eval =
     universally
       [values "semanticArgs"; values "representedArgs"; outcome "sailOutcome"]
       (implies [arguments_represent; sail_eval]
-         (existentially [outcome "jibOutcome"] (conjunction (jib_eval :: outcomes_refine :: extra_outcome_requirements)))
+         (existentially [outcome "jibOutcome"] (conjunction [jib_eval; outcomes_refine]))
       )
+  in
+  let related_eval_safety requirement =
+    universally
+      [values "semanticArgs"; values "representedArgs"; outcome "sailOutcome"; outcome "jibOutcome"]
+      (implies [arguments_represent; sail_eval; jib_eval; outcomes_refine] requirement)
   in
   match obligation.kind with
   | Representation_adequacy ->
@@ -690,7 +695,7 @@ let obligation_proposition clone obligation =
                )
             );
         ]
-  | Operation_refinement -> forward_eval []
+  | Operation_refinement -> forward_eval
   | Conversion_correctness ->
       clone.conversions
       |> List.map (fun conversion ->
@@ -729,17 +734,17 @@ let obligation_proposition clone obligation =
       clone.calls
       |> List.map (fun call ->
           universally
-            [values "semanticArgs"; values "representedArgs"; outcome "sailOutcome"]
+            [values "semanticArgs"; outcome "sailOutcome"]
             (implies
                [
-                 relation Call_arguments_represent [string_literal call.call_id; semantic_args; represented_args];
                  relation Sail_call
                    [string_literal base.source_identity; string_literal call.call_id; semantic_args; sail_outcome];
                ]
                (existentially
-                  [outcome "jibOutcome"]
+                  [values "representedArgs"; outcome "jibOutcome"]
                   (conjunction
                      [
+                       relation Call_arguments_represent [string_literal call.call_id; semantic_args; represented_args];
                        relation Jib_call
                          [
                            string_literal base.clone_identity;
@@ -765,23 +770,23 @@ let obligation_proposition clone obligation =
            ]
            (relation Bounds_hold [Bound_list_literal argument_bounds; semantic_args])
         )
-  | Exception_equivalence -> forward_eval [relation Exceptions_equivalent [sail_outcome; jib_outcome]]
+  | Exception_equivalence -> related_eval_safety (relation Exceptions_equivalent [sail_outcome; jib_outcome])
   | Extern_refinement ->
       clone.calls
       |> List.filter (fun call -> call.is_extern)
       |> List.map (fun call ->
           universally
-            [values "semanticArgs"; values "representedArgs"; outcome "sailOutcome"]
+            [values "semanticArgs"; outcome "sailOutcome"]
             (implies
                [
-                 relation Call_arguments_represent [string_literal call.call_id; semantic_args; represented_args];
                  relation Sail_call
                    [string_literal base.source_identity; string_literal call.call_id; semantic_args; sail_outcome];
                ]
                (existentially
-                  [outcome "externOutcome"]
+                  [values "representedArgs"; outcome "externOutcome"]
                   (conjunction
                      [
+                       relation Call_arguments_represent [string_literal call.call_id; semantic_args; represented_args];
                        relation Extern_eval
                          [string_literal call.callee_identity; represented_args; variable "externOutcome"];
                        relation Outcomes_refine [sail_outcome; variable "externOutcome"];
@@ -792,7 +797,8 @@ let obligation_proposition clone obligation =
       )
       |> conjunction
   | Ownership_lifetime ->
-      forward_eval [relation Lifetime_compatible [string_literal base.clone_identity; represented_args; jib_outcome]]
+      related_eval_safety
+        (relation Lifetime_compatible [string_literal base.clone_identity; represented_args; jib_outcome])
 
 let lean_list render values = "[" ^ String.concat ", " (List.map render values) ^ "]"
 let coq_list render values = "[" ^ String.concat "; " (List.map render values) ^ "]"
