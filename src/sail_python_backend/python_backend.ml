@@ -3951,7 +3951,7 @@ let generate_package ?runtime_module ?extern_module ?source_root ?(preserve_stru
       relative_path = "_runtime.py";
       contents =
         ( match runtime_module with
-        | None -> generated_banner ^ "\n" ^ runtime_source ctx runtime_module ^ "\n"
+        | None -> generated_banner ^ "\n" ^ runtime_source ctx runtime_module
         | Some _ ->
             String.concat "\n"
               [generated_banner; "from __future__ import annotations"; ""; runtime_source ctx runtime_module; ""]

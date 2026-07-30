@@ -841,6 +841,7 @@ def main() -> None:
         )
         ethereum_runtime = ethereum_package / "_runtime.py"
         ethereum_runtime_source = ethereum_runtime.read_text()
+        assert not ethereum_runtime_source.endswith("\n\n")
         assert "from ethereum_types.numeric import" in ethereum_runtime_source
         assert "from ethereum_types.bytes import" in ethereum_runtime_source
         assert "class Uint(" not in ethereum_runtime_source
