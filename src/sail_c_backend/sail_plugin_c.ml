@@ -225,9 +225,9 @@ let c_cpp_rewrites (mode : c_backend_mode) =
     ("constant_fold", [String_arg target_name]);
   ]
 
-(* Find overrides (`$target_name` and legacy `$c_override` directives),
-   reserved words (`$c_reserved` directive, and extern functions), and
-   validated C representation annotations. *)
+(* Find overrides (`$c_override` directive), reserved words
+   (`$c_reserved` directive, and extern functions), and validated C
+   representation annotations. *)
 let collect_c_name_info ast (mode : c_backend_mode) =
   let target_name = string_of_mode mode in
   let open Ast in
@@ -336,13 +336,6 @@ let collect_c_name_info ast (mode : c_backend_mode) =
           match Name_generator.parse_override data with
           | Some (from, target) -> overrides := Name_generator.Overrides.add from target !overrides
           | None -> raise (Reporting.err_general def_annot.loc "Failed to interpret $c_override directive")
-        )
-      | DEF_pragma ("target_name", Pragma_structured data) -> (
-          match Name_generator.parse_target_name data with
-          | Some (backend, (from, target)) when backend = target_name ->
-              overrides := Name_generator.Overrides.add from target !overrides
-          | Some _ -> ()
-          | None -> raise (Reporting.err_general def_annot.loc "Failed to interpret $target_name directive")
         )
       | _ -> ()
     )

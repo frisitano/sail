@@ -58,12 +58,6 @@ let parse_override obj =
   in
   Some ((prefix, id, suffix), target)
 
-let parse_target_name obj =
-  let open Util.Option_monad in
-  let* backend = Option.bind (List.assoc_opt "backend" obj) attribute_data_string in
-  let* override = parse_override obj in
-  Some (backend, override)
-
 module Overrides = Map.Make (struct
   type t = string * string * string
 

@@ -2426,47 +2426,6 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   (* Prefix to function name in definitions. *)
   let class_impl_prefix () = if Config.cpp then Config.cpp_class_name ^ "::" else ""
 
-  let valid_readable_name s =
-    valid_c_identifier s
-    && (not (Util.StringSet.mem s Keywords.c_reserved_words))
-    && (not (Util.StringSet.mem s Keywords.c_used_words))
-    && (not (Util.StringSet.mem s Config.reserved_words))
-    && (not (has_bad_prefix s))
-    && not (c_int_type_name s)
-
-  let sanitize_readable_name s =
-    let is_alpha c = ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') in
-    let is_digit c = '0' <= c && c <= '9' in
-    let buffer = Buffer.create (String.length s) in
-    String.iteri
-      (fun i c ->
-        if is_alpha c || c = '_' || (i > 0 && is_digit c) then Buffer.add_char buffer c else Buffer.add_char buffer '_'
-      )
-      s;
-    let name = Buffer.contents buffer in
-    let name = if name = "" then "tmp" else name in
-    if valid_readable_name name then name
-    else (
-      let name = "tmp_" ^ name in
-      if valid_readable_name name then name else "tmp"
-    )
-
-  (* Jib monomorphization appends the concrete type arguments as
-     [name<arg,...>].  Those brackets cannot appear in C identifiers, but the
-     type structure is still useful provenance.  Under [--c-no-mangle], keep
-     it readable rather than immediately falling back to the opaque zencoding. *)
-  let readable_specialized_name s =
-    let buffer = Buffer.create (String.length s + 8) in
-    String.iter
-      (function
-        | '<' -> Buffer.add_string buffer "_of_"
-        | ',' -> Buffer.add_string buffer "_and_"
-        | '>' -> ()
-        | c -> Buffer.add_char buffer c
-        )
-      s;
-    sanitize_readable_name (Buffer.contents buffer)
-
   (* = {} is required to zero-initialise the types. In C output mode this is unnecessary because
     they are emitted as globals and are therefore automatically zero-initialised. However in C++ mode they
     become struct members and aren't initialised. The `sail_set_abstract_()` function assumes that they
@@ -2493,8 +2452,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
         let pretty () s = if Config.no_mangle then s else Util.zencode_string s
 
-        let mangle () s =
-          if Config.no_mangle && String.contains s '<' then readable_specialized_name s else Util.zencode_string s
+        let mangle () s = Util.zencode_string s
 
         let variant s = function 0 -> s | n -> s ^ string_of_int n
 
@@ -2509,9 +2467,10 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | [] -> NameGen.to_string () id
     | _ -> NameGen.translate () (string_of_id id ^ "#" ^ Util.string_of_list "_" string_of_ctyp ctyps)
 
-  let ssa_num n = if n = -1 then "" else "/" ^ string_of_int n
-
-  let sgen_non_generated_name = function
+  let sgen_name =
+    let ssa_num n = if n = -1 then "" else "/" ^ string_of_int n in
+    function
+    | Gen (v1, v2, n, _, _) -> NameGen.to_string () (mk_id (sprintf "%d.%d" v1 v2)) ^ ssa_num n
     | Name (id, n) -> NameGen.to_string () id ^ ssa_num n
     | Abstract id -> NameGen.to_string ~prefix:"abstract_" () id
     | Have_exception n -> "have_exception" ^ ssa_num n
@@ -2522,52 +2481,6 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | Channel (chan, n) -> (
         match chan with Chan_stdout -> "stdout" ^ ssa_num n | Chan_stderr -> "stderr" ^ ssa_num n
       )
-    | Gen _ -> assert false
-
-  let local_generated_names = ref NameMap.empty
-  let local_used_names = ref Util.StringSet.empty
-
-  let rec allocate_local_name base suffix =
-    let candidate = if suffix = 0 then base else base ^ "_" ^ string_of_int suffix in
-    if Util.StringSet.mem candidate !local_used_names then allocate_local_name base (suffix + 1)
-    else (
-      local_used_names := Util.StringSet.add candidate !local_used_names;
-      candidate
-    )
-
-  let readable_generated_name name source_name =
-    match NameMap.find_opt name !local_generated_names with
-    | Some generated_name -> generated_name
-    | None ->
-        let base = sanitize_readable_name (Option.value ~default:"tmp" source_name) in
-        let generated_name = allocate_local_name base 0 in
-        local_generated_names := NameMap.add name generated_name !local_generated_names;
-        generated_name
-
-  let sgen_name = function
-    | Gen (v1, v2, n, source_name, _) as name ->
-        if Config.no_mangle then readable_generated_name name source_name
-        else NameGen.to_string () (mk_id (sprintf "%d.%d" v1 v2)) ^ ssa_num n
-    | name -> sgen_non_generated_name name
-
-  let prepare_local_name_scope def =
-    local_generated_names := NameMap.empty;
-    local_used_names := Util.StringSet.empty;
-    if Config.no_mangle then (
-      let reserve =
-        object
-          inherit empty_jib_visitor
-
-          method! vname name =
-            ( match name with
-            | Gen _ -> ()
-            | name -> local_used_names := Util.StringSet.add (sgen_non_generated_name name) !local_used_names
-            );
-            None
-        end
-      in
-      ignore (visit_cdef reserve def)
-    )
 
   let codegen_id id = string (sgen_id id)
 
@@ -2580,56 +2493,6 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     if Config.no_mangle then str else !opt_prefix ^ String.sub str 1 (String.length str - 1)
 
   let codegen_function_id id = string (sgen_function_id id)
-
-  let readable_ctyp_names = ref CTMap.empty
-  let readable_ctyp_names_used = ref Util.StringSet.empty
-
-  let rec readable_ctyp_stem = function
-    | ctyp when is_c_repr_u320 ctyp -> "u320"
-    | ctyp when is_c_repr_u256 ctyp -> "u256"
-    | ctyp when is_c_repr_fixed_bytes ctyp ->
-        "fixed_bytes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_length ctyp))
-    | CT_unit -> "unit"
-    | CT_bool -> "bool"
-    | CT_fbits n -> "bits_" ^ string_of_int n
-    | CT_sbits n -> "small_bits_" ^ string_of_int n
-    | CT_fint n -> "int_" ^ string_of_int n
-    | CT_fuint n -> "uint_" ^ string_of_int n
-    | CT_constant n -> "constant_" ^ sanitize_readable_name (Big_int.to_string n)
-    | CT_lint -> "int"
-    | CT_lbits -> "bits"
-    | CT_tup ctyps -> "tuple_" ^ String.concat "_" (List.map readable_ctyp_stem ctyps)
-    | CT_struct (id, []) | CT_variant (id, []) -> sgen_id id
-    | CT_struct (id, ctyps) | CT_variant (id, ctyps) ->
-        sgen_id id ^ "_of_" ^ String.concat "_" (List.map readable_ctyp_stem ctyps)
-    | CT_enum id -> sgen_id id
-    | CT_list ctyp -> "list_" ^ readable_ctyp_stem ctyp
-    | CT_vector ctyp | CT_fvector (_, ctyp) -> "vector_" ^ readable_ctyp_stem ctyp
-    | CT_string -> "string"
-    | CT_real -> "real"
-    | CT_json -> "json"
-    | CT_json_key -> "json_key"
-    | CT_ref ctyp -> "ref_" ^ readable_ctyp_stem ctyp
-    | CT_float n -> "float_" ^ string_of_int n
-    | CT_rounding_mode -> "rounding_mode"
-    | CT_memory_writes -> "memory_writes"
-    | CT_poly kid -> "poly_" ^ sanitize_readable_name (string_of_kid kid)
-
-  let rec allocate_readable_ctyp_name ctyp base suffix =
-    let candidate = if suffix = 0 then base else base ^ "_" ^ string_of_int suffix in
-    if Util.StringSet.mem candidate !readable_ctyp_names_used then allocate_readable_ctyp_name ctyp base (suffix + 1)
-    else (
-      readable_ctyp_names := CTMap.add ctyp candidate !readable_ctyp_names;
-      readable_ctyp_names_used := Util.StringSet.add candidate !readable_ctyp_names_used;
-      candidate
-    )
-
-  let readable_ctyp_name ctyp =
-    match CTMap.find_opt ctyp !readable_ctyp_names with
-    | Some name -> name
-    | None -> allocate_readable_ctyp_name ctyp (sanitize_readable_name (readable_ctyp_stem ctyp)) 0
-
-  let composite_ctyp_name legacy ctyp = if Config.no_mangle then readable_ctyp_name ctyp else Util.zencode_string legacy
 
   let rec sgen_ctyp = function
     | ctyp when is_c_repr_u128 ctyp -> "sail_u128"
@@ -2646,12 +2509,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CT_constant _ -> "int64_t"
     | CT_lint -> "sail_int"
     | CT_lbits -> "lbits"
-    | CT_tup _ as tup -> "struct " ^ composite_ctyp_name ("tuple_" ^ string_of_ctyp tup) tup
+    | CT_tup _ as tup -> "struct " ^ Util.zencode_string ("tuple_" ^ string_of_ctyp tup)
     | CT_struct (id, _) -> "struct " ^ sgen_id id
     | CT_enum id -> "enum " ^ sgen_id id
     | CT_variant (id, _) -> "struct " ^ sgen_id id
-    | CT_list _ as l -> composite_ctyp_name (string_of_ctyp l) l
-    | CT_vector _ as v -> composite_ctyp_name (string_of_ctyp v) v
+    | CT_list _ as l -> Util.zencode_string (string_of_ctyp l)
+    | CT_vector _ as v -> Util.zencode_string (string_of_ctyp v)
     | CT_fvector (_, typ) -> sgen_ctyp (CT_vector typ)
     | CT_string -> "sail_string"
     | CT_real -> "real"
@@ -2678,12 +2541,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CT_constant _ -> "mach_int"
     | CT_lint -> "sail_int"
     | CT_lbits -> "lbits"
-    | CT_tup _ as tup -> composite_ctyp_name ("tuple_" ^ string_of_ctyp tup) tup
+    | CT_tup _ as tup -> Util.zencode_string ("tuple_" ^ string_of_ctyp tup)
     | CT_struct (id, _) -> sgen_id id
     | CT_enum id -> sgen_id id
     | CT_variant (id, _) -> sgen_id id
-    | CT_list _ as l -> composite_ctyp_name (string_of_ctyp l) l
-    | CT_vector _ as v -> composite_ctyp_name (string_of_ctyp v) v
+    | CT_list _ as l -> Util.zencode_string (string_of_ctyp l)
+    | CT_vector _ as v -> Util.zencode_string (string_of_ctyp v)
     | CT_fvector (_, typ) -> sgen_ctyp_name (CT_vector typ)
     | CT_string -> "sail_string"
     | CT_real -> "real"
@@ -5864,17 +5727,15 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     )
 
   let codegen_tup ctx ctyps =
-    let ctyp = CT_tup ctyps in
-    let key = mk_id ("tuple_" ^ string_of_ctyp ctyp) in
-    let id = if Config.no_mangle then mk_id (readable_ctyp_name ctyp) else key in
-    if IdSet.mem key !generated then []
+    let id = mk_id ("tuple_" ^ string_of_ctyp (CT_tup ctyps)) in
+    if IdSet.mem id !generated then []
     else (
       let _, fields =
         List.fold_left
           (fun (n, fields) ctyp -> (n + 1, Bindings.add (mk_id ("tup" ^ string_of_int n)) ctyp fields))
           (0, Bindings.empty) ctyps
       in
-      generated := IdSet.add key !generated;
+      generated := IdSet.add id !generated;
       codegen_type_def
         { ctx with records = Bindings.add id ([], fields) ctx.records }
         (CTD_struct (id, [], Bindings.bindings fields))
@@ -5882,12 +5743,10 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
 
   let codegen_list ctx ctyp =
     let open Printf in
-    let list_ctyp = CT_list ctyp in
-    let key = mk_id (string_of_ctyp list_ctyp) in
-    let id = if Config.no_mangle then mk_id (readable_ctyp_name list_ctyp) else key in
-    if IdSet.mem key !generated then []
+    let id = mk_id (string_of_ctyp (CT_list ctyp)) in
+    if IdSet.mem id !generated then []
     else (
-      generated := IdSet.add key !generated;
+      generated := IdSet.add id !generated;
       let codegen_node =
         ksprintf string "struct node_%s {\n  unsigned int rc;\n  %s hd;\n  struct node_%s *tl;\n};\n" (sgen_id id)
           (sgen_ctyp ctyp) (sgen_id id)
@@ -5999,10 +5858,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
   (* Generate functions for working with non-bit vectors of some specific type. *)
   let codegen_vector ctx ctyp =
     let open Printf in
-    let vector_ctyp = CT_vector ctyp in
-    let key = mk_id (string_of_ctyp vector_ctyp) in
-    let id = if Config.no_mangle then mk_id (readable_ctyp_name vector_ctyp) else key in
-    if IdSet.mem key !generated then []
+    let id = mk_id (string_of_ctyp (CT_vector ctyp)) in
+    if IdSet.mem id !generated then []
     else (
       let guard = "SAIL_VECTOR_" ^ String.uppercase_ascii (sgen_id id) ^ "_DEFINED" in
       let vector_typedef =
@@ -6229,7 +6086,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           (ksprintf string "length_%s(sail_int *rop, %s op)" (sgen_id id) (sgen_id id))
           [c_stmt "mpz_set_ui(*rop, (unsigned long int)(op.len))"]
       in
-      generated := IdSet.add key !generated;
+      generated := IdSet.add id !generated;
       [TypeDeclaration vector_typedef; StaticFunctionDefinition vector_decl; StaticFunctionDefinition vector_clear]
       @ (if !emit_generic_sail_int_helpers then [StaticFunctionDefinition vector_init] else [])
       @ [
@@ -6500,7 +6357,6 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     match def with
     | CDEF_aux ((CDEF_val (id, _, _, _, _) | CDEF_fundef (id, _, _, _)), _) when ctx_is_extern id ctx -> []
     | _ ->
-        prepare_local_name_scope def;
         let ctyps = cdef_ctyps def |> CTSet.elements in
         (* We should have erased any polymorphism introduced by variants at this point! *)
         if List.exists is_polymorphic ctyps then (
@@ -6972,24 +6828,6 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       );
 
       generated := IdSet.empty;
-      readable_ctyp_names := CTMap.empty;
-      readable_ctyp_names_used := Util.StringSet.empty;
-      if Config.no_mangle then (
-        let reserve_nominal_types =
-          object
-            inherit empty_jib_visitor
-
-            method! vctyp ctyp =
-              ( match ctyp with
-              | CT_struct (id, _) | CT_variant (id, _) | CT_enum id ->
-                  readable_ctyp_names_used := Util.StringSet.add (sgen_id id) !readable_ctyp_names_used
-              | _ -> ()
-              );
-              DoChildren
-          end
-        in
-        ignore (visit_cdefs reserve_nominal_types cdefs)
-      );
 
       log_phase "generating C definitions=%d" (List.length cdefs);
       let docs = List.map (codegen_def ctx) cdefs |> List.concat in
