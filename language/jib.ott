@@ -149,6 +149,12 @@ op :: '' ::=
 % from the value operands: [nat] records the proved exponent.
   | power_of_two_div nat :: :: power_of_two_idiv
   | power_of_two_mod nat :: :: power_of_two_imod
+% Defined division/remainder over fixed operands whose C arithmetic conversion
+% is proved to preserve their semantic values.  The first [ctyp] is that
+% arithmetic carrier and the second is the independently proved result
+% representation; the operand representations remain visible.
+  | mixed_proven_div ctyp1 ctyp2 :: :: mixed_proven_idiv
+  | mixed_proven_mod ctyp1 ctyp2 :: :: mixed_proven_imod
 % Exact unsigned arithmetic whose complete mathematical result is carried in
 % an N-bit representation wider than one or both operands.  This operation
 % identity must survive lowering; the C backend may select a representation-

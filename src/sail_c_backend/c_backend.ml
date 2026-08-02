@@ -3461,6 +3461,18 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | ctyp ->
             c_error (sprintf "Cannot lower proved power-of-two remainder for %s" (string_of_ctyp ctyp))
       )
+    | (Mixed_proven_idiv (operation_ctyp, result_ctyp) | Mixed_proven_imod (operation_ctyp, result_ctyp)), [left; right] -> (
+        (match (operation_ctyp, cval_ctyp left, cval_ctyp right) with
+        | (CT_fint _ | CT_fuint _), (CT_fint _ | CT_fuint _), (CT_fint _ | CT_fuint _) -> ()
+        | operation_ctyp, left_ctyp, right_ctyp ->
+            c_error
+              (sprintf "Cannot lower mixed proved division with %s for %s and %s" (string_of_ctyp operation_ctyp)
+                 (string_of_ctyp left_ctyp) (string_of_ctyp right_ctyp)
+              ));
+        let operator = match op with Mixed_proven_idiv _ -> "/" | _ -> "%" in
+        sprintf "((%s)(((%s)%s) %s ((%s)%s)))" (sgen_ctyp result_ctyp) (sgen_ctyp operation_ctyp)
+          (sgen_cval left) operator (sgen_ctyp operation_ctyp) (sgen_cval right)
+      )
     | Unsigned width, [vec] -> sprintf "((%s) %s)" (sgen_ctyp (CT_fuint width)) (sgen_cval vec)
     | Signed 64, [vec] -> (
         match cval_ctyp vec with CT_fbits n -> sprintf "fast_signed(%s, %d)" (sgen_cval vec) n | _ -> assert false

@@ -341,6 +341,35 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
         in
         let divisor = bvint width (Big_int.pow_int_positive 2 exponent) in
         Fn ((match op with Power_of_two_idiv _ -> "bvudiv" | _ -> "bvurem"), [arg; divisor])
+    | (Mixed_proven_idiv (operation_ctyp, result_ctyp) | Mixed_proven_imod (operation_ctyp, result_ctyp)), [left; right] ->
+        let signed, operation_width =
+          match operation_ctyp with
+          | CT_fint width -> (true, width)
+          | CT_fuint width -> (false, width)
+          | _ -> failwith "mixed proved division requires a fixed arithmetic carrier"
+        in
+        let extend source_ctyp value =
+          let source_signed, width =
+            match source_ctyp with
+            | CT_fint width -> (true, width)
+            | CT_fuint width -> (false, width)
+            | _ -> failwith "mixed proved division requires fixed operands"
+          in
+          if width = operation_width then value
+          else if source_signed then SignExtend (operation_width, operation_width - width, value)
+          else Fn ("concat", [bvzero (operation_width - width); value])
+        in
+        let operation =
+          Fn
+            ( (match op with Mixed_proven_idiv _ -> if signed then "bvsdiv" else "bvudiv" | _ -> if signed then "bvsrem" else "bvurem"),
+              [extend (List.nth arg_ctyps 0) left; extend (List.nth arg_ctyps 1) right]
+            )
+        in
+        let result_width = int_size result_ctyp in
+        if result_width = operation_width then operation
+        else if result_width < operation_width then Extract (result_width - 1, 0, operation_width, operation)
+        else if signed then SignExtend (result_width, result_width - operation_width, operation)
+        else Fn ("concat", [bvzero (result_width - operation_width); operation])
     | Bvnot, args -> Fn ("bvnot", args)
     | Bvor, args -> Fn ("bvor", args)
     | Bvand, args -> Fn ("bvand", args)

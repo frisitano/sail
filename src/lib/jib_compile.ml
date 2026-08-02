@@ -3398,8 +3398,8 @@ module Make (C : CONFIG) = struct
         | Iadd | Proven_iadd | Widening_iadd _ | Wrapping_iadd _ -> lifetime_add left right
         | Isub | Proven_isub | Wrapping_isub _ -> lifetime_sub left right
         | Imul | Proven_imul | Widening_imul _ | Wrapping_imul _ -> lifetime_mul left right
-        | Idiv | Proven_idiv -> lifetime_div left right
-        | Imod | Proven_imod -> lifetime_mod left right
+        | Idiv | Proven_idiv | Mixed_proven_idiv _ -> lifetime_div left right
+        | Imod | Proven_imod | Mixed_proven_imod _ -> lifetime_mod left right
         | Bvand -> derived_bounds Jib_semantics.bitwise_and_result_bounds
         | Bvor | Bvxor -> derived_bounds Jib_semantics.bitwise_union_result_bounds
         | _ -> ctyp_integer_lifetime (cval_ctyp call)
@@ -5851,6 +5851,8 @@ module Make (C : CONFIG) = struct
             :: representations
         | V_call ((Power_of_two_idiv _ | Power_of_two_imod _), [value]) ->
             represented_integer_lifetime ctx (cval_integer_lifetime lifetime_ranges value) :: representations
+        | V_call ((Mixed_proven_idiv (_, result_ctyp) | Mixed_proven_imod (_, result_ctyp)), [_; _]) ->
+            Some result_ctyp :: representations
         | _ -> representations
       in
       let rec primitive_representations representations (I_aux (instr, (instruction, _)) as whole_instr) =
@@ -6371,7 +6373,7 @@ module Make (C : CONFIG) = struct
               )
             | primitive -> primitive
           in
-          let carrier_lifetime =
+          let result_lifetime, carrier_lifetime =
             match primitive with
             | Some primitive ->
                 let inferred_result = integer_primitive_operation_lifetime primitive left_lifetime right_lifetime in
@@ -6393,8 +6395,8 @@ module Make (C : CONFIG) = struct
                       Lifetime_range (Big_int.max Big_int.zero lower, upper)
                   | result -> result
                 in
-                join_integer_lifetime result_lifetime (join_integer_lifetime left_lifetime right_lifetime)
-            | None -> Lifetime_top
+                (result_lifetime, join_integer_lifetime result_lifetime (join_integer_lifetime left_lifetime right_lifetime))
+            | None -> (Lifetime_top, Lifetime_top)
           in
           let comparison_carrier =
             represented_integer_lifetime ctx (join_integer_lifetime left_lifetime right_lifetime)
@@ -6443,6 +6445,23 @@ module Make (C : CONFIG) = struct
             | CT_fint signed_width, CT_fuint unsigned_width | CT_fuint unsigned_width, CT_fint signed_width ->
                 signed_width > unsigned_width
             | _ -> false
+          in
+          let c_integer_promotion = function
+            | CT_fint width when width < 32 -> Some (CT_fint 32)
+            | CT_fuint width when width < 32 -> Some (CT_fint 32)
+            | (CT_fint _ | CT_fuint _) as ctyp -> Some ctyp
+            | _ -> None
+          in
+          let c_arithmetic_carrier left right =
+            match (c_integer_promotion (cval_ctyp left), c_integer_promotion (cval_ctyp right)) with
+            | Some (CT_fint left_width), Some (CT_fint right_width) -> Some (CT_fint (Int.max left_width right_width))
+            | Some (CT_fuint left_width), Some (CT_fuint right_width) ->
+                Some (CT_fuint (Int.max left_width right_width))
+            | Some (CT_fint signed_width), Some (CT_fuint unsigned_width)
+            | Some (CT_fuint unsigned_width), Some (CT_fint signed_width) ->
+                if signed_width > unsigned_width then Some (CT_fint signed_width)
+                else Some (CT_fuint (Int.max signed_width unsigned_width))
+            | _ -> None
           in
           match (comparison, constant_comparison, comparison_carrier) with
           | Some _, Some value, _ -> I_aux (I_copy (result, V_lit (VL_bool value, CT_bool)), aux)
@@ -6500,38 +6519,7 @@ module Make (C : CONFIG) = struct
                   let proven_mixed_operands =
                     if custom_unsigned_carrier then exact_mixed_unsigned_representations carrier left right else None
                   in
-                  log_progress "primitive=%s carrier=%s left=%s right=%s preserve-mixed=%b" (string_of_id id)
-                    (string_of_ctyp carrier) (string_of_ctyp (cval_ctyp left)) (string_of_ctyp (cval_ctyp right))
-                    (Option.is_some proven_mixed_operands);
-                  let promote lifetime value =
-                    if ctyp_equal (cval_ctyp value) carrier then ([], value, [])
-                    else (
-                      match (proven_native_conversion carrier lifetime value, value) with
-                      | Some converted, _ -> ([], converted, [])
-                      | None, V_lit (VL_int literal, _) -> ([], V_lit (VL_int literal, carrier), [])
-                      | None, _ ->
-                          let temporary = ngensym () in
-                          ( [idecl l carrier temporary; icopy l (CL_id (temporary, carrier)) value],
-                            V_id (temporary, carrier),
-                            [iclear ~loc:l carrier temporary]
-                          )
-                    )
-                  in
-                  let left_setup, left, left_cleanup =
-                    match proven_mixed_operands with
-                    | Some (left, _) -> ([], left, [])
-                    | None -> promote left_lifetime left
-                  in
-                  let right_setup, right, right_cleanup =
-                    match proven_mixed_operands with
-                    | Some (_, right) -> ([], right, [])
-                    | None when custom_unsigned_carrier -> (
-                        match as_native_unsigned right with
-                        | Some right -> ([], right, [])
-                        | None -> promote right_lifetime right
-                      )
-                    | None -> promote right_lifetime right
-                  in
+                  let result_carrier = represented_integer_lifetime ctx result_lifetime in
                   let power_of_two_operation =
                     match (primitive, left_lifetime, right_lifetime, carrier) with
                     | ( (`Div | `Mod),
@@ -6548,6 +6536,93 @@ module Make (C : CONFIG) = struct
                           )
                           (power_of_two_width right_lower)
                     | _ -> None
+                  in
+                  let mixed_fixed_operation =
+                    match (power_of_two_operation, primitive, result_carrier, c_arithmetic_carrier left right) with
+                    | ( None,
+                        (`Div | `Mod as primitive),
+                        Some ((CT_fint _ | CT_fuint _) as result_ctyp),
+                        Some ((CT_fint _ | CT_fuint _) as operation_ctyp) )
+                      when not (ctyp_equal (cval_ctyp left) (cval_ctyp right)) ->
+                        let conversion_is_exact =
+                          match (cval_ctyp left, cval_ctyp right, operation_ctyp) with
+                          | CT_fint _, CT_fint _, _ | CT_fuint _, CT_fuint _, _ -> true
+                          | CT_fint _, CT_fuint _, CT_fint _ | CT_fuint _, CT_fint _, CT_fint _ -> true
+                          | CT_fint _, CT_fuint _, CT_fuint _ -> (
+                              match left_lifetime with
+                              | Lifetime_range (lower, _) -> Big_int.less_equal Big_int.zero lower
+                              | Lifetime_bottom | Lifetime_top -> false
+                            )
+                          | CT_fuint _, CT_fint _, CT_fuint _ -> (
+                              match right_lifetime with
+                              | Lifetime_range (lower, _) -> Big_int.less_equal Big_int.zero lower
+                              | Lifetime_bottom | Lifetime_top -> false
+                            )
+                          | _ -> false
+                        in
+                        let argument_excludes index lifetime value =
+                          Jib_semantics.has_argument_excludes ~index ~value semantic_proofs
+                          || Option.is_some
+                               (Jib_semantics.prove_argument_excludes_interval ~index
+                                  ~interval:(integer_lifetime_interval lifetime) ~value
+                               )
+                        in
+                        let operation_is_defined =
+                          match operation_ctyp with
+                          | CT_fint width ->
+                              argument_excludes 0 left_lifetime (min_int width)
+                              || argument_excludes 1 right_lifetime (Big_int.of_int (-1))
+                          | CT_fuint _ -> true
+                          | _ -> false
+                        in
+                        if conversion_is_exact && operation_is_defined then
+                          Some
+                            (match primitive with
+                            | `Div -> Mixed_proven_idiv (operation_ctyp, result_ctyp)
+                            | `Mod -> Mixed_proven_imod (operation_ctyp, result_ctyp)
+                            | `Add | `Sub | `Mul | `Ediv | `Emod -> assert false
+                            )
+                        else None
+                    | _ -> None
+                  in
+                  let preserve_native_operands =
+                    Option.is_some power_of_two_operation || Option.is_some mixed_fixed_operation
+                  in
+                  log_progress "primitive=%s carrier=%s result=%s left=%s right=%s preserve-mixed=%b" (string_of_id id)
+                    (string_of_ctyp carrier)
+                    (Option.fold ~none:"?" ~some:string_of_ctyp result_carrier)
+                    (string_of_ctyp (cval_ctyp left)) (string_of_ctyp (cval_ctyp right))
+                    (Option.is_some proven_mixed_operands || preserve_native_operands);
+                  let promote lifetime value =
+                    if ctyp_equal (cval_ctyp value) carrier then ([], value, [])
+                    else (
+                      match (proven_native_conversion carrier lifetime value, value) with
+                      | Some converted, _ -> ([], converted, [])
+                      | None, V_lit (VL_int literal, _) -> ([], V_lit (VL_int literal, carrier), [])
+                      | None, _ ->
+                          let temporary = ngensym () in
+                          ( [idecl l carrier temporary; icopy l (CL_id (temporary, carrier)) value],
+                            V_id (temporary, carrier),
+                            [iclear ~loc:l carrier temporary]
+                          )
+                    )
+                  in
+                  let left_setup, left, left_cleanup =
+                    match (preserve_native_operands, proven_mixed_operands) with
+                    | true, _ -> ([], left, [])
+                    | false, Some (left, _) -> ([], left, [])
+                    | false, None -> promote left_lifetime left
+                  in
+                  let right_setup, right, right_cleanup =
+                    match (preserve_native_operands, proven_mixed_operands) with
+                    | true, _ -> ([], right, [])
+                    | false, Some (_, right) -> ([], right, [])
+                    | false, None when custom_unsigned_carrier -> (
+                        match as_native_unsigned right with
+                        | Some right -> ([], right, [])
+                        | None -> promote right_lifetime right
+                      )
+                    | false, None -> promote right_lifetime right
                   in
                   let op =
                     match (primitive, carrier) with
@@ -6566,21 +6641,29 @@ module Make (C : CONFIG) = struct
                     | `Ediv, _ -> Idiv
                     | `Emod, _ -> Imod
                   in
-                  let right_setup, right_cleanup =
-                    match power_of_two_operation with Some _ -> ([], []) | None -> (right_setup, right_cleanup)
-                  in
                   let operation =
-                    match power_of_two_operation with Some op -> V_call (op, [left]) | None -> V_call (op, [left; right])
+                    match (power_of_two_operation, mixed_fixed_operation) with
+                    | Some op, _ -> V_call (op, [left])
+                    | None, Some op -> V_call (op, [left; right])
+                    | None, None -> V_call (op, [left; right])
+                  in
+                  let operation_result_carrier =
+                    match (power_of_two_operation, mixed_fixed_operation, result_carrier) with
+                    | Some _, _, Some result_carrier | None, Some _, Some result_carrier -> result_carrier
+                    | _ -> carrier
                   in
                   let operation_instrs =
-                    if ctyp_equal (clexp_ctyp result) carrier then [I_aux (I_copy (result, operation), aux)]
+                    if ctyp_equal (clexp_ctyp result) operation_result_carrier then
+                      [I_aux (I_copy (result, operation), aux)]
                     else (
-                      let temporary = ngensym ~source_name:"integer_result" ~source_type:(string_of_ctyp carrier) () in
+                      let temporary =
+                        ngensym ~source_name:"integer_result" ~source_type:(string_of_ctyp operation_result_carrier) ()
+                      in
                       [
-                        idecl l carrier temporary;
-                        icopy l (CL_id (temporary, carrier)) operation;
-                        icopy l result (V_id (temporary, carrier));
-                        iclear ~loc:l carrier temporary;
+                        idecl l operation_result_carrier temporary;
+                        icopy l (CL_id (temporary, operation_result_carrier)) operation;
+                        icopy l result (V_id (temporary, operation_result_carrier));
+                        iclear ~loc:l operation_result_carrier temporary;
                       ]
                     )
                   in

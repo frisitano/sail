@@ -9,6 +9,9 @@ newtype checked_u64 = Checked_u64 : nat
 $[c_repr int64]
 newtype checked_i64 = Checked_i64 : int
 
+$[c_repr uint32]
+newtype checked_u32 = Checked_u32 : nat
+
 type u64_with_add_headroom = range(0, 2 ^ 64 - 33)
 type u64_at_least_95 = range(95, 2 ^ 64 - 1)
 type bounded_u64 = range(0, 2 ^ 64 - 1)
@@ -20,12 +23,15 @@ type small_i64_product = range(-10000, 10000)
 type thirteen_u64 = range(13, 13)
 type five_u64 = range(5, 5)
 type eight_u64 = range(8, 8)
+type nonzero_u8 = range(3, 255)
+type negative_nonunit_i8 = range(-100, -2)
 type minus_thirteen_i64 = range(-13, -13)
 type minus_five_i64 = range(-5, -5)
 type small_i128 = range(-(2 ^ 65), 2 ^ 65)
 type small_i128_sum = range(-(2 ^ 66), 2 ^ 66)
 type multiplicand_i128 = range(-(2 ^ 63), 2 ^ 63)
 type small_i128_product = range(-(2 ^ 126), 2 ^ 126)
+type negative_i64_result = range(-(2 ^ 32 - 1), 0)
 type thirteen_i128 = range(2 ^ 64 + 13, 2 ^ 64 + 13)
 type divisor_i128 = range(2 ^ 64 + 5, 2 ^ 64 + 5)
 
@@ -154,6 +160,29 @@ val power_two_emod : (checked_u64, eight_u64) -> checked_u64
 function power_two_emod(Checked_u64(value), divisor) -> checked_u64 =
     Checked_u64(emod_int(value, divisor))
 
+val mixed_u64_u8_div : (checked_u64, nonzero_u8) -> checked_u64
+
+function mixed_u64_u8_div(Checked_u64(left), right) -> checked_u64 = {
+    let quotient = tdiv_int(left, right);
+    assert(0 <= quotient);
+    Checked_u64(quotient)
+}
+
+val mixed_u64_u8_mod : (checked_u64, nonzero_u8) -> checked_u64
+
+function mixed_u64_u8_mod(Checked_u64(left), right) -> checked_u64 =
+    Checked_u64(tmod_int(left, right))
+
+/* C would convert the negative divisor to uint64_t.  That does not preserve
+   Sail's mathematical values, so this call must use a wider signed carrier. */
+val mixed_u32_negative_i8_div : (checked_u32, negative_nonunit_i8) -> negative_i64_result
+
+function mixed_u32_negative_i8_div(Checked_u32(left), right) -> negative_i64_result = {
+    let quotient = tdiv_int(left, right);
+    assert(-(2 ^ 32 - 1) <= quotient & quotient <= 0);
+    quotient
+}
+
 /* Represented operands do not determine the representation of a wider
    mathematical result.  In particular, this subtraction may be negative. */
 val signed_u64_difference : (checked_u64, checked_u64) -> int
@@ -205,6 +234,16 @@ val signed_emod_by_eight : (checked_i64, eight_u64) -> checked_i64
 
 function signed_emod_by_eight(Checked_i64(value), divisor) -> checked_i64 =
     Checked_i64(emod_int(value, divisor))
+
+val mixed_i64_i8_div : (checked_i64, negative_nonunit_i8) -> checked_i64
+
+function mixed_i64_i8_div(Checked_i64(left), right) -> checked_i64 =
+    Checked_i64(tdiv_int(left, right))
+
+val mixed_i64_i8_mod : (checked_i64, negative_nonunit_i8) -> checked_i64
+
+function mixed_i64_i8_mod(Checked_i64(left), right) -> checked_i64 =
+    Checked_i64(tmod_int(left, right))
 
 function main() -> unit = {
     let Checked_u64(uadd) = checked_u64_add(Checked_u64(2), Checked_u64(3));

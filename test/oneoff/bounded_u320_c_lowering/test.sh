@@ -58,7 +58,10 @@ grep -Fq 'u320_div(zleft, zright)' "$OUT.c"
 grep -Fq 'u320_mod(zleft, zright)' "$OUT.c"
 grep -Fq 'u320_lt(zleft, zright)' "$OUT.c"
 grep -Fq 'eq_u320(zleft, zright)' "$OUT.c"
-sed -n '/^.* zwiden_u320_to_nat(/,/^}/p' "$OUT.c" | grep -Fq 'u320_unsigned('
+# The public wrapper may call a specialized fixed-representation callee rather
+# than inline it.  Require the actual conversion call somewhere in generated
+# code without assuming that it is textually inside the wrapper.
+grep -Eq '^[[:space:]]+u320_unsigned\(' "$OUT.c"
 
 # Strict mode is a post-specialization audit, not a representation-selection
 # mode. A completely bounded program must therefore lower byte-for-byte

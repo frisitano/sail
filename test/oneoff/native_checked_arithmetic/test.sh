@@ -42,10 +42,13 @@ fi
   --c-preserve checked_u64_mod --c-preserve checked_i64_add \
   --c-preserve power_two_tdiv --c-preserve power_two_tmod \
   --c-preserve power_two_ediv --c-preserve power_two_emod \
+  --c-preserve mixed_u64_u8_div --c-preserve mixed_u64_u8_mod \
+  --c-preserve mixed_u32_negative_i8_div \
   --c-preserve checked_i64_sub --c-preserve checked_i64_mul \
   --c-preserve checked_i64_div --c-preserve checked_i64_mod \
   --c-preserve signed_tdiv_by_eight --c-preserve signed_tmod_by_eight \
   --c-preserve signed_ediv_by_eight --c-preserve signed_emod_by_eight \
+  --c-preserve mixed_i64_i8_div --c-preserve mixed_i64_i8_mod \
   --c-preserve signed_u64_difference \
   "$TEST_DIR/../../c/native_checked_arithmetic.sail" -o "$OUT"
 
@@ -120,16 +123,18 @@ done
 # operations retain their mathematical helpers rather than being rewritten.
 awk '
   /^int64_t zsigned_tdiv_by_eight\(/ { in_function = 1 }
-  in_function && /\/.*UINT8_C\(8\)/ { found_divide = 1 }
+  in_function && /\(int64_t\)zvalue.*\/.*\(int64_t\)zdivisor/ { found_divide = 1 }
+  in_function && /integer_operand/ { found_widened_operand = 1 }
   in_function && />> 3/ { found_shift = 1 }
-  in_function && /^}/ { exit !found_divide || found_shift }
+  in_function && /^}/ { exit !found_divide || found_widened_operand || found_shift }
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
 awk '
   /^int64_t zsigned_tmod_by_eight\(/ { in_function = 1 }
-  in_function && /%.*UINT8_C\(8\)/ { found_remainder = 1 }
+  in_function && /\(int64_t\)zvalue.*%.*\(int64_t\)zdivisor/ { found_remainder = 1 }
+  in_function && /integer_operand/ { found_widened_operand = 1 }
   in_function && /UINT64_C\(7\)/ { found_mask = 1 }
-  in_function && /^}/ { exit !found_remainder || found_mask }
+  in_function && /^}/ { exit !found_remainder || found_widened_operand || found_mask }
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
 for target in zsigned_ediv_by_eight zsigned_emod_by_eight
@@ -142,6 +147,58 @@ do
     END { if (!in_function) exit 2 }
   ' "$OUT.c"
 done
+
+# Mixed fixed operands retain their independently proved ABI widths. The
+# operation records a separate semantic result carrier: the u64 quotient stays
+# u64, while the remainder bounded by the u8 divisor is computed into u8.
+grep -Fq 'uint64_t zmixed_u64_u8_div(uint64_t, uint8_t);' "$OUT.h"
+grep -Fq 'uint64_t zmixed_u64_u8_mod(uint64_t, uint8_t);' "$OUT.h"
+awk '
+  /^uint64_t zmixed_u64_u8_div\(/ { in_function = 1 }
+  in_function && /\(uint64_t\)zleft.*\/.*\(uint64_t\)zright/ { found_mixed_divide = 1 }
+  in_function && /uint64_t .*integer_operand/ { found_widened_operand = 1 }
+  in_function && /^}/ { exit !found_mixed_divide || found_widened_operand }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+awk '
+  /^uint64_t zmixed_u64_u8_mod\(/ { in_function = 1 }
+  in_function && /\(uint64_t\)zleft.*%.*\(uint64_t\)zright/ { found_mixed_remainder = 1 }
+  in_function && /= \(\(uint8_t\)\(\(\(uint64_t\)zleft\).*%/ { found_narrow_result = 1 }
+  in_function && /uint64_t .*integer_operand/ { found_widened_operand = 1 }
+  in_function && /^}/ { exit !found_mixed_remainder || !found_narrow_result || found_widened_operand }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+
+grep -Fq 'int64_t zmixed_i64_i8_div(int64_t, int8_t);' "$OUT.h"
+grep -Fq 'int64_t zmixed_i64_i8_mod(int64_t, int8_t);' "$OUT.h"
+awk '
+  /^int64_t zmixed_i64_i8_div\(/ { in_function = 1 }
+  in_function && /\(int64_t\)zleft.*\/.*\(int64_t\)zright/ { found_mixed_divide = 1 }
+  in_function && /int64_t .*integer_operand/ { found_widened_operand = 1 }
+  in_function && /^}/ { exit !found_mixed_divide || found_widened_operand }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+awk '
+  /^int64_t zmixed_i64_i8_mod\(/ { in_function = 1 }
+  in_function && /\(int64_t\)zleft.*%.*\(int64_t\)zright/ { found_mixed_remainder = 1 }
+  in_function && /= \(\(int8_t\)\(\(\(int64_t\)zleft\).*%/ { found_narrow_result = 1 }
+  in_function && /int64_t .*integer_operand/ { found_widened_operand = 1 }
+  in_function && /^}/ { exit !found_mixed_remainder || !found_narrow_result || found_widened_operand }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+
+# A negative signed operand cannot be converted to an equally wide unsigned
+# arithmetic carrier without changing its semantic value.  Keep the fixed
+# representations, but fall back to a sufficiently wide signed operation.
+grep -Fq 'int64_t zmixed_u32_negative_i8_div(uint32_t, int8_t);' "$OUT.h"
+awk '
+  /^int64_t zmixed_u32_negative_i8_div\(/ { in_function = 1 }
+  in_function && /= \(int64_t\)\(zleft\)/ { found_wide_left = 1 }
+  in_function && /= \(int64_t\)\(zright\)/ { found_wide_right = 1 }
+  in_function && /\(uint32_t\)zleft.*\/.*\(uint32_t\)zright/ { found_inexact_unsigned = 1 }
+  in_function && /^}/ { exit !found_wide_left || !found_wide_right || found_inexact_unsigned }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
 
 # A mathematical result remains mathematical even when both operands use a
 # represented uint64 ABI. The subtraction must happen after widening.
