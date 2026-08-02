@@ -72,6 +72,7 @@ type semantic_proof_method = Proof_structural | Proof_interval | Proof_type_cons
 type semantic_relation =
   | Argument_le of int * int
   | Argument_bounds of int * Nat_big_num.num * Nat_big_num.num
+  | Argument_excludes of int * Nat_big_num.num
   | Result_bounds of Nat_big_num.num * Nat_big_num.num
   | Result_nonnegative
   | Conversion_value_preserving of int * int

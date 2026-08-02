@@ -21,7 +21,13 @@ else
 fi
 
 OUT="$TMP_DIR/native_checked_arithmetic"
-"$SAIL" --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
+if [ -n "${SAIL_PLUGIN:-}" ]; then
+  set -- -plugin "$SAIL_PLUGIN"
+else
+  set --
+fi
+
+"$SAIL" "$@" --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
   --c-preserve proven_u64_add_32 --c-preserve proven_u64_sub_95 \
   --c-preserve proven_u64_mul --c-preserve proven_u64_div \
   --c-preserve proven_u64_mod --c-preserve proven_i64_add \
@@ -46,26 +52,36 @@ OUT="$TMP_DIR/native_checked_arithmetic"
 
 "$OUT.bin"
 
-# Fixed-width arithmetic has no runtime overflow/division checks. Operations
-# without a source proof remain in Sail's mathematical integer domain.
+# Fixed-width arithmetic has no runtime overflow/division checks.
 if grep -Eq 'sail_checked_(u64|i64)_(add|sub|mul|div|mod)' "$OUT.c"; then
   echo "generated C contains checked fixed-width arithmetic" >&2
   exit 1
 fi
-grep -Fq 'add_int' "$OUT.c"
-grep -Fq 'mult_int' "$OUT.c"
 
-# An ABI representation is not an arithmetic proof.  The unbounded carrier
-# operations below must stay in Sail's mathematical-integer runtime even
-# though their arguments and results cross the ABI as uint64_t/int64_t.
-for target in \
-  zchecked_u64_add zchecked_u64_mul zchecked_u64_div zchecked_u64_mod \
-  zchecked_i64_add zchecked_i64_sub zchecked_i64_mul \
-  zchecked_i64_div zchecked_i64_mod
+# An ABI representation is not itself an arithmetic proof. Broad add/sub/mul
+# operations use a wider fixed carrier before converting back to the ABI;
+# they must not silently perform the operation at uint64_t/int64_t width.
+grep -Fq 'u128_add_u64' "$OUT.c"
+grep -Fq 'u128_mul_u64' "$OUT.c"
+for target in zchecked_i64_add zchecked_i64_sub zchecked_i64_mul
 do
   awk -v target="$target" '
     $0 ~ ("^.* " target "\\(") { in_function = 1 }
-    in_function && /(add_int|sub_int|mult_int|tdiv_int|tmod_int)/ { found_math = 1 }
+    in_function && /__int128/ { found_wide = 1 }
+    in_function && /sail_native_conversion_failure/ { found_checked_boundary = 1 }
+    in_function && /^}/ { exit !found_wide || !found_checked_boundary }
+    END { if (!in_function) exit 2 }
+  ' "$OUT.c"
+done
+
+# Broad signed division and remainder still include zero and MIN / -1, so
+# they remain in Sail's mathematical-integer runtime. The guarded unsigned
+# versions are checked below and lower natively on their nonzero branch.
+for target in zchecked_i64_div zchecked_i64_mod
+do
+  awk -v target="$target" '
+    $0 ~ ("^.* " target "\\(") { in_function = 1 }
+    in_function && /(tdiv_int|tmod_int)/ { found_math = 1 }
     in_function && /^}/ { exit !found_math }
     END { if (!in_function) exit 2 }
   ' "$OUT.c"
@@ -87,7 +103,7 @@ awk '
 grep -Fq 'uint64_t zproven_u64_add_32(uint64_t);' "$OUT.h"
 awk '
   /^uint64_t zproven_u64_add_32\(/ { in_function = 1 }
-  in_function && /\+ UINT64_C\(32\)/ { found_add = 1 }
+  in_function && /\+ .*UINT64_C\(32\)/ { found_add = 1 }
   in_function && /^}/ { exit !found_add }
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
@@ -95,26 +111,26 @@ awk '
 grep -Fq 'uint64_t zproven_u64_sub_95(uint64_t);' "$OUT.h"
 awk '
   /^uint64_t zproven_u64_sub_95\(/ { in_function = 1 }
-  in_function && /- UINT64_C\(95\)/ { found_sub = 1 }
+  in_function && /- .*UINT64_C\(95\)/ { found_sub = 1 }
   in_function && /^}/ { exit !found_sub }
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
 
-grep -Fq 'uint64_t zproven_u64_mul(uint64_t, uint64_t);' "$OUT.h"
+grep -Fq 'uint16_t zproven_u64_mul(uint8_t, uint8_t);' "$OUT.h"
 grep -Fq ' = (zleft * zright);' "$OUT.c"
 
 # Division and modulo additionally require a proof that the divisor is nonzero;
 # signed division must also exclude INT64_MIN / -1.
-grep -Fq 'void zproven_u64_div(sail_int *rop, uint64_t, uint64_t);' "$OUT.h"
-grep -Fq 'void zproven_u64_mod(sail_int *rop, uint64_t, uint64_t);' "$OUT.h"
+grep -Fq 'void zproven_u64_div(sail_int *rop, uint8_t, uint8_t);' "$OUT.h"
+grep -Fq 'void zproven_u64_mod(sail_int *rop, uint8_t, uint8_t);' "$OUT.h"
 grep -Fq '(zleft / zright)' "$OUT.c"
 grep -Fq '(zleft % zright)' "$OUT.c"
 
-grep -Fq 'int64_t zproven_i64_add(int64_t, int64_t);' "$OUT.h"
-grep -Fq 'int64_t zproven_i64_sub(int64_t, int64_t);' "$OUT.h"
-grep -Fq 'int64_t zproven_i64_mul(int64_t, int64_t);' "$OUT.h"
-grep -Fq 'void zproven_i64_div(sail_int *rop, int64_t, int64_t);' "$OUT.h"
-grep -Fq 'void zproven_i64_mod(sail_int *rop, int64_t, int64_t);' "$OUT.h"
+grep -Fq 'int16_t zproven_i64_add(int8_t, int8_t);' "$OUT.h"
+grep -Fq 'int16_t zproven_i64_sub(int8_t, int8_t);' "$OUT.h"
+grep -Fq 'int16_t zproven_i64_mul(int8_t, int8_t);' "$OUT.h"
+grep -Fq 'void zproven_i64_div(sail_int *rop, int8_t, int8_t);' "$OUT.h"
+grep -Fq 'void zproven_i64_mod(sail_int *rop, int8_t, int8_t);' "$OUT.h"
 grep -Fq ' = (zleft + zright);' "$OUT.c"
 grep -Fq ' = (zleft - zright);' "$OUT.c"
 grep -Fq ' = (zleft * zright);' "$OUT.c"

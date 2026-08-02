@@ -231,6 +231,32 @@ let prove_argument_bounds ~env ~index ~typ ~interval ~lower ~upper =
       | Some _ | None -> None
     )
 
+let prove_argument_excludes_interval ~index ~interval ~value =
+  let proof semantic_proof_method =
+    Some { semantic_relation = Argument_excludes (index, value); semantic_proof_method }
+  in
+  match interval with
+  | Some (actual_lower, actual_upper)
+    when Big_int.less value actual_lower || Big_int.greater value actual_upper ->
+      proof Proof_interval
+  | Some _ | None -> None
+
+let prove_argument_excludes ~env ~index ~typ ~interval ~value =
+  match prove_argument_excludes_interval ~index ~interval ~value with
+  | Some _ as proof -> proof
+  | None -> (
+      match symbolic_range env typ with
+      | Some (env, actual_lower, actual_upper)
+        when Type_check.prove __POS__ env (nc_lt actual_upper (nconstant value))
+             || Type_check.prove __POS__ env (nc_lt (nconstant value) actual_lower) ->
+          Some
+            {
+              semantic_relation = Argument_excludes (index, value);
+              semantic_proof_method = Proof_type_constraint;
+            }
+      | Some _ | None -> None
+    )
+
 let prove_result_bounds ~env ~result_typ ~result_interval ~lower ~upper =
   let proof semantic_proof_method = Some { semantic_relation = Result_bounds (lower, upper); semantic_proof_method } in
   match result_interval with
@@ -307,7 +333,7 @@ let has_argument_le ~left ~right proofs =
     (fun proof ->
       match proof.semantic_relation with
       | Argument_le (proof_left, proof_right) -> proof_left = left && proof_right = right
-      | Argument_bounds _ | Result_bounds _ | Result_nonnegative | Conversion_value_preserving _
+      | Argument_bounds _ | Argument_excludes _ | Result_bounds _ | Result_nonnegative | Conversion_value_preserving _
       | Signed_conversion_value_preserving _ | Conversion_low_bits _ | Shift_count_bounds _ ->
           false
     )
@@ -319,7 +345,19 @@ let has_argument_bounds ~index ~lower ~upper proofs =
       match proof.semantic_relation with
       | Argument_bounds (proof_index, proof_lower, proof_upper) ->
           proof_index = index && Big_int.less_equal lower proof_lower && Big_int.less_equal proof_upper upper
-      | Argument_le _ | Result_bounds _ | Result_nonnegative | Conversion_value_preserving _
+      | Argument_le _ | Argument_excludes _ | Result_bounds _ | Result_nonnegative | Conversion_value_preserving _
+      | Signed_conversion_value_preserving _ | Conversion_low_bits _ | Shift_count_bounds _ ->
+          false
+    )
+    proofs
+
+let has_argument_excludes ~index ~value proofs =
+  List.exists
+    (fun proof ->
+      match proof.semantic_relation with
+      | Argument_excludes (proof_index, proof_value) ->
+          proof_index = index && Big_int.equal proof_value value
+      | Argument_le _ | Argument_bounds _ | Result_bounds _ | Result_nonnegative | Conversion_value_preserving _
       | Signed_conversion_value_preserving _ | Conversion_low_bits _ | Shift_count_bounds _ ->
           false
     )
@@ -331,7 +369,7 @@ let has_result_bounds ~lower ~upper proofs =
       match proof.semantic_relation with
       | Result_bounds (proof_lower, proof_upper) ->
           Big_int.less_equal lower proof_lower && Big_int.less_equal proof_upper upper
-      | Argument_le _ | Argument_bounds _ | Result_nonnegative | Conversion_value_preserving _
+      | Argument_le _ | Argument_bounds _ | Argument_excludes _ | Result_nonnegative | Conversion_value_preserving _
       | Signed_conversion_value_preserving _ | Conversion_low_bits _ | Shift_count_bounds _ ->
           false
     )
@@ -342,7 +380,7 @@ let has_result_nonnegative proofs =
     (fun proof ->
       match proof.semantic_relation with
       | Result_nonnegative -> true
-      | Argument_le _ | Argument_bounds _ | Result_bounds _ | Conversion_value_preserving _
+      | Argument_le _ | Argument_bounds _ | Argument_excludes _ | Result_bounds _ | Conversion_value_preserving _
       | Signed_conversion_value_preserving _ | Conversion_low_bits _ | Shift_count_bounds _ ->
           false
     )
@@ -354,7 +392,8 @@ let has_conversion_value_preserving ~source_width ~target_width proofs =
       match proof.semantic_relation with
       | Conversion_value_preserving (proof_source, proof_target) ->
           proof_source = source_width && proof_target = target_width
-      | Argument_le _ | Argument_bounds _ | Result_bounds _ | Result_nonnegative | Signed_conversion_value_preserving _
+      | Argument_le _ | Argument_bounds _ | Argument_excludes _ | Result_bounds _ | Result_nonnegative
+      | Signed_conversion_value_preserving _
       | Conversion_low_bits _ | Shift_count_bounds _ ->
           false
     )
@@ -366,7 +405,8 @@ let has_signed_conversion_value_preserving ~source_width ~target_width proofs =
       match proof.semantic_relation with
       | Signed_conversion_value_preserving (proof_source, proof_target) ->
           proof_source = source_width && proof_target = target_width
-      | Argument_le _ | Argument_bounds _ | Result_bounds _ | Result_nonnegative | Conversion_value_preserving _
+      | Argument_le _ | Argument_bounds _ | Argument_excludes _ | Result_bounds _ | Result_nonnegative
+      | Conversion_value_preserving _
       | Conversion_low_bits _ | Shift_count_bounds _ ->
           false
     )
@@ -377,7 +417,8 @@ let has_conversion_low_bits ~source_width ~target_width proofs =
     (fun proof ->
       match proof.semantic_relation with
       | Conversion_low_bits (proof_source, proof_target) -> proof_source = source_width && proof_target = target_width
-      | Argument_le _ | Argument_bounds _ | Result_bounds _ | Result_nonnegative | Conversion_value_preserving _
+      | Argument_le _ | Argument_bounds _ | Argument_excludes _ | Result_bounds _ | Result_nonnegative
+      | Conversion_value_preserving _
       | Signed_conversion_value_preserving _ | Shift_count_bounds _ ->
           false
     )
@@ -391,7 +432,8 @@ let has_shift_count_bounds ~index ~carrier_width proofs =
       match proof.semantic_relation with
       | Shift_count_bounds (proof_index, proof_lower, proof_upper) ->
           proof_index = index && Big_int.less_equal lower proof_lower && Big_int.less_equal proof_upper upper
-      | Argument_le _ | Argument_bounds _ | Result_bounds _ | Result_nonnegative | Conversion_value_preserving _
+      | Argument_le _ | Argument_bounds _ | Argument_excludes _ | Result_bounds _ | Result_nonnegative
+      | Conversion_value_preserving _
       | Signed_conversion_value_preserving _ | Conversion_low_bits _ ->
           false
     )

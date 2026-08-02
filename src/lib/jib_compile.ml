@@ -1029,7 +1029,7 @@ module Make (C : CONFIG) = struct
       | "__sail_proven_native_mod" -> Some Proven_imod
       | _ -> None
     in
-    let semantic_proofs =
+    let source_semantic_proofs =
       match (proven_native_op, args, argument_intervals) with
       | (Some (Proven_iadd | Proven_isub | Proven_imul) as operation), [left; right], [left_interval; right_interval] ->
           let exact_bounds =
@@ -1063,13 +1063,69 @@ module Make (C : CONFIG) = struct
         | _, Some represented when Option.is_some (C.integer_representation_bounds represented) -> Some represented
         | _ -> None
       in
+      let semantic_proofs =
+        match (proven_native_op, operation_representation, args, argument_intervals) with
+        | ( Some (Proven_idiv | Proven_imod),
+            Some represented,
+            [left; right],
+            [left_interval; right_interval] ) ->
+            let argument_bounds =
+              prove_exact_arithmetic_bounds ~env:ctx.local_env
+                ~operands:[(aval_typ left, left_interval); (aval_typ right, right_interval)]
+                ~result_typ:source_return_typ ~result_interval ~represented
+            in
+            let excludes index arg interval value =
+              Jib_semantics.prove_argument_excludes ~env:ctx.local_env ~index ~typ:(aval_typ arg) ~interval ~value
+            in
+            let divisor_nonzero = excludes 1 right right_interval Big_int.zero in
+            let signed_overflow_exclusion =
+              match represented with
+              | CT_fint width -> (
+                  match excludes 0 left left_interval (min_int width) with
+                  | Some proof -> Some proof
+                  | None -> excludes 1 right right_interval (Big_int.of_int (-1))
+                )
+              | _ -> None
+            in
+            argument_bounds @ List.filter_map Fun.id [divisor_nonzero; signed_overflow_exclusion]
+        | _ -> source_semantic_proofs
+      in
+      if !opt_debug_function_representations && Option.is_some proven_native_op then (
+        let string_of_interval = function
+          | Some (lower, upper) -> Big_int.to_string lower ^ ".." ^ Big_int.to_string upper
+          | None -> "?"
+        in
+        Printf.eprintf
+          "C semantic proof: primitive=%s args=[%s] intervals=[%s] source-result=%s return=%s destination=%s operation=%s proofs=%d\n%!"
+          (string_of_id id)
+          (Util.string_of_list "," (fun arg -> string_of_typ (aval_typ arg)) args)
+          (Util.string_of_list "," string_of_interval argument_intervals)
+          (string_of_interval result_interval)
+          (match return_ctyp with Some ctyp -> string_of_ctyp ctyp | None -> "?")
+          (string_of_ctyp (clexp_ctyp clexp))
+          (match operation_representation with Some ctyp -> string_of_ctyp ctyp | None -> "?")
+          (List.length semantic_proofs)
+      );
       match (proven_native_op, operation_representation, setup_args, semantic_proofs) with
-      | _, _, _, _ :: _ ->
+      | Some _, Some represented, _, _ :: _ ->
           (* Keep the call boundary until the semantic-web pass has consumed
              its source proof.  Ordinary primitive specialization lowers it
              to the same native [V_call] if no larger transformation applies. *)
+          if ctyp_equal (clexp_ctyp clexp) represented then
+            ifuncall_with_bounds ~semantic_proofs l (argument_intervals, result_interval) clexp (id, []) setup_args
+          else
+            let temporary = ngensym ~source_name:"integer_result" ~source_type:(string_of_ctyp represented) () in
+            iblock
+              [
+                idecl l represented temporary;
+                ifuncall_with_bounds ~semantic_proofs l (argument_intervals, result_interval)
+                  (CL_id (temporary, represented)) (id, []) setup_args;
+                icopy l clexp (V_id (temporary, represented));
+                iclear ~loc:l represented temporary;
+              ]
+      | _, _, _, _ :: _ ->
           ifuncall_with_bounds ~semantic_proofs l (argument_intervals, result_interval) clexp (id, []) setup_args
-      | Some op, Some represented, [left; right], [] ->
+      | Some ((Proven_iadd | Proven_isub | Proven_imul) as op), Some represented, [left; right], [] ->
           (* The ANF optimizer emits this marker only after proving that both
              operands and the result fit [represented].  Promote before the
              operation so mixed-width arithmetic has the selected lifetime
@@ -1101,6 +1157,14 @@ module Make (C : CONFIG) = struct
             )
           in
           iblock (left_setup @ right_setup @ operation_instrs @ right_cleanup @ left_cleanup)
+      | Some (Proven_idiv | Proven_imod), _, _, [] ->
+          (* A marker without explicit definedness evidence is not authority
+             to emit C division. This defensive fallback also prevents a
+             future producer from accidentally treating the marker name
+             itself as proof. Keep it until the late resolver, which can
+             restore the managed operand boundary if no proof emerges from
+             graph specialization. *)
+          ifuncall_with_bounds l (argument_intervals, result_interval) clexp (id, []) setup_args
       | _, _, _, [] -> iextern ?return_ctyp l clexp (id, []) setup_args
     in
     (List.rev !setup, compile_call, !cleanup)
@@ -6299,6 +6363,12 @@ module Make (C : CONFIG) = struct
                   | None -> inferred_result
                 in
                 let result_lifetime =
+                  match C.integer_representation_bounds (clexp_ctyp result) with
+                  | Some (lower, upper) when Jib_semantics.has_result_bounds ~lower ~upper semantic_proofs ->
+                      meet_integer_lifetime result_lifetime (Lifetime_range (lower, upper))
+                  | Some _ | None -> result_lifetime
+                in
+                let result_lifetime =
                   match result_lifetime with
                   | Lifetime_range (lower, upper)
                     when primitive = `Sub && Jib_semantics.has_result_nonnegative semantic_proofs ->
@@ -6315,6 +6385,23 @@ module Make (C : CONFIG) = struct
             match comparison with
             | Some comparison -> constant_integer_comparison comparison left_lifetime right_lifetime
             | None -> None
+          in
+          let division_semantic_proofs carrier =
+            match primitive with
+            | Some (`Div | `Mod) ->
+                let prove index lifetime value =
+                  Jib_semantics.prove_argument_excludes_interval ~index
+                    ~interval:(integer_lifetime_interval lifetime) ~value
+                in
+                let signed_exclusions =
+                  match carrier with
+                  | CT_fint width ->
+                      [prove 0 left_lifetime (min_int width); prove 1 right_lifetime (Big_int.of_int (-1))]
+                  | _ -> []
+                in
+                List.filter_map Fun.id (prove 1 right_lifetime Big_int.zero :: signed_exclusions)
+                @ semantic_proofs
+            | Some (`Add | `Sub | `Mul | `Ediv | `Emod) | None -> semantic_proofs
           in
           let l = snd aux in
           let promote carrier lifetime value =
@@ -6352,9 +6439,27 @@ module Make (C : CONFIG) = struct
                 @ right_cleanup @ left_cleanup
                 )
           | _ -> (
-              match (primitive, represented_integer_lifetime ctx carrier_lifetime, clexp_ctyp result) with
-              | Some _, Some _, CT_lint -> instr
-              | Some primitive, Some carrier, _ ->
+              match (primitive, represented_integer_lifetime ctx carrier_lifetime) with
+              | Some primitive, Some carrier ->
+                  let semantic_proofs = division_semantic_proofs carrier in
+                  let division_is_defined =
+                    match primitive with
+                    | `Div | `Mod ->
+                        Jib_semantics.has_argument_excludes ~index:1 ~value:Big_int.zero semantic_proofs
+                        &&
+                        (match carrier with
+                        | CT_fint width ->
+                            Jib_semantics.has_argument_excludes ~index:0 ~value:(min_int width) semantic_proofs
+                            || Jib_semantics.has_argument_excludes ~index:1 ~value:(Big_int.of_int (-1))
+                                 semantic_proofs
+                        | _ -> true)
+                    | `Add | `Sub | `Mul | `Ediv | `Emod -> true
+                  in
+                  if
+                    (ctyp_equal (clexp_ctyp result) CT_lint && primitive <> `Div && primitive <> `Mod)
+                    || not division_is_defined
+                  then instr
+                  else
                   let custom_unsigned_carrier =
                     match carrier with
                     | CT_fint _ | CT_fuint _ -> false
@@ -6803,8 +6908,37 @@ module Make (C : CONFIG) = struct
           | _ -> DoChildren
       end
     in
-    let resolve_generic_proven_arithmetic = function
-      | I_aux (I_funcall (CR_one result, (Call (_, semantic_proofs) as call), (id, tyargs), [left; right]), aux)
+    let resolve_generic_proven_arithmetic =
+      let ordinary_math_call result ordinary tyargs left right aux =
+        let l = snd aux in
+        let promote value =
+          if ctyp_equal (cval_ctyp value) CT_lint then ([], value, [])
+          else
+            let temporary = ngensym ~source_name:"integer_operand" ~source_type:(string_of_ctyp CT_lint) () in
+            ( [idecl l CT_lint temporary; icopy l (CL_id (temporary, CT_lint)) value],
+              V_id (temporary, CT_lint),
+              [iclear ~loc:l CT_lint temporary]
+            )
+        in
+        let left_setup, left, left_cleanup = promote left in
+        let right_setup, right, right_cleanup = promote right in
+        let result_setup, call_result, result_cleanup =
+          if ctyp_equal (clexp_ctyp result) CT_lint then ([], result, [])
+          else
+            let temporary = ngensym ~source_name:"integer_result" ~source_type:(string_of_ctyp CT_lint) () in
+            ( [idecl l CT_lint temporary],
+              CL_id (temporary, CT_lint),
+              [icopy l result (V_id (temporary, CT_lint)); iclear ~loc:l CT_lint temporary]
+            )
+        in
+        iblock
+          (left_setup @ right_setup @ result_setup
+          @ [I_aux (I_funcall (CR_one call_result, Extern CT_lint, (mk_id ordinary, tyargs), [left; right]), aux)]
+          @ result_cleanup @ right_cleanup @ left_cleanup
+          )
+      in
+      function
+      | I_aux (I_funcall (CR_one result, Call (_, semantic_proofs), (id, tyargs), [left; right]), aux)
         when String.starts_with ~prefix:"__sail_proven_native_" (string_of_id id) -> (
           let represented = clexp_ctyp result in
           let l = snd aux in
@@ -6821,7 +6955,23 @@ module Make (C : CONFIG) = struct
           match C.integer_representation_bounds represented with
           | Some (lower, upper)
             when value_fits 0 left lower upper && value_fits 1 right lower upper
-                 && Jib_semantics.has_result_bounds ~lower ~upper semantic_proofs ->
+                 &&
+                 let operation_is_proved =
+                   match string_of_id id with
+                   | "__sail_proven_native_add" | "__sail_proven_native_sub" | "__sail_proven_native_mul" ->
+                       Jib_semantics.has_result_bounds ~lower ~upper semantic_proofs
+                   | "__sail_proven_native_div" | "__sail_proven_native_mod" ->
+                       Jib_semantics.has_argument_excludes ~index:1 ~value:Big_int.zero semantic_proofs
+                       &&
+                       (match represented with
+                       | CT_fint width ->
+                           Jib_semantics.has_argument_excludes ~index:0 ~value:(min_int width) semantic_proofs
+                           || Jib_semantics.has_argument_excludes ~index:1 ~value:(Big_int.of_int (-1))
+                                semantic_proofs
+                       | _ -> true)
+                   | _ -> false
+                 in
+                 operation_is_proved ->
               (* The semantic web may reject a larger rewrite (for example a
                  non-power-of-two modulus) without invalidating the exact
                  native arithmetic proof carried by this call. Consume that
@@ -6886,20 +7036,12 @@ module Make (C : CONFIG) = struct
                 | "__sail_proven_native_mod" -> "tmod_int"
                 | _ -> assert false
               in
-              I_aux (I_funcall (CR_one result, call, (mk_id ordinary, tyargs), [left; right]), aux)
+              ordinary_math_call result ordinary tyargs left right aux
         )
-      | I_aux (I_funcall (creturn, call, (id, tyargs), args), aux)
+      | I_aux (I_funcall (_, Call _, (id, _), _), (_, l))
         when String.starts_with ~prefix:"__sail_proven_native_" (string_of_id id) ->
-          let ordinary =
-            match string_of_id id with
-            | "__sail_proven_native_add" -> "add_int"
-            | "__sail_proven_native_sub" -> "sub_int"
-            | "__sail_proven_native_mul" -> "mult_int"
-            | "__sail_proven_native_div" -> "tdiv_int"
-            | "__sail_proven_native_mod" -> "tmod_int"
-            | _ -> assert false
-          in
-          I_aux (I_funcall (creturn, call, (mk_id ordinary, tyargs), args), aux)
+          Reporting.unreachable l __POS__
+            ("Malformed proven native arithmetic marker " ^ string_of_id id)
       | instr -> instr
     in
     let generated =

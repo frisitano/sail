@@ -101,6 +101,23 @@ val prove_argument_bounds :
   upper:Nat_big_num.num ->
   semantic_proof option
 
+(** Prove that no value denoted by a call argument is equal to [value].
+    This is useful for semantic definedness obligations such as a nonzero
+    divisor and the signed MIN / -1 overflow exclusion. *)
+val prove_argument_excludes :
+  env:Env.t ->
+  index:int ->
+  typ:typ ->
+  interval:integer_interval option ->
+  value:Nat_big_num.num ->
+  semantic_proof option
+
+(** Prove that an argument interval excludes one value. This interval-only
+    form is used after call-graph and path refinement have made a source value
+    more precise than its declared type. *)
+val prove_argument_excludes_interval :
+  index:int -> interval:integer_interval option -> value:Nat_big_num.num -> semantic_proof option
+
 (** Prove inclusive lower and upper bounds for every value denoted by a call result. *)
 val prove_result_bounds :
   env:Env.t ->
@@ -144,6 +161,7 @@ val prove_bit_insert_position_bounds :
 
 val has_argument_le : left:int -> right:int -> semantic_proof list -> bool
 val has_argument_bounds : index:int -> lower:Nat_big_num.num -> upper:Nat_big_num.num -> semantic_proof list -> bool
+val has_argument_excludes : index:int -> value:Nat_big_num.num -> semantic_proof list -> bool
 val has_result_bounds : lower:Nat_big_num.num -> upper:Nat_big_num.num -> semantic_proof list -> bool
 val has_result_nonnegative : semantic_proof list -> bool
 val has_conversion_value_preserving : source_width:int -> target_width:int -> semantic_proof list -> bool
