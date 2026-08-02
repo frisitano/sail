@@ -36,7 +36,9 @@ fi
   --c-preserve proven_i128_add --c-preserve proven_i128_sub \
   --c-preserve proven_i128_mul --c-preserve proven_i128_div \
   --c-preserve proven_i128_mod --c-preserve mixed_i128_u64_lte \
-  --c-preserve mixed_u64_i128_lte \
+  --c-preserve mixed_u64_i128_lte --c-preserve mixed_i8_u8_lt \
+  --c-preserve bounded_signed_lt \
+  --c-preserve path_narrow_signed_lt \
   --c-preserve checked_u64_add --c-preserve checked_u64_sub \
   --c-preserve checked_u64_mul --c-preserve checked_u64_div \
   --c-preserve checked_u64_mod --c-preserve checked_i64_add \
@@ -284,6 +286,22 @@ if awk '
   echo "mixed u64/i128 comparison used arbitrary-precision integers" >&2
   exit 1
 fi
+grep -Fq 'bool zmixed_i8_u8_lt(int8_t, uint8_t);' "$OUT.h"
+awk '
+  /^bool zmixed_i8_u8_lt\(/ { in_function = 1 }
+  in_function && /zleft < zright/ { found_native_comparison = 1 }
+  in_function && /(sail_int|cmp_int)/ { found_math = 1 }
+  in_function && /^}/ { exit !found_native_comparison || found_math }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+grep -Fq 'bool zpath_narrow_signed_lt(int64_t, int64_t);' "$OUT.h"
+awk '
+  /^bool zpath_narrow_signed_lt\(/ { in_function = 1 }
+  in_function && /zbounded_signed_lt.*\(int8_t\).*zleft.*\(int8_t\).*zright/ { found_narrow_call = 1 }
+  in_function && /sail_native_conversion_failure/ { found_checked_conversion = 1 }
+  in_function && /^}/ { exit !found_narrow_call || found_checked_conversion }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
 if grep -Fq 'if (u128_is_zero(divisor))' "$OUT.c"; then
   echo "u128 division retained a runtime zero-divisor check" >&2
   exit 1

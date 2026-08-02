@@ -4108,6 +4108,20 @@ module Make (C : CONFIG) = struct
   let map_instr_with_lifetime_ranges global_ranges path_ranges f =
     map_instr (fun instr -> f (instruction_lifetime_ranges global_ranges path_ranges instr) instr)
 
+  let proven_fixed_integer_conversion represented interval value =
+    let conversion =
+      match (represented, cval_ctyp value) with
+      | CT_fuint width, (CT_fint _ | CT_fuint _ | CT_constant _ | CT_fbits _) -> Some (Unsigned width)
+      | CT_fint 64, CT_fbits _ -> Some (Signed 64)
+      | CT_fint width, (CT_fint _ | CT_fuint _ | CT_constant _) -> Some (Signed width)
+      | _ -> None
+    in
+    match (conversion, C.integer_representation_bounds represented, interval) with
+    | Some conversion, Some (represented_lower, represented_upper), Some (lower, upper)
+      when Big_int.less_equal represented_lower lower && Big_int.less_equal upper represented_upper ->
+        Some (V_call (conversion, [value]))
+    | _ -> None
+
   let prune_proved_unreachable path_ranges path_decisions body =
     let rec rewrite instrs =
       List.filter_map
@@ -6183,15 +6197,7 @@ module Make (C : CONFIG) = struct
       | Some _, None | None, Some _ | None, None -> false
     in
     let proven_native_conversion represented lifetime value =
-      let conversion =
-        match represented with CT_fuint width -> Some (Unsigned width) | _ -> None
-      in
-      match (conversion, C.integer_representation_bounds represented, lifetime) with
-      | Some conversion, Some (represented_lower, represented_upper), Lifetime_range (lower, upper)
-        when Big_int.less_equal represented_lower lower && Big_int.less_equal upper represented_upper ->
-          Some (V_call (conversion, [value]))
-      | Some _, Some _, (Lifetime_bottom | Lifetime_top | Lifetime_range _)
-      | None, _, _ | _, None, _ -> None
+      proven_fixed_integer_conversion represented (integer_lifetime_interval lifetime) value
     in
     let specialize_proven_integer_conversion lifetime_ranges = function
       | I_aux (I_copy (result, value), aux) as instr -> (
@@ -6438,14 +6444,6 @@ module Make (C : CONFIG) = struct
                   )
             )
           in
-          let exact_mixed_fixed_comparison left right =
-            match (cval_ctyp left, cval_ctyp right) with
-            | CT_fint left_width, CT_fint right_width -> left_width <> right_width
-            | CT_fuint left_width, CT_fuint right_width -> left_width <> right_width
-            | CT_fint signed_width, CT_fuint unsigned_width | CT_fuint unsigned_width, CT_fint signed_width ->
-                signed_width > unsigned_width
-            | _ -> false
-          in
           let c_integer_promotion = function
             | CT_fint width when width < 32 -> Some (CT_fint 32)
             | CT_fuint width when width < 32 -> Some (CT_fint 32)
@@ -6462,6 +6460,24 @@ module Make (C : CONFIG) = struct
                 if signed_width > unsigned_width then Some (CT_fint signed_width)
                 else Some (CT_fuint (Int.max signed_width unsigned_width))
             | _ -> None
+          in
+          let exact_mixed_fixed_comparison left right =
+            if ctyp_equal (cval_ctyp left) (cval_ctyp right) then false
+            else
+              match (cval_ctyp left, cval_ctyp right, c_arithmetic_carrier left right) with
+              | CT_fint _, CT_fint _, Some _ | CT_fuint _, CT_fuint _, Some _ -> true
+              | CT_fint _, CT_fuint _, Some (CT_fint _) | CT_fuint _, CT_fint _, Some (CT_fint _) -> true
+              | CT_fint _, CT_fuint _, Some (CT_fuint _) -> (
+                  match left_lifetime with
+                  | Lifetime_range (lower, _) -> Big_int.less_equal Big_int.zero lower
+                  | Lifetime_bottom | Lifetime_top -> false
+                )
+              | CT_fuint _, CT_fint _, Some (CT_fuint _) -> (
+                  match right_lifetime with
+                  | Lifetime_range (lower, _) -> Big_int.less_equal Big_int.zero lower
+                  | Lifetime_bottom | Lifetime_top -> false
+                )
+              | _ -> false
           in
           match (comparison, constant_comparison, comparison_carrier) with
           | Some _, Some value, _ -> I_aux (I_copy (result, V_lit (VL_bool value, CT_bool)), aux)
@@ -7499,7 +7515,7 @@ module Make (C : CONFIG) = struct
                 @ cleanup @ tail
               )
               else instr :: tail
-          | Call callsite_info -> (
+          | Call (((argument_intervals, result_interval), _) as callsite_info) -> (
               match get_function_typ id with
               | Some (param_ctyps, ret_ctyp) when C.make_call_precise ctx id param_ctyps ret_ctyp ->
                   if List.compare_lengths args param_ctyps <> 0 then
@@ -7516,10 +7532,17 @@ module Make (C : CONFIG) = struct
                                   ~semantic:param_ctyp ~represented:arg_ctyp
                                )
                         then (
-                          let gs = ngensym () in
-                          let cast = [idecl l param_ctyp gs; icopy l (CL_id (gs, param_ctyp)) arg] in
-                          let cleanup = [iclear ~loc:l param_ctyp gs] in
-                          (cast, V_id (gs, param_ctyp), cleanup)
+                          match
+                            proven_fixed_integer_conversion param_ctyp
+                              (Option.value ~default:None (List.nth_opt argument_intervals index))
+                              arg
+                          with
+                          | Some arg -> ([], arg, [])
+                          | None ->
+                              let gs = ngensym () in
+                              let cast = [idecl l param_ctyp gs; icopy l (CL_id (gs, param_ctyp)) arg] in
+                              let cleanup = [iclear ~loc:l param_ctyp gs] in
+                              (cast, V_id (gs, param_ctyp), cleanup)
                         )
                         else ([], arg, [])
                       )
@@ -7534,10 +7557,12 @@ module Make (C : CONFIG) = struct
                            )
                     then (
                       let gs = ngensym () in
-                      ( [idecl l ret_ctyp gs],
-                        CL_id (gs, ret_ctyp),
-                        [icopy l clexp (V_id (gs, ret_ctyp)); iclear ~loc:l ret_ctyp gs]
-                      )
+                      let result = V_id (gs, ret_ctyp) in
+                      let result =
+                        Option.value ~default:result
+                          (proven_fixed_integer_conversion (clexp_ctyp clexp) result_interval result)
+                      in
+                      ([idecl l ret_ctyp gs], CL_id (gs, ret_ctyp), [icopy l clexp result; iclear ~loc:l ret_ctyp gs])
                     )
                     else ([], clexp, [])
                   in

@@ -49,5 +49,9 @@ int main(void) {
   if (zmixed_i128_u64_lte(((__int128)UINT64_MAX) + 1, UINT64_MAX)) return 19;
   if (zmixed_u64_i128_lte(UINT64_C(0), -(__int128)1)) return 20;
   if (!zmixed_u64_i128_lte(UINT64_MAX, ((__int128)UINT64_MAX) + 1)) return 21;
+  if (!zpath_narrow_signed_lt(INT64_C(-100), INT64_C(99))) return 35;
+  if (zpath_narrow_signed_lt(INT64_C(1000), INT64_C(1001))) return 36;
+  if (!zmixed_i8_u8_lt(INT8_C(-1), UINT8_C(0))) return 37;
+  if (zmixed_i8_u8_lt(INT8_C(7), UINT8_C(0))) return 38;
   return 0;
 }

@@ -20,6 +20,8 @@ type small_u64_product = range(0, 10000)
 type small_i64 = range(-100, 100)
 type small_i64_sum = range(-200, 200)
 type small_i64_product = range(-10000, 10000)
+type tiny_i8 = range(-8, 7)
+type tiny_u8 = range(0, 15)
 type thirteen_u64 = range(13, 13)
 type five_u64 = range(5, 5)
 type eight_u64 = range(8, 8)
@@ -102,6 +104,23 @@ function mixed_i128_u64_lte(left, right) = left <= right
 val mixed_u64_i128_lte : (bounded_u64, small_i128) -> bool
 
 function mixed_u64_i128_lte(left, right) = left <= right
+
+val mixed_i8_u8_lt : (tiny_i8, tiny_u8) -> bool
+
+function mixed_i8_u8_lt(left, right) = left < right
+
+val bounded_signed_lt : (small_i64, small_i64) -> bool
+
+function bounded_signed_lt(left, right) = left < right
+
+val path_narrow_signed_lt : (checked_i64, checked_i64) -> bool
+
+function path_narrow_signed_lt(Checked_i64(left), Checked_i64(right)) -> bool =
+    if left < -100 then false
+    else if 100 < left then false
+    else if right < -100 then false
+    else if 100 < right then false
+    else bounded_signed_lt(left, right)
 
 val checked_u64_add : (checked_u64, checked_u64) -> checked_u64
 

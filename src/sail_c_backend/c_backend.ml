@@ -3474,8 +3474,11 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           (sgen_cval left) operator (sgen_ctyp operation_ctyp) (sgen_cval right)
       )
     | Unsigned width, [vec] -> sprintf "((%s) %s)" (sgen_ctyp (CT_fuint width)) (sgen_cval vec)
-    | Signed 64, [vec] -> (
-        match cval_ctyp vec with CT_fbits n -> sprintf "fast_signed(%s, %d)" (sgen_cval vec) n | _ -> assert false
+    | Signed width, [value] -> (
+        match cval_ctyp value with
+        | CT_fbits n when width = 64 -> sprintf "fast_signed(%s, %d)" (sgen_cval value) n
+        | CT_fint _ | CT_fuint _ | CT_constant _ -> sprintf "((%s) %s)" (sgen_ctyp (CT_fint width)) (sgen_cval value)
+        | ctyp -> c_error (sprintf "Cannot lower proved signed conversion from %s" (string_of_ctyp ctyp))
       )
     | Bvand, [v1; v2] -> (
         match cval_ctyp v1 with
