@@ -22,6 +22,10 @@ static bool u256_is(const sail_u256 value, const uint64_t limb0, const uint64_t 
          value.limbs[3] == limb3;
 }
 
+static bool u128_is_u64(const sail_u128 value, const uint64_t expected) {
+  return value.limbs[0] == expected && value.limbs[1] == 0;
+}
+
 int main(void) {
   _Static_assert(sizeof(sail_u256) == 32, "u256 must be four native 64-bit limbs");
   _Static_assert(sizeof(sail_fixed_bytes_20) == 20, "B160/address must be exactly 20 bytes");
@@ -74,9 +78,21 @@ int main(void) {
   CHECK(zlimb_shift_left(UINT64_C(1), UINT64_C(64)) == UINT64_C(0));
   CHECK(zlimb_shift_right((UINT64_C(1) << 63), UINT64_C(63)) == UINT64_C(1));
   CHECK(zlimb_shift_right(UINT64_MAX, UINT64_C(64)) == UINT64_C(0));
+  CHECK(zbyte_sign_identity(UINT64_C(0x80)) == UINT64_C(0x80));
+  CHECK(zbyte_truncate_identity(UINT64_C(0xab)) == UINT64_C(0xab));
+  CHECK(zbyte_unsigned_extend_truncate_roundtrip(UINT64_C(0xab)) == UINT64_C(0xab));
+  CHECK(zbyte_sign_extend_truncate_roundtrip(UINT64_C(0x80)) == UINT64_C(0x80));
+  CHECK(zword_truncate_byte(UINT64_C(0x12ab)) == UINT64_C(0xab));
+  CHECK(zbyte_sign_widen(UINT64_C(0x80)) == UINT64_C(0xff80));
+  CHECK(zbyte_unsigned_extend_truncate_seven(UINT64_C(0xff)) == UINT64_C(0x7f));
+  CHECK(zbyte_sign_extend_truncate_nine(UINT64_C(0x80)) == UINT64_C(0x180));
   CHECK(zbyte_arith_shift_right(UINT64_C(0x80), UINT64_C(1)) == UINT64_C(0xc0));
   CHECK(zbyte_arith_shift_right(UINT64_C(0x80), UINT64_C(8)) == UINT64_C(0xff));
   CHECK(zbyte_arith_shift_right(UINT64_C(0x7f), UINT64_C(8)) == UINT64_C(0));
+  CHECK(u128_is_u64(zmultiply_masked_bytes(UINT64_C(0x1234)), UINT64_C(936)));
+  CHECK(u128_is_u64(zmultiply_sliced_bytes(UINT64_C(0x1234)), UINT64_C(936)));
+  CHECK(u128_is_u64(zmultiply_concatenated_bytes(UINT64_C(0x1234)), UINT64_C(177688900)));
+  CHECK(u128_is_u64(zmultiply_inserted_byte(UINT64_C(0x12)), UINT64_C(21233664)));
 
   sail_fixed_bytes_20 address = {{0}};
   address.bytes[0] = UINT8_C(0x11);

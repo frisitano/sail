@@ -70,6 +70,11 @@ val opt_memo_cache : bool ref
     [--c-specialize-log]. *)
 val opt_debug_function_representations : bool ref
 
+(** Maximum number of distinct proof-backed C representation specializations
+    generated for one source function. Exceeding the limit is an error rather
+    than permission to route a caller through a weaker specialization. *)
+val opt_max_function_specializations : int ref
+
 (** {2 Jib context} *)
 
 (* For an abstract type like `type xlen : Int`, is it initialised?
@@ -254,6 +259,11 @@ module type CONFIG = sig
 
   (** Assertions in the Sail code will be compiled to exceptions in the Jib output *)
   val assert_to_exception : bool
+
+  (** Compile assertion conditions without carrying their diagnostic Sail
+      strings into Jib. Used by fixed-representation backends that lower a
+      failed assertion directly to a target trap. *)
+  val erase_assert_messages : bool
 
   val use_void : bool
 

@@ -22,18 +22,26 @@ fi
 
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+run_sail() {
+  if [ -n "${SAIL_PLUGIN:-}" ]; then
+    "$SAIL" -plugin "$SAIL_PLUGIN" "$@"
+  else
+    "$SAIL" "$@"
+  fi
+}
+
 expect_boundary_failure() {
   name=$1
   expected=$2
   output="$TMP_DIR/$name"
 
-  "$SAIL" --no-color -O -c --c-specialize "$TEST_DIR/$name.sail" -o "$output"
+  run_sail --no-color -O -c --c-specialize "$TEST_DIR/$name.sail" -o "$output"
   # Word splitting is intentional for user/compiler and pkg-config flags.
   # shellcheck disable=SC2086
   "$CC" ${CFLAGS:-} $GMP_CFLAGS "$output.c" "$SAIL_DIR"/lib/*.c -I "$SAIL_DIR/lib" $GMP_LIBS -o "$output.bin"
 
   if "$output.bin" > "$output.result" 2> "$output.err"; then
-    echo "$name unexpectedly crossed the uint64 representation boundary" >&2
+    echo "$name unexpectedly crossed its native integer representation boundary" >&2
     exit 1
   fi
 
@@ -49,3 +57,5 @@ if grep -Fq 'neg_int(' "$TMP_DIR/negative.c"; then
 fi
 expect_boundary_failure overflow 'Sail C backend: integer value is outside the uint64_t domain'
 expect_boundary_failure nat_overflow 'Sail C backend: integer value is outside the uint64_t domain'
+expect_boundary_failure negative_u8 'Sail C backend: negative integer cannot be represented as uint8_t'
+expect_boundary_failure overflow_u8 'Sail C backend: integer value is outside the uint8_t domain'

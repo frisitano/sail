@@ -30,7 +30,7 @@ expect_error() {
   grep -Fq "$expected" "$output.result"
 }
 
-expect_error unsupported.sail 'C backend: unsupported representation "u32" in $[c_repr]; supported representations are uint64, int64, u256, fixed_bytes'
+expect_error unsupported.sail 'C backend: unsupported representation "u32" in $[c_repr]; supported representations are uint8, uint16, uint32, uint64, int8, int16, int32, int64, u256, fixed_bytes'
 expect_error wrong_target.sail 'C backend: $[c_repr] is only valid on a newtype'
 expect_error wrong_payload.sail 'C backend: $[c_repr] uint64 requires a mathematical int or nat payload'
 expect_error missing_argument.sail 'C backend: $[c_repr] requires a representation name'
@@ -63,7 +63,7 @@ run_sail --no-color -c --c-specialize --c-require-bounded-int --c-preserve main 
   "$TEST_DIR/bounded_accumulator.sail" -o "$TMP_DIR/bounded_accumulator"
 grep -Fq '__int128 ztotal;' "$TMP_DIR/bounded_accumulator.h"
 grep -Fq 'unit zkeep(__int128);' "$TMP_DIR/bounded_accumulator.h"
-grep -Eq 'unit zkeep.*repr.*\(int64_t\);' "$TMP_DIR/bounded_accumulator.h"
+grep -Eq 'unit zkeep.*repr.*\(int16_t\);' "$TMP_DIR/bounded_accumulator.h"
 if grep -Eq 'sail_int|CREATE\(sail_int\)|add_int' "$TMP_DIR/bounded_accumulator.c"; then
   echo 'range-bounded accumulator retained arbitrary-precision arithmetic' >&2
   exit 1

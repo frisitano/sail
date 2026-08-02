@@ -83,6 +83,7 @@ module Env : sig
 
   val get_current_module : t -> Project.mod_id
   val get_modules : t -> Project.project_structure option
+  val set_modules : Project.project_structure -> t -> t
 
   (** Note: Most get_ functions assume the identifiers exist, and throw type errors if they don't. *)
 

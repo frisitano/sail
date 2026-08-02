@@ -50,7 +50,23 @@ run_sail --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
   --c-preserve limb_signed \
   --c-preserve limb_shift_left \
   --c-preserve limb_shift_right \
+  --c-preserve limb_shift_left_in_range \
+  --c-preserve limb_shift_right_in_range \
+  --c-preserve byte_widen_identity \
+  --c-preserve byte_sign_identity \
+  --c-preserve byte_truncate_identity \
+  --c-preserve byte_unsigned_extend_truncate_roundtrip \
+  --c-preserve byte_sign_extend_truncate_roundtrip \
+  --c-preserve word_truncate_byte \
+  --c-preserve byte_sign_widen \
+  --c-preserve byte_unsigned_extend_truncate_seven \
+  --c-preserve byte_sign_extend_truncate_nine \
   --c-preserve byte_arith_shift_right \
+  --c-preserve multiply_bit_words \
+  --c-preserve multiply_masked_bytes \
+  --c-preserve multiply_sliced_bytes \
+  --c-preserve multiply_concatenated_bytes \
+  --c-preserve multiply_inserted_byte \
   --c-preserve address_equal \
   --c-preserve address_equal_vector \
   --c-preserve address_byte \
@@ -75,10 +91,10 @@ grep -Fq 'typedef struct { uint8_t bytes[48]; } sail_fixed_bytes_48;' "$TMP_DIR/
 grep -Fq 'sail_u256 zu256_add(sail_u256, sail_u256);' "$TMP_DIR/model.h"
 grep -Fq 'sail_u256 zu256_from_lbits(lbits);' "$TMP_DIR/model.h"
 grep -Fq 'void zu256_to_nat(sail_int *rop, sail_u256);' "$TMP_DIR/model.h"
-grep -Fq 'uint64_t zu256_bit(sail_u256, uint64_t);' "$TMP_DIR/model.h"
-grep -Fq 'sail_fixed_bytes_20 zaddress_update(sail_fixed_bytes_20, uint64_t, uint64_t);' "$TMP_DIR/model.h"
+grep -Fq 'uint64_t zu256_bit(sail_u256, uint8_t);' "$TMP_DIR/model.h"
+grep -Fq 'sail_fixed_bytes_20 zaddress_update(sail_fixed_bytes_20, uint8_t, uint64_t);' "$TMP_DIR/model.h"
 grep -Fq 'sail_fixed_bytes_32 zb256_fill(uint64_t);' "$TMP_DIR/model.h"
-grep -Fq 'sail_fixed_bytes_20 zbytes20_inc_update(sail_fixed_bytes_20, uint64_t, uint64_t);' "$TMP_DIR/model.h"
+grep -Fq 'sail_fixed_bytes_20 zbytes20_inc_update(sail_fixed_bytes_20, uint8_t, uint64_t);' "$TMP_DIR/model.h"
 grep -Fq 'sail_u256 zb256_to_u256(sail_fixed_bytes_32);' "$TMP_DIR/model.h"
 grep -Fq 'sail_fixed_bytes_32 zu256_to_b256(sail_u256);' "$TMP_DIR/model.h"
 grep -Fq 'sail_u256 zaddress_to_word(sail_fixed_bytes_20);' "$TMP_DIR/model.h"
@@ -187,7 +203,56 @@ assert_native_function limb_unsigned '((uint64_t) zvalue)'
 assert_native_function limb_signed 'fast_signed(zvalue, 64)'
 assert_native_function limb_shift_left '? UINT64_C(0) : ((zvalue << zamount)'
 assert_native_function limb_shift_right 'safe_rshift(zvalue, zamount)'
+assert_native_function limb_shift_left_in_range 'zvalue << zamount'
+if grep -Fq '>= UINT64_C(64)' "$TMP_DIR/limb_shift_left_in_range.body"; then
+  echo 'proved in-range left shift retained its generic C guard' >&2
+  exit 1
+fi
+assert_native_function limb_shift_right_in_range '(zvalue >> zamount)'
+if grep -Fq 'safe_rshift' "$TMP_DIR/limb_shift_right_in_range.body"; then
+  echo 'proved in-range right shift retained its generic C helper' >&2
+  exit 1
+fi
+assert_native_function byte_widen_identity '= zvalue;'
+assert_native_function byte_sign_identity '= zvalue;'
+assert_native_function byte_truncate_identity '= zvalue;'
+assert_native_function byte_unsigned_extend_truncate_roundtrip '= zvalue;'
+assert_native_function byte_sign_extend_truncate_roundtrip '= zvalue;'
+for function_name in byte_unsigned_extend_truncate_roundtrip byte_sign_extend_truncate_roundtrip; do
+  if grep -Eq 'fast_(zero|sign)_extend|safe_rshift|UINT64_MAX' "$TMP_DIR/$function_name.body"; then
+    echo "$function_name retained an extension/truncation round trip" >&2
+    exit 1
+  fi
+done
+assert_native_function word_truncate_byte 'safe_rshift(UINT64_MAX, 64 - 8)'
+assert_native_function byte_sign_widen 'fast_sign_extend(zvalue, 8, 16)'
+assert_native_function byte_unsigned_extend_truncate_seven 'safe_rshift(UINT64_MAX, 64 - 7)'
+assert_native_function byte_sign_extend_truncate_nine 'fast_sign_extend(zvalue, 8, 16)'
+grep -Fq 'safe_rshift(UINT64_MAX, 64 - 9)' "$TMP_DIR/byte_sign_extend_truncate_nine.body"
 assert_native_function byte_arith_shift_right 'safe_rshift(zvalue, zamount)'
+
+# Result-bound facts remain attached to calls even when the source and clone
+# ABIs are both bits(64).  Equal proof partitions are shared, while the
+# preserved full-width control retains its u128 multiplication.
+assert_native_function multiply_bit_words 'u128_mul_u64_u64('
+assert_native_function multiply_masked_bytes 'zmultiply_bit_wordszIrepr'
+assert_native_function multiply_sliced_bytes 'zmultiply_bit_wordszIrepr'
+assert_native_function multiply_concatenated_bytes 'zmultiply_bit_wordszIrepr'
+assert_native_function multiply_inserted_byte 'zmultiply_bit_wordszIrepr'
+awk '
+  /^sail_u128 zmultiply_bit_wordszIrepr/ { printing = 1 }
+  printing { print }
+  printing && /^}$/ { printing = 0 }
+' "$TMP_DIR/model.c" > "$TMP_DIR/multiply_bit_words.clones"
+test "$(grep -Ec '^sail_u128 zmultiply_bit_wordszIrepr' "$TMP_DIR/multiply_bit_words.clones")" -eq 2
+grep -Eq 'uint16_t [^;]+;' "$TMP_DIR/multiply_bit_words.clones"
+grep -Eq 'uint32_t [^;]+;' "$TMP_DIR/multiply_bit_words.clones"
+if grep -Eq 'u128_mul_u64_u64|sail_native_conversion_failure|sail_int|mpz_|lbits|CONVERT_OF' \
+    "$TMP_DIR/multiply_bit_words.clones"; then
+  echo 'proof-specialized multiply clone retained a wide or managed operation' >&2
+  exit 1
+fi
+grep -Fq '& ~(UINT64_C(0xFF) <<' "$TMP_DIR/multiply_inserted_byte.body"
 assert_native_function address_equal 'eq_fixed_bytes_20('
 assert_native_function address_equal_vector 'eq_fixed_bytes_20('
 assert_native_function address_byte 'fast_unsigned_vector_access_fixed_bytes_20('

@@ -190,6 +190,8 @@ let string_of_op = function
   | Bvshiftl -> "@bvshiftl"
   | Bvshiftr -> "@bvshiftr"
   | Bvarith_shiftr -> "@bvarith_shiftr"
+  | Proven_bvshiftl n -> "@proven_bvshiftl::<" ^ string_of_int n ^ ">"
+  | Proven_bvshiftr n -> "@proven_bvshiftr::<" ^ string_of_int n ^ ">"
   | Bvaccess -> "@bvaccess"
   | Ilt -> "@lt"
   | Igt -> "@gt"
@@ -201,6 +203,11 @@ let string_of_op = function
   | Proven_imul -> "@proven_imul"
   | Proven_idiv -> "@proven_idiv"
   | Proven_imod -> "@proven_imod"
+  | Widening_iadd (n, _) -> "@widening_iadd::<" ^ string_of_int n ^ ">"
+  | Widening_imul (n, _) -> "@widening_imul::<" ^ string_of_int n ^ ">"
+  | Wrapping_iadd n -> "@wrapping_iadd::<" ^ string_of_int n ^ ">"
+  | Wrapping_isub n -> "@wrapping_isub::<" ^ string_of_int n ^ ">"
+  | Wrapping_imul n -> "@wrapping_imul::<" ^ string_of_int n ^ ">"
   | Isub -> "@isub"
   | Imul -> "@imul"
   | Idiv -> "@idiv"
@@ -417,17 +424,13 @@ let ijson_key l id parts = I_aux (I_init (CT_json_key, id, Init_json_key parts),
 
 let iif l cval then_instrs else_instrs = I_aux (I_if (cval, then_instrs, else_instrs), (instr_number (), l))
 
-let ifuncall_with_bounds l bounds clexp id cvals =
-  I_aux (I_funcall (CR_one clexp, Call bounds, id, cvals), (instr_number (), l))
+let ifuncall_with_bounds ?(semantic_proofs = []) l bounds clexp id cvals =
+  I_aux (I_funcall (CR_one clexp, Call (bounds, semantic_proofs), id, cvals), (instr_number (), l))
 
-let ifuncall l clexp id cvals =
-  ifuncall_with_bounds l (List.map (fun _ -> None) cvals, None) clexp id cvals
+let ifuncall l clexp id cvals = ifuncall_with_bounds l (List.map (fun _ -> None) cvals, None) clexp id cvals
 
 let ifuncall_multi l clexps id cvals =
-  I_aux
-    ( I_funcall (CR_multi clexps, Call (List.map (fun _ -> None) cvals, None), id, cvals),
-      (instr_number (), l)
-    )
+  I_aux (I_funcall (CR_multi clexps, Call ((List.map (fun _ -> None) cvals, None), []), id, cvals), (instr_number (), l))
 
 let iextern ?return_ctyp l clexp id cvals =
   let return_ctyp = match return_ctyp with None -> clexp_ctyp clexp | Some ctyp -> ctyp in
@@ -1125,9 +1128,15 @@ let rec infer_call op vs =
   | (Eq | Neq), _ -> CT_bool
   | Bvnot, [v] -> cval_ctyp v
   | Bvaccess, _ -> CT_fbits 1
-  | (Bvor | Bvand | Bvxor | Bvadd | Bvsub | Bvshiftl | Bvshiftr | Bvarith_shiftr), [v; _] -> cval_ctyp v
+  | ( ( Bvor | Bvand | Bvxor | Bvadd | Bvsub | Bvshiftl | Bvshiftr | Bvarith_shiftr | Proven_bvshiftl _
+      | Proven_bvshiftr _ ),
+      [v; _] ) ->
+      cval_ctyp v
   | (Ilt | Igt | Ilteq | Igteq), _ -> CT_bool
-  | (Iadd | Proven_iadd | Proven_isub | Proven_imul | Proven_idiv | Proven_imod | Isub | Imul | Idiv | Imod), [v; _] ->
+  | (Widening_iadd (_, result_ctyp) | Widening_imul (_, result_ctyp)), [_; _] -> result_ctyp
+  | ( ( Iadd | Proven_iadd | Proven_isub | Proven_imul | Proven_idiv | Proven_imod | Wrapping_iadd _ | Wrapping_isub _
+      | Wrapping_imul _ | Isub | Imul | Idiv | Imod ),
+      [v; _] ) ->
       cval_ctyp v
   | Unsigned n, _ -> CT_fuint n
   | Signed n, _ -> CT_fint n
@@ -1139,8 +1148,7 @@ let rec infer_call op vs =
   | Slice n, [vec; _] -> (
       match cval_ctyp vec with
       | CT_fbits _ | CT_sbits _ | CT_fuint _ -> CT_fbits n
-      | CT_struct (id, [])
-        when string_of_id id = "__sail_c_repr_u128" || string_of_id id = "__sail_c_repr_u256" ->
+      | CT_struct (id, []) when string_of_id id = "__sail_c_repr_u128" || string_of_id id = "__sail_c_repr_u256" ->
           CT_fbits n
       | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Invalid type for extract argument"
     )

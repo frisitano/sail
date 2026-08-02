@@ -66,9 +66,15 @@ let opt_no_rts = ref false
 let opt_preserve_types = ref IdSet.empty
 let opt_specialize_c = ref false
 let opt_require_bounded_int = ref false
+let opt_optimized_model = ref false
+let opt_c_package = ref "model"
+let opt_c_output_dir = ref None
 let opt_cpp_class_name = ref "Model"
 let opt_cpp_namespace = ref "model"
 let opt_cpp_derive_from = ref None
+let input_project = ref None
+
+let remember_input_project _ _ env = input_project := Type_check.Env.get_modules env
 
 let c_options =
   [
@@ -110,9 +116,29 @@ let c_options =
       Arg.Set Jib_compile.opt_debug_function_representations,
       "log C representation inference and specialization worklist progress"
     );
+    ( Flag.create ~prefix:["c"] ~arg:"count" "specialization_limit",
+      Arg.Int
+        (fun limit ->
+          if limit < 1 then raise (Arg.Bad "--c-specialization-limit must be at least 1")
+          else Jib_compile.opt_max_function_specializations := limit
+        ),
+      "set the maximum proof-backed specializations generated per source function"
+    );
     ( Flag.create ~prefix:["c"] "require_bounded_int",
       Arg.Set opt_require_bounded_int,
       "reject arbitrary-precision integers that need a finite semantic Sail bound"
+    );
+    ( Flag.create ~prefix:["c"] "optimized_model",
+      Arg.Set opt_optimized_model,
+      "generate a strict allocation-free specialized C model split by Sail module"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"package" "package",
+      Arg.Set_string opt_c_package,
+      "package name used by --c-optimized-model (for example evmsail)"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"directory" "output_dir",
+      Arg.String (fun directory -> opt_c_output_dir := Some directory),
+      "output root used by --c-optimized-model"
     );
     ( Flag.create ~prefix:["c"] "preserve",
       Arg.String (fun str -> Specialize.add_initial_calls (IdSet.singleton (mk_id str))),
@@ -214,12 +240,24 @@ let collect_c_name_info ast (mode : c_backend_mode) =
   let open Ast_defs in
   let reserved = ref Util.StringSet.empty in
   let overrides = ref Name_generator.Overrides.empty in
-  let c_repr_uint64 = ref IdSet.empty in
-  let c_repr_int64 = ref IdSet.empty in
+  let c_repr_unsigned = ref Bindings.empty in
+  let c_repr_signed = ref Bindings.empty in
   let c_repr_u256 = ref IdSet.empty in
   let c_repr_fixed_bytes = ref Bindings.empty in
   let c_repr_error loc message = raise (Reporting.err_general loc ("C backend: $[c_repr] " ^ message)) in
-  let supported_c_repr = ["uint64"; "int64"; "u256"; "fixed_bytes"] in
+  let native_integer_representations =
+    [
+      ("uint8", (`Unsigned, 8));
+      ("uint16", (`Unsigned, 16));
+      ("uint32", (`Unsigned, 32));
+      ("uint64", (`Unsigned, 64));
+      ("int8", (`Signed, 8));
+      ("int16", (`Signed, 16));
+      ("int32", (`Signed, 32));
+      ("int64", (`Signed, 64));
+    ]
+  in
+  let supported_c_repr = List.map fst native_integer_representations @ ["u256"; "fixed_bytes"] in
   let collect_c_repr def def_annot =
     match get_def_attribute "c_repr" def_annot with
     | None -> ()
@@ -256,17 +294,20 @@ let collect_c_name_info ast (mode : c_backend_mode) =
                   )
                 | _ -> false
               in
-              match (repr, payload) with
-              | "uint64", Typ_aux (Typ_id payload_id, _)
+              let native_integer_representation = List.assoc_opt repr native_integer_representations in
+              match (native_integer_representation, repr, payload) with
+              | Some (`Unsigned, width), _, Typ_aux (Typ_id payload_id, _)
                 when let payload = string_of_id payload_id in
                      payload = "int" || payload = "nat" ->
-                  c_repr_uint64 := IdSet.add id !c_repr_uint64
-              | "int64", Typ_aux (Typ_id payload_id, _) when string_of_id payload_id = "int" ->
-                  c_repr_int64 := IdSet.add id !c_repr_int64
-              | "u256", payload
+                  c_repr_unsigned := Bindings.add id width !c_repr_unsigned
+              | Some (`Signed, width), _, Typ_aux (Typ_id payload_id, _) when string_of_id payload_id = "int" ->
+                  c_repr_signed := Bindings.add id width !c_repr_signed
+              | None, "u256", payload
                 when is_bits 256 payload || is_unsigned_range 256 declared_payload || is_unsigned_range 256 payload ->
                   c_repr_u256 := IdSet.add id !c_repr_u256
-              | "fixed_bytes", Typ_aux (Typ_app (vector_id, [A_aux (A_nexp length, _); A_aux (A_typ elem_typ, _)]), _)
+              | ( None,
+                  "fixed_bytes",
+                  Typ_aux (Typ_app (vector_id, [A_aux (A_nexp length, _); A_aux (A_typ elem_typ, _)]), _) )
                 when string_of_id vector_id = "vector" -> (
                   let elem_typ = Type_check.Env.expand_synonyms def_annot.env elem_typ in
                   if not (is_bits 8 elem_typ) then
@@ -278,10 +319,11 @@ let collect_c_name_info ast (mode : c_backend_mode) =
                     )
                   | _ -> c_repr_error attr_loc "fixed_bytes requires a statically sized, positive vector payload"
                 )
-              | "uint64", _ -> c_repr_error attr_loc "uint64 requires a mathematical int or nat payload"
-              | "int64", _ -> c_repr_error attr_loc "int64 requires a mathematical int payload"
-              | "u256", _ -> c_repr_error attr_loc "u256 requires an exact bits(256) or range(0, 2^256 - 1) payload"
-              | "fixed_bytes", _ ->
+              | Some (`Unsigned, _), _, _ -> c_repr_error attr_loc (repr ^ " requires a mathematical int or nat payload")
+              | Some (`Signed, _), _, _ -> c_repr_error attr_loc (repr ^ " requires a mathematical int payload")
+              | None, "u256", _ ->
+                  c_repr_error attr_loc "u256 requires an exact bits(256) or range(0, 2^256 - 1) payload"
+              | None, "fixed_bytes", _ ->
                   c_repr_error attr_loc
                     (Printf.sprintf "fixed_bytes requires a statically sized vector of byte elements as its %s" kind)
               | _ -> assert false
@@ -327,20 +369,27 @@ let collect_c_name_info ast (mode : c_backend_mode) =
       | _ -> ()
     )
     ast.defs;
-  ( !reserved,
-    !overrides,
-    !c_repr_uint64,
-    !c_repr_int64,
-    !c_repr_u256,
-    !c_repr_fixed_bytes
-  )
+  (!reserved, !overrides, !c_repr_unsigned, !c_repr_signed, !c_repr_u256, !c_repr_fixed_bytes)
 
 let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_sail_dir; _ } =
-  let reserveds, overrides, c_repr_uint64, c_repr_int64, c_repr_u256, c_repr_fixed_bytes =
+  if !opt_optimized_model then (
+    match mode with
+    | C ->
+        opt_specialize_c := true;
+        opt_require_bounded_int := true;
+        opt_no_main := true;
+        opt_no_lib := true;
+        opt_no_rts := true;
+        opt_no_mangle := true;
+        C_backend.optimize_primops := true
+    | Cpp ->
+        raise (Reporting.err_general Parse_ast.Unknown "--c-optimized-model is only supported by the C target")
+  );
+  let reserveds, overrides, c_repr_unsigned, c_repr_signed, c_repr_u256, c_repr_fixed_bytes =
     collect_c_name_info ast mode
   in
-  let c_repr_uint64 = if !opt_specialize_c then c_repr_uint64 else IdSet.empty in
-  let c_repr_int64 = if !opt_specialize_c then c_repr_int64 else IdSet.empty in
+  let c_repr_unsigned = if !opt_specialize_c then c_repr_unsigned else Bindings.empty in
+  let c_repr_signed = if !opt_specialize_c then c_repr_signed else Bindings.empty in
   let c_repr_u256 = if !opt_specialize_c then c_repr_u256 else IdSet.empty in
   let c_repr_fixed_bytes = if !opt_specialize_c then c_repr_fixed_bytes else Bindings.empty in
 
@@ -356,12 +405,14 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let branch_coverage = !opt_branch_coverage
     let assert_to_exception = !opt_assert_to_exception
     let preserve_types = !opt_preserve_types
-    let c_repr_uint64 = c_repr_uint64
-    let c_repr_int64 = c_repr_int64
+    let c_repr_unsigned = c_repr_unsigned
+    let c_repr_signed = c_repr_signed
     let c_repr_u256 = c_repr_u256
     let c_repr_fixed_bytes = c_repr_fixed_bytes
     let specialize_c = !opt_specialize_c
     let require_bounded_int = !opt_require_bounded_int
+    let optimized_model = !opt_optimized_model
+    let package_name = !opt_c_package
 
     (* TODO: Convert `cpp` to use `c_backend_mode` instead of `bool`. *)
     let cpp = match mode with C -> false | Cpp -> true
@@ -381,19 +432,74 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
   let out_file = Option.value out_file ~default:"out" in
   let basename = Filename.basename out_file in
 
-  let header, impl = Codegen.compile_ast env effect_info basename ast in
+  let write_file path contents =
+    let output = Util.open_output_with_check path in
+    output_string output.channel contents;
+    flush output.channel;
+    Util.close_output_with_check output
+  in
+  let rec ensure_directory path =
+    if path = "" || path = "." || Sys.file_exists path then ()
+    else (
+      ensure_directory (Filename.dirname path);
+      Unix.mkdir path 0o755
+    )
+  in
+  let module_file_stem name =
+    let buffer = Buffer.create (String.length name) in
+    String.iteri
+      (fun index c ->
+        if Char.uppercase_ascii c = c && Char.lowercase_ascii c <> c && index > 0 then Buffer.add_char buffer '_';
+        let c = Char.lowercase_ascii c in
+        Buffer.add_char buffer (if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') then c else '_')
+      )
+      name;
+    Buffer.contents buffer
+  in
 
-  let impl_out = Util.open_output_with_check (out_file ^ "." ^ string_of_mode mode) in
-  output_string impl_out.channel impl;
-  flush impl_out.channel;
-  Util.close_output_with_check impl_out;
+  if !opt_optimized_model then (
+    let project =
+      match !input_project with
+      | Some project -> project
+      | None ->
+          raise
+            (Reporting.err_general Parse_ast.Unknown
+               "--c-optimized-model requires an input .sail_project so generated files can follow Sail modules"
+            )
+    in
+    let module_name id = fst (Project.module_name project id) in
+    let modules =
+      Project.module_order project
+      |> List.map (fun id ->
+             let name = module_name id in
+             let files = List.map fst (Project.module_files project id) in
+             let requires = List.map module_name (Project.module_requires project id) in
+             Codegen.{ name; file_stem = module_file_stem name; files; requires }
+         )
+    in
+    let output_root = Option.value !opt_c_output_dir ~default:"ffi/optimized" in
+    let include_root = Filename.concat (Filename.concat output_root "include") !opt_c_package in
+    let include_spec = Filename.concat include_root "spec" in
+    let source_spec = Filename.concat (Filename.concat output_root "src") "spec" in
+    ensure_directory include_spec;
+    ensure_directory source_spec;
+    let umbrella, outputs = Codegen.compile_ast_modules env effect_info ~package:!opt_c_package modules ast in
+    write_file (Filename.concat include_root "spec.h") umbrella;
+    List.iter
+      (fun (output : Codegen.c_module_output) ->
+        write_file (Filename.concat include_spec (output.file_stem ^ ".h")) output.header;
+        write_file (Filename.concat source_spec (output.file_stem ^ ".c")) output.implementation
+      )
+      outputs
+  )
+  else (
+    let header, impl = Codegen.compile_ast env effect_info basename ast in
 
-  let header_out = Util.open_output_with_check (out_file ^ ".h") in
-  output_string header_out.channel header;
-  flush header_out.channel;
-  Util.close_output_with_check header_out;
+    write_file (out_file ^ "." ^ string_of_mode mode) impl;
+    write_file (out_file ^ ".h") header
+  );
 
-  if !opt_build then (
+  if !opt_build && not !opt_optimized_model then (
     let sail_dir = Reporting.get_sail_dir default_sail_dir in
     let cmd = Printf.sprintf "%s -lgmp -I '%s'/lib '%s'/lib/*.c %s.c -o %s" "gcc" sail_dir sail_dir out_file out_file in
     let _ = Unix.system cmd in
@@ -406,10 +512,10 @@ let _ =
   Pragma.register "c_reserved";
   Pragma.register "c_override";
   ignore
-    (Target.register ~name:"c" ~options:c_options ~rewrites:(c_cpp_rewrites C) ~supports_abstract_types:true
+    (Target.register ~name:"c" ~options:c_options ~pre_rewrites_hook:remember_input_project ~rewrites:(c_cpp_rewrites C) ~supports_abstract_types:true
        ~supports_runtime_config:true (c_target C)
     );
   ignore
-    (Target.register ~name:"cpp" ~options:cpp_options ~rewrites:(c_cpp_rewrites Cpp) ~supports_abstract_types:true
+    (Target.register ~name:"cpp" ~options:cpp_options ~pre_rewrites_hook:remember_input_project ~rewrites:(c_cpp_rewrites Cpp) ~supports_abstract_types:true
        ~supports_runtime_config:true (c_target Cpp)
     )

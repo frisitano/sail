@@ -44,9 +44,21 @@ grep -Fq 'u256_div_u128(zleft, zright)' "$OUT.c"
 grep -Fq 'u256_eq_u128(zleft, zright)' "$OUT.c"
 grep -Fq 'u256_eq_u128(zright, zleft)' "$OUT.c"
 grep -Fq 'u128_lt_u256(zleft, zright)' "$OUT.c"
-grep -Fq 'u128_sub_u256(zleft, zright)' "$OUT.c"
 grep -Fq 'u128_div_u256(zleft, zright)' "$OUT.c"
 grep -Fq 'u128_mod_u256(zleft, zright)' "$OUT.c"
+
+# The guard proves that the u256 subtrahend fits the u128 minuend on the true
+# branch.  Keep that stronger path-sensitive bound: narrow once and use the
+# cheaper homogeneous operation instead of forcing the declared parameter's
+# wider representation through the arithmetic expression.
+sed -n '/^sail_u128 zsub_128_256(/,/^}/p' "$OUT.c" > "$TMP_DIR/sub_128_256.c"
+grep -Fq 'u128_lt_u256(zleft, zright)' "$TMP_DIR/sub_128_256.c"
+grep -Fq 'u128_of_u256(zright)' "$TMP_DIR/sub_128_256.c"
+grep -Fq 'u128_sub(zleft,' "$TMP_DIR/sub_128_256.c"
+if grep -Fq 'sail_int' "$TMP_DIR/sub_128_256.c"; then
+  echo 'path-refined fixed-width subtraction retained sail_int' >&2
+  exit 1
+fi
 if sed -n '/^sail_u256 zadd_widen_128(/,/^}/p' "$OUT.c" | grep -Fq sail_int; then
   echo 'widened fixed-width operation retained sail_int' >&2
   exit 1

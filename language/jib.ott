@@ -65,11 +65,35 @@ type iannot = int * Parse_ast.l
 type integer_interval = Nat_big_num.num * Nat_big_num.num
 type callsite_bounds = integer_interval option list * integer_interval option
 
+(* Compact proof certificates computed while the source type environment is
+   still available.  Later lowering passes can consume these without retaining
+   or reconstructing the type-checker environment. *)
+type semantic_proof_method = Proof_structural | Proof_interval | Proof_type_constraint
+type semantic_relation =
+  | Argument_le of int * int
+  | Argument_bounds of int * Nat_big_num.num * Nat_big_num.num
+  | Result_bounds of Nat_big_num.num * Nat_big_num.num
+  | Result_nonnegative
+  | Conversion_value_preserving of int * int
+  | Signed_conversion_value_preserving of int * int
+  | Conversion_low_bits of int * int
+  | Shift_count_bounds of int * Nat_big_num.num * Nat_big_num.num
+type semantic_proof = {
+  semantic_relation : semantic_relation;
+  semantic_proof_method : semantic_proof_method;
+}
+type callsite_info = callsite_bounds * semantic_proof list
+
 }}
 
 metavar callsite_bounds ::=
   {{ phantom }}
   {{ ocaml callsite_bounds }}
+  {{ lem unit }}
+
+metavar callsite_info ::=
+  {{ phantom }}
+  {{ ocaml callsite_info }}
   {{ lem unit }}
 
 grammar
@@ -119,6 +143,19 @@ op :: '' ::=
   | proven_mul        :: :: proven_imul
   | proven_div        :: :: proven_idiv
   | proven_mod        :: :: proven_imod
+% Exact unsigned arithmetic whose complete mathematical result is carried in
+% an N-bit representation wider than one or both operands.  This operation
+% identity must survive lowering; the C backend may select a representation-
+% specific helper without later passes having to recover semantics from that
+% helper's external name.
+  | widening_add nat ctyp  :: :: widening_iadd
+  | widening_mul nat ctyp  :: :: widening_imul
+% Integer arithmetic whose result is observed modulo 2^N.  Unlike the proven
+% operations above, these do not assert that the complete mathematical result
+% fits the selected representation.
+  | wrapping_add nat  :: :: wrapping_iadd
+  | wrapping_sub nat  :: :: wrapping_isub
+  | wrapping_mul nat  :: :: wrapping_imul
   | sub               :: :: isub
   | mul               :: :: imul
   | div               :: :: idiv
@@ -135,6 +172,10 @@ op :: '' ::=
   | bvshiftl          :: :: bvshiftl
   | bvshiftr          :: :: bvshiftr
   | bvarith_shiftr    :: :: bvarith_shiftr
+% Fixed-carrier shifts whose source range proves the count is defined by C.
+% The width records the carrier used when discharging that obligation.
+  | proven_bvshiftl nat :: :: proven_bvshiftl
+  | proven_bvshiftr nat :: :: proven_bvshiftr
   | bvaccess          :: :: bvaccess
   | concat            :: :: concat
   | zero_extend nat   :: :: zero_extend
@@ -257,7 +298,7 @@ init :: 'Init_' ::=
 % special runtime functions used by the C backend, or used to implement
 % type specific peephole optimisations etc.
 funtype :: '' ::=
-  | callsite_bounds call :: :: call
+  | callsite_info call :: :: call
   | extern ctyp :: :: extern
 
 instr :: 'I_' ::=
