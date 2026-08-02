@@ -261,15 +261,31 @@ let prove_conversion_low_bits ~source_width ~target_width =
       { semantic_relation = Conversion_low_bits (source_width, target_width); semantic_proof_method = Proof_structural }
   else None
 
-let prove_shift_count_bounds ~env ~index ~typ ~interval ~carrier_width =
+let prove_shift_count_interval ~index ~interval ~carrier_width =
   if carrier_width <= 0 then None
-  else (
+  else
     let lower = Big_int.zero in
     let upper = Big_int.of_int (carrier_width - 1) in
-    Option.map
-      (fun proof -> { proof with semantic_relation = Shift_count_bounds (index, lower, upper) })
-      (prove_argument_bounds ~env ~index ~typ ~interval ~lower ~upper)
-  )
+    match interval with
+    | Some (actual_lower, actual_upper)
+      when Big_int.less_equal lower actual_lower && Big_int.less_equal actual_upper upper ->
+        Some
+          {
+            semantic_relation = Shift_count_bounds (index, lower, upper);
+            semantic_proof_method = Proof_interval;
+          }
+    | Some _ | None -> None
+
+let prove_shift_count_bounds ~env ~index ~typ ~interval ~carrier_width =
+  match prove_shift_count_interval ~index ~interval ~carrier_width with
+  | Some proof -> Some proof
+  | None when carrier_width <= 0 -> None
+  | None ->
+      let lower = Big_int.zero in
+      let upper = Big_int.of_int (carrier_width - 1) in
+      Option.map
+        (fun proof -> { proof with semantic_relation = Shift_count_bounds (index, lower, upper) })
+        (prove_argument_bounds ~env ~index ~typ ~interval:None ~lower ~upper)
 
 let has_argument_le ~left ~right proofs =
   List.exists

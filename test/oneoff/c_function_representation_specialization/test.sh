@@ -74,6 +74,15 @@ fi
   --c-preserve comparison_fold_forwarded \
   --c-preserve comparison_fold_unknown \
   --c-preserve comparison_fold_after_mutation \
+  --c-preserve path_proven_shift_left \
+  --c-preserve path_proven_shift_right \
+  --c-preserve path_proven_arith_shift_right \
+  --c-preserve predicate_proven_shift_left \
+  --c-preserve unknown_shift_left \
+  --c-preserve invalidated_shift_left \
+  --c-preserve path_proven_slice \
+  --c-preserve predicate_proven_slice \
+  --c-preserve unknown_slice \
   --c-preserve invalidated_u64_square \
   --c-preserve bounded_integer_box_value \
   --c-preserve mutable_unbounded_accumulator \
@@ -735,6 +744,54 @@ for function_name in comparison_fold_unknown comparison_fold_after_mutation; do
   grep -Fq 'zcomparison_observable_path(' "$TMP_DIR/$function_name.c"
   grep -Fq 'if (' "$TMP_DIR/$function_name.c"
 done
+
+# Shift safety is discharged after path analysis. Direct and forwarded bounds
+# therefore select unchecked native C operations while preserving the guarding
+# branch/helper call; this is proof propagation, not function inlining.
+for function_name in path_proven_shift_left path_proven_shift_right path_proven_arith_shift_right predicate_proven_shift_left; do
+  awk -v function_name="$function_name" '
+    $0 ~ "^uint64_t z" function_name "\\(" { printing = 1 }
+    printing { print }
+    printing && /^}/ { printing = 0 }
+  ' "$TMP_DIR/model.c" > "$TMP_DIR/$function_name.c"
+  if grep -Eq 'safe_rshift|>= UINT64_C\((32|64)\)' "$TMP_DIR/$function_name.c"; then
+    echo "$function_name retained a C shift guard despite a semantic path proof" >&2
+    exit 1
+  fi
+done
+grep -Fq 'zforwarded_is_tiny_u64(zamount)' "$TMP_DIR/predicate_proven_shift_left.c"
+
+# An unconstrained count and a saved predicate invalidated by mutation cannot
+# justify an unchecked C shift. Both retain the defined fallback guard.
+for function_name in unknown_shift_left invalidated_shift_left; do
+  awk -v function_name="$function_name" '
+    $0 ~ "^uint64_t z" function_name "\\(" { printing = 1 }
+    printing { print }
+    printing && /^}/ { printing = 0 }
+  ' "$TMP_DIR/model.c" > "$TMP_DIR/$function_name.c"
+  grep -Fq '>= UINT64_C(64)' "$TMP_DIR/$function_name.c"
+done
+
+# Slice extraction has the same C-definedness obligation as a right shift.
+# Proved starts use a direct shift; an unknown start uses the safe primitive.
+for function_name in path_proven_slice predicate_proven_slice; do
+  awk -v function_name="$function_name" '
+    $0 ~ "^uint64_t z" function_name "\\(" { printing = 1 }
+    printing { print }
+    printing && /^}/ { printing = 0 }
+  ' "$TMP_DIR/model.c" > "$TMP_DIR/$function_name.c"
+  if grep -Fq 'safe_rshift(zvalue, zstart)' "$TMP_DIR/$function_name.c"; then
+    echo "$function_name retained a safe slice shift despite a semantic path proof" >&2
+    exit 1
+  fi
+done
+grep -Fq 'zforwarded_is_tiny_u64(zstart)' "$TMP_DIR/predicate_proven_slice.c"
+awk '
+  /^uint64_t zunknown_slice\(/ { printing = 1 }
+  printing { print }
+  printing && /^}/ { printing = 0 }
+' "$TMP_DIR/model.c" > "$TMP_DIR/unknown_slice.c"
+grep -Fq 'safe_rshift(zvalue, zstart)' "$TMP_DIR/unknown_slice.c"
 
 # A saved condition is valid across unrelated instructions, but writing one
 # of its operands invalidates it. The replacement value is unconstrained, so

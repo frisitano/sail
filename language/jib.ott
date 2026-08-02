@@ -176,11 +176,13 @@ op :: '' ::=
 % The width records the carrier used when discharging that obligation.
   | proven_bvshiftl nat :: :: proven_bvshiftl
   | proven_bvshiftr nat :: :: proven_bvshiftr
+  | proven_bvarith_shiftr nat :: :: proven_bvarith_shiftr
   | bvaccess          :: :: bvaccess
   | concat            :: :: concat
   | zero_extend nat   :: :: zero_extend
   | sign_extend nat   :: :: sign_extend
   | slice nat         :: :: slice
+  | proven_slice nat0 nat1 :: :: proven_slice
   | sslice nat        :: :: sslice
   | set_slice         :: :: set_slice
   | replicate nat     :: :: replicate

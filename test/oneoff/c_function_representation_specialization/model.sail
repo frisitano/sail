@@ -340,6 +340,37 @@ function comparison_fold_after_mutation(value : full_u64, replacement : full_u64
   else current
 }
 
+function path_proven_shift_left(value : bits(32), amount : full_u64) -> bits(32) =
+  if amount < 64 then sail_shiftleft(value, amount) else value
+
+function path_proven_shift_right(value : bits(32), amount : full_u64) -> bits(32) =
+  if amount < 64 then sail_shiftright(value, amount) else value
+
+function path_proven_arith_shift_right(value : bits(32), amount : full_u64) -> bits(32) =
+  if amount < 64 then sail_arith_shiftright(value, amount) else value
+
+function predicate_proven_shift_left(value : bits(32), amount : full_u64) -> bits(32) =
+  if forwarded_is_tiny_u64(amount) then sail_shiftleft(value, amount) else value
+
+function unknown_shift_left(value : bits(32), amount : full_u64) -> bits(32) =
+  sail_shiftleft(value, amount)
+
+function invalidated_shift_left(value : bits(32), amount : full_u64, replacement : full_u64) -> bits(32) = {
+  var current : full_u64 = amount;
+  let in_range = current < 64;
+  current = replacement;
+  if in_range then sail_shiftleft(value, current) else value
+}
+
+function path_proven_slice(value : bits(32), start : full_u64) -> bits(8) =
+  if start < 64 then slice(value, start, 8) else 0x00
+
+function predicate_proven_slice(value : bits(32), start : full_u64) -> bits(8) =
+  if forwarded_is_tiny_u64(start) then slice(value, start, 8) else 0x00
+
+function unknown_slice(value : bits(32), start : full_u64) -> bits(8) =
+  slice(value, start, 8)
+
 function invalidated_u64_square(value : full_u64, replacement : full_u64) -> nat = {
   var current : full_u64 = value;
   let fits_in_tiny = current <= 8;

@@ -224,12 +224,20 @@ for function_name in byte_unsigned_extend_truncate_roundtrip byte_sign_extend_tr
     exit 1
   fi
 done
-assert_native_function word_truncate_byte 'safe_rshift(UINT64_MAX, 64 - 8)'
+assert_native_function word_truncate_byte 'UINT64_C(0xFF)'
+if grep -Fq 'safe_rshift(zvalue' "$TMP_DIR/word_truncate_byte.body"; then
+  echo 'word_truncate_byte retained a generic slice helper for a proven start' >&2
+  exit 1
+fi
 assert_native_function byte_sign_widen 'fast_sign_extend(zvalue, 8, 16)'
-assert_native_function byte_unsigned_extend_truncate_seven 'safe_rshift(UINT64_MAX, 64 - 7)'
+assert_native_function byte_unsigned_extend_truncate_seven 'UINT64_C(0x7F)'
 assert_native_function byte_sign_extend_truncate_nine 'fast_sign_extend(zvalue, 8, 16)'
-grep -Fq 'safe_rshift(UINT64_MAX, 64 - 9)' "$TMP_DIR/byte_sign_extend_truncate_nine.body"
-assert_native_function byte_arith_shift_right 'safe_rshift(zvalue, zamount)'
+grep -Fq 'UINT64_C(0x1FF)' "$TMP_DIR/byte_sign_extend_truncate_nine.body"
+assert_native_function byte_arith_shift_right '(zvalue >> zamount)'
+if grep -Eq 'safe_rshift|>= UINT64_C\(8\)' "$TMP_DIR/byte_arith_shift_right.body"; then
+  echo 'byte_arith_shift_right retained a generic C guard for a proven count' >&2
+  exit 1
+fi
 
 # Result-bound facts remain attached to calls even when the source and clone
 # ABIs are both bits(64).  Equal proof partitions are shared, while the

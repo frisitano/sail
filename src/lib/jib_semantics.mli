@@ -119,6 +119,12 @@ val prove_conversion_low_bits : source_width:int -> target_width:int -> semantic
 val prove_shift_count_bounds :
   env:Env.t -> index:int -> typ:typ -> interval:integer_interval option -> carrier_width:int -> semantic_proof option
 
+(** Prove a defined native shift directly from an inferred interval. This is
+    used after path analysis, when the source Sail type is no longer attached
+    to the JIB value but the branch-refined semantic interval is available. *)
+val prove_shift_count_interval :
+  index:int -> interval:integer_interval option -> carrier_width:int -> semantic_proof option
+
 val has_argument_le : left:int -> right:int -> semantic_proof list -> bool
 val has_argument_bounds : index:int -> lower:Nat_big_num.num -> upper:Nat_big_num.num -> semantic_proof list -> bool
 val has_result_bounds : lower:Nat_big_num.num -> upper:Nat_big_num.num -> semantic_proof list -> bool

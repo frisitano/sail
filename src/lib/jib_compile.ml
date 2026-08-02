@@ -3297,7 +3297,7 @@ module Make (C : CONFIG) = struct
         in
         Option.fold ~none:(ctyp_integer_lifetime ctyp)
           ~some:(fun value -> Lifetime_range (value, value)) value
-    | V_call (Slice width, [source; start]) ->
+    | V_call ((Slice width | Proven_slice (width, _)), [source; start]) ->
         let source = integer_lifetime_interval (cval_integer_lifetime ranges source) in
         let start = integer_lifetime_interval (cval_integer_lifetime ranges start) in
         Option.fold ~none:Lifetime_top ~some:(fun (lower, upper) -> Lifetime_range (lower, upper))
@@ -6120,6 +6120,45 @@ module Make (C : CONFIG) = struct
         )
       | instr -> instr
     in
+    let specialize_proven_bitvector_shift lifetime_ranges = function
+      | I_aux (I_copy (result, V_call ((Bvshiftl | Bvshiftr | Bvarith_shiftr as op), [value; amount])), aux)
+        as instr -> (
+          match cval_ctyp value with
+          | CT_fbits width when 0 < width && width <= 64 ->
+              let interval = integer_lifetime_interval (cval_integer_lifetime lifetime_ranges amount) in
+              let proof = Jib_semantics.prove_shift_count_interval ~index:1 ~interval ~carrier_width:64 in
+              if Jib_semantics.has_shift_count_bounds ~index:1 ~carrier_width:64 (Option.to_list proof) then
+                let op =
+                  match op with
+                  | Bvshiftl -> Proven_bvshiftl 64
+                  | Bvshiftr -> Proven_bvshiftr 64
+                  | Bvarith_shiftr -> Proven_bvarith_shiftr 64
+                  | _ -> assert false
+                in
+                I_aux (I_copy (result, V_call (op, [value; amount])), aux)
+              else instr
+          | _ -> instr
+        )
+      | instr -> instr
+    in
+    let specialize_proven_bitvector_slice lifetime_ranges = function
+      | I_aux (I_copy (result, V_call (Slice width, [value; start])), aux) as instr -> (
+          let scalar_source =
+            match cval_ctyp value with
+            | CT_fbits source_width -> 0 < source_width && source_width <= 64
+            | CT_sbits 64 | CT_fuint _ -> true
+            | _ -> false
+          in
+          if scalar_source then
+            let interval = integer_lifetime_interval (cval_integer_lifetime lifetime_ranges start) in
+            let proof = Jib_semantics.prove_shift_count_interval ~index:1 ~interval ~carrier_width:64 in
+            if Jib_semantics.has_shift_count_bounds ~index:1 ~carrier_width:64 (Option.to_list proof) then
+              I_aux (I_copy (result, V_call (Proven_slice (width, 64), [value; start])), aux)
+            else instr
+          else instr
+        )
+      | instr -> instr
+    in
     let mixed_custom_unsigned_representations left right =
       let has_custom_unsigned_representation value =
         match cval_ctyp value with
@@ -6500,6 +6539,14 @@ module Make (C : CONFIG) = struct
                      )
                 |> List.map
                      (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                        specialize_proven_bitvector_shift
+                     )
+                |> List.map
+                     (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                        specialize_proven_bitvector_slice
+                     )
+                |> List.map
+                     (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
                         specialize_structural_integer_primitive
                      )
                 |> List.map
@@ -6597,6 +6644,14 @@ module Make (C : CONFIG) = struct
             |> List.map
                  (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
                     specialize_proven_integer_conversion
+                 )
+            |> List.map
+                 (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                    specialize_proven_bitvector_shift
+                 )
+            |> List.map
+                 (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                    specialize_proven_bitvector_slice
                  )
             |> List.map
                  (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges

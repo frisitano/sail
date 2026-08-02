@@ -1690,7 +1690,8 @@ end) : CONFIG = struct
               | "shiftr", true -> Proven_bvshiftr 64
               | "shiftl", false -> Bvshiftl
               | "shiftr", false -> Bvshiftr
-              | "arith_shiftr", _ -> Bvarith_shiftr
+              | "arith_shiftr", true -> Proven_bvarith_shiftr 64
+              | "arith_shiftr", false -> Bvarith_shiftr
               | _ -> assert false
             in
             AE_val (AV_cval (V_call (op, [value; amount]), typ))
@@ -3189,7 +3190,16 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | CT_fbits _ -> sprintf "(%s >> %s)" (sgen_cval value) (sgen_cval amount)
         | _ -> assert false
       )
-    | (Proven_bvshiftl _ | Proven_bvshiftr _), _ -> assert false
+    | Proven_bvarith_shiftr 64, [value; amount] -> (
+        match cval_ctyp value with
+        | CT_fbits width ->
+            let mask = sgen_mask width in
+            let sign = sprintf "((%s >> %d) & UINT64_C(1))" (sgen_cval value) (width - 1) in
+            sprintf "((%s >> %s) | (%s ? (%s ^ (%s >> %s)) : UINT64_C(0)))" (sgen_cval value)
+              (sgen_cval amount) sign mask mask (sgen_cval amount)
+        | _ -> assert false
+      )
+    | (Proven_bvshiftl _ | Proven_bvshiftr _ | Proven_bvarith_shiftr _), _ -> assert false
     | Bvarith_shiftr, [value; amount] -> (
         match cval_ctyp value with
         | CT_fbits width ->
@@ -3210,11 +3220,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       )
     | Slice len, [vec; start] -> (
         match cval_ctyp vec with
-        | CT_fbits _ -> sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & (%s >> %s))" len (sgen_cval vec) (sgen_cval start)
+        | CT_fbits _ ->
+            sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & safe_rshift(%s, %s))" len (sgen_cval vec)
+              (sgen_cval start)
         | CT_fuint _ ->
             sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & safe_rshift(%s, %s))" len (sgen_cval vec) (sgen_cval start)
         | CT_sbits _ ->
-            sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & (%s.bits >> %s))" len (sgen_cval vec) (sgen_cval start)
+            sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & safe_rshift(%s.bits, %s))" len (sgen_cval vec)
+              (sgen_cval start)
         | ctyp when is_c_repr_u128 ctyp ->
             let extracted = sprintf "u128_extract_u64(%s, (uint64_t)(%s))" (sgen_cval vec) (sgen_cval start) in
             if len = 64 then extracted else sprintf "(%s & %s)" (sgen_mask len) extracted
@@ -3223,6 +3236,16 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             if len = 64 then extracted else sprintf "(%s & %s)" (sgen_mask len) extracted
         | _ -> assert false
       )
+    | Proven_slice (len, 64), [vec; start] -> (
+        let extracted =
+          match cval_ctyp vec with
+          | CT_fbits _ | CT_fuint _ -> sprintf "(%s >> %s)" (sgen_cval vec) (sgen_cval start)
+          | CT_sbits _ -> sprintf "(%s.bits >> %s)" (sgen_cval vec) (sgen_cval start)
+          | _ -> assert false
+        in
+        if len = 64 then extracted else sprintf "(%s & %s)" (sgen_mask len) extracted
+      )
+    | Proven_slice _, _ -> assert false
     | Sslice 64, [vec; start; len] -> (
         match cval_ctyp vec with
         | CT_fbits _ -> sprintf "sslice(%s, %s, %s)" (sgen_cval vec) (sgen_cval start) (sgen_cval len)
@@ -3231,6 +3254,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       )
     | Set_slice, [vec; start; slice] -> (
         match (cval_ctyp vec, cval_ctyp slice) with
+        | CT_fbits _, CT_fbits 0 -> sgen_cval vec
         | CT_fbits _, CT_fbits m ->
             sprintf "((%s & ~(%s << %s)) | (%s << %s))" (sgen_cval vec) (sgen_mask m) (sgen_cval start)
               (sgen_cval slice) (sgen_cval start)

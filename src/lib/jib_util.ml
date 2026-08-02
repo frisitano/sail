@@ -192,6 +192,7 @@ let string_of_op = function
   | Bvarith_shiftr -> "@bvarith_shiftr"
   | Proven_bvshiftl n -> "@proven_bvshiftl::<" ^ string_of_int n ^ ">"
   | Proven_bvshiftr n -> "@proven_bvshiftr::<" ^ string_of_int n ^ ">"
+  | Proven_bvarith_shiftr n -> "@proven_bvarith_shiftr::<" ^ string_of_int n ^ ">"
   | Bvaccess -> "@bvaccess"
   | Ilt -> "@lt"
   | Igt -> "@gt"
@@ -217,6 +218,8 @@ let string_of_op = function
   | Zero_extend n -> "@zero_extend::<" ^ string_of_int n ^ ">"
   | Sign_extend n -> "@sign_extend::<" ^ string_of_int n ^ ">"
   | Slice n -> "@slice::<" ^ string_of_int n ^ ">"
+  | Proven_slice (n, carrier) ->
+      "@proven_slice::<" ^ string_of_int n ^ "," ^ string_of_int carrier ^ ">"
   | Sslice n -> "@sslice::<" ^ string_of_int n ^ ">"
   | Replicate n -> "@replicate::<" ^ string_of_int n ^ ">"
   | Set_slice -> "@set_slice"
@@ -1129,7 +1132,7 @@ let rec infer_call op vs =
   | Bvnot, [v] -> cval_ctyp v
   | Bvaccess, _ -> CT_fbits 1
   | ( ( Bvor | Bvand | Bvxor | Bvadd | Bvsub | Bvshiftl | Bvshiftr | Bvarith_shiftr | Proven_bvshiftl _
-      | Proven_bvshiftr _ ),
+      | Proven_bvshiftr _ | Proven_bvarith_shiftr _ ),
       [v; _] ) ->
       cval_ctyp v
   | (Ilt | Igt | Ilteq | Igteq), _ -> CT_bool
@@ -1145,7 +1148,7 @@ let rec infer_call op vs =
       | CT_fbits _ | CT_sbits _ -> CT_fbits n
       | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Invalid type for zero/sign_extend argument"
     )
-  | Slice n, [vec; _] -> (
+  | (Slice n | Proven_slice (n, _)), [vec; _] -> (
       match cval_ctyp vec with
       | CT_fbits _ | CT_sbits _ | CT_fuint _ -> CT_fbits n
       | CT_struct (id, []) when string_of_id id = "__sail_c_repr_u128" || string_of_id id = "__sail_c_repr_u256" ->
