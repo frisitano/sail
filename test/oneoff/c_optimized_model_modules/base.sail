@@ -5,6 +5,7 @@ $include <prelude.sail>
 type byte = range(0, 255)
 type word = range(0, 4294967295)
 type fixed_index = range(0, 16)
+type four_index = range(0, 3)
 type maybe_fixed_index = range(0, 17)
 type fixed_id = range(0, 256)
 

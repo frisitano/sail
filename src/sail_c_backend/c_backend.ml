@@ -2723,6 +2723,10 @@ type file_doc =
   (* Pure static utility functions created for the model's types, e.g. to initialise
      enums, access vector elements, etc. These don't have corresponding declarations. *)
   | StaticFunctionDefinition of document
+  (* A static type helper selected by a generated function body.  Modular
+     emission uses the symbolic helper name to keep the definition only in
+     translation units whose typed JIB lowering actually selected it. *)
+  | DemandedStaticFunctionDefinition of string * document
 
 module type CODEGEN_CONFIG = sig
   val includes : string list
@@ -2770,6 +2774,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let requested_modules : (string * c_module list) option ref = ref None
   let generated_modules : c_module_output list option ref = ref None
   let emitted_external_functions = ref Util.StringSet.empty
+  let current_static_helper_demands = ref Util.StringSet.empty
 
   let has_prefix prefix s =
     if String.length s < String.length prefix then false else String.sub s 0 (String.length prefix) = prefix
@@ -4265,6 +4270,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
               sgen_cval value
           | _ -> default_c_args
         in
+        current_static_helper_demands := Util.StringSet.add fname !current_static_helper_demands;
         if is_extern && raw_fname <> "__sail_fixed_assert" && fname <> "reg_deref" then
           emitted_external_functions := Util.StringSet.add fname !emitted_external_functions;
         if raw_fname = "__sail_fixed_assert" then (
@@ -6779,17 +6785,33 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         c_function ~return:"static void" (ksprintf string "length_%s(sail_int *rop, %s op)" name name)
           [c_stmt "mpz_set_ui(*rop, (unsigned long int)op.len)"]
       in
+      let static_helper helper_name doc =
+        if Config.optimized_model && stack_elem then DemandedStaticFunctionDefinition (helper_name, doc)
+        else StaticFunctionDefinition doc
+      in
       generated := IdSet.add key !generated;
       [TypeDeclaration typedef]
       @ (if stack_elem then [] else List.map (fun d -> StaticFunctionDefinition d) [create; clear; recreate; copy])
       @ (if !emit_generic_sail_int_helpers then
            List.map (fun d -> StaticFunctionDefinition d) [vector_init; vector_access; vector_update; undefined; vector_length]
          else [])
-      @ List.map (fun d -> StaticFunctionDefinition d)
-          [init "fast_vector_init" "int64_t" "n"; init "fast_unsigned_vector_init" "uint64_t" "n";
-           access "fast_vector_access" "int64_t"; access "fast_unsigned_vector_access" "uint64_t";
-           update "fast_vector_update" "int64_t" "n";
-           update "fast_unsigned_vector_update" "uint64_t" "n"; equal; internal_update; internal_init]
+      @ [
+          static_helper ("fast_vector_init_" ^ name) (init "fast_vector_init" "int64_t" "n");
+          static_helper
+            ("fast_unsigned_vector_init_" ^ name)
+            (init "fast_unsigned_vector_init" "uint64_t" "n");
+          static_helper ("fast_vector_access_" ^ name) (access "fast_vector_access" "int64_t");
+          static_helper
+            ("fast_unsigned_vector_access_" ^ name)
+            (access "fast_unsigned_vector_access" "uint64_t");
+          static_helper ("fast_vector_update_" ^ name) (update "fast_vector_update" "int64_t" "n");
+          static_helper
+            ("fast_unsigned_vector_update_" ^ name)
+            (update "fast_unsigned_vector_update" "uint64_t" "n");
+          static_helper ("eq_" ^ name) equal;
+          static_helper ("internal_vector_update_" ^ name) internal_update;
+          static_helper ("internal_vector_init_" ^ name) internal_init;
+        ]
     )
 
   let codegen_vector ctx ctyp =
@@ -7295,6 +7317,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         | VariableDeclaration doc -> { acc with var_decl = acc.var_decl ^^ doc ^^ twice hardline }
         | VariableDefinition doc -> { acc with var_def = acc.var_def ^^ doc ^^ twice hardline }
         | StaticFunctionDefinition doc -> { acc with static_func_def = acc.static_func_def ^^ doc ^^ twice hardline }
+        | DemandedStaticFunctionDefinition (_, doc) ->
+            { acc with static_func_def = acc.static_func_def ^^ doc ^^ twice hardline }
         )
       {
         type_decl = empty;
@@ -7810,6 +7834,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
 
       generated := IdSet.empty;
       emitted_external_functions := Util.StringSet.empty;
+      current_static_helper_demands := Util.StringSet.empty;
       readable_ctyp_names := CTMap.empty;
       readable_ctyp_names_used := Util.StringSet.empty;
       if Config.no_mangle then (
@@ -7934,25 +7959,43 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       in
 
       log_phase "generating C definitions=%d" (List.length cdefs);
-      let docs_by_definition = List.map (fun cdef -> (cdef, codegen_def ctx cdef)) cdefs in
+      let codegen_with_helper_demands generate =
+        current_static_helper_demands := Util.StringSet.empty;
+        let docs = generate () in
+        (docs, !current_static_helper_demands)
+      in
+      let docs_by_definition =
+        List.map
+          (fun cdef ->
+            let docs, helper_demands = codegen_with_helper_demands (fun () -> codegen_def ctx cdef) in
+            (cdef, docs, helper_demands)
+          )
+          cdefs
+      in
       let docs_by_definition =
         if Config.optimized_model then
           List.map
-            (fun ((CDEF_aux (cdef, _) as annotated), docs) ->
+            (fun ((CDEF_aux (cdef, _) as annotated), docs, helper_demands) ->
               match cdef with
               | CDEF_val (id, _, _, _, extern) when Option.is_some extern || ctx_is_extern id ctx ->
                   let function_name = match extern with Some name -> name | None -> ctx_get_extern id ctx in
-                  if Util.StringSet.mem function_name !emitted_external_functions then (annotated, docs)
-                  else (annotated, [])
-              | CDEF_val _ -> (annotated, docs)
-              | _ -> (annotated, docs)
+                  if Util.StringSet.mem function_name !emitted_external_functions then
+                    (annotated, docs, helper_demands)
+                  else (annotated, [], helper_demands)
+              | CDEF_val _ -> (annotated, docs, helper_demands)
+              | _ -> (annotated, docs, helper_demands)
             )
             docs_by_definition
         else docs_by_definition
       in
-      let definition_docs = List.concat (List.map snd docs_by_definition) in
-      let model_docs = gen_model_init_fini ctx cdefs in
-      let unit_test_docs = if Config.optimized_model then [] else gen_unit_test_defs ctx cdefs in
+      let definition_docs = List.concat (List.map (fun (_, docs, _) -> docs) docs_by_definition) in
+      let model_docs, model_helper_demands =
+        codegen_with_helper_demands (fun () -> gen_model_init_fini ctx cdefs)
+      in
+      let unit_test_docs, unit_test_helper_demands =
+        if Config.optimized_model then ([], Util.StringSet.empty)
+        else codegen_with_helper_demands (fun () -> gen_unit_test_defs ctx cdefs)
+      in
       let docs = definition_docs @ model_docs @ unit_test_docs in
       let docs = if Config.cpp then docs @ gen_constructor_destructor ctx cdefs else docs in
 
@@ -8183,16 +8226,36 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       | Some (package, _) ->
           let modules, module_index = Option.get modular_layout in
           let module_docs = Array.make (Array.length modules) [] in
+          let module_helper_demands = Array.make (Array.length modules) Util.StringSet.empty in
+          let demanded_helper_definitions =
+            List.filter_map
+              (function DemandedStaticFunctionDefinition (name, doc) -> Some (name, doc) | _ -> None)
+              docs
+          in
+          let ordinary_docs =
+            List.filter (function DemandedStaticFunctionDefinition _ -> false | _ -> true) docs
+          in
           List.iter
-            (fun (annotated, docs) ->
+            (fun (annotated, docs, helper_demands) ->
               let index = module_index annotated in
-              module_docs.(index) <- List.rev_append docs module_docs.(index)
+              let docs =
+                List.filter (function DemandedStaticFunctionDefinition _ -> false | _ -> true) docs
+              in
+              module_docs.(index) <- List.rev_append docs module_docs.(index);
+              module_helper_demands.(index) <-
+                Util.StringSet.union helper_demands module_helper_demands.(index)
             )
             docs_by_definition;
           Array.iteri (fun index docs -> module_docs.(index) <- List.rev docs) module_docs;
-          if Array.length modules > 0 then
+          if Array.length modules > 0 then (
             module_docs.(Array.length modules - 1) <- module_docs.(Array.length modules - 1) @ model_docs @ unit_test_docs;
-          let all_static = (merge_file_docs docs).static_func_def in
+            module_helper_demands.(Array.length modules - 1) <-
+              Util.StringSet.union model_helper_demands
+                (Util.StringSet.union unit_test_helper_demands
+                   module_helper_demands.(Array.length modules - 1)
+                )
+          );
+          let all_static = (merge_file_docs ordinary_docs).static_func_def in
           let include_module stem = ksprintf string "#include \"%s/spec/%s.h\"" package stem in
           let find_required name =
             Array.to_list modules
@@ -8200,6 +8263,15 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           in
           let output_for index (mdl : c_module) =
             let split = merge_file_docs module_docs.(index) in
+            let required_static =
+              demanded_helper_definitions
+              |> List.filter_map (fun (name, doc) ->
+                     if Util.StringSet.mem name module_helper_demands.(index) then Some doc else None
+                 )
+              |> List.map (fun doc -> StaticFunctionDefinition doc)
+              |> merge_file_docs
+              |> fun docs -> docs.static_func_def
+            in
             let required_headers =
               List.filter_map
                 (fun name ->
@@ -8217,7 +8289,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             in
             let implementation_doc =
               ksprintf string "#include \"%s/spec.h\"" package
-              ^^ twice hardline ^^ all_static ^^ split.var_def ^^ split.func_def
+              ^^ twice hardline ^^ all_static ^^ required_static ^^ split.var_def ^^ split.func_def
             in
             {
               name = mdl.name;

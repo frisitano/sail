@@ -27,6 +27,7 @@ cp "$TEST_DIR/host-sentinel.txt" "$HOST_INCLUDE/sentinel.txt"
   --c-preserve-type pair --c-preserve-type four_bytes --c-preserve-type fixed_ids \
   --c-preserve run --c-preserve step --c-preserve pick_fixed_id --c-preserve pick_initialized_id \
   --c-preserve pick_guarded_id \
+  --c-preserve machine_pick_zero \
   --c-preserve catch_byte \
   "$TEST_DIR/model.sail_project"
 
@@ -74,6 +75,23 @@ if grep -Eq '(fast_)?(unsigned_)?vector_access_' "$TMP_DIR/proved_fixed_vector_a
   echo 'proved fixed-vector access retained an out-of-line helper call' >&2
   exit 1
 fi
+
+# Helper demand is recorded while lowering each module's typed JIB calls.  The
+# vector-17 construction helpers are needed by base.c and vector-4 helpers by
+# machine.c. Definitions follow the module that selects them, not the source
+# module that happened to declare the carrier type.
+grep -Fq 'internal_vector_init_vector_17_uint_16' "$SPEC_SOURCE/base.c"
+grep -Fq 'internal_vector_update_vector_17_uint_16' "$SPEC_SOURCE/base.c"
+test "$(grep -Ec '^static .*vector_' "$SPEC_SOURCE/base.c")" -eq 2
+grep -Fq 'internal_vector_init_vector_4_uint_8' "$SPEC_SOURCE/machine.c"
+grep -Fq 'internal_vector_update_vector_4_uint_8' "$SPEC_SOURCE/machine.c"
+test "$(grep -Ec '^static .*vector_' "$SPEC_SOURCE/machine.c")" -eq 2
+for module in host_contracts entry; do
+  if grep -Eq '^static .*vector_|^static bool EQUAL\(vector_' "$SPEC_SOURCE/$module.c"; then
+    echo "unrelated module $module contains a fixed-vector helper definition" >&2
+    exit 1
+  fi
+done
 
 for source in "$SPEC_SOURCE"/*.c; do
   "$CC" ${CFLAGS:-} -std=c11 -Wall -I "$SPEC_INCLUDE" -c "$source" -o "$TMP_DIR/$(basename "$source" .c).o"
