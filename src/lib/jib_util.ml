@@ -193,6 +193,8 @@ let string_of_op = function
   | Proven_bvshiftl n -> "@proven_bvshiftl::<" ^ string_of_int n ^ ">"
   | Proven_bvshiftr n -> "@proven_bvshiftr::<" ^ string_of_int n ^ ">"
   | Proven_bvarith_shiftr n -> "@proven_bvarith_shiftr::<" ^ string_of_int n ^ ">"
+  | Bvrotr (width, amount) ->
+      "@bvrotr::<" ^ string_of_int width ^ "," ^ string_of_int amount ^ ">"
   | Bvaccess -> "@bvaccess"
   | Ilt -> "@lt"
   | Igt -> "@gt"
@@ -1135,6 +1137,7 @@ let rec infer_call op vs =
       | Proven_bvshiftr _ | Proven_bvarith_shiftr _ ),
       [v; _] ) ->
       cval_ctyp v
+  | Bvrotr (width, _), [_] -> CT_fbits width
   | (Ilt | Igt | Ilteq | Igteq), _ -> CT_bool
   | (Widening_iadd (_, result_ctyp) | Widening_imul (_, result_ctyp)), [_; _] -> result_ctyp
   | ( ( Iadd | Proven_iadd | Proven_isub | Proven_imul | Proven_idiv | Proven_imod | Wrapping_iadd _ | Wrapping_isub _

@@ -66,6 +66,7 @@ run_sail --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
   --c-preserve multiply_masked_bytes \
   --c-preserve multiply_sliced_bytes \
   --c-preserve multiply_concatenated_bytes \
+  --c-preserve concatenate_distinct_sources \
   --c-preserve multiply_inserted_byte \
   --c-preserve address_equal \
   --c-preserve address_equal_vector \
@@ -246,6 +247,18 @@ assert_native_function multiply_bit_words 'u128_mul_u64_u64('
 assert_native_function multiply_masked_bytes 'zmultiply_bit_wordszIrepr'
 assert_native_function multiply_sliced_bytes 'zmultiply_bit_wordszIrepr'
 assert_native_function multiply_concatenated_bytes 'zmultiply_bit_wordszIrepr'
+grep -Fq 'zvalue & UINT64_C(0xFFFF)' "$TMP_DIR/multiply_concatenated_bytes.body"
+grep -Fq '>> 8' "$TMP_DIR/multiply_concatenated_bytes.body"
+grep -Fq '<< 8' "$TMP_DIR/multiply_concatenated_bytes.body"
+if grep -Fq 'UINT64_C(0xFF) &' "$TMP_DIR/multiply_concatenated_bytes.body"; then
+  echo 'multiply_concatenated_bytes retained its private slice/concat web' >&2
+  exit 1
+fi
+assert_native_function concatenate_distinct_sources '<< 8) |'
+if grep -Fq 'UINT64_C(0xFFFF)' "$TMP_DIR/concatenate_distinct_sources.body"; then
+  echo 'concatenate_distinct_sources incorrectly fused slices from distinct sources' >&2
+  exit 1
+fi
 assert_native_function multiply_inserted_byte 'zmultiply_bit_wordszIrepr'
 awk '
   /^sail_u128 zmultiply_bit_wordszIrepr/ { printing = 1 }

@@ -2325,6 +2325,163 @@ let drop_redundant_to_bytes_mask =
     | cdef -> cdef
     )
 
+(* Fixed-bitvector primitives are materialized by ANF lowering before this
+   point, so recognize reconstructions by following their JIB def/use web.  A
+   pair [slice source 0; slice source n; concat] denotes a rotate of the low
+   fixed-width word when the slice temporaries are private and the source is
+   unchanged.  Recording that fact as [Bvrotr] keeps the proof-bearing rewrite
+   independent of the final C spelling. *)
+let fuse_fixed_bitvector_webs cdefs =
+  let fusions = ref 0 in
+  let rec rewrite instrs =
+    let instrs =
+      List.map
+        (function
+          | I_aux (I_block body, aux) -> I_aux (I_block (rewrite body), aux)
+          | I_aux (I_try_block body, aux) -> I_aux (I_try_block (rewrite body), aux)
+          | I_aux (I_if (condition, then_body, else_body), aux) ->
+              I_aux (I_if (condition, rewrite then_body, rewrite else_body), aux)
+          | instr -> instr
+        )
+        instrs
+    in
+    let instructions = Array.of_list instrs in
+    let count = Array.length instructions in
+    let literal_index = function
+      | V_lit (VL_int value, _)
+        when Big_int.less_equal Big_int.zero value
+             && Big_int.less_equal value (Big_int.of_int Stdlib.max_int) ->
+          Some (Big_int.to_int value)
+      | _ -> None
+    in
+    let slice_definitions =
+      Array.fold_left
+        (fun (index, definitions) (I_aux (instr, _)) ->
+          let definitions =
+            match instr with
+            | I_copy (CL_id (name, _), V_call ((Slice width | Proven_slice (width, _)), [source; start])) -> (
+                match literal_index start with
+                | Some start -> NameMap.add name (index, width, source, start) definitions
+                | None -> definitions
+              )
+            | _ -> definitions
+          in
+          (index + 1, definitions)
+        )
+        (0, NameMap.empty) instructions
+      |> snd
+    in
+    let owns_lifecycle name = function
+      | I_aux
+          ((I_decl (_, candidate) | I_reset (_, candidate) | I_clear (_, candidate) | I_init (_, candidate, _)), _)
+        ->
+          Name.compare name candidate = 0
+      | _ -> false
+    in
+    let private_slice_temporary name definition_index concat_index =
+      let rec loop index =
+        if index = count then true
+        else
+          let instr = instructions.(index) in
+          let allowed =
+            index = definition_index || index = concat_index || owns_lifecycle name instr
+            || not (NameSet.mem name (instr_ids ~direct:false instr))
+          in
+          allowed && loop (index + 1)
+      in
+      loop 0
+    in
+    let source_is_stable source first last =
+      match source with
+      | V_id (source_name, _) ->
+          let rec loop index =
+            index >= last
+            ||
+            (not (NameSet.mem source_name (instr_writes ~direct:false instructions.(index)))
+            && loop (index + 1)
+            )
+          in
+          loop (first + 1)
+      | V_lit _ -> true
+      | _ -> false
+    in
+    let same_source left right =
+      match (left, right) with
+      | V_id (left_name, left_ctyp), V_id (right_name, right_ctyp) ->
+          Name.compare left_name right_name = 0 && ctyp_equal left_ctyp right_ctyp
+      | V_lit (left_lit, left_ctyp), V_lit (right_lit, right_ctyp) ->
+          Stdlib.compare left_lit right_lit = 0 && ctyp_equal left_ctyp right_ctyp
+      | _ -> false
+    in
+    let replacements = Hashtbl.create 2 in
+    let removed = ref NameSet.empty in
+    Array.iteri
+      (fun concat_index (I_aux (instr, aux)) ->
+        match instr with
+        | I_copy (destination, V_call (Concat, [V_id (left_name, _); V_id (right_name, _)])) -> (
+            match (NameMap.find_opt left_name slice_definitions, NameMap.find_opt right_name slice_definitions) with
+            | ( Some (left_index, left_width, left_source, left_start),
+                Some (right_index, right_width, right_source, right_start) ) ->
+                let result_width = left_width + right_width in
+                let source_width = match cval_ctyp left_source with CT_fbits width -> Some width | _ -> None in
+                let semantic_rotation =
+                  left_start = 0 && right_start = left_width && 0 < left_width && 0 < right_width
+                in
+                let definitions_precede_use = left_index < concat_index && right_index < concat_index in
+                let web_is_private =
+                  private_slice_temporary left_name left_index concat_index
+                  && private_slice_temporary right_name right_index concat_index
+                in
+                let sources_match = same_source left_source right_source in
+                let source_is_wide_enough =
+                  match source_width with Some width -> result_width <= width && result_width <= 64 | None -> false
+                in
+                let stable_source = source_is_stable left_source (min left_index right_index) concat_index in
+                if
+                  semantic_rotation && definitions_precede_use && web_is_private && sources_match
+                  && source_is_wide_enough && stable_source
+                  && ctyp_equal (clexp_ctyp destination) (CT_fbits result_width)
+                then (
+                  Hashtbl.add replacements concat_index
+                    (I_aux (I_copy (destination, V_call (Bvrotr (result_width, left_width), [left_source])), aux));
+                  removed := NameSet.add left_name (NameSet.add right_name !removed);
+                  incr fusions
+                )
+            | _ -> ()
+          )
+        | _ -> ()
+      )
+      instructions;
+    Array.to_list instructions
+    |> List.mapi (fun index instr ->
+           match Hashtbl.find_opt replacements index with
+           | Some replacement -> Some replacement
+           | None -> (
+               match instr with
+               | I_aux
+                   ( ( I_decl (_, name) | I_reset (_, name) | I_clear (_, name)
+                     | I_init (_, name, _) ),
+                     _
+                   )
+                 when NameSet.mem name !removed ->
+                   None
+               | I_aux (I_copy (CL_id (name, _), _), _) when NameSet.mem name !removed -> None
+               | _ -> Some instr
+             )
+       )
+    |> List.filter_map Fun.id
+  in
+  let cdefs =
+    List.map
+      (function
+        | CDEF_aux (CDEF_fundef (id, return, args, body), annot) ->
+            CDEF_aux (CDEF_fundef (id, return, args, rewrite body), annot)
+        | cdef -> cdef
+      )
+      cdefs
+  in
+  (cdefs, !fusions)
+
 let optimize ~have_rts ~specialize_c ctx recursive_functions cdefs =
   let nothing cdefs = cdefs in
   cdefs
@@ -3200,6 +3357,16 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | _ -> assert false
       )
     | (Proven_bvshiftl _ | Proven_bvshiftr _ | Proven_bvarith_shiftr _), _ -> assert false
+    | Bvrotr (width, amount), [value]
+      when 0 < width && width <= 64 && 0 < amount && amount < width -> (
+        match cval_ctyp value with
+        | CT_fbits source_width when width <= source_width ->
+            let masked = sprintf "(%s & %s)" (sgen_cval value) (sgen_mask width) in
+            sprintf "(((%s >> %d) | (%s << %d)) & %s)" masked amount masked (width - amount)
+              (sgen_mask width)
+        | _ -> assert false
+      )
+    | Bvrotr _, _ -> assert false
     | Bvarith_shiftr, [value; amount] -> (
         match cval_ctyp value with
         | CT_fbits width ->
@@ -7232,6 +7399,11 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       log_phase "lowered JIB definitions=%d" (List.length cdefs);
       (* let cdefs', _ = Jib_optimize.remove_tuples cdefs ctx in *)
       let cdefs = insert_heap_returns ctx Bindings.empty cdefs in
+
+      let cdefs, fixed_bitvector_fusions =
+        if Config.specialize_c then fuse_fixed_bitvector_webs cdefs else (cdefs, 0)
+      in
+      log_phase "fused fixed-bitvector webs=%d" fixed_bitvector_fusions;
 
       let recursive_functions = get_recursive_functions cdefs in
       log_phase "optimizing JIB definitions=%d recursive-functions=%d" (List.length cdefs)

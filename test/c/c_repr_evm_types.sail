@@ -264,6 +264,13 @@ function multiply_concatenated_bytes(value) = {
   multiply_bit_words(sail_zero_extend(joined, 64), sail_zero_extend(joined, 64))
 }
 
+/* The fixed-bitvector web fusion must not merge slices from distinct semantic
+   sources, even when their widths and constant offsets otherwise line up. */
+val concatenate_distinct_sources : (bits(64), bits(64)) -> bits(16)
+
+function concatenate_distinct_sources(left, right) =
+  append(left[7 .. 0], right[15 .. 8])
+
 val multiply_inserted_byte : bits(8) -> range(0, 340282366920938463426481119284349108225)
 
 function multiply_inserted_byte(value) = {

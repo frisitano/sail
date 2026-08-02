@@ -177,6 +177,7 @@ op :: '' ::=
   | proven_bvshiftl nat :: :: proven_bvshiftl
   | proven_bvshiftr nat :: :: proven_bvshiftr
   | proven_bvarith_shiftr nat :: :: proven_bvarith_shiftr
+  | bvrotr nat0 nat1 :: :: bvrotr
   | bvaccess          :: :: bvaccess
   | concat            :: :: concat
   | zero_extend nat   :: :: zero_extend
