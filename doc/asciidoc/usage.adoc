@@ -98,6 +98,28 @@ There are several Sail options that affect the C output:
     be given a finite semantic bound. Use this only for targets that require an
     entirely fixed-width integer model.
 
+* `--c-optimized-include-dir` select the include root containing handwritten
+    headers used by an optimized-model extraction.
+
+* `--c-optimized-external-type TYPE=HEADER` declare that `TYPE`'s final C
+    declaration is owned by `HEADER`, relative to the optimized include root.
+    This repeatable option requires `--c-optimized-model`. The generated module
+    headers include `HEADER` and omit Sail's declaration of `TYPE`; generated
+    functions continue to use the external type directly. Sail trusts the
+    external declaration as an ABI contract and does not parse it or emit
+    layout assertions. For example:
+
+[source,shell]
+----
+sail -c --c-optimized-model \
+  --c-optimized-include-dir ffi/optimized/include \
+  --c-optimized-external-type pair=evmsail/host/types.h \
+  model.sail_project
+----
+
+    Compile the generated sources with the same root on the C include path,
+    for example `-I ffi/optimized/include`.
+
 The structured `$target_name` directive can override a source identifier's
 generated spelling for one backend. The C backend currently supports it with
 `backend = "c"`; directives for other backends are ignored. For example:

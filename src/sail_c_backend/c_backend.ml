@@ -2747,6 +2747,7 @@ module type CODEGEN_CONFIG = sig
   val specialize_c : bool
   val require_bounded_int : bool
   val optimized_model : bool
+  val external_types : string Bindings.t
   val package_name : string
   val cpp : bool
   val cpp_class_name : string
@@ -7188,7 +7189,11 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
               );
           ]
         )
-    | CDEF_type ctype_def -> codegen_type_def ctx ctype_def
+    | CDEF_type ctype_def ->
+        let docs = codegen_type_def ctx ctype_def in
+        if Config.optimized_model && Bindings.mem (ctype_def_id ctype_def) Config.external_types then
+          List.filter (function TypeDeclaration _ -> false | _ -> true) docs
+        else docs
     | CDEF_startup (id, instrs) ->
         let startup_header =
           string (Printf.sprintf "void %sstartup_%s(void)" (class_impl_prefix ()) (sgen_function_id id))
@@ -7683,6 +7688,39 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
          calls left, then use the final program to decide whether compatibility
          helpers for generic runtime values are needed at all. *)
       let cdefs = remove_uncalled_specialized_wrappers cdefs in
+      if Config.optimized_model && not (Bindings.is_empty Config.external_types) then (
+        let type_definitions =
+          List.fold_left
+            (fun definitions -> function
+              | CDEF_aux (CDEF_type ctype_def, _) ->
+                  Bindings.add (ctype_def_id ctype_def) ctype_def definitions
+              | _ -> definitions
+            )
+            Bindings.empty cdefs
+        in
+        Bindings.iter
+          (fun id _ ->
+            match Bindings.find_opt id type_definitions with
+            | None ->
+                c_error
+                  (Printf.sprintf
+                     "external optimized-model type %s does not name a concrete type retained after specialization"
+                     (string_of_id id)
+                  )
+            | Some (CTD_abstract _) ->
+                c_error
+                  (Printf.sprintf "abstract Sail type %s cannot reuse an external C declaration" (string_of_id id))
+            | Some (CTD_struct (_, params, _) | CTD_variant (_, params, _))
+              when not (Util.list_empty params) ->
+                c_error
+                  (Printf.sprintf
+                     "polymorphic Sail type %s cannot reuse one external C declaration; map each concrete specialization"
+                     (string_of_id id)
+                  )
+            | Some _ -> ()
+          )
+          Config.external_types
+      );
       let has_sail_int = cdefs_contain ctx (function CT_lint -> true | _ -> false) cdefs in
       let has_lbits = cdefs_contain ctx (function CT_lbits -> true | _ -> false) cdefs in
       let has_sail_config = cdefs_contain ctx (function CT_json | CT_json_key -> true | _ -> false) cdefs in
@@ -8020,7 +8058,21 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         | None -> if Config.no_rts then ([], [], []) else ([], [coverage_hook_header], [no_coverage_hook])
       in
 
+      let external_type_headers =
+        Bindings.fold
+          (fun _ header headers -> Util.StringSet.add header headers)
+          Config.external_types Util.StringSet.empty
+        |> Util.StringSet.elements
+      in
+
       let preamble in_header =
+        let configured_headers =
+          (if in_header then external_type_headers @ Config.header_includes else Config.includes)
+          |> List.fold_left
+               (fun headers header -> Util.StringSet.add header headers)
+               Util.StringSet.empty
+          |> Util.StringSet.elements
+        in
         separate hardline
           (( if Config.optimized_model then
                [
@@ -8058,7 +8110,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           @ coverage_include
           @ List.map
               (fun h -> string (Printf.sprintf "#include \"%s\"" h))
-              (if in_header then Config.header_includes else Config.includes)
+              configured_headers
           @ extern_cpp_begin
           @ if in_header then coverage_hook_header else coverage_hook
           )

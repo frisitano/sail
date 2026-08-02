@@ -23,6 +23,8 @@ union exception = {
 
 function add_byte(left : byte, right : byte) -> range(0, 510) = left + right
 
+function pair_sum(value : pair) -> range(0, 510) = value.first + value.second
+
 function pick_fixed_id(index : fixed_index) -> fixed_id = {
   let ids : fixed_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 256];
   ids[index]

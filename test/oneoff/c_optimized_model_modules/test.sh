@@ -20,11 +20,15 @@ fi
 HOST_INCLUDE="$TMP_DIR/ffi/optimized/include/evmsail/host"
 mkdir -p "$HOST_INCLUDE"
 cp "$TEST_DIR/host-sentinel.txt" "$HOST_INCLUDE/sentinel.txt"
+cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
 
 "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
   --all-modules \
   --c-optimized-model --c-package evmsail --c-output-dir "$TMP_DIR/ffi/optimized" \
+  --c-optimized-include-dir "$TMP_DIR/ffi/optimized/include" \
+  --c-optimized-external-type pair=evmsail/host/types.h \
   --c-preserve-type pair --c-preserve-type four_bytes --c-preserve-type fixed_ids \
+  --c-preserve pair_sum \
   --c-preserve run --c-preserve step --c-preserve pick_fixed_id --c-preserve pick_initialized_id \
   --c-preserve pick_guarded_id \
   --c-preserve machine_pick_zero \
@@ -42,8 +46,13 @@ test -f "$SPEC_INCLUDE/evmsail/spec.h"
 cmp "$TEST_DIR/host-sentinel.txt" "$HOST_INCLUDE/sentinel.txt"
 
 grep -Fq '#include "evmsail/spec/base.h"' "$SPEC_INCLUDE/evmsail/spec.h"
+grep -Fq '#include "evmsail/host/types.h"' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint8_t' "$SPEC_INCLUDE/evmsail/spec/base.h"
-grep -Fq 'struct pair' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'uint16_t pair_sum(struct pair);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+if grep -REq 'struct pair[[:space:]]*\{' "$SPEC_INCLUDE/evmsail/spec"; then
+  echo 'optimized extraction redefined an externally owned struct' >&2
+  exit 1
+fi
 grep -Fq 'uint8_t data[4]' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint8_t catch_byte(uint8_t);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint32_t host_mix_exact(uint32_t, uint8_t);' "$SPEC_INCLUDE/evmsail/spec/host_contracts.h"
@@ -113,3 +122,31 @@ if "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
 fi
 
 grep -Eqi 'bounded|unbounded|fixed representation|optimized model' "$TMP_DIR/negative.stderr"
+
+if "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
+    --all-modules \
+    --c-optimized-model --c-package evmsail \
+    --c-output-dir "$TMP_DIR/missing-header/ffi/optimized" \
+    --c-optimized-include-dir "$TMP_DIR/ffi/optimized/include" \
+    --c-optimized-external-type pair=evmsail/host/missing.h \
+    --c-preserve-type pair "$TEST_DIR/model.sail_project" \
+    >"$TMP_DIR/missing-header.stdout" 2>"$TMP_DIR/missing-header.stderr"; then
+  echo 'optimized extraction unexpectedly accepted a missing external type header' >&2
+  exit 1
+fi
+
+grep -Fqi 'does not exist' "$TMP_DIR/missing-header.stderr"
+
+if "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
+    --all-modules \
+    --c-optimized-model --c-package evmsail \
+    --c-output-dir "$TMP_DIR/missing-type/ffi/optimized" \
+    --c-optimized-include-dir "$TMP_DIR/ffi/optimized/include" \
+    --c-optimized-external-type missing_type=evmsail/host/types.h \
+    "$TEST_DIR/model.sail_project" \
+    >"$TMP_DIR/missing-type.stdout" 2>"$TMP_DIR/missing-type.stderr"; then
+  echo 'optimized extraction unexpectedly accepted an unknown external type' >&2
+  exit 1
+fi
+
+grep -Fqi 'does not name a concrete type' "$TMP_DIR/missing-type.stderr"

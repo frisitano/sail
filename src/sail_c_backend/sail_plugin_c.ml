@@ -67,6 +67,8 @@ let opt_preserve_types = ref IdSet.empty
 let opt_specialize_c = ref false
 let opt_require_bounded_int = ref false
 let opt_optimized_model = ref false
+let opt_c_optimized_include_dir = ref None
+let opt_c_external_types : string Bindings.t ref = ref Bindings.empty
 let opt_c_package = ref "model"
 let opt_c_output_dir = ref None
 let opt_cpp_class_name = ref "Model"
@@ -131,6 +133,30 @@ let c_options =
     ( Flag.create ~prefix:["c"] "optimized_model",
       Arg.Set opt_optimized_model,
       "generate a strict allocation-free specialized C model split by Sail module"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"directory" "optimized_include_dir",
+      Arg.String (fun directory -> opt_c_optimized_include_dir := Some directory),
+      "include root containing externally supplied optimized-model type definitions"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"type=header" "optimized_external_type",
+      Arg.String
+        (fun mapping ->
+          match String.index_opt mapping '=' with
+          | None -> raise (Arg.Bad "--c-optimized-external-type expects TYPE=HEADER")
+          | Some separator ->
+              let type_name = String.sub mapping 0 separator |> String.trim in
+              let header =
+                String.sub mapping (separator + 1) (String.length mapping - separator - 1) |> String.trim
+              in
+              if type_name = "" || header = "" then
+                raise (Arg.Bad "--c-optimized-external-type expects non-empty TYPE=HEADER")
+              else
+                let id = mk_id type_name in
+                if Bindings.mem id !opt_c_external_types then
+                  raise (Arg.Bad ("duplicate external optimized-model type " ^ type_name))
+                else opt_c_external_types := Bindings.add id header !opt_c_external_types
+        ),
+      "reuse TYPE from HEADER instead of emitting its C declaration in an optimized-model build"
     );
     ( Flag.create ~prefix:["c"] ~arg:"package" "package",
       Arg.Set_string opt_c_package,
@@ -372,6 +398,50 @@ let collect_c_name_info ast (mode : c_backend_mode) =
   (!reserved, !overrides, !c_repr_unsigned, !c_repr_signed, !c_repr_u256, !c_repr_fixed_bytes)
 
 let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_sail_dir; _ } =
+  if not (Bindings.is_empty !opt_c_external_types) then (
+    if not !opt_optimized_model then
+      raise
+        (Reporting.err_general Parse_ast.Unknown
+           "--c-optimized-external-type requires --c-optimized-model"
+        );
+    let include_dir =
+      match !opt_c_optimized_include_dir with
+      | Some directory -> directory
+      | None ->
+          raise
+            (Reporting.err_general Parse_ast.Unknown
+               "--c-optimized-external-type requires --c-optimized-include-dir"
+            )
+    in
+    Bindings.iter
+      (fun id header ->
+        let escapes_include_root =
+          String.split_on_char '/' header |> List.exists (fun component -> component = "..")
+        in
+        if not (Filename.is_relative header) || escapes_include_root then
+          raise
+            (Reporting.err_general Parse_ast.Unknown
+               (Printf.sprintf
+                  "external optimized-model header for type %s must stay within --c-optimized-include-dir"
+                  (string_of_id id)
+               )
+            );
+        if String.exists (fun c -> c = '\n' || c = '\r' || c = '"') header then
+          raise
+            (Reporting.err_general Parse_ast.Unknown
+               (Printf.sprintf "invalid external optimized-model header path for type %s" (string_of_id id))
+            );
+        let path = Filename.concat include_dir header in
+        if not (Sys.file_exists path && not (Sys.is_directory path)) then
+          raise
+            (Reporting.err_general Parse_ast.Unknown
+               (Printf.sprintf "external optimized-model header for type %s does not exist: %s"
+                  (string_of_id id) path
+               )
+            )
+      )
+      !opt_c_external_types
+  );
   if !opt_optimized_model then (
     match mode with
     | C ->
@@ -412,6 +482,7 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let specialize_c = !opt_specialize_c
     let require_bounded_int = !opt_require_bounded_int
     let optimized_model = !opt_optimized_model
+    let external_types = !opt_c_external_types
     let package_name = !opt_c_package
 
     (* TODO: Convert `cpp` to use `c_backend_mode` instead of `bool`. *)

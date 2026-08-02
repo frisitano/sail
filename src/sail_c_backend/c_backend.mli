@@ -131,6 +131,10 @@ module type CODEGEN_CONFIG = sig
   (** Generate the strict, allocation-free optimized-model ABI. *)
   val optimized_model : bool
 
+  (** Nominal Sail types whose final C declaration is supplied by an external
+      header in an optimized-model build. *)
+  val external_types : string Ast_compare.Bindings.t
+
   (** Package prefix for strict optimized-model entry points. *)
   val package_name : string
 
