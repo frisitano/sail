@@ -3446,6 +3446,21 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
               )
         | _ -> sprintf "(%s %% %s)" (sgen_cval v1) (sgen_cval v2)
       )
+    | Power_of_two_idiv exponent, [value] -> (
+        match cval_ctyp value with
+        | CT_fint _ | CT_fuint _ ->
+            if exponent = 0 then sgen_cval value else sprintf "(%s >> %d)" (sgen_cval value) exponent
+        | ctyp ->
+            c_error (sprintf "Cannot lower proved power-of-two division for %s" (string_of_ctyp ctyp))
+      )
+    | Power_of_two_imod exponent, [value] -> (
+        match cval_ctyp value with
+        | CT_fint _ | CT_fuint _ ->
+            let mask = Big_int.pred (Big_int.pow_int_positive 2 exponent) in
+            sprintf "(%s & %s)" (sgen_cval value) (sgen_cval (V_lit (VL_int mask, cval_ctyp value)))
+        | ctyp ->
+            c_error (sprintf "Cannot lower proved power-of-two remainder for %s" (string_of_ctyp ctyp))
+      )
     | Unsigned width, [vec] -> sprintf "((%s) %s)" (sgen_ctyp (CT_fuint width)) (sgen_cval vec)
     | Signed 64, [vec] -> (
         match cval_ctyp vec with CT_fbits n -> sprintf "fast_signed(%s, %d)" (sgen_cval vec) n | _ -> assert false

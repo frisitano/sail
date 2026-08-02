@@ -333,6 +333,14 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
     | (Imul | Proven_imul | Widening_imul _ | Wrapping_imul _), args -> Fn ("bvmul", args)
     | (Idiv | Proven_idiv), args -> Fn ((if unsigned_integer_args then "bvudiv" else "bvsdiv"), args)
     | (Imod | Proven_imod), args -> Fn ((if unsigned_integer_args then "bvurem" else "bvsrem"), args)
+    | (Power_of_two_idiv exponent | Power_of_two_imod exponent), [arg] ->
+        let width =
+          match arg_ctyps with
+          | [CT_fint width | CT_fuint width] -> width
+          | _ -> failwith "power-of-two arithmetic requires a fixed integer"
+        in
+        let divisor = bvint width (Big_int.pow_int_positive 2 exponent) in
+        Fn ((match op with Power_of_two_idiv _ -> "bvudiv" | _ -> "bvurem"), [arg; divisor])
     | Bvnot, args -> Fn ("bvnot", args)
     | Bvor, args -> Fn ("bvor", args)
     | Bvand, args -> Fn ("bvand", args)

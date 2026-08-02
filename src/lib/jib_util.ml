@@ -206,6 +206,8 @@ let string_of_op = function
   | Proven_imul -> "@proven_imul"
   | Proven_idiv -> "@proven_idiv"
   | Proven_imod -> "@proven_imod"
+  | Power_of_two_idiv n -> "@power_of_two_idiv::<" ^ string_of_int n ^ ">"
+  | Power_of_two_imod n -> "@power_of_two_imod::<" ^ string_of_int n ^ ">"
   | Widening_iadd (n, _) -> "@widening_iadd::<" ^ string_of_int n ^ ">"
   | Widening_imul (n, _) -> "@widening_imul::<" ^ string_of_int n ^ ">"
   | Wrapping_iadd n -> "@wrapping_iadd::<" ^ string_of_int n ^ ">"
@@ -1140,6 +1142,7 @@ let rec infer_call op vs =
   | Bvrotr (width, _), [_] -> CT_fbits width
   | (Ilt | Igt | Ilteq | Igteq), _ -> CT_bool
   | (Widening_iadd (_, result_ctyp) | Widening_imul (_, result_ctyp)), [_; _] -> result_ctyp
+  | (Power_of_two_idiv _ | Power_of_two_imod _), [v] -> cval_ctyp v
   | ( ( Iadd | Proven_iadd | Proven_isub | Proven_imul | Proven_idiv | Proven_imod | Wrapping_iadd _ | Wrapping_isub _
       | Wrapping_imul _ | Isub | Imul | Idiv | Imod ),
       [v; _] ) ->

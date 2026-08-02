@@ -3404,6 +3404,22 @@ module Make (C : CONFIG) = struct
         | Bvor | Bvxor -> derived_bounds Jib_semantics.bitwise_union_result_bounds
         | _ -> ctyp_integer_lifetime (cval_ctyp call)
       )
+    | V_call (Power_of_two_idiv exponent, [value]) -> (
+        match cval_integer_lifetime ranges value with
+        | Lifetime_range (lower, upper) ->
+            let divisor = Big_int.pow_int_positive 2 exponent in
+            Lifetime_range (Big_int.div lower divisor, Big_int.div upper divisor)
+        | Lifetime_bottom -> Lifetime_bottom
+        | Lifetime_top -> Lifetime_top
+      )
+    | V_call (Power_of_two_imod exponent, [value]) -> (
+        match cval_integer_lifetime ranges value with
+        | Lifetime_range (lower, upper) ->
+            let mask = Big_int.pred (Big_int.pow_int_positive 2 exponent) in
+            Lifetime_range (Big_int.zero, Big_int.min upper mask)
+        | Lifetime_bottom -> Lifetime_bottom
+        | Lifetime_top -> Lifetime_top
+      )
     | cval -> ctyp_integer_lifetime (cval_ctyp cval)
 
   let integer_comparison_name ctx id =
@@ -5833,6 +5849,8 @@ module Make (C : CONFIG) = struct
                  (cval_integer_lifetime lifetime_ranges right)
               )
             :: representations
+        | V_call ((Power_of_two_idiv _ | Power_of_two_imod _), [value]) ->
+            represented_integer_lifetime ctx (cval_integer_lifetime lifetime_ranges value) :: representations
         | _ -> representations
       in
       let rec primitive_representations representations (I_aux (instr, (instruction, _)) as whole_instr) =
@@ -6514,6 +6532,23 @@ module Make (C : CONFIG) = struct
                       )
                     | None -> promote right_lifetime right
                   in
+                  let power_of_two_operation =
+                    match (primitive, left_lifetime, right_lifetime, carrier) with
+                    | ( (`Div | `Mod),
+                        Lifetime_range (left_lower, _),
+                        Lifetime_range (right_lower, right_upper),
+                        (CT_fint _ | CT_fuint _) )
+                      when Big_int.less_equal Big_int.zero left_lower && Big_int.equal right_lower right_upper ->
+                        Option.map
+                          (fun exponent ->
+                            match primitive with
+                            | `Div -> Power_of_two_idiv exponent
+                            | `Mod -> Power_of_two_imod exponent
+                            | `Add | `Sub | `Mul | `Ediv | `Emod -> assert false
+                          )
+                          (power_of_two_width right_lower)
+                    | _ -> None
+                  in
                   let op =
                     match (primitive, carrier) with
                     | `Add, (CT_fint _ | CT_fuint _) -> Proven_iadd
@@ -6531,7 +6566,12 @@ module Make (C : CONFIG) = struct
                     | `Ediv, _ -> Idiv
                     | `Emod, _ -> Imod
                   in
-                  let operation = V_call (op, [left; right]) in
+                  let right_setup, right_cleanup =
+                    match power_of_two_operation with Some _ -> ([], []) | None -> (right_setup, right_cleanup)
+                  in
+                  let operation =
+                    match power_of_two_operation with Some op -> V_call (op, [left]) | None -> V_call (op, [left; right])
+                  in
                   let operation_instrs =
                     if ctyp_equal (clexp_ctyp result) carrier then [I_aux (I_copy (result, operation), aux)]
                     else (

@@ -144,6 +144,11 @@ op :: '' ::=
   | proven_mul        :: :: proven_imul
   | proven_div        :: :: proven_idiv
   | proven_mod        :: :: proven_imod
+% Division/remainder by 2^N after proving a non-negative dividend and the
+% source operation's rounding semantics.  The divisor is deliberately absent
+% from the value operands: [nat] records the proved exponent.
+  | power_of_two_div nat :: :: power_of_two_idiv
+  | power_of_two_mod nat :: :: power_of_two_imod
 % Exact unsigned arithmetic whose complete mathematical result is carried in
 % an N-bit representation wider than one or both operands.  This operation
 % identity must survive lowering; the C backend may select a representation-

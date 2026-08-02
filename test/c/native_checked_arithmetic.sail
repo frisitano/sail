@@ -1,6 +1,7 @@
 default Order dec
 
 $include <prelude.sail>
+$include <smt.sail>
 
 $[c_repr uint64]
 newtype checked_u64 = Checked_u64 : nat
@@ -18,6 +19,7 @@ type small_i64_sum = range(-200, 200)
 type small_i64_product = range(-10000, 10000)
 type thirteen_u64 = range(13, 13)
 type five_u64 = range(5, 5)
+type eight_u64 = range(8, 8)
 type minus_thirteen_i64 = range(-13, -13)
 type minus_five_i64 = range(-5, -5)
 type small_i128 = range(-(2 ^ 65), 2 ^ 65)
@@ -126,6 +128,32 @@ val checked_u64_mod : (checked_u64, checked_u64) -> checked_u64
 function checked_u64_mod(Checked_u64(left), Checked_u64(right)) -> checked_u64 =
     if right == 0 then Checked_u64(0) else Checked_u64(tmod_int(left, right))
 
+val power_two_tdiv : (checked_u64, eight_u64) -> checked_u64
+
+function power_two_tdiv(Checked_u64(value), divisor) -> checked_u64 = {
+    let quotient = tdiv_int(value, divisor);
+    assert(0 <= quotient);
+    Checked_u64(quotient)
+}
+
+val power_two_tmod : (checked_u64, eight_u64) -> checked_u64
+
+function power_two_tmod(Checked_u64(value), divisor) -> checked_u64 =
+    Checked_u64(tmod_int(value, divisor))
+
+val power_two_ediv : (checked_u64, eight_u64) -> checked_u64
+
+function power_two_ediv(Checked_u64(value), divisor) -> checked_u64 = {
+    let quotient = ediv_int(value, divisor);
+    assert(0 <= quotient);
+    Checked_u64(quotient)
+}
+
+val power_two_emod : (checked_u64, eight_u64) -> checked_u64
+
+function power_two_emod(Checked_u64(value), divisor) -> checked_u64 =
+    Checked_u64(emod_int(value, divisor))
+
 /* Represented operands do not determine the representation of a wider
    mathematical result.  In particular, this subtraction may be negative. */
 val signed_u64_difference : (checked_u64, checked_u64) -> int
@@ -157,6 +185,26 @@ val checked_i64_mod : (checked_i64, checked_i64) -> checked_i64
 
 function checked_i64_mod(Checked_i64(left), Checked_i64(right)) -> checked_i64 =
     Checked_i64(tmod_int(left, right))
+
+val signed_tdiv_by_eight : (checked_i64, eight_u64) -> checked_i64
+
+function signed_tdiv_by_eight(Checked_i64(value), divisor) -> checked_i64 =
+    Checked_i64(tdiv_int(value, divisor))
+
+val signed_tmod_by_eight : (checked_i64, eight_u64) -> checked_i64
+
+function signed_tmod_by_eight(Checked_i64(value), divisor) -> checked_i64 =
+    Checked_i64(tmod_int(value, divisor))
+
+val signed_ediv_by_eight : (checked_i64, eight_u64) -> checked_i64
+
+function signed_ediv_by_eight(Checked_i64(value), divisor) -> checked_i64 =
+    Checked_i64(ediv_int(value, divisor))
+
+val signed_emod_by_eight : (checked_i64, eight_u64) -> checked_i64
+
+function signed_emod_by_eight(Checked_i64(value), divisor) -> checked_i64 =
+    Checked_i64(emod_int(value, divisor))
 
 function main() -> unit = {
     let Checked_u64(uadd) = checked_u64_add(Checked_u64(2), Checked_u64(3));

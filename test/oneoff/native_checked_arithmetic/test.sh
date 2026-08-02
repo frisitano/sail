@@ -40,8 +40,12 @@ fi
   --c-preserve checked_u64_add --c-preserve checked_u64_sub \
   --c-preserve checked_u64_mul --c-preserve checked_u64_div \
   --c-preserve checked_u64_mod --c-preserve checked_i64_add \
+  --c-preserve power_two_tdiv --c-preserve power_two_tmod \
+  --c-preserve power_two_ediv --c-preserve power_two_emod \
   --c-preserve checked_i64_sub --c-preserve checked_i64_mul \
   --c-preserve checked_i64_div --c-preserve checked_i64_mod \
+  --c-preserve signed_tdiv_by_eight --c-preserve signed_tmod_by_eight \
+  --c-preserve signed_ediv_by_eight --c-preserve signed_emod_by_eight \
   --c-preserve signed_u64_difference \
   "$TEST_DIR/../../c/native_checked_arithmetic.sail" -o "$OUT"
 
@@ -83,6 +87,58 @@ do
     $0 ~ ("^.* " target "\\(") { in_function = 1 }
     in_function && /(tdiv_int|tmod_int)/ { found_math = 1 }
     in_function && /^}/ { exit !found_math }
+    END { if (!in_function) exit 2 }
+  ' "$OUT.c"
+done
+
+# An exact semantic divisor range and a nonnegative dividend prove that both
+# truncating and Euclidean division by eight have unsigned shift/mask semantics.
+# The explicit proof-carrying JIB operations omit the divisor entirely.
+for target in zpower_two_tdiv zpower_two_ediv
+do
+  awk -v target="$target" '
+    $0 ~ ("^.* " target "\\(") { in_function = 1 }
+    in_function && />> 3/ { found_shift = 1 }
+    in_function && /[[:space:]]\/[[:space:]]/ { found_divide = 1 }
+    in_function && /^}/ { exit !found_shift || found_divide }
+    END { if (!in_function) exit 2 }
+  ' "$OUT.c"
+done
+for target in zpower_two_tmod zpower_two_emod
+do
+  awk -v target="$target" '
+    $0 ~ ("^.* " target "\\(") { in_function = 1 }
+    in_function && /& .*UINT64_C\(7\)/ { found_mask = 1 }
+    in_function && /[[:space:]]%[[:space:]]/ { found_remainder = 1 }
+    in_function && /^}/ { exit !found_mask || found_remainder }
+    END { if (!in_function) exit 2 }
+  ' "$OUT.c"
+done
+
+# A fixed signed representation does not prove a nonnegative dividend.
+# Truncating operations keep C's signed rounding semantics, while Euclidean
+# operations retain their mathematical helpers rather than being rewritten.
+awk '
+  /^int64_t zsigned_tdiv_by_eight\(/ { in_function = 1 }
+  in_function && /\/.*UINT8_C\(8\)/ { found_divide = 1 }
+  in_function && />> 3/ { found_shift = 1 }
+  in_function && /^}/ { exit !found_divide || found_shift }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+awk '
+  /^int64_t zsigned_tmod_by_eight\(/ { in_function = 1 }
+  in_function && /%.*UINT8_C\(8\)/ { found_remainder = 1 }
+  in_function && /UINT64_C\(7\)/ { found_mask = 1 }
+  in_function && /^}/ { exit !found_remainder || found_mask }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+for target in zsigned_ediv_by_eight zsigned_emod_by_eight
+do
+  awk -v target="$target" '
+    $0 ~ ("^.* " target "\\(") { in_function = 1 }
+    in_function && /(ediv_int|emod_int)/ { found_math = 1 }
+    in_function && /(>> 3|UINT64_C\(7\))/ { found_strength_reduction = 1 }
+    in_function && /^}/ { exit !found_math || found_strength_reduction }
     END { if (!in_function) exit 2 }
   ' "$OUT.c"
 done
