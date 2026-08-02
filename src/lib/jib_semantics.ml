@@ -112,6 +112,15 @@ let unsigned_width value =
     Some (width 0 value)
   )
 
+let prove_low_mask_width ~carrier_width ~mask =
+  if carrier_width <= 0 || Big_int.less_equal mask Big_int.zero then None
+  else
+    Option.bind (unsigned_width mask) (fun width ->
+        match fixed_unsigned_bounds width with
+        | Some (_, expected) when width <= carrier_width && Big_int.equal mask expected -> Some width
+        | Some _ | None -> None
+    )
+
 let unsigned_cover upper = Option.bind (unsigned_width upper) (fun width -> fixed_unsigned_bounds width)
 
 let slice_result_bounds ~width ~source ~start =

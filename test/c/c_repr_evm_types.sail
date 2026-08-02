@@ -252,6 +252,13 @@ function multiply_masked_bytes(value) = {
   multiply_bit_words(value & mask, sail_shiftright(value, 8) & mask)
 }
 
+/* A non-contiguous mask is not a low-bit slice certificate.  It must remain
+   an ordinary shift-and-mask web even though its shift count is defined. */
+val shift_noncontiguous_mask : bits(64) -> bits(64)
+
+function shift_noncontiguous_mask(value) =
+  sail_shiftright(value, 8) & 0x00000000000000F5
+
 val multiply_sliced_bytes : bits(64) -> range(0, 340282366920938463426481119284349108225)
 
 function multiply_sliced_bytes(value) =

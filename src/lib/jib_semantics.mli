@@ -38,6 +38,11 @@ val bindings : t -> evidence list
 (** Inclusive bounds for an unsigned value represented by exactly [width] bits. *)
 val fixed_unsigned_bounds : int -> integer_interval option
 
+(** Structurally prove that [mask] is exactly the low [n] one-bits of a
+    [carrier_width]-bit unsigned word, returning [n]. Zero, negative,
+    non-contiguous, and over-wide masks are rejected. *)
+val prove_low_mask_width : carrier_width:int -> mask:Nat_big_num.num -> int option
+
 (** Refine the inclusive bounds of both operands on one edge of an integer
     comparison. [None] means the edge is infeasible. This is a semantic range
     operation and deliberately does not select a target representation. *)

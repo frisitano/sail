@@ -2326,33 +2326,73 @@ let drop_redundant_to_bytes_mask =
     )
 
 (* Fixed-bitvector primitives are materialized by ANF lowering before this
-   point, so recognize reconstructions by following their JIB def/use web.  A
-   pair [slice source 0; slice source n; concat] denotes a rotate of the low
-   fixed-width word when the slice temporaries are private and the source is
-   unchanged.  Recording that fact as [Bvrotr] keeps the proof-bearing rewrite
-   independent of the final C spelling. *)
+   point, so recognize compatible operations by following their JIB def/use
+   webs.  Record the proved semantic operation explicitly before backend
+   cleanup, rather than reconstructing it from the final C spelling. *)
 let fuse_fixed_bitvector_webs cdefs =
   let fusions = ref 0 in
-  let rec rewrite instrs =
-    let instrs =
-      List.map
-        (function
-          | I_aux (I_block body, aux) -> I_aux (I_block (rewrite body), aux)
-          | I_aux (I_try_block body, aux) -> I_aux (I_try_block (rewrite body), aux)
-          | I_aux (I_if (condition, then_body, else_body), aux) ->
-              I_aux (I_if (condition, rewrite then_body, rewrite else_body), aux)
-          | instr -> instr
+  let rec rewrite inherited_literals instrs =
+    (* JIB introduces nested blocks around ANF fragments, while immutable Sail
+       bindings can be defined in an enclosing block.  Carry literal facts
+       forward through the lexical instruction stream, invalidating them at
+       the first intervening write, so nested webs can use the same semantic
+       constant without treating arbitrary C expressions as constants. *)
+    let _, instrs =
+      List.fold_left
+        (fun (literal_environment, rewritten) instr ->
+          let instr =
+            match instr with
+            | I_aux (I_block body, aux) -> I_aux (I_block (rewrite literal_environment body), aux)
+            | I_aux (I_try_block body, aux) -> I_aux (I_try_block (rewrite literal_environment body), aux)
+            | I_aux (I_if (condition, then_body, else_body), aux) ->
+                I_aux
+                  ( I_if
+                      ( condition,
+                        rewrite literal_environment then_body,
+                        rewrite literal_environment else_body
+                      ),
+                    aux
+                  )
+            | instr -> instr
+          in
+          let literal_environment =
+            match instr with
+            | I_aux (I_copy (CL_id (name, _), (V_lit _ as literal)), _) ->
+                NameMap.add name literal literal_environment
+            | _ ->
+                NameSet.fold
+                  (fun name environment -> NameMap.remove name environment)
+                  (instr_writes ~direct:false instr) literal_environment
+          in
+          (literal_environment, instr :: rewritten)
         )
-        instrs
+        (inherited_literals, []) instrs
     in
+    let instrs = List.rev instrs in
     let instructions = Array.of_list instrs in
     let count = Array.length instructions in
-    let literal_index = function
-      | V_lit (VL_int value, _)
+    let literal_value = function
+      | V_lit (VL_int value, _) -> Some value
+      | V_lit (VL_bits bits, _) ->
+          List.fold_left
+            (fun value bit ->
+              Option.bind value (fun value ->
+                  match bit with
+                  | Sail2_values.B0 -> Some (Big_int.mul value (Big_int.of_int 2))
+                  | Sail2_values.B1 -> Some (Big_int.succ (Big_int.mul value (Big_int.of_int 2)))
+                  | Sail2_values.BU -> None
+              )
+            )
+            (Some Big_int.zero) bits
+      | _ -> None
+    in
+    let literal_index value =
+      match literal_value value with
+      | Some value
         when Big_int.less_equal Big_int.zero value
              && Big_int.less_equal value (Big_int.of_int Stdlib.max_int) ->
           Some (Big_int.to_int value)
-      | _ -> None
+      | Some _ | None -> None
     in
     let slice_definitions =
       Array.fold_left
@@ -2371,6 +2411,37 @@ let fuse_fixed_bitvector_webs cdefs =
         (0, NameMap.empty) instructions
       |> snd
     in
+    let literal_definitions =
+      Array.fold_left
+        (fun (index, definitions) (I_aux (instr, _)) ->
+          let definitions =
+            match instr with
+            | I_copy (CL_id (name, _), (V_lit _ as literal)) ->
+                NameMap.add name (index, literal) definitions
+            | _ -> definitions
+          in
+          (index + 1, definitions)
+        )
+        (0, NameMap.empty) instructions
+      |> snd
+    in
+    let logical_right_shift_definitions =
+      Array.fold_left
+        (fun (index, definitions) (I_aux (instr, _)) ->
+          let definitions =
+            match instr with
+            | I_copy
+                ( CL_id (name, _),
+                  V_call (((Bvshiftr | Proven_bvshiftr _) as op), [source; amount])
+                ) ->
+                NameMap.add name (index, op, source, amount) definitions
+            | _ -> definitions
+          in
+          (index + 1, definitions)
+        )
+        (0, NameMap.empty) instructions
+      |> snd
+    in
     let owns_lifecycle name = function
       | I_aux
           ((I_decl (_, candidate) | I_reset (_, candidate) | I_clear (_, candidate) | I_init (_, candidate, _)), _)
@@ -2378,13 +2449,13 @@ let fuse_fixed_bitvector_webs cdefs =
           Name.compare name candidate = 0
       | _ -> false
     in
-    let private_slice_temporary name definition_index concat_index =
+    let private_temporary name definition_index use_index =
       let rec loop index =
         if index = count then true
         else
           let instr = instructions.(index) in
           let allowed =
-            index = definition_index || index = concat_index || owns_lifecycle name instr
+            index = definition_index || index = use_index || owns_lifecycle name instr
             || not (NameSet.mem name (instr_ids ~direct:false instr))
           in
           allowed && loop (index + 1)
@@ -2413,6 +2484,53 @@ let fuse_fixed_bitvector_webs cdefs =
           Stdlib.compare left_lit right_lit = 0 && ctyp_equal left_ctyp right_ctyp
       | _ -> false
     in
+    let resolve_literal use_index = function
+      | V_lit _ as literal -> Option.map (fun value -> (None, value)) (literal_value literal)
+      | V_id (name, ctyp) as value -> (
+          match NameMap.find_opt name literal_definitions with
+          | Some (definition_index, literal)
+            when definition_index < use_index
+                 && ctyp_equal ctyp (cval_ctyp literal)
+                 && source_is_stable value definition_index use_index ->
+              Option.map (fun literal -> (Some (name, definition_index), literal)) (literal_value literal)
+          | Some _ -> None
+          | None -> (
+              match NameMap.find_opt name inherited_literals with
+              | Some literal
+                when ctyp_equal ctyp (cval_ctyp literal) && source_is_stable value (-1) use_index ->
+                  Option.map (fun literal -> (None, literal)) (literal_value literal)
+              | Some _ | None -> None
+            )
+        )
+      | _ -> None
+    in
+    let resolve_proven_logical_right_shift use_index = function
+      | V_id (name, ctyp) -> (
+          match NameMap.find_opt name logical_right_shift_definitions with
+          | Some (definition_index, op, source, amount)
+            when definition_index < use_index
+                 && private_temporary name definition_index use_index
+                 && ctyp_equal ctyp (cval_ctyp source)
+                 && source_is_stable source definition_index use_index -> (
+              let proven =
+                match op with
+                | Proven_bvshiftr 64 -> true
+                | Bvshiftr -> (
+                    match literal_value amount with
+                    | Some amount ->
+                        let interval = Some (amount, amount) in
+                        Option.is_some
+                          (Jib_semantics.prove_shift_count_interval ~index:1 ~interval ~carrier_width:64)
+                    | None -> false
+                  )
+                | Proven_bvshiftr _ | _ -> false
+              in
+              if proven then Some (name, definition_index, source, amount) else None
+            )
+          | Some _ | None -> None
+        )
+      | _ -> None
+    in
     let replacements = Hashtbl.create 2 in
     let removed = ref NameSet.empty in
     Array.iteri
@@ -2429,8 +2547,8 @@ let fuse_fixed_bitvector_webs cdefs =
                 in
                 let definitions_precede_use = left_index < concat_index && right_index < concat_index in
                 let web_is_private =
-                  private_slice_temporary left_name left_index concat_index
-                  && private_slice_temporary right_name right_index concat_index
+                  private_temporary left_name left_index concat_index
+                  && private_temporary right_name right_index concat_index
                 in
                 let sources_match = same_source left_source right_source in
                 let source_is_wide_enough =
@@ -2448,6 +2566,57 @@ let fuse_fixed_bitvector_webs cdefs =
                   incr fusions
                 )
             | _ -> ()
+          )
+        | _ -> ()
+      )
+      instructions;
+    Array.iteri
+      (fun mask_index (I_aux (instr, aux)) ->
+        match instr with
+        | I_copy (destination, V_call (Bvand, [left; right])) -> (
+            let web =
+              List.find_map
+                (fun (shifted, mask) ->
+                  let shift = resolve_proven_logical_right_shift mask_index shifted in
+                  let literal = resolve_literal mask_index mask in
+                  Option.bind shift (fun shift ->
+                      Option.map (fun literal -> (shift, mask, literal)) literal
+                  )
+                )
+                [(left, right); (right, left)]
+            in
+            match web with
+            | ( Some
+                  ( (shift_name, shift_index, source, amount),
+                    mask,
+                    (mask_definition, mask_value)
+                  ) ) -> (
+                match (cval_ctyp source, clexp_ctyp destination) with
+                | CT_fbits source_width, CT_fbits result_width
+                  when 0 < source_width && source_width <= 64 && source_width = result_width
+                       && ctyp_equal (cval_ctyp mask) (CT_fbits result_width) -> (
+                    match Jib_semantics.prove_low_mask_width ~carrier_width:result_width ~mask:mask_value with
+                    | Some slice_width when slice_width <= source_width ->
+                        let slice = V_call (Proven_slice (slice_width, 64), [source; amount]) in
+                        let extracted =
+                          if slice_width = result_width then slice
+                          else V_call (Zero_extend result_width, [slice])
+                        in
+                        Hashtbl.replace replacements mask_index
+                          (I_aux (I_copy (destination, extracted), aux));
+                        removed := NameSet.add shift_name !removed;
+                        ( match mask_definition with
+                        | Some (mask_name, definition_index)
+                          when private_temporary mask_name definition_index mask_index ->
+                            removed := NameSet.add mask_name !removed
+                        | Some _ | None -> ()
+                        );
+                        incr fusions
+                    | Some _ | None -> ()
+                  )
+                | _ -> ()
+              )
+            | None -> ()
           )
         | _ -> ()
       )
@@ -2475,7 +2644,7 @@ let fuse_fixed_bitvector_webs cdefs =
     List.map
       (function
         | CDEF_aux (CDEF_fundef (id, return, args, body), annot) ->
-            CDEF_aux (CDEF_fundef (id, return, args, rewrite body), annot)
+            CDEF_aux (CDEF_fundef (id, return, args, rewrite NameMap.empty body), annot)
         | cdef -> cdef
       )
       cdefs

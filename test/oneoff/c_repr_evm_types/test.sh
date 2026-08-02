@@ -64,6 +64,7 @@ run_sail --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
   --c-preserve byte_arith_shift_right \
   --c-preserve multiply_bit_words \
   --c-preserve multiply_masked_bytes \
+  --c-preserve shift_noncontiguous_mask \
   --c-preserve multiply_sliced_bytes \
   --c-preserve multiply_concatenated_bytes \
   --c-preserve concatenate_distinct_sources \
@@ -245,6 +246,13 @@ fi
 # preserved full-width control retains its u128 multiplication.
 assert_native_function multiply_bit_words 'u128_mul_u64_u64('
 assert_native_function multiply_masked_bytes 'zmultiply_bit_wordszIrepr'
+grep -Fq 'UINT64_C(0xFF) & (zvalue >> UINT64_C(8))' "$TMP_DIR/multiply_masked_bytes.body"
+if grep -Fq '= (zvalue >> UINT64_C(8));' "$TMP_DIR/multiply_masked_bytes.body"; then
+  echo 'multiply_masked_bytes retained its private shift temporary' >&2
+  exit 1
+fi
+assert_native_function shift_noncontiguous_mask 'UINT64_C(0x00000000000000F5)'
+grep -Fq '= (zvalue >> UINT64_C(8));' "$TMP_DIR/shift_noncontiguous_mask.body"
 assert_native_function multiply_sliced_bytes 'zmultiply_bit_wordszIrepr'
 assert_native_function multiply_concatenated_bytes 'zmultiply_bit_wordszIrepr'
 grep -Fq 'zvalue & UINT64_C(0xFFFF)' "$TMP_DIR/multiply_concatenated_bytes.body"
