@@ -6249,6 +6249,35 @@ module Make (C : CONFIG) = struct
         )
       | instr -> instr
     in
+    let plain_fixed_vector_element = function
+      | CT_unit | CT_bool | CT_fint _ | CT_fuint _ | CT_float _ | CT_rounding_mode | CT_fbits _ | CT_sbits _
+      | CT_constant _ | CT_enum _ ->
+          true
+      | _ -> false
+    in
+    let specialize_proven_fixed_vector_access lifetime_ranges = function
+      | I_aux (I_funcall (CR_one result, _, (id, _), [vector; index]), aux) as instr
+        when C.specialize_c
+             &&
+             (match string_of_id id with
+             | "vector_access" | "vector_access_inc" | "fast_vector_access" | "fast_unsigned_vector_access" -> true
+             | _ -> false) -> (
+          match cval_ctyp vector with
+          | CT_fvector (length, element_ctyp)
+            when 0 < length
+                 && plain_fixed_vector_element element_ctyp
+                 && ctyp_equal (clexp_ctyp result) element_ctyp -> (
+              match integer_lifetime_interval (cval_integer_lifetime lifetime_ranges index) with
+              | Some (lower, upper)
+                when Big_int.less_equal Big_int.zero lower
+                     && Big_int.less upper (Big_int.of_int length) ->
+                  I_aux (I_copy (result, V_call (Proven_vector_access length, [vector; index])), aux)
+              | Some _ | None -> instr
+            )
+          | _ -> instr
+        )
+      | instr -> instr
+    in
     let mixed_custom_unsigned_representations left right =
       let has_custom_unsigned_representation value =
         match cval_ctyp value with
@@ -6791,6 +6820,10 @@ module Make (C : CONFIG) = struct
                      )
                 |> List.map
                      (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                        specialize_proven_fixed_vector_access
+                     )
+                |> List.map
+                     (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
                         specialize_structural_integer_primitive
                      )
                 |> List.map
@@ -6899,6 +6932,10 @@ module Make (C : CONFIG) = struct
                  )
             |> List.map
                  (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                    specialize_proven_fixed_vector_access
+                 )
+            |> List.map
+                 (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
                     specialize_structural_integer_primitive
                  )
             |> List.map
@@ -7000,6 +7037,7 @@ module Make (C : CONFIG) = struct
             |> List.map (map_instr (specialize_structural_integer_primitive lifetime_ranges))
             |> List.map (map_instr specialize_literal_assignment)
             |> List.map (map_instr (specialize_integer_primitive lifetime_ranges))
+            |> List.map (map_instr (specialize_proven_fixed_vector_access lifetime_ranges))
           in
           CDEF_aux (CDEF_let (index, List.map represented_binding bindings, body), def_annot)
       | cdef -> cdef

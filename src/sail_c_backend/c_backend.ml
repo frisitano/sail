@@ -1278,6 +1278,13 @@ end) : CONFIG = struct
         | None -> None
       with Type_error.Type_error _ -> None
     in
+    let semantic_index_in_bounds length aval =
+      match semantic_integer_bounds aval with
+      | Some (env, lower, upper) ->
+          prove __POS__ env (nc_lteq (nconstant Big_int.zero) lower)
+          && prove __POS__ env (nc_lt upper (nconstant (Big_int.of_int length)))
+      | None -> false
+    in
     let semantic_integer_excludes value aval =
       match aval with
       | AV_lit (L_aux (L_num literal, _), _) -> not (Big_int.equal value literal)
@@ -1771,6 +1778,18 @@ end) : CONFIG = struct
                GMP integer merely to extract at most one limb. *)
             AE_val (AV_cval (V_call (Slice n, [value; start]), typ))
         | _ -> no_change
+      )
+    | "vector_access", [AV_cval (vec, _); AV_cval (n, _)]
+      when Opts.specialize_c
+           &&
+           (match (cval_ctyp vec, semantic_args) with
+           | CT_fvector (length, element_ctyp), [_; semantic_index]
+             when is_stack_ctyp ctx element_ctyp && semantic_index_in_bounds length semantic_index ->
+               true
+           | _ -> false) -> (
+        match cval_ctyp vec with
+        | CT_fvector (length, _) -> AE_val (AV_cval (V_call (Proven_vector_access length, [vec; n]), typ))
+        | _ -> assert false
       )
     | "vector_access", [AV_cval (vec, _); AV_cval (n, _)]
       when match cval_ctyp vec with CT_fbits _ | CT_sbits _ -> true | ctyp -> is_c_repr_u256 ctyp ->
@@ -3592,6 +3611,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | CT_fbits _ -> sprintf "(UINT64_C(1) & (%s >> %s))" (sgen_cval vec) (sgen_cval n)
         | CT_sbits _ -> sprintf "(UINT64_C(1) & (%s.bits >> %s))" (sgen_cval vec) (sgen_cval n)
         | ctyp when is_c_repr_u256 ctyp -> sprintf "u256_bit(%s, %s)" (sgen_cval vec) (sgen_cval n)
+        | _ -> assert false
+      )
+    | Proven_vector_access length, [vector; index] -> (
+        match cval_ctyp vector with
+        | CT_fvector (actual_length, _) when length = actual_length ->
+            sprintf "((%s).data[(size_t)(%s)])" (sgen_cval vector) (sgen_cval index)
         | _ -> assert false
       )
     | Slice len, [vec; start] -> (

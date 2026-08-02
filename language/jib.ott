@@ -130,6 +130,11 @@ op :: '' ::=
   | ite               :: :: ite
   | string_eq         :: :: string_eq
   | index nat         :: :: index
+% A fixed-vector access whose semantic index interval has been proved to lie
+% inside [0, length).  Unlike [index], which selects a compile-time constant
+% slot, this retains a dynamic native index together with the discharged
+% bounds obligation.
+  | proven_vector_access nat :: :: proven_vector_access
 % Integer ops
   | lt                :: :: ilt
   | lteq              :: :: ilteq

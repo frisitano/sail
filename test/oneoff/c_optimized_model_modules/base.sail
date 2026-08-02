@@ -5,6 +5,7 @@ $include <prelude.sail>
 type byte = range(0, 255)
 type word = range(0, 4294967295)
 type fixed_index = range(0, 16)
+type maybe_fixed_index = range(0, 17)
 type fixed_id = range(0, 256)
 
 struct pair = {
@@ -30,6 +31,12 @@ function pick_initialized_id(index : fixed_index) -> fixed_id = {
   let ids : fixed_ids = vector_init(17, 256);
   ids[index]
 }
+
+function pick_guarded_id(index : maybe_fixed_index) -> fixed_id =
+  if index < 17 then {
+    let ids : fixed_ids = vector_init(17, 256);
+    ids[index]
+  } else 0
 
 function catch_byte(value : byte) -> byte =
   try throw(E_byte(value)) catch {

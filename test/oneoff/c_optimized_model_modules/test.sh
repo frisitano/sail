@@ -26,6 +26,7 @@ cp "$TEST_DIR/host-sentinel.txt" "$HOST_INCLUDE/sentinel.txt"
   --c-optimized-model --c-package evmsail --c-output-dir "$TMP_DIR/ffi/optimized" \
   --c-preserve-type pair --c-preserve-type four_bytes --c-preserve-type fixed_ids \
   --c-preserve run --c-preserve step --c-preserve pick_fixed_id --c-preserve pick_initialized_id \
+  --c-preserve pick_guarded_id \
   --c-preserve catch_byte \
   "$TEST_DIR/model.sail_project"
 
@@ -57,6 +58,20 @@ fi
 if grep -REq 'sail_int|mpz_|sail_new|sail_free|CREATE\(|COPY\(|RECREATE\(|KILL\(' \
     "$SPEC_INCLUDE/evmsail" "$SPEC_SOURCE"; then
   echo 'strict optimized model contains a managed Sail representation or ownership helper' >&2
+  exit 1
+fi
+
+# The fixed_index source type proves every access lies inside the 17-element
+# POD array.  Preserve that proof through JIB and emit the C member access
+# directly instead of routing through a generated vector helper.
+awk '
+  /^(uint16_t )?pick_(fixed|initialized|guarded)_id\(/ { printing = 1 }
+  printing { print }
+  printing && /^}/ { printing = 0 }
+' "$SPEC_SOURCE/base.c" > "$TMP_DIR/proved_fixed_vector_accesses.c"
+test "$(grep -Fc '.data[(size_t)(index)]' "$TMP_DIR/proved_fixed_vector_accesses.c")" -eq 3
+if grep -Eq '(fast_)?(unsigned_)?vector_access_' "$TMP_DIR/proved_fixed_vector_accesses.c"; then
+  echo 'proved fixed-vector access retained an out-of-line helper call' >&2
   exit 1
 fi
 

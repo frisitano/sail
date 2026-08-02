@@ -233,6 +233,7 @@ let string_of_op = function
   | Ite -> "@ite"
   | String_eq -> "@string_eq"
   | Index n -> "@index::<" ^ string_of_int n ^ ">"
+  | Proven_vector_access n -> "@proven_vector_access::<" ^ string_of_int n ^ ">"
 
 (* String representation of ctyps here is only for debugging and
    intermediate language pretty-printer. *)
@@ -1189,6 +1190,11 @@ let rec infer_call op vs =
       match cval_ctyp v with
       | CT_fvector (_, ctyp) -> ctyp
       | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Invalid type for index argument"
+    )
+  | Proven_vector_access length, [vector; _] -> (
+      match cval_ctyp vector with
+      | CT_fvector (actual_length, ctyp) when length = actual_length -> ctyp
+      | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Invalid proved fixed-vector access"
     )
   | _, _ -> Reporting.unreachable Parse_ast.Unknown __POS__ ("Invalid call to function " ^ string_of_op op)
 
