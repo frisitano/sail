@@ -296,6 +296,12 @@ let prove_shift_count_bounds ~env ~index ~typ ~interval ~carrier_width =
         (fun proof -> { proof with semantic_relation = Shift_count_bounds (index, lower, upper) })
         (prove_argument_bounds ~env ~index ~typ ~interval:None ~lower ~upper)
 
+let prove_bit_insert_position_bounds ~env ~index ~typ ~interval ~carrier_width ~inserted_width =
+  if carrier_width < 0 || inserted_width < 0 || inserted_width > carrier_width then None
+  else
+    prove_argument_bounds ~env ~index ~typ ~interval ~lower:Big_int.zero
+      ~upper:(Big_int.of_int (carrier_width - inserted_width))
+
 let has_argument_le ~left ~right proofs =
   List.exists
     (fun proof ->

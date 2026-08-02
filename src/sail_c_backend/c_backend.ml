@@ -1718,18 +1718,28 @@ end) : CONFIG = struct
         | CT_sbits 64 -> AE_val (AV_cval (V_call (Sslice 64, [vec; start; len]), typ))
         | _ -> no_change
       )
-    | ( "set_slice",
-        [_; _; AV_cval (vec, _); AV_cval (V_lit (VL_int start, _) as start_value, _); AV_cval (slice, _)] ) -> (
+    | "set_slice", [_; _; AV_cval (vec, _); AV_cval (start, _); AV_cval (slice, _)] -> (
         match (convert_typ ctx typ, cval_ctyp vec, cval_ctyp slice) with
         | CT_fbits result_width, CT_fbits source_width, CT_fbits slice_width
-          when result_width = source_width
-               && Big_int.less_equal Big_int.zero start
-               && Big_int.less_equal (Big_int.add start (Big_int.of_int slice_width)) (Big_int.of_int result_width) ->
-            (* A statically in-range insertion into a fixed carrier is a plain
-               masked C value operation.  Keep its structural result bound in
-               JIB so the definition/call-graph analysis can compose it with
-               later unsigned conversion and arithmetic. *)
-            AE_val (AV_cval (V_call (Set_slice, [vec; start_value; slice]), typ))
+          when result_width = source_width -> (
+            let position_is_proven =
+              match semantic_args with
+              | [_; _; _; semantic_start; _] ->
+                  Option.is_some
+                    (Jib_semantics.prove_bit_insert_position_bounds ~env:ctx.local_env ~index:3
+                       ~typ:(aval_typ semantic_start) ~interval:None ~carrier_width:result_width
+                       ~inserted_width:slice_width)
+              | _ -> false
+            in
+            match (position_is_proven, native_shift_amount start) with
+            | true, Some start ->
+                (* The semantic position proof makes both native shifts
+                   defined and keeps the inserted value inside the carrier.
+                   Preserve Set_slice as a structural JIB operation so its
+                   result bound can flow through the definition/call graph. *)
+                AE_val (AV_cval (V_call (Set_slice, [vec; start; slice]), typ))
+            | false, _ | _, None -> no_change
+          )
         | _ -> no_change
       )
     | "get_slice_int", [AV_cval (V_lit (VL_int width, _), _); AV_cval (value, _); AV_cval (V_lit (VL_int start, _), _)]

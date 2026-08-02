@@ -285,6 +285,20 @@ function multiply_inserted_byte(value) = {
   multiply_bit_words(inserted, inserted)
 }
 
+/* A bounded dynamic position is just as safe as a literal insertion point.
+   The optimized backend should use the same native mask/shift operation. */
+val insert_byte_at : (bits(64), range(0, 56), bits(8)) -> bits(64)
+
+function insert_byte_at(base, start, value) =
+  set_slice_bits(64, 8, base, start, value)
+
+/* This position range does not prove that the inserted byte remains inside
+   the carrier, so it must retain the generic checked Sail implementation. */
+val insert_byte_at_unproven : (bits(64), range(0, 57), bits(8)) -> bits(64)
+
+function insert_byte_at_unproven(base, start, value) =
+  set_slice_bits(64, 8, base, start, value)
+
 val address_equal : (address, address) -> bool
 
 function address_equal(Address(left), Address(right)) = left == right

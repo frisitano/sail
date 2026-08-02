@@ -93,6 +93,10 @@ int main(void) {
   CHECK(u128_is_u64(zmultiply_sliced_bytes(UINT64_C(0x1234)), UINT64_C(936)));
   CHECK(u128_is_u64(zmultiply_concatenated_bytes(UINT64_C(0x1234)), UINT64_C(177688900)));
   CHECK(u128_is_u64(zmultiply_inserted_byte(UINT64_C(0x12)), UINT64_C(21233664)));
+  CHECK(zinsert_byte_at(UINT64_C(0xffff00000000ffff), UINT64_C(16), UINT64_C(0x12)) ==
+        UINT64_C(0xffff00000012ffff));
+  CHECK(zinsert_byte_at(UINT64_C(0), UINT64_C(56), UINT64_C(0xab)) ==
+        UINT64_C(0xab00000000000000));
 
   sail_fixed_bytes_20 address = {{0}};
   address.bytes[0] = UINT8_C(0x11);

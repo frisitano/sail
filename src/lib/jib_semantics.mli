@@ -130,6 +130,18 @@ val prove_shift_count_bounds :
 val prove_shift_count_interval :
   index:int -> interval:integer_interval option -> carrier_width:int -> semantic_proof option
 
+(** Prove that a fixed-width bit insertion position keeps the entire inserted
+    value within its carrier. The resulting argument-bounds certificate lets
+    a backend select an unchecked native mask/shift implementation. *)
+val prove_bit_insert_position_bounds :
+  env:Env.t ->
+  index:int ->
+  typ:typ ->
+  interval:integer_interval option ->
+  carrier_width:int ->
+  inserted_width:int ->
+  semantic_proof option
+
 val has_argument_le : left:int -> right:int -> semantic_proof list -> bool
 val has_argument_bounds : index:int -> lower:Nat_big_num.num -> upper:Nat_big_num.num -> semantic_proof list -> bool
 val has_result_bounds : lower:Nat_big_num.num -> upper:Nat_big_num.num -> semantic_proof list -> bool

@@ -69,6 +69,8 @@ run_sail --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
   --c-preserve multiply_concatenated_bytes \
   --c-preserve concatenate_distinct_sources \
   --c-preserve multiply_inserted_byte \
+  --c-preserve insert_byte_at \
+  --c-preserve insert_byte_at_unproven \
   --c-preserve address_equal \
   --c-preserve address_equal_vector \
   --c-preserve address_byte \
@@ -282,6 +284,14 @@ if grep -Eq 'u128_mul_u64_u64|sail_native_conversion_failure|sail_int|mpz_|lbits
   exit 1
 fi
 grep -Fq '& ~(UINT64_C(0xFF) <<' "$TMP_DIR/multiply_inserted_byte.body"
+assert_native_function insert_byte_at '& ~(UINT64_C(0xFF) << zstart)'
+grep -Fq '| (zvalue << zstart)' "$TMP_DIR/insert_byte_at.body"
+extract_function insert_byte_at_unproven
+grep -Fq 'set_slice(' "$TMP_DIR/insert_byte_at_unproven.body"
+if ! grep -Eq 'sail_int|lbits|CONVERT_OF' "$TMP_DIR/insert_byte_at_unproven.body"; then
+  echo 'insert_byte_at_unproven unexpectedly selected native fixed-width insertion' >&2
+  exit 1
+fi
 assert_native_function address_equal 'eq_fixed_bytes_20('
 assert_native_function address_equal_vector 'eq_fixed_bytes_20('
 assert_native_function address_byte 'fast_unsigned_vector_access_fixed_bytes_20('
