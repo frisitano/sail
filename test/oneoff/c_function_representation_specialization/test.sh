@@ -155,6 +155,21 @@ fi
 grep -Fq 'Function budgeted_square requires more than 1 C representation specializations' \
   "$TMP_DIR/specialization_limit.log"
 
+# A recursive clone may reuse itself only when the recursive call remains
+# inside the bounds which justified that clone's pruned branches.  Starting at
+# 1..8 removes the zero branch, but the recursive edge reaches 0..7 and must
+# therefore target a second clone which retains the base case.
+"$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c --c-specialize --c-no-main \
+  --c-preserve descending_to_zero \
+  --c-preserve positive_countdown \
+  --c-preserve ascending_to_eight \
+  --c-preserve low_countup \
+  "$TEST_DIR/recursive_bound_partition.sail" -o "$TMP_DIR/recursive_bound_partition"
+test "$(grep -Ec 'unit zdescending_to_zzero.*repr.*\(uint8_t\);' \
+  "$TMP_DIR/recursive_bound_partition.h")" -eq 2
+test "$(grep -Ec 'unit zascending_to_eight.*repr.*\(uint8_t\);' \
+  "$TMP_DIR/recursive_bound_partition.h")" -eq 2
+
 # A terminating zero guard is part of the source proof context.  Preserve it
 # across ANF/JIB lowering so non-negative Euclidean division can use the native
 # quotient operation without materialising sail_int operands.

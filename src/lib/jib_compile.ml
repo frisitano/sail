@@ -5993,6 +5993,18 @@ module Make (C : CONFIG) = struct
     let merge_call_bounds (left_arguments, left_result) (right_arguments, right_result) =
       (List.map2 merge_interval left_arguments right_arguments, merge_interval left_result right_result)
     in
+    let call_arguments_within (inner_arguments, _) (outer_arguments, _) =
+      List.compare_lengths inner_arguments outer_arguments = 0
+      && List.for_all2
+           (fun inner outer ->
+             match (inner, outer) with
+             | _, None -> true
+             | Some (inner_lower, inner_upper), Some (outer_lower, outer_upper) ->
+                 Big_int.less_equal outer_lower inner_lower && Big_int.less_equal inner_upper outer_upper
+             | None, Some _ -> false
+           )
+           inner_arguments outer_arguments
+    in
     let demand l id actual_ctyps actual_ret_ctyp bounds =
       let signature_ctyps = actual_ctyps @ [actual_ret_ctyp] in
       let ( lifetime_ranges,
@@ -6095,7 +6107,7 @@ module Make (C : CONFIG) = struct
           | Some ([], param_ctyps, ret_ctyp, None, _), Some _ when List.compare_lengths args param_ctyps = 0 ->
               let bounds = infer_call_bounds lifetime_ranges result args bounds in
               log_progress "call-edge instruction=%d caller=%s bounds=%s" n
-                (Option.fold ~none:"canonical" ~some:(fun (id, _, _, _) -> string_of_id id) current_specialization)
+                (Option.fold ~none:"canonical" ~some:(fun (id, _, _, _, _) -> string_of_id id) current_specialization)
                 (string_of_call_bounds bounds);
               let actual_ctyps = List.map cval_ctyp args in
               let actual_ret_ctyp = clexp_ctyp result in
@@ -6114,13 +6126,23 @@ module Make (C : CONFIG) = struct
               if eligible then (
                 let specialized_id =
                   match current_specialization with
-                  | Some (current_id, current_specialized_id, current_ctyps, current_ret_ctyp)
+                  | Some (current_id, current_specialized_id, current_ctyps, current_ret_ctyp, current_bounds)
                     when Id.compare id current_id = 0 ->
-                      if
+                      let same_representation =
                         List.compare_lengths actual_ctyps current_ctyps = 0
                         && List.for_all2 ctyp_equal actual_ctyps current_ctyps
                         && ctyp_equal actual_ret_ctyp current_ret_ctyp
-                      then current_specialized_id
+                      in
+                      if same_representation && call_arguments_within bounds current_bounds then
+                        current_specialized_id
+                      else if same_representation then
+                        (* A recursive edge which escapes the proof partition
+                           of its current clone must not reuse any branches
+                           pruned by that partition.  Re-analyze it at the
+                           represented signature's complete bounds.  This
+                           yields one safe recursion fallback rather than one
+                           clone per increasing or decreasing singleton. *)
+                        demand l id actual_ctyps actual_ret_ctyp (List.map (fun _ -> None) actual_ctyps, None)
                       else demand l id actual_ctyps actual_ret_ctyp bounds
                   | _ -> demand l id actual_ctyps actual_ret_ctyp bounds
                 in
@@ -6975,7 +6997,8 @@ module Make (C : CONFIG) = struct
                 |> List.map
                      (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges (fun lifetime_ranges ->
                           rewrite_call ~lifetime_ranges
-                            ~current_specialization:(id, specialized_id, actual_ctyps, actual_ret_ctyp)
+                            ~current_specialization:
+                              (id, specialized_id, actual_ctyps, actual_ret_ctyp, !(demand.RepresentationDemand.bounds))
                       )
                      )
           in

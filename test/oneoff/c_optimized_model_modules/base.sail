@@ -17,6 +17,10 @@ struct pair = {
 type four_bytes = vector(4, byte)
 type fixed_ids = vector(17, fixed_id)
 
+struct fixed_ids_box = {
+  ids : fixed_ids,
+}
+
 union exception = {
   E_byte : byte,
 }

@@ -1,0 +1,5 @@
+SourceTree {
+  files
+    filename_first/first_source.sail,
+    filename_second/second_source.sail
+}

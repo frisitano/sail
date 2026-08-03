@@ -71,6 +71,7 @@ let opt_specialization_plan_human = ref None
 let opt_specialization_obligations_lean = ref None
 let opt_specialization_obligations_coq = ref None
 let opt_optimized_model = ref false
+let opt_c_optimized_source_root = ref None
 let opt_c_optimized_include_dir = ref None
 let opt_c_external_types : string Bindings.t ref = ref Bindings.empty
 let opt_c_package = ref "model"
@@ -152,7 +153,11 @@ let c_options =
     );
     ( Flag.create ~prefix:["c"] "optimized_model",
       Arg.Set opt_optimized_model,
-      "generate a strict allocation-free specialized C model split by Sail module"
+      "generate a strict allocation-free specialized C model split by Sail module or source file"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"directory" "optimized_source_root",
+      Arg.String (fun directory -> opt_c_optimized_source_root := Some directory),
+      "emit optimized-model translation units at paths relative to this Sail source root"
     );
     ( Flag.create ~prefix:["c"] ~arg:"directory" "optimized_include_dir",
       Arg.String (fun directory -> opt_c_optimized_include_dir := Some directory),
@@ -468,6 +473,11 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     | Cpp ->
         raise (Reporting.err_general Parse_ast.Unknown "--c-optimized-model is only supported by the C target")
   );
+  if Option.is_some !opt_c_optimized_source_root && not !opt_optimized_model then
+    raise
+      (Reporting.err_general Parse_ast.Unknown
+         "--c-optimized-source-root requires --c-optimized-model"
+      );
   let reserveds, overrides, c_repr_unsigned, c_repr_signed, c_repr_u256, c_repr_fixed_bytes =
     collect_c_name_info ast mode
   in
@@ -546,6 +556,21 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
       Unix.mkdir path 0o755
     )
   in
+  let clean_previous_optimized_outputs include_spec source_spec =
+    let rec remove_generated_files suffix directory =
+      if Sys.file_exists directory && Sys.is_directory directory then
+        Sys.readdir directory
+        |> Array.iter (fun entry ->
+               let path = Filename.concat directory entry in
+               if Sys.is_directory path then remove_generated_files suffix path
+               else if Filename.check_suffix entry suffix then Sys.remove path
+           )
+    in
+    remove_generated_files ".h" include_spec;
+    remove_generated_files ".c" source_spec;
+    let manifest = Filename.concat source_spec "sources.list" in
+    if Sys.file_exists manifest then Sys.remove manifest
+  in
   let module_file_stem name =
     let buffer = Buffer.create (String.length name) in
     String.iteri
@@ -556,6 +581,36 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
       )
       name;
     Buffer.contents buffer
+  in
+
+  let source_file_stem source_root filename =
+    let canonical kind path =
+      try Unix.realpath path
+      with Unix.Unix_error (_, _, _) ->
+        raise
+          (Reporting.err_general Parse_ast.Unknown
+             (Printf.sprintf "optimized-model %s does not exist: %s" kind path)
+          )
+    in
+    let source_root = canonical "source root" source_root in
+    let filename = canonical "source file" filename in
+    let root_prefix = source_root ^ Filename.dir_sep in
+    if
+      String.length filename <= String.length root_prefix
+      || String.sub filename 0 (String.length root_prefix) <> root_prefix
+    then
+      raise
+        (Reporting.err_general Parse_ast.Unknown
+           (Printf.sprintf "optimized-model source file lies outside --c-optimized-source-root: %s" filename)
+        );
+    let relative = String.sub filename (String.length root_prefix) (String.length filename - String.length root_prefix) in
+    if not (Filename.check_suffix relative ".sail") then
+      raise
+        (Reporting.err_general Parse_ast.Unknown
+           (Printf.sprintf "optimized-model source file must use the .sail extension: %s" filename)
+        );
+    let relative = String.sub relative 0 (String.length relative - String.length ".sail") in
+    relative |> String.split_on_char '/' |> List.map module_file_stem |> String.concat "/"
   in
 
   if !opt_optimized_model then (
@@ -569,7 +624,7 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
             )
     in
     let module_name id = fst (Project.module_name project id) in
-    let modules =
+    let project_modules =
       Project.module_order project
       |> List.map (fun id ->
              let name = module_name id in
@@ -577,6 +632,42 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
              let requires = List.map module_name (Project.module_requires project id) in
              Codegen.{ name; file_stem = module_file_stem name; files; requires }
          )
+    in
+    let modules =
+      match !opt_c_optimized_source_root with
+      | None -> project_modules
+      | Some source_root ->
+          let outputs_by_module : (string, Codegen.c_module list) Hashtbl.t =
+            Hashtbl.create (List.length project_modules)
+          in
+          List.fold_left
+            (fun outputs (module_ : Codegen.c_module) ->
+              let required_outputs =
+                List.filter_map
+                  (fun required ->
+                    match Hashtbl.find_opt outputs_by_module required with
+                    | Some units -> (
+                        match List.rev units with [] -> None | unit :: _ -> Some unit.Codegen.name
+                      )
+                    | None -> None
+                  )
+                  module_.requires
+              in
+              let units, _ =
+                List.fold_left
+                  (fun (units, previous) filename ->
+                    let file_stem = source_file_stem source_root filename in
+                    let requires = match previous with Some previous -> [previous] | None -> required_outputs in
+                    let unit = Codegen.{ name = file_stem; file_stem; files = [filename]; requires } in
+                    (unit :: units, Some unit.name)
+                  )
+                  ([], None) module_.files
+              in
+              let units = List.rev units in
+              Hashtbl.add outputs_by_module module_.name units;
+              outputs @ units
+            )
+            [] project_modules
     in
     let module_names_by_file_stem = Hashtbl.create (List.length modules) in
     List.iter
@@ -599,14 +690,21 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let source_spec = Filename.concat (Filename.concat output_root "src") "spec" in
     ensure_directory include_spec;
     ensure_directory source_spec;
+    clean_previous_optimized_outputs include_spec source_spec;
     let umbrella, outputs = Codegen.compile_ast_modules env effect_info ~package:!opt_c_package modules ast in
     write_file (Filename.concat include_root "spec.h") umbrella;
     List.iter
       (fun (output : Codegen.c_module_output) ->
-        write_file (Filename.concat include_spec (output.file_stem ^ ".h")) output.header;
-        write_file (Filename.concat source_spec (output.file_stem ^ ".c")) output.implementation
+        let header_path = Filename.concat include_spec (output.file_stem ^ ".h") in
+        let source_path = Filename.concat source_spec (output.file_stem ^ ".c") in
+        ensure_directory (Filename.dirname header_path);
+        ensure_directory (Filename.dirname source_path);
+        write_file header_path output.header;
+        write_file source_path output.implementation
       )
-      outputs
+      outputs;
+    write_file (Filename.concat source_spec "sources.list")
+      (String.concat "" (List.map (fun (output : Codegen.c_module_output) -> output.file_stem ^ ".c\n") outputs))
   )
   else (
     let header, impl = Codegen.compile_ast env effect_info basename ast in

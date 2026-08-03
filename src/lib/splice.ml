@@ -86,7 +86,11 @@ let filter_old_ast repl_ids repl_specs repl_types { defs; _ } =
     | DEF_type td -> (
         let id = id_of_type_def td in
         match Bindings.find_opt id repl_types with
-        | Some repl_def -> (repl_def :: rdefs, specs_found, IdSet.add id types_found)
+        | Some (DEF_aux (repl_aux, repl_annot)) ->
+            ( DEF_aux (repl_aux, { repl_annot with loc = def_annot.loc }) :: rdefs,
+              specs_found,
+              IdSet.add id types_found
+            )
         | None -> (def :: rdefs, specs_found, types_found)
       )
     | _ -> (def :: rdefs, specs_found, types_found)
@@ -104,12 +108,19 @@ let filter_replacements specs_found types_found { defs; _ } =
 
 let move_replacement_fundefs ast =
   let rec aux acc = function
-    | DEF_aux (DEF_pragma ("spliced_function#", Pragma_line (id, _)), _) :: defs ->
+    | DEF_aux (DEF_pragma ("spliced_function#", Pragma_line (id, original_loc)), _) :: defs ->
         let is_replacement = function
           | DEF_aux (DEF_fundef fd, _) -> string_of_id (id_of_fundef fd) = id
           | _ -> false
         in
         let replacement, other_defs = List.partition is_replacement defs in
+        let replacement =
+          List.map
+            (function
+              | DEF_aux (repl_aux, repl_annot) -> DEF_aux (repl_aux, { repl_annot with loc = original_loc })
+            )
+            replacement
+        in
         aux (replacement @ acc) other_defs
     | def :: defs -> aux (def :: acc) defs
     | [] -> List.rev acc

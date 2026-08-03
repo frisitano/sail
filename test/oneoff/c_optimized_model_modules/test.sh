@@ -28,6 +28,7 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-optimized-include-dir "$TMP_DIR/ffi/optimized/include" \
   --c-optimized-external-type pair=evmsail/host/types.h \
   --c-preserve-type pair --c-preserve-type four_bytes --c-preserve-type fixed_ids \
+  --c-preserve-type fixed_ids_box \
   --c-preserve pair_sum \
   --c-preserve run --c-preserve step --c-preserve pick_fixed_id --c-preserve pick_initialized_id \
   --c-preserve pick_guarded_id \
@@ -43,6 +44,8 @@ for module in base host_contracts machine entry; do
   test -f "$SPEC_SOURCE/$module.c"
 done
 test -f "$SPEC_INCLUDE/evmsail/spec.h"
+printf '%s\n' base.c host_contracts.c machine.c entry.c > "$TMP_DIR/expected-sources.list"
+cmp "$TMP_DIR/expected-sources.list" "$SPEC_SOURCE/sources.list"
 cmp "$TEST_DIR/host-sentinel.txt" "$HOST_INCLUDE/sentinel.txt"
 
 grep -Fq '#include "evmsail/spec/base.h"' "$SPEC_INCLUDE/evmsail/spec.h"
@@ -91,19 +94,21 @@ fi
 # module that happened to declare the carrier type.
 grep -Fq 'internal_vector_init_vector_17_uint_16' "$SPEC_SOURCE/base.c"
 grep -Fq 'internal_vector_update_vector_17_uint_16' "$SPEC_SOURCE/base.c"
-test "$(grep -Ec '^static .*vector_' "$SPEC_SOURCE/base.c")" -eq 2
+test "$(grep -Ec '^static .*vector_.*\{$' "$SPEC_SOURCE/base.c")" -eq 3
 grep -Fq 'internal_vector_init_vector_4_uint_8' "$SPEC_SOURCE/machine.c"
 grep -Fq 'internal_vector_update_vector_4_uint_8' "$SPEC_SOURCE/machine.c"
-test "$(grep -Ec '^static .*vector_' "$SPEC_SOURCE/machine.c")" -eq 2
+test "$(grep -Ec '^static .*vector_.*\{$' "$SPEC_SOURCE/machine.c")" -eq 3
 for module in host_contracts entry; do
-  if grep -Eq '^static .*vector_|^static bool EQUAL\(vector_' "$SPEC_SOURCE/$module.c"; then
-    echo "unrelated module $module contains a fixed-vector helper definition" >&2
+  if test "$(grep -Ec '^static .*vector_.*\{$' "$SPEC_SOURCE/$module.c")" -ne 1 \
+      || ! grep -Fq 'EQUAL(vector_17_uint_16)' "$SPEC_SOURCE/$module.c"; then
+    echo "module $module does not contain exactly the globally required fixed-vector equality helper" >&2
     exit 1
   fi
 done
 
 for source in "$SPEC_SOURCE"/*.c; do
-  "$CC" ${CFLAGS:-} -std=c11 -Wall -I "$SPEC_INCLUDE" -c "$source" -o "$TMP_DIR/$(basename "$source" .c).o"
+  "$CC" ${CFLAGS:-} -std=c11 -Wall -Werror=implicit-function-declaration \
+    -I "$SPEC_INCLUDE" -c "$source" -o "$TMP_DIR/$(basename "$source" .c).o"
 done
 
 "$CC" ${CFLAGS:-} -std=c11 -Wall -I "$SPEC_INCLUDE" \
@@ -183,6 +188,56 @@ if grep -Fq 'from_second_filename' "$FILENAME_INCLUDE/spec/first_filename_output
   echo 'optimized extraction assigned a definition to the wrong project module' >&2
   exit 1
 fi
+
+# Source-tree output preserves the source layout without changing the
+# project's semantic module structure. The manifest is the authoritative,
+# ordered compilation input for nested generated translation units.
+"$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
+  --all-modules \
+  --c-optimized-model --c-package evmsail \
+  --c-output-dir "$TMP_DIR/source-tree/ffi/optimized" \
+  --c-optimized-source-root "$TEST_DIR" \
+  --c-preserve from_first_filename --c-preserve from_second_filename \
+  "$TEST_DIR/source_tree.sail_project"
+
+SOURCE_TREE_INCLUDE="$TMP_DIR/source-tree/ffi/optimized/include/evmsail"
+SOURCE_TREE_SOURCE="$TMP_DIR/source-tree/ffi/optimized/src/spec"
+
+for source in filename_first/first_source filename_second/second_source; do
+  test -f "$SOURCE_TREE_INCLUDE/spec/$source.h"
+  test -f "$SOURCE_TREE_SOURCE/$source.c"
+  test "$(grep -Fc "#include \"evmsail/spec/$source.h\"" "$SOURCE_TREE_INCLUDE/spec.h")" -eq 1
+done
+test ! -e "$SOURCE_TREE_INCLUDE/spec/source_tree.h"
+test ! -e "$SOURCE_TREE_SOURCE/source_tree.c"
+grep -Fq '#include "evmsail/spec/filename_first/first_source.h"' \
+  "$SOURCE_TREE_INCLUDE/spec/filename_second/second_source.h"
+grep -Fq 'from_first_filename' "$SOURCE_TREE_SOURCE/filename_first/first_source.c"
+grep -Fq 'from_second_filename' "$SOURCE_TREE_SOURCE/filename_second/second_source.c"
+printf '%s\n' filename_first/first_source.c filename_second/second_source.c \
+  > "$TMP_DIR/source-tree-expected.list"
+cmp "$TMP_DIR/source-tree-expected.list" "$SOURCE_TREE_SOURCE/sources.list"
+
+# Regeneration replaces the previous manifest-owned output set. This keeps a
+# switch from module output to source-tree output from leaving an obsolete
+# monolithic translation unit visible beside the new package.
+touch "$SOURCE_TREE_SOURCE/obsolete.c" "$SOURCE_TREE_INCLUDE/spec/obsolete.h"
+"$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
+  --all-modules \
+  --c-optimized-model --c-package evmsail \
+  --c-output-dir "$TMP_DIR/source-tree/ffi/optimized" \
+  --c-optimized-source-root "$TEST_DIR" \
+  --c-preserve from_first_filename --c-preserve from_second_filename \
+  "$TEST_DIR/source_tree.sail_project"
+test ! -e "$SOURCE_TREE_SOURCE/obsolete.c"
+test ! -e "$SOURCE_TREE_INCLUDE/spec/obsolete.h"
+cmp "$TMP_DIR/source-tree-expected.list" "$SOURCE_TREE_SOURCE/sources.list"
+
+while IFS= read -r source; do
+  object=$(printf '%s' "$source" | tr '/' '_')
+  "$CC" ${CFLAGS:-} -std=c11 -Wall -I "$TMP_DIR/source-tree/ffi/optimized/include" \
+    -c "$SOURCE_TREE_SOURCE/$source" -o "$TMP_DIR/$object.o"
+done < "$SOURCE_TREE_SOURCE/sources.list"
 
 if "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
     --all-modules \

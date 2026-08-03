@@ -2782,6 +2782,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let generated_modules : c_module_output list option ref = ref None
   let emitted_external_functions = ref Util.StringSet.empty
   let current_static_helper_demands = ref Util.StringSet.empty
+  let static_equality_declarations : (string * document) list ref = ref []
+  let static_equality_declaration_names = ref Util.StringSet.empty
 
   let has_prefix prefix s =
     if String.length s < String.length prefix then false else String.sub s 0 (String.length prefix) = prefix
@@ -3681,7 +3683,24 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     match ctyp with
     | CT_ref _ -> ksprintf string "(%s == %s)" arg1 arg2
     | CT_fint _ | CT_fuint _ -> ksprintf string "(%s == %s)" arg1 arg2
-    | ctyp -> sail_equal (sgen_ctyp_name ctyp) "%s, %s" arg1 arg2
+    | ctyp ->
+        let helper = "eq_" ^ sgen_ctyp_name ctyp in
+        current_static_helper_demands := Util.StringSet.add helper !current_static_helper_demands;
+        ( match ctyp with
+        | CT_struct _ | CT_variant _ | CT_enum _ | CT_tup _ | CT_list _ | CT_vector _ | CT_fvector _ ->
+            if not (Util.StringSet.mem helper !static_equality_declaration_names) then (
+              static_equality_declaration_names :=
+                Util.StringSet.add helper !static_equality_declaration_names;
+              static_equality_declarations :=
+                ( helper,
+                  ksprintf string "static bool %s(const %s op1, const %s op2);" helper
+                    (sgen_ctyp ctyp) (sgen_ctyp ctyp)
+                )
+                :: !static_equality_declarations
+            )
+        | _ -> ()
+        );
+        sail_equal (sgen_ctyp_name ctyp) "%s, %s" arg1 arg2
 
   let monomorphic_id_base id =
     let name = string_of_id id in
@@ -7875,6 +7894,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       generated := IdSet.empty;
       emitted_external_functions := Util.StringSet.empty;
       current_static_helper_demands := Util.StringSet.empty;
+      static_equality_declarations := [];
+      static_equality_declaration_names := Util.StringSet.empty;
       readable_ctyp_names := CTMap.empty;
       readable_ctyp_names_used := Util.StringSet.empty;
       if Config.no_mangle then (
@@ -7911,8 +7932,11 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
               | Parse_ast.Hint (_, loc, _) -> filename_of_loc loc
               | Parse_ast.Range (start_pos, _) -> Some start_pos.Lexing.pos_fname
             in
+            let canonical_file filename =
+              try Unix.realpath filename with Unix.Unix_error (_, _, _) -> filename
+            in
             let same_file left right =
-              String.equal left right || String.equal (Filename.basename left) (Filename.basename right)
+              String.equal left right || String.equal (canonical_file left) (canonical_file right)
             in
             let module_index_of_loc loc =
               match filename_of_loc loc with
@@ -8293,6 +8317,18 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           let ordinary_docs =
             List.filter (function DemandedStaticFunctionDefinition _ -> false | _ -> true) docs
           in
+          let all_static_helper_demands =
+            List.fold_left
+              (fun demands (_, definition_docs, helper_demands) ->
+                if
+                  List.exists
+                    (function StaticFunctionDefinition _ -> true | _ -> false)
+                    definition_docs
+                then Util.StringSet.union helper_demands demands
+                else demands
+              )
+              Util.StringSet.empty docs_by_definition
+          in
           List.iter
             (fun (annotated, docs, helper_demands) ->
               let index = module_index annotated in
@@ -8313,7 +8349,26 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
                    module_helper_demands.(Array.length modules - 1)
                 )
           );
-          let all_static = (merge_file_docs ordinary_docs).static_func_def in
+          let globally_required_static =
+            demanded_helper_definitions
+            |> List.filter_map (fun (name, doc) ->
+                   if Util.StringSet.mem name all_static_helper_demands then Some doc else None
+               )
+            |> List.map (fun doc -> StaticFunctionDefinition doc)
+            |> merge_file_docs
+            |> fun docs -> docs.static_func_def
+          in
+          let static_equality_declarations =
+            !static_equality_declarations
+            |> List.rev_map snd
+            |> separate hardline
+            |> fun declarations -> if declarations = empty then empty else declarations ^^ twice hardline
+          in
+          let all_static =
+            static_equality_declarations
+            ^^ (merge_file_docs ordinary_docs).static_func_def
+            ^^ globally_required_static
+          in
           let include_module stem = ksprintf string "#include \"%s/spec/%s.h\"" package stem in
           let find_required name =
             Array.to_list modules
@@ -8324,7 +8379,11 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             let required_static =
               demanded_helper_definitions
               |> List.filter_map (fun (name, doc) ->
-                     if Util.StringSet.mem name module_helper_demands.(index) then Some doc else None
+                     if
+                       Util.StringSet.mem name module_helper_demands.(index)
+                       && not (Util.StringSet.mem name all_static_helper_demands)
+                     then Some doc
+                     else None
                  )
               |> List.map (fun doc -> StaticFunctionDefinition doc)
               |> merge_file_docs

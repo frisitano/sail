@@ -106,6 +106,14 @@ There are several Sail options that affect the C output:
 * `--c-optimized-include-dir` select the include root containing handwritten
     headers used by an optimized-model extraction.
 
+* `--c-optimized-source-root` split an optimized-model extraction by Sail
+    source file, preserving each file's path relative to the supplied source
+    root beneath the generated `include/PACKAGE/spec/` and `src/spec/`
+    directories. The compiler also writes the generated C paths, in build
+    order and relative to `src/spec/`, to `src/spec/sources.list`. Without
+    this option, optimized-model output remains split by semantic Sail module.
+    This option requires `--c-optimized-model`.
+
 * `--c-optimized-external-type TYPE=HEADER` declare that `TYPE`'s final C
     declaration is owned by `HEADER`, relative to the optimized include root.
     This repeatable option requires `--c-optimized-model`. The generated module
