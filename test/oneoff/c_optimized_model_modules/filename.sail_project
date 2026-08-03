@@ -1,0 +1,7 @@
+FirstFilenameOutput {
+  files "filename_first/first_source.sail"
+}
+
+SecondFilenameOutput {
+  files "filename_second/second_source.sail"
+}

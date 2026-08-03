@@ -151,6 +151,39 @@ fi
 
 grep -Fqi 'does not name a concrete type' "$TMP_DIR/missing-type.stderr"
 
+# Output stems follow Sail module names, not source basenames.  Both source
+# basenames deliberately differ from their project module names.
+"$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
+  --all-modules \
+  --c-optimized-model --c-package evmsail \
+  --c-output-dir "$TMP_DIR/filename/ffi/optimized" \
+  --c-preserve from_first_filename --c-preserve from_second_filename \
+  "$TEST_DIR/filename.sail_project"
+
+FILENAME_INCLUDE="$TMP_DIR/filename/ffi/optimized/include/evmsail"
+FILENAME_SOURCE="$TMP_DIR/filename/ffi/optimized/src/spec"
+
+for module in first_filename_output second_filename_output; do
+  test -f "$FILENAME_INCLUDE/spec/$module.h"
+  test -f "$FILENAME_SOURCE/$module.c"
+  test "$(grep -Fc "#include \"evmsail/spec/$module.h\"" "$FILENAME_INCLUDE/spec.h")" -eq 1
+done
+test ! -e "$FILENAME_INCLUDE/spec/first_source.h"
+test ! -e "$FILENAME_SOURCE/first_source.c"
+test ! -e "$FILENAME_INCLUDE/spec/second_source.h"
+test ! -e "$FILENAME_SOURCE/second_source.c"
+grep -Fq 'from_first_filename' "$FILENAME_INCLUDE/spec/first_filename_output.h"
+grep -Fq 'from_first_filename' "$FILENAME_SOURCE/first_filename_output.c"
+grep -Fq 'from_second_filename' "$FILENAME_INCLUDE/spec/second_filename_output.h"
+grep -Fq 'from_second_filename' "$FILENAME_SOURCE/second_filename_output.c"
+if grep -Fq 'from_second_filename' "$FILENAME_INCLUDE/spec/first_filename_output.h" \
+    || grep -Fq 'from_second_filename' "$FILENAME_SOURCE/first_filename_output.c" \
+    || grep -Fq 'from_first_filename' "$FILENAME_INCLUDE/spec/second_filename_output.h" \
+    || grep -Fq 'from_first_filename' "$FILENAME_SOURCE/second_filename_output.c"; then
+  echo 'optimized extraction assigned a definition to the wrong project module' >&2
+  exit 1
+fi
+
 if "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
     --all-modules \
     --c-optimized-model --c-package evmsail \
@@ -164,5 +197,6 @@ fi
 grep -Fq 'FooBar' "$TMP_DIR/collision.stderr"
 grep -Fq 'Foo_bar' "$TMP_DIR/collision.stderr"
 grep -Fq "file stem 'foo_bar'" "$TMP_DIR/collision.stderr"
+test ! -e "$TMP_DIR/collision/ffi/optimized/include/evmsail/spec.h"
 test ! -e "$TMP_DIR/collision/ffi/optimized/include/evmsail/spec/foo_bar.h"
 test ! -e "$TMP_DIR/collision/ffi/optimized/src/spec/foo_bar.c"
