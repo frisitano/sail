@@ -3794,18 +3794,32 @@ module Make (C : CONFIG) = struct
             (fun dependencies (_, value) -> NameSet.union dependencies (cval_dependencies value))
             NameSet.empty fields
     in
-    let condition_fact ?(comparison_when_true = true) comparison left right =
-      Option.map
-        (fun comparison ->
-          {
-            comparison;
-            left;
-            right;
-            comparison_when_true;
-            dependencies = NameSet.union (cval_dependencies left) (cval_dependencies right);
-          }
-        )
-        (semantic_integer_comparison comparison)
+    let condition_operand state value =
+      match (value, integer_lifetime_interval (path_cval_integer_lifetime state value)) with
+      | V_id (_, ctyp), Some (lower, upper) when Big_int.equal lower upper ->
+          (* Comparison lowering can introduce a scoped temporary for a
+             negative literal.  Snapshot singleton operands into the fact so
+             clearing that temporary does not discard a still-valid relation
+             between the condition result and the variables it constrains. *)
+          V_lit (VL_int lower, ctyp)
+      | _ -> value
+    in
+    let remembered_condition state ?(comparison_when_true = true) comparison left right =
+      let left = condition_operand state left in
+      let right = condition_operand state right in
+      Some
+        {
+          comparison;
+          left;
+          right;
+          comparison_when_true;
+          dependencies = NameSet.union (cval_dependencies left) (cval_dependencies right);
+        }
+    in
+    let condition_fact state ?(comparison_when_true = true) comparison left right =
+      Option.bind (semantic_integer_comparison comparison) (fun comparison ->
+          remembered_condition state ~comparison_when_true comparison left right
+      )
     in
     let rec condition_from_cval state = function
       | V_id (name, _) -> NameMap.find_opt name state.conditions
@@ -3813,7 +3827,7 @@ module Make (C : CONFIG) = struct
           Option.map
             (fun fact -> {fact with comparison_when_true = not fact.comparison_when_true})
             (condition_from_cval state condition)
-      | V_call (comparison, [left; right]) -> condition_fact comparison left right
+      | V_call (comparison, [left; right]) -> condition_fact state comparison left right
       | _ -> None
     and condition_from_call state id args =
       match (boolean_negation_name ctx id, args) with
@@ -3823,18 +3837,11 @@ module Make (C : CONFIG) = struct
             (condition_from_cval state condition)
       | _ -> (
           match (integer_comparison_name ctx id, args) with
-          | Some comparison, [left; right] -> condition_fact comparison left right
+          | Some comparison, [left; right] -> condition_fact state comparison left right
           | _ -> (
               match call_predicate_fact id args with
               | Some (comparison, left, right, comparison_when_true) ->
-                  Some
-                    {
-                      comparison;
-                      left;
-                      right;
-                      comparison_when_true;
-                      dependencies = NameSet.union (cval_dependencies left) (cval_dependencies right);
-                    }
+                  remembered_condition state ~comparison_when_true comparison left right
               | None -> None
             )
         )
@@ -6076,6 +6083,12 @@ module Make (C : CONFIG) = struct
               let actual_ret_ctyp = clexp_ctyp result in
               let generic_signature = generic_signature_for id (List.length param_ctyps) in
               let bounds = normalize_call_bounds generic_signature param_ctyps bounds in
+              (* Even when the callee already has its final representation and
+                 needs no clone, the later precise-call pass consumes these
+                 path-refined bounds to prove argument conversions safe. *)
+              let instr =
+                I_aux (I_funcall (creturn, Call (bounds, semantic_proofs), (id, []), args), (n, l))
+              in
               let eligible =
                 specialization_is_eligible l id param_ctyps ret_ctyp actual_ctyps actual_ret_ctyp
                 || semantic_bounds_specialize_body id generic_signature actual_ctyps bounds
