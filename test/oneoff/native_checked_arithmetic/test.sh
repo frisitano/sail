@@ -195,10 +195,9 @@ awk '
 grep -Fq 'int64_t zmixed_u32_negative_i8_div(uint32_t, int8_t);' "$OUT.h"
 awk '
   /^int64_t zmixed_u32_negative_i8_div\(/ { in_function = 1 }
-  in_function && /= \(int64_t\)\(zleft\)/ { found_wide_left = 1 }
-  in_function && /= \(int64_t\)\(zright\)/ { found_wide_right = 1 }
-  in_function && /\(uint32_t\)zleft.*\/.*\(uint32_t\)zright/ { found_inexact_unsigned = 1 }
-  in_function && /^}/ { exit !found_wide_left || !found_wide_right || found_inexact_unsigned }
+  in_function && index($0, "(((int64_t) zleft) / ((int64_t) zright))") { found_exact_signed = 1 }
+  in_function && /[[:space:]]\/[[:space:]]/ && /uint(32|64)_t/ { found_inexact_unsigned = 1 }
+  in_function && /^}/ { exit !found_exact_signed || found_inexact_unsigned }
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
 

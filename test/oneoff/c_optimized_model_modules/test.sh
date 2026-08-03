@@ -150,3 +150,19 @@ if "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
 fi
 
 grep -Fqi 'does not name a concrete type' "$TMP_DIR/missing-type.stderr"
+
+if "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
+    --all-modules \
+    --c-optimized-model --c-package evmsail \
+    --c-output-dir "$TMP_DIR/collision/ffi/optimized" \
+    "$TEST_DIR/collision.sail_project" \
+    >"$TMP_DIR/collision.stdout" 2>"$TMP_DIR/collision.stderr"; then
+  echo 'optimized extraction unexpectedly accepted colliding module file stems' >&2
+  exit 1
+fi
+
+grep -Fq 'FooBar' "$TMP_DIR/collision.stderr"
+grep -Fq 'Foo_bar' "$TMP_DIR/collision.stderr"
+grep -Fq "file stem 'foo_bar'" "$TMP_DIR/collision.stderr"
+test ! -e "$TMP_DIR/collision/ffi/optimized/include/evmsail/spec/foo_bar.h"
+test ! -e "$TMP_DIR/collision/ffi/optimized/src/spec/foo_bar.c"

@@ -548,6 +548,21 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
              Codegen.{ name; file_stem = module_file_stem name; files; requires }
          )
     in
+    let module_names_by_file_stem = Hashtbl.create (List.length modules) in
+    List.iter
+      (fun (module_ : Codegen.c_module) ->
+        match Hashtbl.find_opt module_names_by_file_stem module_.file_stem with
+        | Some previous_name ->
+            raise
+              (Reporting.err_general Parse_ast.Unknown
+                 (Printf.sprintf
+                    "Optimized C module filename collision: Sail modules %s and %s both map to the file stem '%s'"
+                    previous_name module_.name module_.file_stem
+                 )
+              )
+        | None -> Hashtbl.add module_names_by_file_stem module_.file_stem module_.name
+      )
+      modules;
     let output_root = Option.value !opt_c_output_dir ~default:"ffi/optimized" in
     let include_root = Filename.concat (Filename.concat output_root "include") !opt_c_package in
     let include_spec = Filename.concat include_root "spec" in

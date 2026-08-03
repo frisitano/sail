@@ -1,0 +1,7 @@
+FooBar {
+  files collision_foo_bar.sail
+}
+
+Foo_bar {
+  files collision_foo_underscore_bar.sail
+}
