@@ -77,6 +77,7 @@ let optimize_hoist_allocations = ref false
 let optimize_alias = ref false
 let optimize_fixed_int = ref false
 let optimize_fixed_bits = ref false
+let optimize_stack_aggregates = ref false
 
 let ngensym = symbol_generator ()
 
@@ -89,6 +90,20 @@ let c_error ?loc:(l = Parse_ast.Unknown) message = raise (Reporting.err_general 
 let max_int n = Big_int.pred (Big_int.pow_int_positive 2 (n - 1))
 let min_int n = Big_int.negate (Big_int.pow_int_positive 2 (n - 1))
 let max_uint n = Big_int.pred (Big_int.pow_int_positive 2 n)
+let native_integer_widths = [8; 16; 32; 64]
+
+let smallest_native_integer_ctyp lower upper =
+  if Big_int.less_equal Big_int.zero lower then
+    List.find_map
+      (fun width -> if Big_int.less_equal upper (max_uint width) then Some (CT_fuint width) else None)
+      native_integer_widths
+  else
+    List.find_map
+      (fun width ->
+        if Big_int.less_equal (min_int width) lower && Big_int.less_equal upper (max_int width) then Some (CT_fint width)
+        else None
+      )
+      native_integer_widths
 
 (* C-only opaque JIB markers for representations that have no general-purpose
    JIB equivalent.  Encoding them as reserved synthetic structs keeps the
@@ -124,7 +139,7 @@ let rec ctyp_suprema_for_c specialize = function
   | (CT_fint _ | CT_fuint _ | CT_fbits _ | CT_sbits _) as ctyp when specialize -> ctyp
   | CT_tup ctyps when specialize -> CT_tup (List.map (ctyp_suprema_for_c specialize) ctyps)
   | CT_vector ctyp when specialize -> CT_vector (ctyp_suprema_for_c specialize ctyp)
-  | CT_fvector (_, ctyp) when specialize -> CT_vector (ctyp_suprema_for_c specialize ctyp)
+  | CT_fvector (length, ctyp) when specialize -> CT_fvector (length, ctyp_suprema_for_c specialize ctyp)
   | CT_list ctyp when specialize -> CT_list (ctyp_suprema_for_c specialize ctyp)
   | CT_ref ctyp when specialize -> CT_ref (ctyp_suprema_for_c specialize ctyp)
   | ctyp -> Jib_util.ctyp_suprema ctyp
@@ -143,11 +158,15 @@ let rec is_stack_ctyp ctx ctyp =
   | CT_lint -> false
   | CT_lbits when !optimize_fixed_bits -> true
   | CT_lbits -> false
-  | CT_real | CT_string | CT_list _ | CT_vector _ | CT_fvector _ -> false
+  | CT_real | CT_string | CT_list _ | CT_vector _ -> false
+  | CT_fvector (_, ctyp) -> !optimize_stack_aggregates && is_stack_ctyp ctx ctyp
   | CT_struct (_, _) ->
       let _, fields = struct_field_bindings Parse_ast.Unknown ctx ctyp in
       Bindings.for_all (fun _ ctyp -> is_stack_ctyp ctx ctyp) fields
-  | CT_variant (_, _) -> false
+  | CT_variant _ as ctyp when !optimize_stack_aggregates ->
+      let _, constructors = variant_constructor_bindings Parse_ast.Unknown ctx ctyp in
+      Bindings.for_all (fun _ ctyp -> is_stack_ctyp ctx ctyp) constructors
+  | CT_variant _ -> false
   | CT_tup ctyps -> List.for_all (is_stack_ctyp ctx) ctyps
   | CT_ref _ -> true
   | CT_poly _ -> true
@@ -288,12 +307,13 @@ module C_config (Opts : sig
   val branch_coverage : out_channel option
   val assert_to_exception : bool
   val preserve_types : IdSet.t
-  val c_repr_uint64 : IdSet.t
-  val c_repr_int64 : IdSet.t
+  val c_repr_unsigned : int Bindings.t
+  val c_repr_signed : int Bindings.t
   val c_repr_u256 : IdSet.t
   val c_repr_fixed_bytes : int Bindings.t
   val specialize_c : bool
   val require_bounded_int : bool
+  val optimized_model : bool
 end) : CONFIG = struct
   let specialize_c = Opts.specialize_c
   let require_bounded_int = Opts.require_bounded_int
@@ -301,25 +321,18 @@ end) : CONFIG = struct
   (* Representation annotations are C-only and may sit behind one or more
      transparent Sail aliases. Inspect that chain before expand_synonyms erases
      the semantic type names. *)
-  let rec has_c_repr_uint64 env (Typ_aux (typ_aux, _)) =
+  let rec find_c_repr_integer representations env (Typ_aux (typ_aux, _)) =
     match typ_aux with
-    | Typ_id id when IdSet.mem id Opts.c_repr_uint64 -> true
     | Typ_id id -> (
-        match Bindings.find_opt id (Env.get_typ_synonyms env) with
-        | Some ([], A_aux (A_typ typ, _)) -> has_c_repr_uint64 env typ
-        | _ -> false
+        match Bindings.find_opt id representations with
+        | Some width -> Some width
+        | None -> (
+            match Bindings.find_opt id (Env.get_typ_synonyms env) with
+            | Some ([], A_aux (A_typ typ, _)) -> find_c_repr_integer representations env typ
+            | _ -> None
+          )
       )
-    | _ -> false
-
-  let rec has_c_repr_int64 env (Typ_aux (typ_aux, _)) =
-    match typ_aux with
-    | Typ_id id when IdSet.mem id Opts.c_repr_int64 -> true
-    | Typ_id id -> (
-        match Bindings.find_opt id (Env.get_typ_synonyms env) with
-        | Some ([], A_aux (A_typ typ, _)) -> has_c_repr_int64 env typ
-        | _ -> false
-      )
-    | _ -> false
+    | _ -> None
 
   let rec has_c_repr_u256 env (Typ_aux (typ_aux, _)) =
     match typ_aux with
@@ -347,8 +360,8 @@ end) : CONFIG = struct
   let ctyp_suprema = ctyp_suprema_for_c Opts.specialize_c
 
   let specialize_newtype_payload id ctyp =
-    if Opts.specialize_c && IdSet.mem id Opts.c_repr_uint64 then CT_fuint 64
-    else if Opts.specialize_c && IdSet.mem id Opts.c_repr_int64 then CT_fint 64
+    if Opts.specialize_c && Bindings.mem id Opts.c_repr_unsigned then CT_fuint (Bindings.find id Opts.c_repr_unsigned)
+    else if Opts.specialize_c && Bindings.mem id Opts.c_repr_signed then CT_fint (Bindings.find id Opts.c_repr_signed)
     else if Opts.specialize_c && IdSet.mem id Opts.c_repr_u256 then c_repr_u256_ctyp
     else (
       match Bindings.find_opt id Opts.c_repr_fixed_bytes with
@@ -360,65 +373,75 @@ end) : CONFIG = struct
         )
     )
 
-  let representation_refines ~semantic ~represented =
+  let specializes_narrow_fixed_integer ~semantic ~represented =
     match (semantic, represented) with
+    | (CT_fint semantic_width | CT_fuint semantic_width), (CT_fint represented_width | CT_fuint represented_width) ->
+        represented_width < semantic_width
+    | _ -> false
+
+  let rec representation_refines ~semantic ~represented =
+    match (semantic, represented) with
+    | semantic, represented when specializes_narrow_fixed_integer ~semantic ~represented -> true
     | CT_lint, (CT_fint _ | CT_fuint _) -> true
-    | CT_lint, represented
-      when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
+    | CT_lint, represented when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented
+      ->
         true
     | CT_lbits, represented when is_c_repr_u256 represented -> true
-    | semantic, CT_fuint _
-      when is_c_repr_u128 semantic || is_c_repr_u256 semantic || is_c_repr_u320 semantic ->
-        true
+    | semantic, CT_fuint _ when is_c_repr_u128 semantic || is_c_repr_u256 semantic || is_c_repr_u320 semantic -> true
     | semantic, represented
       when (is_c_repr_u256 semantic && is_c_repr_u128 represented)
            || (is_c_repr_u320 semantic && (is_c_repr_u128 represented || is_c_repr_u256 represented)) ->
         true
     | (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), represented when is_c_repr_fixed_bytes represented -> true
+    | CT_vector semantic_element, CT_fvector (_, represented_element) ->
+        ctyp_equal semantic_element represented_element
+        || representation_refines ~semantic:semantic_element ~represented:represented_element
     | _ -> false
 
   (* The Sail typechecker has already proved the actual argument inhabits the
      semantic parameter type.  When its selected fixed representation is
      strictly narrower, retain it by cloning the local function instead of
      inserting a widening conversion at the call boundary. *)
-  let specializes_narrow_fixed_integer_argument ~semantic ~represented =
-    match (semantic, represented) with
-    | (CT_fint semantic_width | CT_fuint semantic_width),
-      (CT_fint represented_width | CT_fuint represented_width) ->
-        represented_width < semantic_width
-    | _ -> false
-
   let specialize_function_argument_representation ~semantic ~represented =
     Opts.specialize_c
-    &&
-    (specializes_narrow_fixed_integer_argument ~semantic ~represented
-    || match (semantic, represented) with
-    | CT_lint, (CT_fint _ | CT_fuint _) -> true
-    | CT_lint, represented
-      when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
-        true
-    | semantic, CT_fuint _
-      when is_c_repr_u128 semantic || is_c_repr_u256 semantic || is_c_repr_u320 semantic ->
-        true
-    | semantic, represented
-      when (is_c_repr_u256 semantic && is_c_repr_u128 represented)
-           || (is_c_repr_u320 semantic && (is_c_repr_u128 represented || is_c_repr_u256 represented)) ->
-        true
-    | CT_lbits, represented when is_c_repr_u256 represented -> true
-    | (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), represented when is_c_repr_fixed_bytes represented -> true
-    | _ -> false)
+    && (specializes_narrow_fixed_integer ~semantic ~represented
+       ||
+       match (semantic, represented) with
+       | CT_lint, (CT_fint _ | CT_fuint _) -> true
+       | CT_lint, represented
+         when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
+           true
+       | semantic, CT_fuint _ when is_c_repr_u128 semantic || is_c_repr_u256 semantic || is_c_repr_u320 semantic -> true
+       | semantic, represented
+         when (is_c_repr_u256 semantic && is_c_repr_u128 represented)
+              || (is_c_repr_u320 semantic && (is_c_repr_u128 represented || is_c_repr_u256 represented)) ->
+           true
+       | CT_lbits, represented when is_c_repr_u256 represented -> true
+       | (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), represented when is_c_repr_fixed_bytes represented ->
+           true
+       | CT_vector semantic_element, CT_fvector (_, represented_element) ->
+           ctyp_equal semantic_element represented_element
+           || representation_refines ~semantic:semantic_element ~represented:represented_element
+       | _ -> false
+       )
 
   let specialize_function_result_representation ~semantic ~represented =
     Opts.specialize_c
-    &&
-    match (semantic, represented) with
-    | CT_lint, (CT_fint _ | CT_fuint _) -> true
-    | CT_lint, represented
-      when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
-        true
-    | CT_lbits, represented when is_c_repr_u256 represented -> true
-    | (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), represented when is_c_repr_fixed_bytes represented -> true
-    | _ -> false
+    && (specializes_narrow_fixed_integer ~semantic ~represented
+       ||
+       match (semantic, represented) with
+       | CT_lint, (CT_fint _ | CT_fuint _) -> true
+       | CT_lint, represented
+         when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
+           true
+       | CT_lbits, represented when is_c_repr_u256 represented -> true
+       | (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), represented when is_c_repr_fixed_bytes represented ->
+           true
+       | CT_vector semantic_element, CT_fvector (_, represented_element) ->
+           ctyp_equal semantic_element represented_element
+           || representation_refines ~semantic:semantic_element ~represented:represented_element
+       | _ -> false
+       )
 
   let specialize_function_body_representation = specialize_function_result_representation
 
@@ -458,23 +481,26 @@ end) : CONFIG = struct
 
   let function_argument_unification_type ~expected ~represented =
     match (c_repr_fixed_bytes_length expected, expected, represented, c_repr_fixed_bytes_length represented) with
-    | Some expected_length, _, CT_fvector (represented_length, CT_fbits 8), _
-      when expected_length = represented_length ->
+    | Some expected_length, _, CT_fvector (represented_length, CT_fbits 8), _ when expected_length = represented_length
+      ->
         Some expected
     | Some _, _, CT_vector (CT_fbits 8), _ -> Some expected
     | None, (CT_vector _ | CT_fvector _), _, Some length -> Some (CT_fvector (length, CT_fbits 8))
-    | _ when specializes_narrow_fixed_integer_argument ~semantic:expected ~represented -> Some expected
+    | None, CT_vector semantic_element, (CT_fvector (_, represented_element) as represented), None
+      when ctyp_equal semantic_element represented_element
+           || representation_refines ~semantic:semantic_element ~represented:represented_element ->
+        Some represented
+    | _ when specializes_narrow_fixed_integer ~semantic:expected ~represented -> Some expected
     | _ -> None
 
-  let function_argument_narrowing_allowed ~expected ~source ~represented =
-    ctyp_equal expected source
-    && (((is_c_repr_u128 expected || is_c_repr_u256 expected || is_c_repr_u320 expected)
-         && ctyp_equal represented CT_lint)
-       ||
-       match expected with
-       | CT_fuint _ -> is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented
-       | _ -> false
-       )
+  let function_argument_narrowing_allowed ~expected ~source:_ ~represented =
+    ((is_c_repr_u128 expected || is_c_repr_u256 expected || is_c_repr_u320 expected)
+     && ctyp_equal represented CT_lint
+    ||
+    match expected with
+    | CT_fuint _ -> is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented
+    | _ -> false
+    )
 
   (* Flow typing can refine a local integer to a range whose preferred native
      signedness differs from the C type selected when the storage was
@@ -502,12 +528,25 @@ end) : CONFIG = struct
       )
     | CT_lbits -> is_c_repr_u256 represented
     | CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8) -> is_c_repr_fixed_bytes represented
+    | CT_vector semantic_element -> (
+        match represented with
+        | CT_fvector (_, represented_element) ->
+            ctyp_equal semantic_element represented_element
+            || representation_refines ~semantic:semantic_element ~represented:represented_element
+        | _ -> false
+      )
     | _ -> false
 
   let propagate_newtype_payload_representation id ~semantic ~represented =
     representation_refines ~semantic ~represented
-    || (IdSet.mem id Opts.c_repr_uint64 && ctyp_equal represented (CT_fuint 64))
-    || (IdSet.mem id Opts.c_repr_int64 && ctyp_equal represented (CT_fint 64))
+    || ( match Bindings.find_opt id Opts.c_repr_unsigned with
+      | Some width -> ctyp_equal represented (CT_fuint width)
+      | None -> false
+      )
+    || ( match Bindings.find_opt id Opts.c_repr_signed with
+      | Some width -> ctyp_equal represented (CT_fint width)
+      | None -> false
+      )
     || (IdSet.mem id Opts.c_repr_u256 && is_c_repr_u256 represented)
     ||
     match Bindings.find_opt id Opts.c_repr_fixed_bytes with
@@ -547,6 +586,9 @@ end) : CONFIG = struct
       | "vector_init", (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), represented, _
         when is_c_repr_fixed_bytes represented ->
           true
+      | "vector_init", CT_vector semantic_element, (CT_fvector _ as represented), _
+        when representation_refines ~semantic:(CT_vector semantic_element) ~represented ->
+          true
       | _ -> false
     )
 
@@ -585,6 +627,13 @@ end) : CONFIG = struct
         (CT_fint _ | CT_fuint _) )
       when first_argument_is_fixed_bytes || first_argument_is_vector ->
         true
+    | ( ("vector_access" | "vector_access_inc" | "fast_vector_access" | "fast_unsigned_vector_access"),
+        _,
+        0,
+        CT_vector semantic_element,
+        (CT_fvector _ as represented) )
+      when representation_refines ~semantic:(CT_vector semantic_element) ~represented ->
+        true
     | "vector_init", return_ctyp, 0, CT_lint, (CT_fint _ | CT_fuint _)
       when is_c_repr_fixed_bytes return_ctyp || match return_ctyp with CT_vector _ | CT_fvector _ -> true | _ -> false
       ->
@@ -615,6 +664,14 @@ end) : CONFIG = struct
         represented )
       when is_c_repr_fixed_bytes return_ctyp && ctyp_equal return_ctyp represented ->
         true
+    | ( ("vector_update" | "vector_update_inc" | "internal_vector_update"),
+        return_ctyp,
+        0,
+        CT_vector semantic_element,
+        (CT_fvector _ as represented) )
+      when ctyp_equal return_ctyp represented
+           && representation_refines ~semantic:(CT_vector semantic_element) ~represented ->
+        true
     | ("vector_update" | "vector_update_inc" | "internal_vector_update"), return_ctyp, 0, CT_lbits, represented
       when is_c_repr_u256 return_ctyp && is_c_repr_u256 represented ->
         true
@@ -632,14 +689,14 @@ end) : CONFIG = struct
       analyse the Sail types and attempts to fit them into the smallest possible C types, provided ctx.optimize_smt is
       true (default) **)
   let rec convert_typ ctx typ =
-    let c_repr_uint64 = has_c_repr_uint64 ctx.local_env typ in
-    let c_repr_int64 = has_c_repr_int64 ctx.local_env typ in
+    let c_repr_unsigned = find_c_repr_integer Opts.c_repr_unsigned ctx.local_env typ in
+    let c_repr_signed = find_c_repr_integer Opts.c_repr_signed ctx.local_env typ in
     let c_repr_u256 = has_c_repr_u256 ctx.local_env typ in
     let c_repr_fixed_bytes = find_c_repr_fixed_bytes ctx.local_env typ in
     let (Typ_aux (typ_aux, l) as typ) = Env.expand_synonyms ctx.local_env typ in
     match typ_aux with
-    | _ when c_repr_uint64 -> CT_fuint 64
-    | _ when c_repr_int64 -> CT_fint 64
+    | _ when Option.is_some c_repr_unsigned -> CT_fuint (Option.get c_repr_unsigned)
+    | _ when Option.is_some c_repr_signed -> CT_fint (Option.get c_repr_signed)
     | _ when c_repr_u256 -> c_repr_u256_ctyp
     | _ when Option.is_some c_repr_fixed_bytes -> c_repr_fixed_bytes_ctyp (Option.get c_repr_fixed_bytes)
     | Typ_id id when string_of_id id = "bool" -> CT_bool
@@ -662,54 +719,81 @@ end) : CONFIG = struct
               }
             in
             match (nexp_simp n, nexp_simp m) with
+            | Nexp_aux (Nexp_constant n, _), Nexp_aux (Nexp_constant m, _) when Opts.specialize_c -> (
+                match smallest_native_integer_ctyp n m with
+                | Some ctyp -> ctyp
+                | None when Big_int.less_equal Big_int.zero n && Big_int.less_equal m (max_uint 128) -> c_repr_u128_ctyp
+                | None when Big_int.less_equal (min_int 128) n && Big_int.less_equal m (max_int 128) -> CT_fint 128
+                | None when Big_int.less_equal Big_int.zero n && Big_int.less_equal m (max_uint 256) -> c_repr_u256_ctyp
+                | None when Big_int.less_equal Big_int.zero n && Big_int.less_equal m (max_uint 320) -> c_repr_u320_ctyp
+                | None -> CT_lint
+              )
             | Nexp_aux (Nexp_constant n, _), Nexp_aux (Nexp_constant m, _)
               when Big_int.less_equal Big_int.zero n && Big_int.less_equal m (max_uint 64) ->
                 CT_fuint 64
             | Nexp_aux (Nexp_constant n, _), Nexp_aux (Nexp_constant m, _)
               when Big_int.less_equal (min_int 64) n && Big_int.less_equal m (max_int 64) ->
                 CT_fint 64
-            | Nexp_aux (Nexp_constant n, _), Nexp_aux (Nexp_constant m, _)
-              when Opts.specialize_c && Big_int.less_equal Big_int.zero n && Big_int.less_equal m (max_uint 128) ->
-                c_repr_u128_ctyp
-            | Nexp_aux (Nexp_constant n, _), Nexp_aux (Nexp_constant m, _)
-              when Opts.specialize_c && Big_int.less_equal (min_int 128) n && Big_int.less_equal m (max_int 128) ->
-                CT_fint 128
-            | Nexp_aux (Nexp_constant n, _), Nexp_aux (Nexp_constant m, _)
-              when Opts.specialize_c && Big_int.less_equal Big_int.zero n && Big_int.less_equal m (max_uint 256) ->
-                c_repr_u256_ctyp
-            | Nexp_aux (Nexp_constant n, _), Nexp_aux (Nexp_constant m, _)
-              when Opts.specialize_c && Big_int.less_equal Big_int.zero n && Big_int.less_equal m (max_uint 320) ->
-                c_repr_u320_ctyp
-            | n, m ->
-                if
-                  prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
-                  && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_uint 64)))
-                then CT_fuint 64
-                else if
-                  prove __POS__ ctx.local_env (nc_lteq (nconstant (min_int 64)) n)
-                  && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_int 64)))
-                then CT_fint 64
-                else if
-                  Opts.specialize_c
-                  && prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
-                  && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_uint 128)))
-                then c_repr_u128_ctyp
-                else if
-                  Opts.specialize_c
-                  && prove __POS__ ctx.local_env (nc_lteq (nconstant (min_int 128)) n)
-                  && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_int 128)))
-                then CT_fint 128
-                else if
-                  Opts.specialize_c
-                  && prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
-                  && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_uint 256)))
-                then c_repr_u256_ctyp
-                else if
-                  Opts.specialize_c
-                  && prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
-                  && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_uint 320)))
-                then c_repr_u320_ctyp
-                else CT_lint
+            | n, m -> (
+                let prove_native_integer_ctyp () =
+                  if not Opts.specialize_c then None
+                  else (
+                    match
+                      List.find_map
+                        (fun width ->
+                          if
+                            prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
+                            && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_uint width)))
+                          then Some (CT_fuint width)
+                          else None
+                        )
+                        native_integer_widths
+                    with
+                    | Some ctyp -> Some ctyp
+                    | None ->
+                        List.find_map
+                          (fun width ->
+                            if
+                              prove __POS__ ctx.local_env (nc_lteq (nconstant (min_int width)) n)
+                              && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_int width)))
+                            then Some (CT_fint width)
+                            else None
+                          )
+                          native_integer_widths
+                  )
+                in
+                match prove_native_integer_ctyp () with
+                | Some ctyp -> ctyp
+                | None
+                  when prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
+                       && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_uint 64))) ->
+                    CT_fuint 64
+                | None
+                  when prove __POS__ ctx.local_env (nc_lteq (nconstant (min_int 64)) n)
+                       && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_int 64))) ->
+                    CT_fint 64
+                | None
+                  when Opts.specialize_c
+                       && prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
+                       && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_uint 128))) ->
+                    c_repr_u128_ctyp
+                | None
+                  when Opts.specialize_c
+                       && prove __POS__ ctx.local_env (nc_lteq (nconstant (min_int 128)) n)
+                       && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_int 128))) ->
+                    CT_fint 128
+                | None
+                  when Opts.specialize_c
+                       && prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
+                       && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_uint 256))) ->
+                    c_repr_u256_ctyp
+                | None
+                  when Opts.specialize_c
+                       && prove __POS__ ctx.local_env (nc_lteq (nconstant Big_int.zero) n)
+                       && prove __POS__ ctx.local_env (nc_lteq m (nconstant (max_uint 320))) ->
+                    c_repr_u320_ctyp
+                | None -> CT_lint
+              )
           )
       )
     | Typ_app (id, [A_aux (A_typ typ, _)]) when string_of_id id = "list" -> CT_list (ctyp_suprema (convert_typ ctx typ))
@@ -740,6 +824,10 @@ end) : CONFIG = struct
           when Opts.specialize_c && ctyp_equal elem_ctyp (CT_fbits 8) && Big_int.less_equal (Big_int.of_int 1) length
           -> (
             try c_repr_fixed_bytes_ctyp (Big_int.to_int length) with _ -> CT_vector elem_ctyp
+          )
+        | Nexp_aux (Nexp_constant length, _)
+          when Opts.specialize_c && Big_int.less_equal (Big_int.of_int 1) length -> (
+            try CT_fvector (Big_int.to_int length, elem_ctyp) with _ -> CT_vector elem_ctyp
           )
         | _ -> CT_vector elem_ctyp
       )
@@ -870,17 +958,83 @@ end) : CONFIG = struct
         | _ -> convert_typ ctx (aval_typ aval)
       )
 
-  (* Map over all the functions in an aexp. *)
-  let rec analyze_functions ctx f (AE_aux (aexp, ({ env; _ } as annot))) =
+  type conversion_origin = { origin_value : cval; origin_width : int }
+
+  let conversion_origin conversion_origins value =
+    match value with
+    | V_id (id, _) -> (
+        match NameMap.find_opt id conversion_origins with
+        | Some origin -> Some origin
+        | None -> (
+            match cval_ctyp value with
+            | CT_fbits width -> Some { origin_value = value; origin_width = width }
+            | _ -> None
+          )
+      )
+    | _ -> (
+        match cval_ctyp value with
+        | CT_fbits width -> Some { origin_value = value; origin_width = width }
+        | _ -> None
+      )
+
+  let rec conversion_result_origin conversion_origins (AE_aux (aexp, _)) =
+    (* Only immutable, conversion-only ANF chains qualify.  This restriction is
+       what makes it sound to remove the chain after a proven round trip has
+       replaced its final use: no effectful computation can be hidden here. *)
+    match aexp with
+    | AE_val (AV_cval (V_call ((Zero_extend _ | Sign_extend _), [source]), _)) ->
+        conversion_origin conversion_origins source
+    | AE_val (AV_cval ((V_id _ as value), _)) -> conversion_origin conversion_origins value
+    | AE_typ (aexp, _) -> conversion_result_origin conversion_origins aexp
+    | AE_let (mut, id, _, binding, body, _) ->
+        (match (mut, conversion_result_origin conversion_origins binding) with
+        | Immutable, Some origin ->
+            conversion_result_origin (NameMap.add id origin conversion_origins) body
+        | Mutable, _ | Immutable, None -> None)
+    | _ -> None
+
+  let aexp_uses_name id aexp =
+    (* [optimize_anf] runs after [no_shadow], so equality of ANF names is enough
+       to decide whether the rewritten body still refers to this binding. *)
+    let used = ref false in
+    let check_cval cval =
+      Jib_util.map_cval
+        (function
+          | V_id (used_id, _) as cval when used_id = id ->
+              used := true;
+              cval
+          | cval -> cval
+          )
+        cval
+    in
+    ignore
+      (Anf.map_aval
+         (fun _ -> function
+           | AV_id (used_id, _) as aval when used_id = id ->
+               used := true;
+               aval
+           | AV_cval (cval, typ) -> AV_cval (check_cval cval, typ)
+           | aval -> aval
+           )
+         aexp
+      );
+    !used
+
+  (* Map over all the functions in an aexp.  Immutable extension origins are
+     retained alongside represented locals so later truncations can discharge
+     round-trip identities while the semantic conversion chain is still
+     explicit. *)
+  let rec analyze_functions ctx conversion_origins f (AE_aux (aexp, ({ env; _ } as annot))) =
     let ctx = { ctx with local_env = env } in
     let aexp =
       match aexp with
-      | AE_app (id, vs, typ) -> f ctx id vs typ
-      | AE_typ (aexp, typ) -> AE_typ (analyze_functions ctx f aexp, typ)
-      | AE_assign (alexp, aexp) -> AE_assign (alexp, analyze_functions ctx f aexp)
-      | AE_short_circuit (op, aval, aexp) -> AE_short_circuit (op, aval, analyze_functions ctx f aexp)
+      | AE_app (id, vs, typ) -> f ctx conversion_origins id vs typ
+      | AE_typ (aexp, typ) -> AE_typ (analyze_functions ctx conversion_origins f aexp, typ)
+      | AE_assign (alexp, aexp) -> AE_assign (alexp, analyze_functions ctx conversion_origins f aexp)
+      | AE_short_circuit (op, aval, aexp) ->
+          AE_short_circuit (op, aval, analyze_functions ctx conversion_origins f aexp)
       | AE_let (mut, id, typ1, aexp1, (AE_aux (_, { env = env2; _ }) as aexp2), typ2) ->
-          let aexp1 = analyze_functions ctx f aexp1 in
+          let aexp1 = analyze_functions ctx conversion_origins f aexp1 in
           (* Use aexp2's environment because it will contain constraints for id *)
           let semantic_ctyp1 = convert_typ { ctx with local_env = env2 } typ1 in
           let ctyp1 =
@@ -923,22 +1077,50 @@ end) : CONFIG = struct
             | _ -> semantic_ctyp1
           in
           let ctx = { ctx with locals = NameMap.add id (mut, ctyp1) ctx.locals } in
-          AE_let (mut, id, typ1, aexp1, analyze_functions ctx f aexp2, typ2)
+          let binding_origin =
+            match mut with
+            | Immutable -> conversion_result_origin conversion_origins aexp1
+            | Mutable -> None
+          in
+          let conversion_origins =
+            match binding_origin with
+            | Some origin -> NameMap.add id origin conversion_origins
+            | None -> NameMap.remove id conversion_origins
+          in
+          let aexp2 = analyze_functions ctx conversion_origins f aexp2 in
+          (match binding_origin with
+          | Some _ when not (aexp_uses_name id aexp2) ->
+              let AE_aux (aexp2, _) = aexp2 in
+              aexp2
+          | Some _ | None -> AE_let (mut, id, typ1, aexp1, aexp2, typ2))
       | AE_block (aexps, aexp, typ) ->
-          AE_block (List.map (analyze_functions ctx f) aexps, analyze_functions ctx f aexp, typ)
+          AE_block
+            ( List.map (analyze_functions ctx conversion_origins f) aexps,
+              analyze_functions ctx conversion_origins f aexp,
+              typ
+            )
       | AE_if (aval, aexp1, aexp2, typ) ->
-          AE_if (aval, analyze_functions ctx f aexp1, analyze_functions ctx f aexp2, typ)
+          AE_if
+            ( aval,
+              analyze_functions ctx conversion_origins f aexp1,
+              analyze_functions ctx conversion_origins f aexp2,
+              typ
+            )
       | AE_loop (loop_typ, aexp1, aexp2) ->
-          AE_loop (loop_typ, analyze_functions ctx f aexp1, analyze_functions ctx f aexp2)
+          AE_loop
+            ( loop_typ,
+              analyze_functions ctx conversion_origins f aexp1,
+              analyze_functions ctx conversion_origins f aexp2
+            )
       | AE_for (id, aexp1, aexp2, aexp3, order, aexp4) ->
-          let aexp1 = analyze_functions ctx f aexp1 in
-          let aexp2 = analyze_functions ctx f aexp2 in
-          let aexp3 = analyze_functions ctx f aexp3 in
+          let aexp1 = analyze_functions ctx conversion_origins f aexp1 in
+          let aexp2 = analyze_functions ctx conversion_origins f aexp2 in
+          let aexp3 = analyze_functions ctx conversion_origins f aexp3 in
           (* JIB compilation selects int64_t only after proving the complete
              loop cursor lifecycle, including the update after the last
              iteration.  Keep this earlier ANF pass representation-neutral. *)
           let ctx = { ctx with locals = NameMap.add id (Immutable, CT_lint) ctx.locals } in
-          let aexp4 = analyze_functions ctx f aexp4 in
+          let aexp4 = analyze_functions ctx (NameMap.remove id conversion_origins) f aexp4 in
           AE_for (id, aexp1, aexp2, aexp3, order, aexp4)
       | AE_match (aval, cases, typ) ->
           let merge_pattern_bindings left right =
@@ -1023,15 +1205,26 @@ end) : CONFIG = struct
                 (fun ctx (id, ctyp) -> { ctx with locals = NameMap.add id (Immutable, ctyp) ctx.locals })
                 ctx pat_bindings
             in
-            (pat, analyze_functions ctx f aexp1, analyze_functions ctx f aexp2, uannot)
+            let conversion_origins =
+              List.fold_left (fun origins (id, _) -> NameMap.remove id origins) conversion_origins pat_bindings
+            in
+            ( pat,
+              analyze_functions ctx conversion_origins f aexp1,
+              analyze_functions ctx conversion_origins f aexp2,
+              uannot
+            )
           in
           AE_match (aval, List.map analyze_case cases, typ)
       | AE_try (aexp, cases, typ) ->
           AE_try
-            ( analyze_functions ctx f aexp,
+            ( analyze_functions ctx conversion_origins f aexp,
               List.map
                 (fun (pat, aexp1, aexp2, uannot) ->
-                  (pat, analyze_functions ctx f aexp1, analyze_functions ctx f aexp2, uannot)
+                  ( pat,
+                    analyze_functions ctx conversion_origins f aexp1,
+                    analyze_functions ctx conversion_origins f aexp2,
+                    uannot
+                  )
                 )
                 cases,
               typ
@@ -1040,7 +1233,7 @@ end) : CONFIG = struct
     in
     AE_aux (aexp, annot)
 
-  let analyze_primop' ctx id args typ =
+  let analyze_primop' ctx conversion_origins id args typ =
     let no_change = AE_app (Sail_function id, args, typ) in
     let semantic_args = args in
     let args = List.map (c_aval ctx) args in
@@ -1067,12 +1260,9 @@ end) : CONFIG = struct
             match represented with
             | CT_fuint width -> fits (nconstant Big_int.zero) (nconstant (max_uint width))
             | CT_fint width -> fits (nconstant (min_int width)) (nconstant (max_int width))
-            | represented when is_c_repr_u128 represented ->
-                fits (nconstant Big_int.zero) (nconstant (max_uint 128))
-            | represented when is_c_repr_u256 represented ->
-                fits (nconstant Big_int.zero) (nconstant (max_uint 256))
-            | represented when is_c_repr_u320 represented ->
-                fits (nconstant Big_int.zero) (nconstant (max_uint 320))
+            | represented when is_c_repr_u128 represented -> fits (nconstant Big_int.zero) (nconstant (max_uint 128))
+            | represented when is_c_repr_u256 represented -> fits (nconstant Big_int.zero) (nconstant (max_uint 256))
+            | represented when is_c_repr_u320 represented -> fits (nconstant Big_int.zero) (nconstant (max_uint 320))
             | _ -> false
           )
         | None -> false
@@ -1090,6 +1280,13 @@ end) : CONFIG = struct
         | None -> None
       with Type_error.Type_error _ -> None
     in
+    let semantic_index_in_bounds length aval =
+      match semantic_integer_bounds aval with
+      | Some (env, lower, upper) ->
+          prove __POS__ env (nc_lteq (nconstant Big_int.zero) lower)
+          && prove __POS__ env (nc_lt upper (nconstant (Big_int.of_int length)))
+      | None -> false
+    in
     let semantic_integer_excludes value aval =
       match aval with
       | AV_lit (L_aux (L_num literal, _), _) -> not (Big_int.equal value literal)
@@ -1101,20 +1298,29 @@ end) : CONFIG = struct
           | None -> false
         )
     in
+    let semantic_integer_nonnegative aval =
+      match aval with
+      | AV_lit (L_aux (L_num literal, _), _) -> Big_int.less_equal Big_int.zero literal
+      | AV_cval (V_lit (VL_int literal, _), _) -> Big_int.less_equal Big_int.zero literal
+      | _ -> (
+          match semantic_integer_bounds aval with
+          | Some (env, lower, _) -> prove __POS__ env (nc_lteq (nconstant Big_int.zero) lower)
+          | None -> false
+        )
+    in
     let semantic_division_defined represented =
       match semantic_args with
-      | [left; right] ->
+      | [left; right] -> (
           semantic_integer_excludes Big_int.zero right
           &&
-          (match represented with
+          match represented with
           | CT_fint width ->
-              semantic_integer_excludes (min_int width) left
-              || semantic_integer_excludes (Big_int.of_int (-1)) right
+              semantic_integer_excludes (min_int width) left || semantic_integer_excludes (Big_int.of_int (-1)) right
           | CT_fuint _ -> true
           | represented when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
               true
           | _ -> false
-          )
+        )
       | _ -> false
     in
     let proven_native_op represented op =
@@ -1185,8 +1391,8 @@ end) : CONFIG = struct
           match (left, right) with
           | CT_fint left_width, CT_fint right_width -> left_width <> right_width
           | CT_fuint left_width, CT_fuint right_width -> left_width <> right_width
-          | CT_fint signed_width, CT_fuint unsigned_width
-          | CT_fuint unsigned_width, CT_fint signed_width -> signed_width > unsigned_width
+          | CT_fint signed_width, CT_fuint unsigned_width | CT_fuint unsigned_width, CT_fint signed_width ->
+              signed_width > unsigned_width
           | _ -> false
         in
         comparison && exact_c_conversion (cval_ctyp left) (cval_ctyp right)
@@ -1207,9 +1413,7 @@ end) : CONFIG = struct
               | Iadd | Isub | Imul | Idiv | Imod -> proven_native_op represented op
               | _ -> false
             in
-            if operation_fits then
-              Some (AE_val (AV_cval (V_call (proven_op op, [left; right]), typ)))
-            else None
+            if operation_fits then Some (AE_val (AV_cval (V_call (proven_op op, [left; right]), typ))) else None
         )
     in
     let native_binary_or_no_change op left right = Option.value (native_binary op left right) ~default:no_change in
@@ -1249,74 +1453,70 @@ end) : CONFIG = struct
       | false, false -> None
     in
     let widening_u128_binary op left right =
-      let name =
+      let widening_op =
         match op with
-        | Iadd -> Some "u128_add_u64_u64"
-        | Isub -> Some "u128_sub_u64_u64"
-        | Imul -> Some "u128_mul_u64_u64"
+        | Iadd -> Some (Widening_iadd (128, convert_typ ctx typ))
+        | Imul -> Some (Widening_imul (128, convert_typ ctx typ))
         | _ -> None
       in
-      match (name, as_native_u64 left, as_native_u64 right) with
-      | Some name, Some left, Some right ->
-          let semantic_typ index = aval_typ (List.nth semantic_args index) in
-          Some
-            (AE_app
-               ( Pure_extern (mk_id name, Some typ),
-                 [AV_cval (left, semantic_typ 0); AV_cval (right, semantic_typ 1)],
-                 typ
-               )
-            )
+      match (widening_op, as_native_u64 left, as_native_u64 right) with
+      | Some op, Some left, Some right -> Some (AE_val (AV_cval (V_call (op, [left; right]), typ)))
       | _ -> None
     in
     let widening_u256_binary op left right =
-      let suffix =
+      let supported_operands =
         match (cval_ctyp left, cval_ctyp right) with
-        | left, right when is_c_repr_u128 left && is_c_repr_u128 right -> Some "u128_u128"
-        | left, CT_fuint _ when is_c_repr_u128 left -> Some "u128_u64"
-        | CT_fuint _, right when is_c_repr_u128 right -> Some "u64_u128"
+        | left, right when is_c_repr_u128 left && is_c_repr_u128 right -> true
+        | left, CT_fuint _ when is_c_repr_u128 left -> true
+        | CT_fuint _, right when is_c_repr_u128 right -> true
+        | _ -> false
+      in
+      let widening_op =
+        match op with
+        | Iadd -> Some (Widening_iadd (256, convert_typ ctx typ))
+        | Imul -> Some (Widening_imul (256, convert_typ ctx typ))
         | _ -> None
       in
-      let stem = match op with Iadd -> Some "u256_add" | Imul -> Some "u256_mul" | _ -> None in
-      match (stem, suffix) with
-      | Some stem, Some suffix ->
-          let semantic_typ index = aval_typ (List.nth semantic_args index) in
-          Some
-            (AE_app
-               ( Pure_extern (mk_id (stem ^ "_" ^ suffix), Some typ),
-                 [AV_cval (left, semantic_typ 0); AV_cval (right, semantic_typ 1)],
-                 typ
-               )
-            )
+      match widening_op with
+      | Some op when supported_operands -> Some (AE_val (AV_cval (V_call (op, [left; right]), typ)))
       | _ -> None
     in
     let widening_u320_binary op left right =
-      let stem =
-        match op with Iadd -> Some "u320_add_widen" | Imul -> Some "u320_mul_widen" | _ -> None
+      let widening_op =
+        match op with
+        | Iadd -> Some (Widening_iadd (320, convert_typ ctx typ))
+        | Imul -> Some (Widening_imul (320, convert_typ ctx typ))
+        | _ -> None
       in
-      match stem with
-      | Some stem
-        when (match (cval_ctyp left, cval_ctyp right) with
+      match widening_op with
+      | Some op
+        when match (cval_ctyp left, cval_ctyp right) with
              | left, right ->
                  (is_c_repr_u320 left || is_c_repr_u256 left || is_c_repr_u128 left
-                 || match left with CT_fuint _ -> true | _ -> false)
+                 || match left with CT_fuint _ -> true | _ -> false
+                 )
                  && (is_c_repr_u320 right || is_c_repr_u256 right || is_c_repr_u128 right
-                    || match right with CT_fuint _ -> true | _ -> false)) ->
-          let semantic_typ index = aval_typ (List.nth semantic_args index) in
-          Some
-            (AE_app
-               ( Pure_extern (mk_id stem, Some typ),
-                 [AV_cval (left, semantic_typ 0); AV_cval (right, semantic_typ 1)],
-                 typ
-               )
-            )
+                    || match right with CT_fuint _ -> true | _ -> false
+                    ) ->
+          Some (AE_val (AV_cval (V_call (op, [left; right]), typ)))
       | _ -> None
     in
     let native_integer_binary_or_no_change ?(commutative = false) op left right =
+      let native_operation left right =
+        match op with
+        | Iadd | Isub | Imul ->
+            let semantic_typ index = aval_typ (List.nth semantic_args index) in
+            AE_app
+              ( Pure_extern (mk_id (proven_marker op), Some typ),
+                [AV_cval (left, semantic_typ 0); AV_cval (right, semantic_typ 1)],
+                typ
+              )
+        | _ -> AE_val (AV_cval (V_call (op, [left; right]), typ))
+      in
       let operation_fits represented =
         match op with
         | Eq | Neq | Ilt | Igt | Ilteq | Igteq -> true
-        | Iadd | Isub | Imul | Idiv | Imod when is_c_repr_u320 represented ->
-            is_c_repr_u320 (convert_typ ctx typ)
+        | (Iadd | Isub | Imul | Idiv | Imod) when is_c_repr_u320 represented -> is_c_repr_u320 (convert_typ ctx typ)
         | Iadd | Isub | Imul | Idiv | Imod -> proven_native_op represented op
         | _ -> false
       in
@@ -1325,20 +1525,19 @@ end) : CONFIG = struct
       | None -> (
           match align_u320_integers left right with
           | Some (left, right)
-            when (match op with
-                 | Idiv | Imod -> is_c_repr_u320 (cval_ctyp left)
-                 | _ -> operation_fits c_repr_u320_ctyp) ->
+            when match op with Idiv | Imod -> is_c_repr_u320 (cval_ctyp left) | _ -> operation_fits c_repr_u320_ctyp ->
               let left, right =
                 if commutative && not (is_c_repr_u320 (cval_ctyp left)) then (right, left) else (left, right)
               in
-              if op = Imod && match cval_ctyp right with CT_fuint _ -> true | _ -> false then
+              if op = Imod && match cval_ctyp right with CT_fuint _ -> true | _ -> false then (
                 let semantic_typ index = aval_typ (List.nth semantic_args index) in
                 AE_app
                   ( Pure_extern (mk_id "u320_mod_u64", Some typ),
                     [AV_cval (left, semantic_typ 0); AV_cval (right, semantic_typ 1)],
                     typ
                   )
-              else AE_val (AV_cval (V_call (op, [left; right]), typ))
+              )
+              else native_operation left right
           | Some _ | None -> (
               match if is_c_repr_u256 (convert_typ ctx typ) then widening_u256_binary op left right else None with
               | Some widened -> widened
@@ -1348,14 +1547,14 @@ end) : CONFIG = struct
                       let left, right =
                         if commutative && not (is_c_repr_u256 (cval_ctyp left)) then (right, left) else (left, right)
                       in
-                      AE_val (AV_cval (V_call (op, [left; right]), typ))
+                      native_operation left right
                   | Some _ | None -> (
                       match align_u128_integers left right with
                       | Some (left, right) when operation_fits c_repr_u128_ctyp ->
                           let left, right =
                             if commutative && not (is_c_repr_u128 (cval_ctyp left)) then (right, left) else (left, right)
                           in
-                          AE_val (AV_cval (V_call (op, [left; right]), typ))
+                          native_operation left right
                       | (Some _ | None) when is_c_repr_u128 (convert_typ ctx typ) ->
                           Option.value (widening_u128_binary op left right) ~default:no_change
                       | Some _ | None -> native_binary_or_no_change op left right
@@ -1404,15 +1603,58 @@ end) : CONFIG = struct
         | _ -> no_change
       )
     | "zero_extend", [AV_cval (v, _); _] -> (
-        match destruct_bitvector ctx.tc_env typ with
-        | Some (Nexp_aux (Nexp_constant n, _)) when Big_int.less_equal n (Big_int.of_int 64) ->
-            AE_val (AV_cval (V_call (Zero_extend (Big_int.to_int n), [v]), typ))
+        let source_typ = aval_typ (List.hd semantic_args) in
+        match (destruct_bitvector ctx.local_env source_typ, destruct_bitvector ctx.local_env typ) with
+        | ( Some (Nexp_aux (Nexp_constant source_width, _)),
+            Some (Nexp_aux (Nexp_constant target_width, _)) )
+          when Big_int.less_equal source_width (Big_int.of_int 64)
+               && Big_int.less_equal target_width (Big_int.of_int 64) -> (
+            let source_width = Big_int.to_int source_width in
+            let target_width = Big_int.to_int target_width in
+            match Jib_semantics.prove_conversion_value_preserving ~source_width ~target_width with
+            | Some _ when source_width = target_width -> AE_val (AV_cval (v, typ))
+            | Some _ -> AE_val (AV_cval (V_call (Zero_extend target_width, [v]), typ))
+            | None -> no_change
+          )
         | _ -> no_change
       )
     | "sign_extend", [AV_cval (v, _); _] -> (
-        match destruct_bitvector ctx.tc_env typ with
-        | Some (Nexp_aux (Nexp_constant n, _)) when Big_int.less_equal n (Big_int.of_int 64) ->
-            AE_val (AV_cval (V_call (Sign_extend (Big_int.to_int n), [v]), typ))
+        let source_typ = aval_typ (List.hd semantic_args) in
+        match (destruct_bitvector ctx.local_env source_typ, destruct_bitvector ctx.local_env typ) with
+        | ( Some (Nexp_aux (Nexp_constant source_width, _)),
+            Some (Nexp_aux (Nexp_constant target_width, _)) )
+          when Big_int.less_equal source_width (Big_int.of_int 64)
+               && Big_int.less_equal target_width (Big_int.of_int 64) -> (
+            let source_width = Big_int.to_int source_width in
+            let target_width = Big_int.to_int target_width in
+            match Jib_semantics.prove_signed_conversion_value_preserving ~source_width ~target_width with
+            | Some _ when source_width = target_width -> AE_val (AV_cval (v, typ))
+            | Some _ -> AE_val (AV_cval (V_call (Sign_extend target_width, [v]), typ))
+            | None -> no_change
+          )
+        | _ -> no_change
+      )
+    | "sail_truncate", [AV_cval (v, _); _] -> (
+        let source_typ = aval_typ (List.hd semantic_args) in
+        match (destruct_bitvector ctx.local_env source_typ, destruct_bitvector ctx.local_env typ) with
+        | ( Some (Nexp_aux (Nexp_constant source_width, _)),
+            Some (Nexp_aux (Nexp_constant target_width, _)) )
+          when Big_int.less_equal source_width (Big_int.of_int 64)
+               && Big_int.less_equal target_width (Big_int.of_int 64) -> (
+            let source_width = Big_int.to_int source_width in
+            let target_width = Big_int.to_int target_width in
+            match Jib_semantics.prove_conversion_low_bits ~source_width ~target_width with
+            | Some _ when source_width = target_width -> AE_val (AV_cval (v, typ))
+            | Some _ -> (
+                match conversion_origin conversion_origins v with
+                | Some { origin_value; origin_width } when origin_width = target_width ->
+                    AE_val (AV_cval (origin_value, typ))
+                | Some _ | None ->
+                    let start = V_lit (VL_int Big_int.zero, CT_fuint 64) in
+                    AE_val (AV_cval (V_call (Slice target_width, [v; start]), typ))
+              )
+            | None -> no_change
+          )
         | _ -> no_change
       )
     | "lteq", [AV_cval (v1, _); AV_cval (v2, _)] -> native_integer_binary_or_no_change Ilteq v1 v2
@@ -1436,14 +1678,29 @@ end) : CONFIG = struct
     | "xor_bits", [AV_cval (v1, _); AV_cval (v2, _)] when ctyp_equal (cval_ctyp v1) (cval_ctyp v2) ->
         AE_val (AV_cval (V_call (Bvxor, [v1; v2]), typ))
     | (("shiftl" | "shiftr" | "arith_shiftr") as shift), [AV_cval (value, _); AV_cval (amount, _)] -> (
+        let count_is_proven =
+          match semantic_args with
+          | [_; semantic_amount] -> (
+              match
+                Jib_semantics.prove_shift_count_bounds ~env:ctx.local_env ~index:1 ~typ:(aval_typ semantic_amount)
+                  ~interval:None ~carrier_width:64
+              with
+              | Some proof -> Jib_semantics.has_shift_count_bounds ~index:1 ~carrier_width:64 [proof]
+              | None -> false
+            )
+          | _ -> false
+        in
         match (cval_ctyp value, native_shift_amount amount) with
         | CT_fbits 0, Some _ when shift = "arith_shiftr" -> no_change
         | CT_fbits _, Some amount ->
             let op =
-              match shift with
-              | "shiftl" -> Bvshiftl
-              | "shiftr" -> Bvshiftr
-              | "arith_shiftr" -> Bvarith_shiftr
+              match (shift, count_is_proven) with
+              | "shiftl", true -> Proven_bvshiftl 64
+              | "shiftr", true -> Proven_bvshiftr 64
+              | "shiftl", false -> Bvshiftl
+              | "shiftr", false -> Bvshiftr
+              | "arith_shiftr", true -> Proven_bvarith_shiftr 64
+              | "arith_shiftr", false -> Bvarith_shiftr
               | _ -> assert false
             in
             AE_val (AV_cval (V_call (op, [value; amount]), typ))
@@ -1468,6 +1725,30 @@ end) : CONFIG = struct
         match convert_typ ctx typ with
         | CT_fbits n -> AE_val (AV_cval (V_call (Slice n, [vec; start]), typ))
         | CT_sbits 64 -> AE_val (AV_cval (V_call (Sslice 64, [vec; start; len]), typ))
+        | _ -> no_change
+      )
+    | "set_slice", [_; _; AV_cval (vec, _); AV_cval (start, _); AV_cval (slice, _)] -> (
+        match (convert_typ ctx typ, cval_ctyp vec, cval_ctyp slice) with
+        | CT_fbits result_width, CT_fbits source_width, CT_fbits slice_width
+          when result_width = source_width -> (
+            let position_is_proven =
+              match semantic_args with
+              | [_; _; _; semantic_start; _] ->
+                  Option.is_some
+                    (Jib_semantics.prove_bit_insert_position_bounds ~env:ctx.local_env ~index:3
+                       ~typ:(aval_typ semantic_start) ~interval:None ~carrier_width:result_width
+                       ~inserted_width:slice_width)
+              | _ -> false
+            in
+            match (position_is_proven, native_shift_amount start) with
+            | true, Some start ->
+                (* The semantic position proof makes both native shifts
+                   defined and keeps the inserted value inside the carrier.
+                   Preserve Set_slice as a structural JIB operation so its
+                   result bound can flow through the definition/call graph. *)
+                AE_val (AV_cval (V_call (Set_slice, [vec; start; slice]), typ))
+            | false, _ | _, None -> no_change
+          )
         | _ -> no_change
       )
     | "get_slice_int", [AV_cval (V_lit (VL_int width, _), _); AV_cval (value, _); AV_cval (V_lit (VL_int start, _), _)]
@@ -1501,14 +1782,28 @@ end) : CONFIG = struct
         | _ -> no_change
       )
     | "vector_access", [AV_cval (vec, _); AV_cval (n, _)]
+      when Opts.specialize_c
+           &&
+           (match (cval_ctyp vec, semantic_args) with
+           | CT_fvector (length, element_ctyp), [_; semantic_index]
+             when is_stack_ctyp ctx element_ctyp && semantic_index_in_bounds length semantic_index ->
+               true
+           | _ -> false) -> (
+        match cval_ctyp vec with
+        | CT_fvector (length, _) -> AE_val (AV_cval (V_call (Proven_vector_access length, [vec; n]), typ))
+        | _ -> assert false
+      )
+    | "vector_access", [AV_cval (vec, _); AV_cval (n, _)]
       when match cval_ctyp vec with CT_fbits _ | CT_sbits _ -> true | ctyp -> is_c_repr_u256 ctyp ->
         AE_val (AV_cval (V_call (Bvaccess, [vec; n]), typ))
     | "vector_access", [v; AV_cval (n, _)] -> (
         match destruct_vector ctx.tc_env (aval_typ v) with
         | Some (_, elem_typ) -> (
             match cval_ctyp n with
-            | CT_fint 64 -> AE_app (Pure_extern (mk_id "fast_vector_access", Some elem_typ), args, typ)
-            | CT_fuint 64 -> AE_app (Pure_extern (mk_id "fast_unsigned_vector_access", Some elem_typ), args, typ)
+            | CT_fint width when width <= 64 ->
+                AE_app (Pure_extern (mk_id "fast_vector_access", Some elem_typ), args, typ)
+            | CT_fuint width when width <= 64 ->
+                AE_app (Pure_extern (mk_id "fast_unsigned_vector_access", Some elem_typ), args, typ)
             | _ -> no_change
           )
         | None -> no_change
@@ -1542,8 +1837,37 @@ end) : CONFIG = struct
         (* Both operations agree modulo 2^256 when the result width is 256.
            The backend helper computes exactly those low four limbs. *)
         AE_val (AV_cval (V_call (Imul, [op1; op2]), typ))
-    | (("ediv_int" | "emod_int") as f), [AV_cval (op1, _); AV_cval (op2, _)] ->
-        native_integer_binary_or_no_change (if f = "ediv_int" then Idiv else Imod) op1 op2
+    | "ediv_int", [AV_cval (op1, _); AV_cval (op2, _)] -> (
+        let represented = convert_typ ctx typ in
+        match semantic_args with
+        | [left; right]
+          when semantic_integer_nonnegative left
+               && semantic_integer_nonnegative right
+               && proven_native_op represented Idiv ->
+            (* Euclidean and truncating division coincide for non-negative
+               operands.  Emit the proof-bearing marker while the source
+               environment still knows that the divisor is non-zero (for
+               example after a terminating zero guard); later graph
+               specialization can then keep the operation native. *)
+            AE_app (Pure_extern (mk_id (proven_marker Idiv), Some typ), args, typ)
+        | _ -> native_integer_binary_or_no_change Idiv op1 op2
+      )
+    | "emod_int", [AV_cval (op1, _); AV_cval (op2, _)] ->
+        let nonnegative_dividend =
+          match cval_ctyp op1 with
+          | CT_fuint _ -> true
+          | ctyp when is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_u320 ctyp -> true
+          | CT_constant value -> Big_int.less_equal Big_int.zero value
+          | _ -> false
+        in
+        let represented = convert_typ ctx typ in
+        (match semantic_args with
+        | [left; right]
+          when semantic_integer_nonnegative left
+               && semantic_integer_nonnegative right
+               && proven_native_op represented Imod ->
+            AE_app (Pure_extern (mk_id (proven_marker Imod), Some typ), args, typ)
+        | _ -> if nonnegative_dividend then native_integer_binary_or_no_change Imod op1 op2 else no_change)
     | "replicate_bits", [AV_cval (vec, vtyp); _] -> (
         match (destruct_vector ctx.tc_env typ, destruct_vector ctx.tc_env vtyp) with
         | Some (Nexp_aux (Nexp_constant n, _), _), Some (Nexp_aux (Nexp_constant m, _), _)
@@ -1561,14 +1885,16 @@ end) : CONFIG = struct
     | "undefined_bool", _ -> AE_val (AV_cval (V_lit (VL_bool false, CT_bool), typ))
     | _, _ -> no_change
 
-  let analyze_primop ctx id args typ =
+  let analyze_primop ctx conversion_origins id args typ =
     let no_change = AE_app (id, args, typ) in
     match id with
     | Sail_function id ->
-        if !optimize_primops then (try analyze_primop' ctx id args typ with Failure _ -> no_change) else no_change
+        if !optimize_primops then
+          (try analyze_primop' ctx conversion_origins id args typ with Failure _ -> no_change)
+        else no_change
     | _ -> no_change
 
-  let optimize_anf ctx aexp = analyze_functions ctx analyze_primop (c_literals ctx aexp)
+  let optimize_anf ctx aexp = analyze_functions ctx NameMap.empty analyze_primop (c_literals ctx aexp)
 
   let unroll_loops = None
   let make_call_precise _ _ _ _ = true
@@ -1577,8 +1903,9 @@ end) : CONFIG = struct
   let tuple_value = false
   let use_real = false
   let branch_coverage = Opts.branch_coverage
-  let track_throw = true
+  let track_throw = not Opts.optimized_model
   let assert_to_exception = Opts.assert_to_exception
+  let erase_assert_messages = Opts.optimized_model
   let use_void = false
   let eager_control_flow = false
   let preserve_types = Opts.preserve_types
@@ -2016,8 +2343,7 @@ let drop_redundant_to_bytes_mask =
     | I_aux (I_copy (clexp, V_call (Bvand, [source; mask])), aux) :: instrs when mask_covers_native_source mask source
       ->
         I_aux (I_copy (clexp, source), aux) :: rewrite instrs
-    | (I_aux (I_decl (ctyp, id), _) as instr) :: instrs
-      when is_c_repr_u256 ctyp || is_c_repr_u320 ctyp ->
+    | (I_aux (I_decl (ctyp, id), _) as instr) :: instrs when is_c_repr_u256 ctyp || is_c_repr_u320 ctyp ->
         let instrs = rewrite instrs in
         if List.exists (fun next -> NameSet.mem id (instr_ids ~direct:false next)) instrs then instr :: instrs
         else instrs
@@ -2030,316 +2356,331 @@ let drop_redundant_to_bytes_mask =
     | cdef -> cdef
     )
 
-(* A bounded result does not normally justify narrowing an intermediate
-   arithmetic operation: adding two u256 values has a genuine 257-bit
-   mathematical result.  Reduction modulo 2^N is the important exception.
-   The complete source idiom
-
-     tmod_nat(left + right, 2^N)
-
-   is exactly unsigned N-bit wrapping addition, so replace the generated
-   arbitrary-precision conversion/add/modulo chain with the represented
-   operation.  The analogous multiplication and Euclidean-remainder
-   subtraction idioms have the same low-N-bit semantics.  Keeping these as
-   whole-idiom rewrites is essential: bare widened arithmetic must continue
-   to use sail_int.
-
-   JIB lowering introduces scoped blocks around both primitive calls.  Match
-   that generated shape before C emission.  Operand permutation is
-   deliberately outside this pass: it only specializes operations whose left
-   operand already has the result carrier representation. *)
-let fold_power_of_two_modular_arithmetic =
-  let same_name left right = Name.compare left right = 0 in
-  let unsigned_width = function
-    | CT_fuint width -> Some width
-    | ctyp when is_c_repr_u128 ctyp -> Some 128
-    | ctyp when is_c_repr_u256 ctyp -> Some 256
-    | ctyp when is_c_repr_u320 ctyp -> Some 320
-    | _ -> None
-  in
-  let unsigned_fits width ctyp =
-    match unsigned_width ctyp with Some operand_width -> operand_width <= width | None -> false
-  in
-  let is_named names id = List.exists (String.equal (string_of_id id)) names in
-  let arithmetic_primitive id =
-    if is_named ["add_int"; "add_atom"; "__sail_proven_native_add"] id then Some (`Add, `Truncating)
-    else if is_named ["sub_int"; "sub_atom"; "__sail_proven_native_sub"] id then
-      Some (`Sub, `Euclidean)
-    else if is_named ["mult_int"; "mult_atom"; "__sail_proven_native_mul"] id then
-      Some (`Mul, `Truncating)
-    else None
-  in
-  let reduction_primitive id =
-    if is_named ["tmod_int"; "tmod_nat"; "__sail_proven_native_mod"] id then Some `Truncating
-    else if is_named ["emod_int"; "emod_positive"] id then Some `Euclidean
-    else None
-  in
-  let converted_operands arithmetic_name = function
-    | [
-     I_aux ((I_decl (CT_lint, left_int) | I_reset (CT_lint, left_int)), _);
-     I_aux (I_copy (CL_id (left_copy, CT_lint), left), _);
-     I_aux ((I_decl (CT_lint, right_int) | I_reset (CT_lint, right_int)), _);
-     I_aux (I_copy (CL_id (right_copy, CT_lint), right), _);
-     I_aux
-       ( I_funcall
-           ( CR_one (CL_id (sum_result, CT_lint)),
-             _,
-             (add, _),
-             [V_id (left_arg, CT_lint); V_id (right_arg, CT_lint)]
-           ),
-         _
-       );
-    ]
-      when same_name left_int left_copy
-           && same_name left_int left_arg
-           && same_name right_int right_copy
-           && same_name right_int right_arg
-           && same_name arithmetic_name sum_result -> (
-        match arithmetic_primitive add with
-        | Some (operation, reduction) -> Some (operation, reduction, left, right)
-        | None -> None
-      )
-    | [
-     I_aux ((I_decl (CT_lint, left_int) | I_reset (CT_lint, left_int)), _);
-     I_aux (I_copy (CL_id (left_copy, CT_lint), left), _);
-     I_aux ((I_decl (CT_lint, right_int) | I_reset (CT_lint, right_int)), _);
-     I_aux (I_copy (CL_id (right_copy, CT_lint), right), _);
-     I_aux
-       ( I_funcall
-           ( CR_one (CL_id (sum_result, CT_lint)),
-             _,
-             (add, _),
-             [V_id (left_arg, CT_lint); V_id (right_arg, CT_lint)]
-           ),
-         _
-       );
-     I_aux (I_clear (CT_lint, right_clear), _);
-     I_aux (I_clear (CT_lint, left_clear), _);
-    ]
-      when same_name left_int left_copy
-           && same_name left_int left_arg
-           && same_name left_int left_clear
-           && same_name right_int right_copy
-           && same_name right_int right_arg
-           && same_name right_int right_clear
-           && same_name arithmetic_name sum_result -> (
-        match arithmetic_primitive add with
-        | Some (operation, reduction) -> Some (operation, reduction, left, right)
-        | None -> None
-      )
-    | _ -> None
-  in
-  let reduced_destination sum_name modulus_name = function
-    | [
-     I_aux ((I_decl (CT_lint, remainder) | I_reset (CT_lint, remainder)), _);
-     I_aux
-       ( I_funcall
-           ( CR_one (CL_id (remainder_result, CT_lint)),
-             _,
-             (modulo, _),
-             [V_id (sum_arg, CT_lint); V_id (modulus_arg, CT_lint)]
-           ),
-         _
-       );
-     I_aux (I_copy (destination, V_id (remainder_copy, CT_lint)), copy_aux);
-    ]
-      when same_name remainder remainder_result
-           && same_name remainder remainder_copy
-           && same_name sum_name sum_arg
-           && same_name modulus_name modulus_arg -> (
-        match reduction_primitive modulo with
-        | Some reduction -> Some (reduction, destination, copy_aux)
-        | None -> None
-      )
-    | [
-     I_aux ((I_decl (CT_lint, remainder) | I_reset (CT_lint, remainder)), _);
-     I_aux
-       ( I_funcall
-           ( CR_one (CL_id (remainder_result, CT_lint)),
-             _,
-             (modulo, _),
-             [V_id (sum_arg, CT_lint); V_id (modulus_arg, CT_lint)]
-           ),
-         _
-       );
-     I_aux (I_copy (destination, V_id (remainder_copy, CT_lint)), copy_aux);
-     I_aux (I_clear (CT_lint, remainder_clear), _);
-    ]
-      when same_name remainder remainder_result
-           && same_name remainder remainder_copy
-           && same_name remainder remainder_clear
-           && same_name sum_name sum_arg
-           && same_name modulus_name modulus_arg -> (
-        match reduction_primitive modulo with
-        | Some reduction -> Some (reduction, destination, copy_aux)
-        | None -> None
-      )
-    | _ -> None
-  in
-  let modulus_initializer = function
-    | I_aux
-        ( I_init
-            ( CT_lint,
-              modulus,
-              Init_cval (V_lit (VL_int modulus_literal, _))
-            ),
-          _
-        ) ->
-        Some (modulus, Big_int.to_string modulus_literal)
-    | I_aux
-        ( I_reinit
-            (CT_lint, modulus, V_lit (VL_int modulus_literal, _)),
-          _
-        ) ->
-        Some (modulus, Big_int.to_string modulus_literal)
-    | I_aux
-        ( I_init
-            ( CT_lint,
-              modulus,
-              Init_cval (V_lit (VL_string modulus_literal, CT_string))
-            ),
-          _
-        ) ->
-        Some (modulus, modulus_literal)
-    | I_aux
-        ( I_reinit
-            (CT_lint, modulus, V_lit (VL_string modulus_literal, CT_string)),
-          _
-        ) ->
-        Some (modulus, modulus_literal)
-    | _ -> None
-  in
-  let fold_candidate sum addition modulus_initializer_instr reduction =
-    match modulus_initializer modulus_initializer_instr with
-    | Some (modulus, modulus_literal) -> (
-        let converted = converted_operands sum addition in
-        let reduced = reduced_destination sum modulus reduction in
-        match (converted, reduced) with
-        | Some (operation, arithmetic_reduction, left, right),
-          Some (actual_reduction, destination, copy_aux)
-          when arithmetic_reduction = actual_reduction -> (
-            match unsigned_width (clexp_ctyp destination) with
-            | Some width
-              when unsigned_fits width (cval_ctyp left)
-                   && unsigned_fits width (cval_ctyp right)
-                   && ctyp_equal (cval_ctyp left) (clexp_ctyp destination)
-                   && (match Sail_lib.int_of_string_opt modulus_literal with
-                      | Some value -> Big_int.equal value (Big_int.pow_int_positive 2 width)
-                      | None -> false) ->
-                let operation =
-                  match (operation, clexp_ctyp destination) with
-                  | `Add, CT_fuint _ -> Proven_iadd
-                  | `Sub, CT_fuint _ -> Proven_isub
-                  | `Mul, CT_fuint _ -> Proven_imul
-                  | `Add, _ -> Iadd
-                  | `Sub, _ -> Isub
-                  | `Mul, _ -> Imul
-                in
-                Some (I_aux (I_copy (destination, V_call (operation, [left; right])), copy_aux))
-            | _ -> None
-          )
-        | _ -> None
-      )
-    | _ -> None
-  in
-  let fold_embedded_modulus sum addition reduction =
-    let fold modulus_initializer_instr reduction =
-        match modulus_initializer modulus_initializer_instr with
-        | Some (modulus, _) ->
-            let reduction =
-              match List.rev reduction with
-              | I_aux (I_clear (CT_lint, modulus_clear), _) :: reduction
-                when same_name modulus modulus_clear ->
-                  List.rev reduction
-              | _ -> reduction
-            in
-            fold_candidate sum addition modulus_initializer_instr reduction
-        | None -> None
+(* Fixed-bitvector primitives are materialized by ANF lowering before this
+   point, so recognize compatible operations by following their JIB def/use
+   webs.  Record the proved semantic operation explicitly before backend
+   cleanup, rather than reconstructing it from the final C spelling. *)
+let fuse_fixed_bitvector_webs cdefs =
+  let fusions = ref 0 in
+  let rec rewrite inherited_literals instrs =
+    (* JIB introduces nested blocks around ANF fragments, while immutable Sail
+       bindings can be defined in an enclosing block.  Carry literal facts
+       forward through the lexical instruction stream, invalidating them at
+       the first intervening write, so nested webs can use the same semantic
+       constant without treating arbitrary C expressions as constants. *)
+    let _, instrs =
+      List.fold_left
+        (fun (literal_environment, rewritten) instr ->
+          let instr =
+            match instr with
+            | I_aux (I_block body, aux) -> I_aux (I_block (rewrite literal_environment body), aux)
+            | I_aux (I_try_block body, aux) -> I_aux (I_try_block (rewrite literal_environment body), aux)
+            | I_aux (I_if (condition, then_body, else_body), aux) ->
+                I_aux
+                  ( I_if
+                      ( condition,
+                        rewrite literal_environment then_body,
+                        rewrite literal_environment else_body
+                      ),
+                    aux
+                  )
+            | instr -> instr
+          in
+          let literal_environment =
+            match instr with
+            | I_aux (I_copy (CL_id (name, _), (V_lit _ as literal)), _) ->
+                NameMap.add name literal literal_environment
+            | _ ->
+                NameSet.fold
+                  (fun name environment -> NameMap.remove name environment)
+                  (instr_writes ~direct:false instr) literal_environment
+          in
+          (literal_environment, instr :: rewritten)
+        )
+        (inherited_literals, []) instrs
     in
-    match reduction with
-    | I_aux ((I_decl (CT_lint, modulus) | I_reset (CT_lint, modulus)), aux)
-      :: I_aux
-           ( I_copy
-               ( CL_id (modulus_copy, CT_lint),
-                 (V_lit (VL_int _, _) as modulus_literal)
-               ),
-             _
-           )
-      :: reduction
-      when same_name modulus modulus_copy ->
-        fold
-          (I_aux
-             ( I_init
-                 (CT_lint, modulus, Init_cval modulus_literal),
-               aux
+    let instrs = List.rev instrs in
+    let instructions = Array.of_list instrs in
+    let count = Array.length instructions in
+    let literal_value = function
+      | V_lit (VL_int value, _) -> Some value
+      | V_lit (VL_bits bits, _) ->
+          List.fold_left
+            (fun value bit ->
+              Option.bind value (fun value ->
+                  match bit with
+                  | Sail2_values.B0 -> Some (Big_int.mul value (Big_int.of_int 2))
+                  | Sail2_values.B1 -> Some (Big_int.succ (Big_int.mul value (Big_int.of_int 2)))
+                  | Sail2_values.BU -> None
+              )
+            )
+            (Some Big_int.zero) bits
+      | _ -> None
+    in
+    let literal_index value =
+      match literal_value value with
+      | Some value
+        when Big_int.less_equal Big_int.zero value
+             && Big_int.less_equal value (Big_int.of_int Stdlib.max_int) ->
+          Some (Big_int.to_int value)
+      | Some _ | None -> None
+    in
+    let slice_definitions =
+      Array.fold_left
+        (fun (index, definitions) (I_aux (instr, _)) ->
+          let definitions =
+            match instr with
+            | I_copy (CL_id (name, _), V_call ((Slice width | Proven_slice (width, _)), [source; start])) -> (
+                match literal_index start with
+                | Some start -> NameMap.add name (index, width, source, start) definitions
+                | None -> definitions
+              )
+            | _ -> definitions
+          in
+          (index + 1, definitions)
+        )
+        (0, NameMap.empty) instructions
+      |> snd
+    in
+    let literal_definitions =
+      Array.fold_left
+        (fun (index, definitions) (I_aux (instr, _)) ->
+          let definitions =
+            match instr with
+            | I_copy (CL_id (name, _), (V_lit _ as literal)) ->
+                NameMap.add name (index, literal) definitions
+            | _ -> definitions
+          in
+          (index + 1, definitions)
+        )
+        (0, NameMap.empty) instructions
+      |> snd
+    in
+    let logical_right_shift_definitions =
+      Array.fold_left
+        (fun (index, definitions) (I_aux (instr, _)) ->
+          let definitions =
+            match instr with
+            | I_copy
+                ( CL_id (name, _),
+                  V_call (((Bvshiftr | Proven_bvshiftr _) as op), [source; amount])
+                ) ->
+                NameMap.add name (index, op, source, amount) definitions
+            | _ -> definitions
+          in
+          (index + 1, definitions)
+        )
+        (0, NameMap.empty) instructions
+      |> snd
+    in
+    let owns_lifecycle name = function
+      | I_aux
+          ((I_decl (_, candidate) | I_reset (_, candidate) | I_clear (_, candidate) | I_init (_, candidate, _)), _)
+        ->
+          Name.compare name candidate = 0
+      | _ -> false
+    in
+    let private_temporary name definition_index use_index =
+      let rec loop index =
+        if index = count then true
+        else
+          let instr = instructions.(index) in
+          let allowed =
+            index = definition_index || index = use_index || owns_lifecycle name instr
+            || not (NameSet.mem name (instr_ids ~direct:false instr))
+          in
+          allowed && loop (index + 1)
+      in
+      loop 0
+    in
+    let source_is_stable source first last =
+      match source with
+      | V_id (source_name, _) ->
+          let rec loop index =
+            index >= last
+            ||
+            (not (NameSet.mem source_name (instr_writes ~direct:false instructions.(index)))
+            && loop (index + 1)
+            )
+          in
+          loop (first + 1)
+      | V_lit _ -> true
+      | _ -> false
+    in
+    let same_source left right =
+      match (left, right) with
+      | V_id (left_name, left_ctyp), V_id (right_name, right_ctyp) ->
+          Name.compare left_name right_name = 0 && ctyp_equal left_ctyp right_ctyp
+      | V_lit (left_lit, left_ctyp), V_lit (right_lit, right_ctyp) ->
+          Stdlib.compare left_lit right_lit = 0 && ctyp_equal left_ctyp right_ctyp
+      | _ -> false
+    in
+    let resolve_literal use_index = function
+      | V_lit _ as literal -> Option.map (fun value -> (None, value)) (literal_value literal)
+      | V_id (name, ctyp) as value -> (
+          match NameMap.find_opt name literal_definitions with
+          | Some (definition_index, literal)
+            when definition_index < use_index
+                 && ctyp_equal ctyp (cval_ctyp literal)
+                 && source_is_stable value definition_index use_index ->
+              Option.map (fun literal -> (Some (name, definition_index), literal)) (literal_value literal)
+          | Some _ -> None
+          | None -> (
+              match NameMap.find_opt name inherited_literals with
+              | Some literal
+                when ctyp_equal ctyp (cval_ctyp literal) && source_is_stable value (-1) use_index ->
+                  Option.map (fun literal -> (None, literal)) (literal_value literal)
+              | Some _ | None -> None
+            )
+        )
+      | _ -> None
+    in
+    let resolve_proven_logical_right_shift use_index = function
+      | V_id (name, ctyp) -> (
+          match NameMap.find_opt name logical_right_shift_definitions with
+          | Some (definition_index, op, source, amount)
+            when definition_index < use_index
+                 && private_temporary name definition_index use_index
+                 && ctyp_equal ctyp (cval_ctyp source)
+                 && source_is_stable source definition_index use_index -> (
+              let proven =
+                match op with
+                | Proven_bvshiftr 64 -> true
+                | Bvshiftr -> (
+                    match literal_value amount with
+                    | Some amount ->
+                        let interval = Some (amount, amount) in
+                        Option.is_some
+                          (Jib_semantics.prove_shift_count_interval ~index:1 ~interval ~carrier_width:64)
+                    | None -> false
+                  )
+                | Proven_bvshiftr _ | _ -> false
+              in
+              if proven then Some (name, definition_index, source, amount) else None
+            )
+          | Some _ | None -> None
+        )
+      | _ -> None
+    in
+    let replacements = Hashtbl.create 2 in
+    let removed = ref NameSet.empty in
+    Array.iteri
+      (fun concat_index (I_aux (instr, aux)) ->
+        match instr with
+        | I_copy (destination, V_call (Concat, [V_id (left_name, _); V_id (right_name, _)])) -> (
+            match (NameMap.find_opt left_name slice_definitions, NameMap.find_opt right_name slice_definitions) with
+            | ( Some (left_index, left_width, left_source, left_start),
+                Some (right_index, right_width, right_source, right_start) ) ->
+                let result_width = left_width + right_width in
+                let source_width = match cval_ctyp left_source with CT_fbits width -> Some width | _ -> None in
+                let semantic_rotation =
+                  left_start = 0 && right_start = left_width && 0 < left_width && 0 < right_width
+                in
+                let definitions_precede_use = left_index < concat_index && right_index < concat_index in
+                let web_is_private =
+                  private_temporary left_name left_index concat_index
+                  && private_temporary right_name right_index concat_index
+                in
+                let sources_match = same_source left_source right_source in
+                let source_is_wide_enough =
+                  match source_width with Some width -> result_width <= width && result_width <= 64 | None -> false
+                in
+                let stable_source = source_is_stable left_source (min left_index right_index) concat_index in
+                if
+                  semantic_rotation && definitions_precede_use && web_is_private && sources_match
+                  && source_is_wide_enough && stable_source
+                  && ctyp_equal (clexp_ctyp destination) (CT_fbits result_width)
+                then (
+                  Hashtbl.add replacements concat_index
+                    (I_aux (I_copy (destination, V_call (Bvrotr (result_width, left_width), [left_source])), aux));
+                  removed := NameSet.add left_name (NameSet.add right_name !removed);
+                  incr fusions
+                )
+            | _ -> ()
+          )
+        | _ -> ()
+      )
+      instructions;
+    Array.iteri
+      (fun mask_index (I_aux (instr, aux)) ->
+        match instr with
+        | I_copy (destination, V_call (Bvand, [left; right])) -> (
+            let web =
+              List.find_map
+                (fun (shifted, mask) ->
+                  let shift = resolve_proven_logical_right_shift mask_index shifted in
+                  let literal = resolve_literal mask_index mask in
+                  Option.bind shift (fun shift ->
+                      Option.map (fun literal -> (shift, mask, literal)) literal
+                  )
+                )
+                [(left, right); (right, left)]
+            in
+            match web with
+            | ( Some
+                  ( (shift_name, shift_index, source, amount),
+                    mask,
+                    (mask_definition, mask_value)
+                  ) ) -> (
+                match (cval_ctyp source, clexp_ctyp destination) with
+                | CT_fbits source_width, CT_fbits result_width
+                  when 0 < source_width && source_width <= 64 && source_width = result_width
+                       && ctyp_equal (cval_ctyp mask) (CT_fbits result_width) -> (
+                    match Jib_semantics.prove_low_mask_width ~carrier_width:result_width ~mask:mask_value with
+                    | Some slice_width when slice_width <= source_width ->
+                        let slice = V_call (Proven_slice (slice_width, 64), [source; amount]) in
+                        let extracted =
+                          if slice_width = result_width then slice
+                          else V_call (Zero_extend result_width, [slice])
+                        in
+                        Hashtbl.replace replacements mask_index
+                          (I_aux (I_copy (destination, extracted), aux));
+                        removed := NameSet.add shift_name !removed;
+                        ( match mask_definition with
+                        | Some (mask_name, definition_index)
+                          when private_temporary mask_name definition_index mask_index ->
+                            removed := NameSet.add mask_name !removed
+                        | Some _ | None -> ()
+                        );
+                        incr fusions
+                    | Some _ | None -> ()
+                  )
+                | _ -> ()
+              )
+            | None -> ()
+          )
+        | _ -> ()
+      )
+      instructions;
+    Array.to_list instructions
+    |> List.mapi (fun index instr ->
+           match Hashtbl.find_opt replacements index with
+           | Some replacement -> Some replacement
+           | None -> (
+               match instr with
+               | I_aux
+                   ( ( I_decl (_, name) | I_reset (_, name) | I_clear (_, name)
+                     | I_init (_, name, _) ),
+                     _
+                   )
+                 when NameSet.mem name !removed ->
+                   None
+               | I_aux (I_copy (CL_id (name, _), _), _) when NameSet.mem name !removed -> None
+               | _ -> Some instr
              )
-          )
-          reduction
-    | modulus_initializer_instr :: reduction -> fold modulus_initializer_instr reduction
-    | [] -> None
+       )
+    |> List.filter_map Fun.id
   in
-  let modular_arithmetic = function
-    | [
-     I_aux ((I_decl (CT_lint, sum) | I_reset (CT_lint, sum)), _);
-     I_aux (I_block addition, _);
-     modulus_initializer_instr;
-     I_aux (I_block reduction, _);
-    ] ->
-        fold_candidate sum addition modulus_initializer_instr reduction
-    | [
-     I_aux ((I_decl (CT_lint, sum) | I_reset (CT_lint, sum)), _);
-     I_aux (I_block addition, _);
-     modulus_initializer_instr;
-     I_aux (I_block reduction, _);
-     I_aux (I_clear (CT_lint, modulus_clear), _);
-     I_aux (I_clear (CT_lint, sum_clear), _);
-    ] -> (
-        match modulus_initializer modulus_initializer_instr with
-        | Some (modulus, _)
-          when same_name modulus modulus_clear && same_name sum sum_clear ->
-            fold_candidate sum addition modulus_initializer_instr reduction
-        | _ -> None
+  let cdefs =
+    List.map
+      (function
+        | CDEF_aux (CDEF_fundef (id, return, args, body), annot) ->
+            CDEF_aux (CDEF_fundef (id, return, args, rewrite NameMap.empty body), annot)
+        | cdef -> cdef
       )
-    | [
-     I_aux ((I_decl (CT_lint, sum) | I_reset (CT_lint, sum)), _);
-     I_aux (I_block addition, _);
-     I_aux (I_block reduction, _);
-     I_aux (I_clear (CT_lint, sum_clear), _);
-    ]
-      when same_name sum sum_clear ->
-        fold_embedded_modulus sum addition reduction
-    | _ -> None
+      cdefs
   in
-  let rec rewrite instrs =
-    match instrs with
-    | first :: second :: third :: fourth :: fifth :: sixth :: rest -> (
-        match modular_arithmetic [first; second; third; fourth; fifth; sixth] with
-        | Some folded -> folded :: rewrite rest
-        | None -> (
-            match modular_arithmetic [first; second; third; fourth] with
-            | Some folded -> folded :: rewrite (fifth :: sixth :: rest)
-            | None -> rewrite_one first :: rewrite (second :: third :: fourth :: fifth :: sixth :: rest)
-          )
-      )
-    | first :: second :: third :: fourth :: rest -> (
-        match modular_arithmetic [first; second; third; fourth] with
-        | Some folded -> folded :: rewrite rest
-        | None -> rewrite_one first :: rewrite (second :: third :: fourth :: rest)
-      )
-    | instr :: rest -> rewrite_one instr :: rewrite rest
-    | [] -> []
-  and rewrite_one = function
-    | I_aux (I_block body, aux) -> I_aux (I_block (rewrite body), aux)
-    | I_aux (I_try_block body, aux) -> I_aux (I_try_block (rewrite body), aux)
-    | I_aux (I_if (condition, then_body, else_body), aux) ->
-        I_aux (I_if (condition, rewrite then_body, rewrite else_body), aux)
-    | instr -> instr
-  in
-  List.map (function
-    | CDEF_aux (CDEF_fundef (id, return, args, body), annot) ->
-        CDEF_aux (CDEF_fundef (id, return, args, rewrite body), annot)
-    | cdef -> cdef
-    )
+  (cdefs, !fusions)
 
 let optimize ~have_rts ~specialize_c ctx recursive_functions cdefs =
   let nothing cdefs = cdefs in
@@ -2350,7 +2691,6 @@ let optimize ~have_rts ~specialize_c ctx recursive_functions cdefs =
   |> ( if !optimize_hoist_allocations && have_rts then List.concat_map (hoist_allocations recursive_functions)
        else nothing
      )
-  |> (if specialize_c then fold_power_of_two_modular_arithmetic else nothing)
   |> (if specialize_c then drop_redundant_to_bytes_mask else nothing)
   |> remove_stack_clears ctx
 
@@ -2385,6 +2725,10 @@ type file_doc =
   (* Pure static utility functions created for the model's types, e.g. to initialise
      enums, access vector elements, etc. These don't have corresponding declarations. *)
   | StaticFunctionDefinition of document
+  (* A static type helper selected by a generated function body.  Modular
+     emission uses the symbolic helper name to keep the definition only in
+     translation units whose typed JIB lowering actually selected it. *)
+  | DemandedStaticFunctionDefinition of string * document
 
 module type CODEGEN_CONFIG = sig
   val includes : string list
@@ -2398,8 +2742,8 @@ module type CODEGEN_CONFIG = sig
   val branch_coverage : out_channel option
   val assert_to_exception : bool
   val preserve_types : IdSet.t
-  val c_repr_uint64 : IdSet.t
-  val c_repr_int64 : IdSet.t
+  val c_repr_unsigned : int Bindings.t
+  val c_repr_signed : int Bindings.t
   val c_repr_u256 : IdSet.t
   val c_repr_fixed_bytes : int Bindings.t
   val specialize_c : bool
@@ -2408,6 +2752,9 @@ module type CODEGEN_CONFIG = sig
   val specialization_plan_human : string option
   val specialization_obligations_lean : string option
   val specialization_obligations_coq : string option
+  val optimized_model : bool
+  val external_types : string Bindings.t
+  val package_name : string
   val cpp : bool
   val cpp_class_name : string
   val cpp_namespace : string
@@ -2417,6 +2764,25 @@ end
 module Codegen (Config : CODEGEN_CONFIG) = struct
   open Printf
 
+  type c_module = {
+    name : string;
+    file_stem : string;
+    files : string list;
+    requires : string list;
+  }
+
+  type c_module_output = {
+    name : string;
+    file_stem : string;
+    header : string;
+    implementation : string;
+  }
+
+  let requested_modules : (string * c_module list) option ref = ref None
+  let generated_modules : c_module_output list option ref = ref None
+  let emitted_external_functions = ref Util.StringSet.empty
+  let current_static_helper_demands = ref Util.StringSet.empty
+
   let has_prefix prefix s =
     if String.length s < String.length prefix then false else String.sub s 0 (String.length prefix) = prefix
 
@@ -2425,6 +2791,31 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   (* Prefix to function name in definitions. *)
   let class_impl_prefix () = if Config.cpp then Config.cpp_class_name ^ "::" else ""
+
+  let valid_readable_name s =
+    valid_c_identifier s
+    && (not (Util.StringSet.mem s Keywords.c_reserved_words))
+    && (not (Util.StringSet.mem s Keywords.c_used_words))
+    && (not (Util.StringSet.mem s Config.reserved_words))
+    && (not (has_bad_prefix s))
+    && not (c_int_type_name s)
+
+  let sanitize_readable_name s =
+    let is_alpha c = ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') in
+    let is_digit c = '0' <= c && c <= '9' in
+    let buffer = Buffer.create (String.length s) in
+    String.iteri
+      (fun i c ->
+        if is_alpha c || c = '_' || (i > 0 && is_digit c) then Buffer.add_char buffer c else Buffer.add_char buffer '_'
+      )
+      s;
+    let name = Buffer.contents buffer in
+    let name = if name = "" then "tmp" else name in
+    if valid_readable_name name then name
+    else (
+      let name = "tmp_" ^ name in
+      if valid_readable_name name then name else "tmp"
+    )
 
   (* = {} is required to zero-initialise the types. In C output mode this is unnecessary because
     they are emitted as globals and are therefore automatically zero-initialised. However in C++ mode they
@@ -2475,7 +2866,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | Abstract id -> NameGen.to_string ~prefix:"abstract_" () id
     | Have_exception n -> "have_exception" ^ ssa_num n
     | Return n -> "return" ^ ssa_num n
-    | Current_exception n -> "(*current_exception)" ^ ssa_num n
+    | Current_exception n ->
+        (if Config.optimized_model then "current_exception" else "(*current_exception)") ^ ssa_num n
     | Throw_location n -> "throw_location" ^ ssa_num n
     | Memory_writes n -> "memory_writes" ^ ssa_num n
     | Channel (chan, n) -> (
@@ -2494,6 +2886,62 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let codegen_function_id id = string (sgen_function_id id)
 
+  let readable_ctyp_names = ref CTMap.empty
+  let readable_ctyp_names_used = ref Util.StringSet.empty
+
+  let rec readable_ctyp_stem = function
+    | ctyp when is_c_repr_u320 ctyp -> "u320"
+    | ctyp when is_c_repr_u256 ctyp -> "u256"
+    | ctyp when is_c_repr_fixed_bytes ctyp ->
+        "fixed_bytes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_length ctyp))
+    | CT_unit -> "unit"
+    | CT_bool -> "bool"
+    | CT_fbits n -> "bits_" ^ string_of_int n
+    | CT_sbits n -> "small_bits_" ^ string_of_int n
+    | CT_fint n -> "int_" ^ string_of_int n
+    | CT_fuint n -> "uint_" ^ string_of_int n
+    | CT_constant n -> "constant_" ^ sanitize_readable_name (Big_int.to_string n)
+    | CT_lint -> "int"
+    | CT_lbits -> "bits"
+    | CT_tup ctyps -> "tuple_" ^ String.concat "_" (List.map readable_ctyp_stem ctyps)
+    | CT_struct (id, []) | CT_variant (id, []) -> sgen_id id
+    | CT_struct (id, ctyps) | CT_variant (id, ctyps) ->
+        sgen_id id ^ "_of_" ^ String.concat "_" (List.map readable_ctyp_stem ctyps)
+    | CT_enum id -> sgen_id id
+    | CT_list ctyp -> "list_" ^ readable_ctyp_stem ctyp
+    | CT_vector ctyp -> "vector_" ^ readable_ctyp_stem ctyp
+    | CT_fvector (length, ctyp) -> "vector_" ^ string_of_int length ^ "_" ^ readable_ctyp_stem ctyp
+    | CT_string -> "string"
+    | CT_real -> "real"
+    | CT_json -> "json"
+    | CT_json_key -> "json_key"
+    | CT_ref ctyp -> "ref_" ^ readable_ctyp_stem ctyp
+    | CT_float n -> "float_" ^ string_of_int n
+    | CT_rounding_mode -> "rounding_mode"
+    | CT_memory_writes -> "memory_writes"
+    | CT_poly kid -> "poly_" ^ sanitize_readable_name (string_of_kid kid)
+
+  let rec allocate_readable_ctyp_name ctyp base suffix =
+    let candidate = if suffix = 0 then base else base ^ "_" ^ string_of_int suffix in
+    if Util.StringSet.mem candidate !readable_ctyp_names_used then allocate_readable_ctyp_name ctyp base (suffix + 1)
+    else (
+      readable_ctyp_names := CTMap.add ctyp candidate !readable_ctyp_names;
+      readable_ctyp_names_used := Util.StringSet.add candidate !readable_ctyp_names_used;
+      candidate
+    )
+
+  let readable_ctyp_name ctyp =
+    match CTMap.find_opt ctyp !readable_ctyp_names with
+    | Some name -> name
+    | None -> allocate_readable_ctyp_name ctyp (sanitize_readable_name (readable_ctyp_stem ctyp)) 0
+
+  let composite_ctyp_name legacy ctyp = if Config.no_mangle then readable_ctyp_name ctyp else Util.zencode_string legacy
+
+  let native_c_integer_width width =
+    if width <= 8 then 8 else if width <= 16 then 16 else if width <= 32 then 32 else 64
+
+  let is_native_unsigned_integer = function CT_fuint width -> width <= 64 | _ -> false
+  let is_native_signed_integer = function CT_fint width -> width <= 64 | _ -> false
   let rec sgen_ctyp = function
     | ctyp when is_c_repr_u128 ctyp -> "sail_u128"
     | ctyp when is_c_repr_u256 ctyp -> "sail_u256"
@@ -2504,8 +2952,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CT_bool -> "bool"
     | CT_fbits _ -> "uint64_t"
     | CT_sbits _ -> "sbits"
-    | CT_fint width -> if width <= 64 then "int64_t" else "__int128"
-    | CT_fuint _ -> "uint64_t"
+    | CT_fint width -> if width <= 64 then "int" ^ string_of_int (native_c_integer_width width) ^ "_t" else "__int128"
+    | CT_fuint width -> "uint" ^ string_of_int (native_c_integer_width width) ^ "_t"
     | CT_constant _ -> "int64_t"
     | CT_lint -> "sail_int"
     | CT_lbits -> "lbits"
@@ -2513,9 +2961,9 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CT_struct (id, _) -> "struct " ^ sgen_id id
     | CT_enum id -> "enum " ^ sgen_id id
     | CT_variant (id, _) -> "struct " ^ sgen_id id
-    | CT_list _ as l -> Util.zencode_string (string_of_ctyp l)
-    | CT_vector _ as v -> Util.zencode_string (string_of_ctyp v)
-    | CT_fvector (_, typ) -> sgen_ctyp (CT_vector typ)
+    | CT_list _ as l -> composite_ctyp_name (string_of_ctyp l) l
+    | CT_vector _ as v -> composite_ctyp_name (string_of_ctyp v) v
+    | CT_fvector _ as v -> composite_ctyp_name (string_of_ctyp v) v
     | CT_string -> "sail_string"
     | CT_real -> "real"
     | CT_json -> "sail_config_json"
@@ -2545,9 +2993,9 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CT_struct (id, _) -> sgen_id id
     | CT_enum id -> sgen_id id
     | CT_variant (id, _) -> sgen_id id
-    | CT_list _ as l -> Util.zencode_string (string_of_ctyp l)
-    | CT_vector _ as v -> Util.zencode_string (string_of_ctyp v)
-    | CT_fvector (_, typ) -> sgen_ctyp_name (CT_vector typ)
+    | CT_list _ as l -> composite_ctyp_name (string_of_ctyp l) l
+    | CT_vector _ as v -> composite_ctyp_name (string_of_ctyp v) v
+    | CT_fvector _ as v -> composite_ctyp_name (string_of_ctyp v) v
     | CT_string -> "sail_string"
     | CT_real -> "real"
     | CT_json -> "sail_config_json"
@@ -2598,29 +3046,42 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let sgen_u256_int value =
     let mask = max_uint 64 in
     let limb shift = Big_int.shift_right value shift |> fun value -> Big_int.bitwise_and value mask in
-    "((sail_u256){{UINT64_C(" ^ Big_int.to_string (limb 0) ^ "), UINT64_C("
-    ^ Big_int.to_string (limb 64) ^ "), UINT64_C(" ^ Big_int.to_string (limb 128)
-    ^ "), UINT64_C(" ^ Big_int.to_string (limb 192) ^ ")}})"
+    "((sail_u256){{UINT64_C("
+    ^ Big_int.to_string (limb 0)
+    ^ "), UINT64_C("
+    ^ Big_int.to_string (limb 64)
+    ^ "), UINT64_C("
+    ^ Big_int.to_string (limb 128)
+    ^ "), UINT64_C("
+    ^ Big_int.to_string (limb 192)
+    ^ ")}})"
 
   let sgen_u320_int value =
     let mask = max_uint 64 in
     let limb shift = Big_int.shift_right value shift |> fun value -> Big_int.bitwise_and value mask in
-    "((sail_u320){{UINT64_C(" ^ Big_int.to_string (limb 0) ^ "), UINT64_C("
-    ^ Big_int.to_string (limb 64) ^ "), UINT64_C(" ^ Big_int.to_string (limb 128)
-    ^ "), UINT64_C(" ^ Big_int.to_string (limb 192) ^ "), UINT64_C("
-    ^ Big_int.to_string (limb 256) ^ ")}})"
+    "((sail_u320){{UINT64_C("
+    ^ Big_int.to_string (limb 0)
+    ^ "), UINT64_C("
+    ^ Big_int.to_string (limb 64)
+    ^ "), UINT64_C("
+    ^ Big_int.to_string (limb 128)
+    ^ "), UINT64_C("
+    ^ Big_int.to_string (limb 192)
+    ^ "), UINT64_C("
+    ^ Big_int.to_string (limb 256)
+    ^ ")}})"
 
   let sgen_i128_int value =
     let unsigned_i128 value =
       let mask = max_uint 64 in
       let lo = Big_int.bitwise_and value mask in
       let hi = Big_int.shift_right value 64 in
-      "((((unsigned __int128)UINT64_C(" ^ Big_int.to_string hi ^ ")) << 64) | UINT64_C("
-      ^ Big_int.to_string lo ^ "))"
+      "((((unsigned __int128)UINT64_C(" ^ Big_int.to_string hi ^ ")) << 64) | UINT64_C(" ^ Big_int.to_string lo ^ "))"
     in
-    if Big_int.less value Big_int.zero then
+    if Big_int.less value Big_int.zero then (
       let magnitude_minus_one = Big_int.pred (Big_int.negate value) in
       "(-((__int128)" ^ unsigned_i128 magnitude_minus_one ^ ") - 1)"
+    )
     else "((__int128)" ^ unsigned_i128 value ^ ")"
 
   let sgen_value ctyp = function
@@ -2632,8 +3093,10 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | ctyp when is_c_repr_u320 ctyp -> sgen_u320_int i
         | ctyp when is_c_repr_u256 ctyp -> sgen_u256_int i
         | ctyp when is_c_repr_u128 ctyp -> sgen_u128_int i
+        | CT_fuint width when width < 64 -> "((" ^ sgen_ctyp ctyp ^ ")UINT64_C(" ^ Big_int.to_string i ^ "))"
         | CT_fuint _ -> "UINT64_C(" ^ Big_int.to_string i ^ ")"
         | CT_fint width when width > 64 -> sgen_i128_int i
+        | CT_fint width when width < 64 -> "((" ^ sgen_ctyp ctyp ^ ")INT64_C(" ^ Big_int.to_string i ^ "))"
         | _ -> if Big_int.equal i (min_int 64) then "INT64_MIN" else "INT64_C(" ^ Big_int.to_string i ^ ")"
       )
     | VL_bool true -> "true"
@@ -2659,6 +3122,37 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         sprintf "{%s}" (Util.string_of_list ", " (fun (field, cval) -> sgen_id field ^ " = " ^ sgen_cval cval) fields)
     | V_ctor_unwrap (f, ctor, _) -> sprintf "%s.variants.%s" (sgen_cval f) (sgen_uid ctor)
     | V_tuple _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Cannot generate C value for a tuple literal"
+
+  and sgen_proven_native_binop operator v1 v2 =
+    let raw () = sprintf "(%s %s %s)" (sgen_cval v1) operator (sgen_cval v2) in
+    match cval_ctyp v1 with
+    | CT_fuint width when width < 32 ->
+        sprintf "((%s)(((uint32_t)%s) %s ((uint32_t)%s)))" (sgen_ctyp (CT_fuint width)) (sgen_cval v1) operator
+          (sgen_cval v2)
+    | CT_fint width when width < 32 ->
+        sprintf "((%s)(((int32_t)%s) %s ((int32_t)%s)))" (sgen_ctyp (CT_fint width)) (sgen_cval v1) operator
+          (sgen_cval v2)
+    | CT_fint _ | CT_fuint _ -> raw ()
+    | ctyp when is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_u320 ctyp ->
+        (* A semantic proof can be attached while an integer still has a
+           scalar JIB carrier and survive a later def/call-graph
+           specialization to a plain wide-value carrier.  The proof remains
+           valid, but C operators do not apply to those structs; use the same
+           allocation-free helpers as ordinary wide arithmetic. *)
+        let op =
+          match operator with
+          | "+" -> Iadd
+          | "-" -> Isub
+          | "*" -> Imul
+          | "/" -> Idiv
+          | "%" -> Imod
+          | _ -> assert false
+        in
+        sgen_call op [v1; v2]
+    | _ ->
+        failwith
+          (Printf.sprintf "Proven native arithmetic requires fixed integer operands, got %s and %s"
+             (string_of_ctyp (cval_ctyp v1)) (string_of_ctyp (cval_ctyp v2)))
 
   and sgen_call op cvals =
     let u320_of value =
@@ -2730,6 +3224,65 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | Igt, [v1; v2] -> sgen_call Ilt [v2; v1]
     | Ilteq, [v1; v2] -> sprintf "(!%s)" (sgen_call Ilt [v2; v1])
     | Igteq, [v1; v2] -> sprintf "(!%s)" (sgen_call Ilt [v1; v2])
+    | Widening_iadd (128, _), [v1; v2] -> sprintf "u128_add_u64_u64(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+    | Widening_imul (128, _), [v1; v2] -> sprintf "u128_mul_u64_u64(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+    | Widening_iadd (256, _), [v1; v2] -> (
+        match (cval_ctyp v1, cval_ctyp v2) with
+        | left, right when is_c_repr_u128 left && is_c_repr_u128 right ->
+            sprintf "u256_add_u128_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | left, CT_fuint _ when is_c_repr_u128 left -> sprintf "u256_add_u128_u64(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | CT_fuint _, right when is_c_repr_u128 right ->
+            sprintf "u256_add_u64_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | left, right ->
+            failwith
+              (sprintf "Unsupported exact widening addition carriers %s and %s" (string_of_ctyp left)
+                 (string_of_ctyp right)
+              )
+      )
+    | Widening_imul (256, _), [v1; v2] -> (
+        match (cval_ctyp v1, cval_ctyp v2) with
+        | left, right when is_c_repr_u128 left && is_c_repr_u128 right ->
+            sprintf "u256_mul_u128_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | left, CT_fuint _ when is_c_repr_u128 left -> sprintf "u256_mul_u128_u64(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | CT_fuint _, right when is_c_repr_u128 right ->
+            sprintf "u256_mul_u64_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | left, right ->
+            failwith
+              (sprintf "Unsupported exact widening multiplication carriers %s and %s" (string_of_ctyp left)
+                 (string_of_ctyp right)
+              )
+      )
+    | Widening_iadd (320, _), [v1; v2] -> sprintf "u320_add_widen(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+    | Widening_imul (320, _), [v1; v2] -> sprintf "u320_mul_widen(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+    | (Widening_iadd (width, _) | Widening_imul (width, _)), _ ->
+        failwith (sprintf "Unsupported exact widening integer operation at width %d" width)
+    | Wrapping_iadd width, [v1; v2] -> (
+        match cval_ctyp v1 with
+        | ctyp when is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_u320 ctyp -> sgen_call Iadd [v1; v2]
+        | CT_fuint _ ->
+            let arithmetic_width = if width <= 16 then 32 else width in
+            sprintf "((uint%d_t)(((uint%d_t)%s) + ((uint%d_t)%s)))" width arithmetic_width (sgen_cval v1)
+              arithmetic_width (sgen_cval v2)
+        | ctyp -> failwith (sprintf "Unsupported wrapping addition carrier %s" (string_of_ctyp ctyp))
+      )
+    | Wrapping_isub width, [v1; v2] -> (
+        match cval_ctyp v1 with
+        | ctyp when is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_u320 ctyp -> sgen_call Isub [v1; v2]
+        | CT_fuint _ ->
+            let arithmetic_width = if width <= 16 then 32 else width in
+            sprintf "((uint%d_t)(((uint%d_t)%s) - ((uint%d_t)%s)))" width arithmetic_width (sgen_cval v1)
+              arithmetic_width (sgen_cval v2)
+        | ctyp -> failwith (sprintf "Unsupported wrapping subtraction carrier %s" (string_of_ctyp ctyp))
+      )
+    | Wrapping_imul width, [v1; v2] -> (
+        match cval_ctyp v1 with
+        | ctyp when is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_u320 ctyp -> sgen_call Imul [v1; v2]
+        | CT_fuint _ ->
+            let arithmetic_width = if width <= 16 then 32 else width in
+            sprintf "((uint%d_t)(((uint%d_t)%s) * ((uint%d_t)%s)))" width arithmetic_width (sgen_cval v1)
+              arithmetic_width (sgen_cval v2)
+        | ctyp -> failwith (sprintf "Unsupported wrapping multiplication carrier %s" (string_of_ctyp ctyp))
+      )
     | Iadd, [v1; v2] -> (
         match (cval_ctyp v1, cval_ctyp v2) with
         | left, right when is_c_repr_u320 left || is_c_repr_u320 right ->
@@ -2746,48 +3299,28 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             sprintf "u256_add(%s, %s)" (sgen_cval v1) (sgen_cval v2)
         | CT_fuint _, _ | CT_fint _, _ ->
             failwith
-              (sprintf "Unproved fixed-width integer addition reached C code generation: %s:%s + %s:%s"
-                 (sgen_cval v1) (string_of_ctyp (cval_ctyp v1))
-                 (sgen_cval v2) (string_of_ctyp (cval_ctyp v2)))
+              (sprintf "Unproved fixed-width integer addition reached C code generation: %s:%s + %s:%s" (sgen_cval v1)
+                 (string_of_ctyp (cval_ctyp v1))
+                 (sgen_cval v2)
+                 (string_of_ctyp (cval_ctyp v2))
+              )
         | _ -> sprintf "(%s + %s)" (sgen_cval v1) (sgen_cval v2)
       )
-    | Proven_iadd, [v1; v2] -> (
-        match cval_ctyp v1 with
-        | CT_fint _ | CT_fuint _ -> sprintf "(%s + %s)" (sgen_cval v1) (sgen_cval v2)
-        | _ -> failwith "Proven native addition requires fixed integer operands"
-      )
-    | Proven_isub, [v1; v2] -> (
-        match cval_ctyp v1 with
-        | CT_fint _ | CT_fuint _ -> sprintf "(%s - %s)" (sgen_cval v1) (sgen_cval v2)
-        | _ -> failwith "Proven native subtraction requires fixed integer operands"
-      )
-    | Proven_imul, [v1; v2] -> (
-        match cval_ctyp v1 with
-        | CT_fint _ | CT_fuint _ -> sprintf "(%s * %s)" (sgen_cval v1) (sgen_cval v2)
-        | _ -> failwith "Proven native multiplication requires fixed integer operands"
-      )
-    | Proven_idiv, [v1; v2] -> (
-        match cval_ctyp v1 with
-        | CT_fint _ | CT_fuint _ -> sprintf "(%s / %s)" (sgen_cval v1) (sgen_cval v2)
-        | _ -> failwith "Proven native division requires fixed integer operands"
-      )
-    | Proven_imod, [v1; v2] -> (
-        match cval_ctyp v1 with
-        | CT_fint _ | CT_fuint _ -> sprintf "(%s %% %s)" (sgen_cval v1) (sgen_cval v2)
-        | _ -> failwith "Proven native modulo requires fixed integer operands"
-      )
+    | Proven_iadd, [v1; v2] -> sgen_proven_native_binop "+" v1 v2
+    | Proven_isub, [v1; v2] -> sgen_proven_native_binop "-" v1 v2
+    | Proven_imul, [v1; v2] -> sgen_proven_native_binop "*" v1 v2
+    | Proven_idiv, [v1; v2] -> sgen_proven_native_binop "/" v1 v2
+    | Proven_imod, [v1; v2] -> sgen_proven_native_binop "%" v1 v2
     | Isub, [v1; v2] -> (
         match (cval_ctyp v1, cval_ctyp v2) with
         | left, right when is_c_repr_u320 left && is_c_repr_u320 right ->
             sprintf "u320_sub(%s, %s)" (sgen_cval v1) (sgen_cval v2)
-        | left, right when is_c_repr_u320 left ->
-            sprintf "u320_sub(%s, %s)" (sgen_cval v1) (u320_of v2)
+        | left, right when is_c_repr_u320 left -> sprintf "u320_sub(%s, %s)" (sgen_cval v1) (u320_of v2)
         | left, right when is_c_repr_u256 left && is_c_repr_u320 right ->
             sprintf "u256_sub_u320(%s, %s)" (sgen_cval v1) (sgen_cval v2)
         | left, right when is_c_repr_u128 left && is_c_repr_u320 right ->
             sprintf "u128_sub_u320(%s, %s)" (sgen_cval v1) (sgen_cval v2)
-        | CT_fuint _, right when is_c_repr_u320 right ->
-            sprintf "u64_sub_u320(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        | CT_fuint _, right when is_c_repr_u320 right -> sprintf "u64_sub_u320(%s, %s)" (sgen_cval v1) (sgen_cval v2)
         | left, right when is_c_repr_u256 left && is_c_repr_u128 right ->
             sprintf "u256_sub_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
         | left, right when is_c_repr_u128 left && is_c_repr_u256 right ->
@@ -2802,9 +3335,11 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             sprintf "u256_sub(%s, %s)" (sgen_cval v1) (sgen_cval v2)
         | CT_fuint _, _ | CT_fint _, _ ->
             failwith
-              (sprintf "Unproved fixed-width integer subtraction reached C code generation: %s:%s - %s:%s"
-                 (sgen_cval v1) (string_of_ctyp (cval_ctyp v1))
-                 (sgen_cval v2) (string_of_ctyp (cval_ctyp v2)))
+              (sprintf "Unproved fixed-width integer subtraction reached C code generation: %s:%s - %s:%s" (sgen_cval v1)
+                 (string_of_ctyp (cval_ctyp v1))
+                 (sgen_cval v2)
+                 (string_of_ctyp (cval_ctyp v2))
+              )
         | _ -> sprintf "(%s - %s)" (sgen_cval v1) (sgen_cval v2)
       )
     | Imul, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) || is_c_repr_u320 (cval_ctyp v2) ->
@@ -2824,16 +3359,16 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | CT_fuint _ | CT_fint _ ->
             failwith
               (sprintf "Unproved fixed-width integer multiplication reached C code generation: %s:%s * %s:%s"
-                 (sgen_cval v1) (string_of_ctyp (cval_ctyp v1))
-                 (sgen_cval v2) (string_of_ctyp (cval_ctyp v2)))
+                 (sgen_cval v1)
+                 (string_of_ctyp (cval_ctyp v1))
+                 (sgen_cval v2)
+                 (string_of_ctyp (cval_ctyp v2))
+              )
         | _ -> sprintf "(%s * %s)" (sgen_cval v1) (sgen_cval v2)
       )
-    | Idiv, [v1; v2]
-      when is_c_repr_u320 (cval_ctyp v1)
-           && (match cval_ctyp v2 with CT_fuint _ -> true | _ -> false) ->
+    | Idiv, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) && match cval_ctyp v2 with CT_fuint _ -> true | _ -> false ->
         sprintf "u320_div_u64(%s, %s)" (sgen_cval v1) (sgen_cval v2)
-    | Idiv, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) ->
-        sprintf "u320_div(%s, %s)" (sgen_cval v1) (u320_of v2)
+    | Idiv, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) -> sprintf "u320_div(%s, %s)" (sgen_cval v1) (u320_of v2)
     | Idiv, [v1; v2] when is_c_repr_u256 (cval_ctyp v1) && is_c_repr_u128 (cval_ctyp v2) ->
         sprintf "u256_div_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
     | Idiv, [v1; v2] when is_c_repr_u128 (cval_ctyp v1) && is_c_repr_u256 (cval_ctyp v2) ->
@@ -2848,17 +3383,16 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         match cval_ctyp v1 with
         | CT_fuint _ | CT_fint _ ->
             failwith
-              (sprintf "Unproved fixed-width integer division reached C code generation: %s:%s / %s:%s"
-                 (sgen_cval v1) (string_of_ctyp (cval_ctyp v1))
-                 (sgen_cval v2) (string_of_ctyp (cval_ctyp v2)))
+              (sprintf "Unproved fixed-width integer division reached C code generation: %s:%s / %s:%s" (sgen_cval v1)
+                 (string_of_ctyp (cval_ctyp v1))
+                 (sgen_cval v2)
+                 (string_of_ctyp (cval_ctyp v2))
+              )
         | _ -> sprintf "(%s / %s)" (sgen_cval v1) (sgen_cval v2)
       )
-    | Imod, [v1; v2]
-      when is_c_repr_u320 (cval_ctyp v1)
-           && (match cval_ctyp v2 with CT_fuint _ -> true | _ -> false) ->
+    | Imod, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) && match cval_ctyp v2 with CT_fuint _ -> true | _ -> false ->
         sprintf "u320_mod_u64(%s, %s)" (sgen_cval v1) (sgen_cval v2)
-    | Imod, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) ->
-        sprintf "u320_mod(%s, %s)" (sgen_cval v1) (u320_of v2)
+    | Imod, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) -> sprintf "u320_mod(%s, %s)" (sgen_cval v1) (u320_of v2)
     | Imod, [v1; v2] when is_c_repr_u256 (cval_ctyp v1) && is_c_repr_u128 (cval_ctyp v2) ->
         sprintf "u256_mod_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
     | Imod, [v1; v2] when is_c_repr_u128 (cval_ctyp v1) && is_c_repr_u256 (cval_ctyp v2) ->
@@ -2873,14 +3407,46 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         match cval_ctyp v1 with
         | CT_fuint _ | CT_fint _ ->
             failwith
-              (sprintf "Unproved fixed-width integer modulo reached C code generation: %s:%s %% %s:%s"
-                 (sgen_cval v1) (string_of_ctyp (cval_ctyp v1))
-                 (sgen_cval v2) (string_of_ctyp (cval_ctyp v2)))
+              (sprintf "Unproved fixed-width integer modulo reached C code generation: %s:%s %% %s:%s" (sgen_cval v1)
+                 (string_of_ctyp (cval_ctyp v1))
+                 (sgen_cval v2)
+                 (string_of_ctyp (cval_ctyp v2))
+              )
         | _ -> sprintf "(%s %% %s)" (sgen_cval v1) (sgen_cval v2)
       )
-    | Unsigned 64, [vec] -> sprintf "((uint64_t) %s)" (sgen_cval vec)
-    | Signed 64, [vec] -> (
-        match cval_ctyp vec with CT_fbits n -> sprintf "fast_signed(%s, %d)" (sgen_cval vec) n | _ -> assert false
+    | Power_of_two_idiv exponent, [value] -> (
+        match cval_ctyp value with
+        | CT_fint _ | CT_fuint _ ->
+            if exponent = 0 then sgen_cval value else sprintf "(%s >> %d)" (sgen_cval value) exponent
+        | ctyp ->
+            c_error (sprintf "Cannot lower proved power-of-two division for %s" (string_of_ctyp ctyp))
+      )
+    | Power_of_two_imod exponent, [value] -> (
+        match cval_ctyp value with
+        | CT_fint _ | CT_fuint _ ->
+            let mask = Big_int.pred (Big_int.pow_int_positive 2 exponent) in
+            sprintf "(%s & %s)" (sgen_cval value) (sgen_cval (V_lit (VL_int mask, cval_ctyp value)))
+        | ctyp ->
+            c_error (sprintf "Cannot lower proved power-of-two remainder for %s" (string_of_ctyp ctyp))
+      )
+    | (Mixed_proven_idiv (operation_ctyp, result_ctyp) | Mixed_proven_imod (operation_ctyp, result_ctyp)), [left; right] -> (
+        (match (operation_ctyp, cval_ctyp left, cval_ctyp right) with
+        | (CT_fint _ | CT_fuint _), (CT_fint _ | CT_fuint _), (CT_fint _ | CT_fuint _) -> ()
+        | operation_ctyp, left_ctyp, right_ctyp ->
+            c_error
+              (sprintf "Cannot lower mixed proved division with %s for %s and %s" (string_of_ctyp operation_ctyp)
+                 (string_of_ctyp left_ctyp) (string_of_ctyp right_ctyp)
+              ));
+        let operator = match op with Mixed_proven_idiv _ -> "/" | _ -> "%" in
+        sprintf "((%s)(((%s)%s) %s ((%s)%s)))" (sgen_ctyp result_ctyp) (sgen_ctyp operation_ctyp)
+          (sgen_cval left) operator (sgen_ctyp operation_ctyp) (sgen_cval right)
+      )
+    | Unsigned width, [vec] -> sprintf "((%s) %s)" (sgen_ctyp (CT_fuint width)) (sgen_cval vec)
+    | Signed width, [value] -> (
+        match cval_ctyp value with
+        | CT_fbits n when width = 64 -> sprintf "fast_signed(%s, %d)" (sgen_cval value) n
+        | CT_fint _ | CT_fuint _ | CT_constant _ -> sprintf "((%s) %s)" (sgen_ctyp (CT_fint width)) (sgen_cval value)
+        | ctyp -> c_error (sprintf "Cannot lower proved signed conversion from %s" (string_of_ctyp ctyp))
       )
     | Bvand, [v1; v2] -> (
         match cval_ctyp v1 with
@@ -2947,6 +3513,37 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | CT_fbits _ -> sprintf "safe_rshift(%s, %s)" (sgen_cval value) (sgen_cval amount)
         | _ -> assert false
       )
+    | Proven_bvshiftl 64, [value; amount] -> (
+        match cval_ctyp value with
+        | CT_fbits width ->
+            sprintf "((%s << %s) & %s)" (sgen_cval value) (sgen_cval amount) (sgen_mask width)
+        | _ -> assert false
+      )
+    | Proven_bvshiftr 64, [value; amount] -> (
+        match cval_ctyp value with
+        | CT_fbits _ -> sprintf "(%s >> %s)" (sgen_cval value) (sgen_cval amount)
+        | _ -> assert false
+      )
+    | Proven_bvarith_shiftr 64, [value; amount] -> (
+        match cval_ctyp value with
+        | CT_fbits width ->
+            let mask = sgen_mask width in
+            let sign = sprintf "((%s >> %d) & UINT64_C(1))" (sgen_cval value) (width - 1) in
+            sprintf "((%s >> %s) | (%s ? (%s ^ (%s >> %s)) : UINT64_C(0)))" (sgen_cval value)
+              (sgen_cval amount) sign mask mask (sgen_cval amount)
+        | _ -> assert false
+      )
+    | (Proven_bvshiftl _ | Proven_bvshiftr _ | Proven_bvarith_shiftr _), _ -> assert false
+    | Bvrotr (width, amount), [value]
+      when 0 < width && width <= 64 && 0 < amount && amount < width -> (
+        match cval_ctyp value with
+        | CT_fbits source_width when width <= source_width ->
+            let masked = sprintf "(%s & %s)" (sgen_cval value) (sgen_mask width) in
+            sprintf "(((%s >> %d) | (%s << %d)) & %s)" masked amount masked (width - amount)
+              (sgen_mask width)
+        | _ -> assert false
+      )
+    | Bvrotr _, _ -> assert false
     | Bvarith_shiftr, [value; amount] -> (
         match cval_ctyp value with
         | CT_fbits width ->
@@ -2965,13 +3562,22 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | ctyp when is_c_repr_u256 ctyp -> sprintf "u256_bit(%s, %s)" (sgen_cval vec) (sgen_cval n)
         | _ -> assert false
       )
+    | Proven_vector_access length, [vector; index] -> (
+        match cval_ctyp vector with
+        | CT_fvector (actual_length, _) when length = actual_length ->
+            sprintf "((%s).data[(size_t)(%s)])" (sgen_cval vector) (sgen_cval index)
+        | _ -> assert false
+      )
     | Slice len, [vec; start] -> (
         match cval_ctyp vec with
-        | CT_fbits _ -> sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & (%s >> %s))" len (sgen_cval vec) (sgen_cval start)
+        | CT_fbits _ ->
+            sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & safe_rshift(%s, %s))" len (sgen_cval vec)
+              (sgen_cval start)
         | CT_fuint _ ->
             sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & safe_rshift(%s, %s))" len (sgen_cval vec) (sgen_cval start)
         | CT_sbits _ ->
-            sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & (%s.bits >> %s))" len (sgen_cval vec) (sgen_cval start)
+            sprintf "(safe_rshift(UINT64_MAX, 64 - %d) & safe_rshift(%s.bits, %s))" len (sgen_cval vec)
+              (sgen_cval start)
         | ctyp when is_c_repr_u128 ctyp ->
             let extracted = sprintf "u128_extract_u64(%s, (uint64_t)(%s))" (sgen_cval vec) (sgen_cval start) in
             if len = 64 then extracted else sprintf "(%s & %s)" (sgen_mask len) extracted
@@ -2980,6 +3586,16 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             if len = 64 then extracted else sprintf "(%s & %s)" (sgen_mask len) extracted
         | _ -> assert false
       )
+    | Proven_slice (len, 64), [vec; start] -> (
+        let extracted =
+          match cval_ctyp vec with
+          | CT_fbits _ | CT_fuint _ -> sprintf "(%s >> %s)" (sgen_cval vec) (sgen_cval start)
+          | CT_sbits _ -> sprintf "(%s.bits >> %s)" (sgen_cval vec) (sgen_cval start)
+          | _ -> assert false
+        in
+        if len = 64 then extracted else sprintf "(%s & %s)" (sgen_mask len) extracted
+      )
+    | Proven_slice _, _ -> assert false
     | Sslice 64, [vec; start; len] -> (
         match cval_ctyp vec with
         | CT_fbits _ -> sprintf "sslice(%s, %s, %s)" (sgen_cval vec) (sgen_cval start) (sgen_cval len)
@@ -2988,6 +3604,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       )
     | Set_slice, [vec; start; slice] -> (
         match (cval_ctyp vec, cval_ctyp slice) with
+        | CT_fbits _, CT_fbits 0 -> sgen_cval vec
         | CT_fbits _, CT_fbits m ->
             sprintf "((%s & ~(%s << %s)) | (%s << %s))" (sgen_cval vec) (sgen_mask m) (sgen_cval start)
               (sgen_cval slice) (sgen_cval start)
@@ -3034,7 +3651,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let rec sgen_clexp l = function
     | CL_id (Have_exception _, _) -> "have_exception"
-    | CL_id (Current_exception _, _) -> "current_exception"
+    | CL_id (Current_exception _, _) -> if Config.optimized_model then "&current_exception" else "current_exception"
     | CL_id (Throw_location _, _) -> "throw_location"
     | CL_id (Memory_writes _, _) -> "memory_writes"
     | CL_id (Channel _, _) -> Reporting.unreachable l __POS__ "CL_id Channel should not appear in C backend"
@@ -3100,6 +3717,59 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           )
     )
 
+  let codegen_fixed_integer_conversion l clexp ctyp_to cval ctyp_from =
+    let storage_width width = if width > 64 then 128 else native_c_integer_width width in
+    let assignment =
+      ksprintf string "  %s = (%s)(%s);" (sgen_clexp_pure l clexp) (sgen_ctyp ctyp_to) (sgen_cval cval)
+    in
+    let failure message = ksprintf string "    sail_native_conversion_failure(\"%s\");" message in
+    let checked condition message =
+      ksprintf string "  if (%s) {" condition ^^ hardline ^^ failure message ^^ hardline ^^ string "  }" ^^ hardline
+    in
+    let lower_bound ctyp width = sgen_value ctyp (VL_int (min_int width)) in
+    let upper_signed_bound ctyp width = sgen_value ctyp (VL_int (max_int width)) in
+    let upper_unsigned_bound ctyp width = sgen_value ctyp (VL_int (max_uint width)) in
+    let outside_target_domain () = sprintf "integer value is outside the %s domain" (sgen_ctyp ctyp_to) in
+    let negative_target () = sprintf "negative integer cannot be represented as %s" (sgen_ctyp ctyp_to) in
+    match (ctyp_to, ctyp_from) with
+    | CT_fuint to_width, CT_fuint from_width ->
+        let to_width = storage_width to_width in
+        let from_width = storage_width from_width in
+        if from_width <= to_width then assignment
+        else
+          checked (sprintf "%s > %s" (sgen_cval cval) (upper_unsigned_bound ctyp_to to_width)) (outside_target_domain ())
+          ^^ assignment
+    | CT_fint to_width, CT_fint from_width ->
+        let to_width = storage_width to_width in
+        let from_width = storage_width from_width in
+        if from_width <= to_width then assignment
+        else
+          checked
+            (sprintf "%s < %s || %s > %s" (sgen_cval cval) (lower_bound ctyp_to to_width) (sgen_cval cval)
+               (upper_signed_bound ctyp_to to_width)
+            )
+            (outside_target_domain ())
+          ^^ assignment
+    | CT_fuint to_width, CT_fint from_width ->
+        let to_width = storage_width to_width in
+        let from_width = storage_width from_width in
+        let negative = checked (sprintf "%s < 0" (sgen_cval cval)) (negative_target ()) in
+        if from_width <= to_width then negative ^^ assignment
+        else
+          negative
+          ^^ checked
+               (sprintf "%s > %s" (sgen_cval cval) (upper_unsigned_bound ctyp_to to_width))
+               (outside_target_domain ())
+          ^^ assignment
+    | CT_fint to_width, CT_fuint from_width ->
+        let to_width = storage_width to_width in
+        let from_width = storage_width from_width in
+        if from_width < to_width then assignment
+        else
+          checked (sprintf "%s > %s" (sgen_cval cval) (upper_signed_bound ctyp_to to_width)) (outside_target_domain ())
+          ^^ assignment
+    | _ -> assert false
+
   (** Generate instructions to copy from a cval to a clexp. This will insert any needed type conversions from big
       integers to small integers (or vice versa), or from arbitrary-length bitvectors to and from uint64 bitvectors as
       needed. *)
@@ -3112,11 +3782,13 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         if is_stack_ctyp ctx ctyp_to then ksprintf string "  %s = %s;" (sgen_clexp_pure l clexp) (sgen_cval cval)
         else sail_copy ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp_to) "%s, %s" (sgen_clexp l clexp) (sgen_cval cval)
     | (CT_fint _ | CT_fuint _), (CT_fint _ | CT_fuint _) ->
-        (* Both storage types were selected from the source-level range at
-           this occurrence.  A width/signedness change here is therefore a
-           proved refinement conversion, not a truncating host cast guessed
-           from the source storage representation. *)
-        ksprintf string "  %s = (%s)(%s);" (sgen_clexp_pure l clexp) (sgen_ctyp ctyp_to) (sgen_cval cval)
+        (* Most width changes are proved refinements selected from semantic
+           ranges.  Explicit [$[c_repr]] newtypes are also represented by this
+           path, however, and their constructors are genuine runtime
+           boundaries.  Retain checks whenever the source C carrier is not a
+           subset of the destination carrier; no arbitrary-precision integer
+           is needed to enforce those bounds. *)
+        codegen_fixed_integer_conversion l clexp ctyp_to cval ctyp_from
     | CT_lint, from_typ when is_c_repr_u320 from_typ ->
         ksprintf string "  u320_unsigned(%s, %s);" (sgen_clexp l clexp) (sgen_cval cval)
     | to_typ, CT_lint when is_c_repr_u320 to_typ ->
@@ -3143,8 +3815,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         ksprintf string "  u128_unsigned(%s, %s);" (sgen_clexp l clexp) (sgen_cval cval)
     | CT_lint, CT_fint width when width > 64 ->
         let limbs = ngensym () in
-        ksprintf string "  {"
-        ^^ hardline
+        ksprintf string "  {" ^^ hardline
         ^^ ksprintf string "    const uint64_t %s[2] = {(uint64_t)(%s)," (sgen_name limbs) (sgen_cval cval)
         ^^ hardline
         ^^ ksprintf string "      (uint64_t)(((unsigned __int128)(%s)) >> 64)};" (sgen_cval cval)
@@ -3253,9 +3924,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
               in
               let conversion = codegen_conversion l ctx (CL_id (converted, payload_to)) source_payload in
               let construct =
-                ksprintf string "%s(%s%s, %s);"
-                  (sgen_function_uid (constructor_to, []))
-                  (extra_arguments false) (sgen_clexp l clexp) (sgen_name converted)
+                if Config.optimized_model && is_stack_ctyp ctx ctyp_to then
+                  ksprintf string "%s = %s(%s%s);" (sgen_clexp_pure l clexp)
+                    (sgen_function_uid (constructor_to, []))
+                    (extra_arguments false) (sgen_name converted)
+                else
+                  ksprintf string "%s(%s%s, %s);"
+                    (sgen_function_uid (constructor_to, []))
+                    (extra_arguments false) (sgen_clexp l clexp) (sgen_name converted)
               in
               let cleanup =
                 if is_stack_ctyp ctx payload_to then empty
@@ -3401,14 +4077,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                      || is_c_repr_fixed_bytes (cval_ctyp value)
                      || match cval_ctyp value with CT_vector _ | CT_fvector _ -> true | _ -> false
                      )
-                     && ctyp_equal (cval_ctyp index) (CT_fuint 64) ->
+                     && is_native_unsigned_integer (cval_ctyp index) ->
                   sprintf "fast_unsigned_vector_access_%s" (sgen_ctyp_name (cval_ctyp value))
               | value :: index :: _
                 when (is_c_repr_u256 (cval_ctyp value)
                      || is_c_repr_fixed_bytes (cval_ctyp value)
                      || match cval_ctyp value with CT_vector _ | CT_fvector _ -> true | _ -> false
                      )
-                     && ctyp_equal (cval_ctyp index) (CT_fint 64) ->
+                     && is_native_signed_integer (cval_ctyp index) ->
                   sprintf "fast_vector_access_%s" (sgen_ctyp_name (cval_ctyp value))
               | cval :: _ -> sprintf "vector_access_%s" (sgen_ctyp_name (cval_ctyp cval))
               | _ -> c_error "vector access function with bad arity."
@@ -3426,9 +4102,9 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           | "vector_init", ctyp
             when is_c_repr_fixed_bytes ctyp || match ctyp with CT_vector _ | CT_fvector _ -> true | _ -> false -> (
               match List.nth_opt args 0 with
-              | Some length when ctyp_equal (cval_ctyp length) (CT_fuint 64) ->
+              | Some length when is_native_unsigned_integer (cval_ctyp length) ->
                   sprintf "fast_unsigned_vector_init_%s" (sgen_ctyp_name ctyp)
-              | Some length when ctyp_equal (cval_ctyp length) (CT_fint 64) ->
+              | Some length when is_native_signed_integer (cval_ctyp length) ->
                   sprintf "fast_vector_init_%s" (sgen_ctyp_name ctyp)
               | _ -> sprintf "vector_init_%s" (sgen_ctyp_name ctyp)
             )
@@ -3441,23 +4117,23 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           | "vector_update", CT_lbits -> "update_lbits"
           | "vector_update", ctyp when is_c_repr_u256 ctyp -> (
               match List.nth_opt args 1 with
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fuint 64) -> "u256_update_u64"
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fint 64) -> "u256_update_i64"
+              | Some index when is_native_unsigned_integer (cval_ctyp index) -> "u256_update_u64"
+              | Some index when is_native_signed_integer (cval_ctyp index) -> "u256_update_i64"
               | _ -> sprintf "vector_update_%s" (sgen_ctyp_name ctyp)
             )
           | "vector_update", ctyp when is_c_repr_fixed_bytes ctyp -> (
               match List.nth_opt args 1 with
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fuint 64) ->
+              | Some index when is_native_unsigned_integer (cval_ctyp index) ->
                   sprintf "fast_unsigned_vector_update_%s" (sgen_ctyp_name ctyp)
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fint 64) ->
+              | Some index when is_native_signed_integer (cval_ctyp index) ->
                   sprintf "internal_vector_update_%s" (sgen_ctyp_name ctyp)
               | _ -> sprintf "vector_update_%s" (sgen_ctyp_name ctyp)
             )
           | "vector_update", ((CT_vector _ | CT_fvector _) as ctyp) -> (
               match List.nth_opt args 1 with
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fuint 64) ->
+              | Some index when is_native_unsigned_integer (cval_ctyp index) ->
                   sprintf "fast_unsigned_vector_update_%s" (sgen_ctyp_name ctyp)
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fint 64) ->
+              | Some index when is_native_signed_integer (cval_ctyp index) ->
                   sprintf "fast_vector_update_%s" (sgen_ctyp_name ctyp)
               | _ -> sprintf "vector_update_%s" (sgen_ctyp_name ctyp)
             )
@@ -3466,31 +4142,31 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           | "vector_update_inc", CT_lbits -> "update_lbits_inc"
           | "vector_update_inc", ctyp when is_c_repr_u256 ctyp -> (
               match List.nth_opt args 1 with
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fuint 64) -> "u256_update_u64"
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fint 64) -> "u256_update_i64"
+              | Some index when is_native_unsigned_integer (cval_ctyp index) -> "u256_update_u64"
+              | Some index when is_native_signed_integer (cval_ctyp index) -> "u256_update_i64"
               | _ -> sprintf "vector_update_%s" (sgen_ctyp_name ctyp)
             )
           | "vector_update_inc", ctyp when is_c_repr_fixed_bytes ctyp -> (
               match List.nth_opt args 1 with
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fuint 64) ->
+              | Some index when is_native_unsigned_integer (cval_ctyp index) ->
                   sprintf "fast_unsigned_vector_update_%s" (sgen_ctyp_name ctyp)
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fint 64) ->
+              | Some index when is_native_signed_integer (cval_ctyp index) ->
                   sprintf "internal_vector_update_%s" (sgen_ctyp_name ctyp)
               | _ -> sprintf "vector_update_%s" (sgen_ctyp_name ctyp)
             )
           | "vector_update_inc", ((CT_vector _ | CT_fvector _) as ctyp) -> (
               match List.nth_opt args 1 with
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fuint 64) ->
+              | Some index when is_native_unsigned_integer (cval_ctyp index) ->
                   sprintf "fast_unsigned_vector_update_%s" (sgen_ctyp_name ctyp)
-              | Some index when ctyp_equal (cval_ctyp index) (CT_fint 64) ->
+              | Some index when is_native_signed_integer (cval_ctyp index) ->
                   sprintf "fast_vector_update_%s" (sgen_ctyp_name ctyp)
               | _ -> sprintf "vector_update_%s" (sgen_ctyp_name ctyp)
             )
           | (("shiftl" | "shiftr" | "arith_shiftr") as shift), ctyp when is_c_repr_u256 ctyp ->
               let suffix =
                 match List.nth_opt args 1 with
-                | Some amount when ctyp_equal (cval_ctyp amount) (CT_fuint 64) -> "_u64"
-                | Some amount when ctyp_equal (cval_ctyp amount) (CT_fint 64) -> "_i64"
+                | Some amount when is_native_unsigned_integer (cval_ctyp amount) -> "_u64"
+                | Some amount when is_native_signed_integer (cval_ctyp amount) -> "_i64"
                 | _ -> ""
               in
               "u256_" ^ shift ^ suffix
@@ -3538,7 +4214,17 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
               sgen_cval value
           | _ -> default_c_args
         in
-        if fname = "reg_deref" then
+        current_static_helper_demands := Util.StringSet.add fname !current_static_helper_demands;
+        if is_extern && raw_fname <> "__sail_fixed_assert" && fname <> "reg_deref" then
+          emitted_external_functions := Util.StringSet.add fname !emitted_external_functions;
+        if raw_fname = "__sail_fixed_assert" then (
+          match args with
+          | [condition] ->
+              ksprintf string "  if (!(%s)) __builtin_trap();\n  %s = UNIT;" (sgen_cval condition)
+                (sgen_clexp_pure l x)
+          | _ -> c_error ~loc:l "fixed assertion marker with bad arity"
+        )
+        else if fname = "reg_deref" then
           if is_stack_ctyp ctx ctyp then ksprintf string "  %s = *(%s);" (sgen_clexp_pure l x) c_args
           else sail_copy ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp) "&%s, *(%s)" (sgen_clexp_pure l x) c_args
         else if is_stack_ctyp ctx ctyp then
@@ -3578,8 +4264,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           | ctyp when is_c_repr_fixed_bytes ctyp -> (sprintf "%s_zero()" (sgen_ctyp_name ctyp), [])
           | CT_unit -> ("UNIT", [])
           | CT_fint width when width > 64 -> ("((__int128)INT64_C(0xdeadc0de))", [])
-          | CT_fint _ -> ("INT64_C(0xdeadc0de)", [])
-          | CT_fuint _ -> ("UINT64_C(0xdeadc0de)", [])
+          | (CT_fint _ | CT_fuint _) as ctyp -> (sprintf "((%s)UINT64_C(0xdeadc0de))" (sgen_ctyp ctyp), [])
           | CT_lint when !optimize_fixed_int -> ("((sail_int) 0xdeadc0de)", [])
           | CT_fbits 1 -> ("UINT64_C(0)", [])
           | CT_fbits _ -> ("UINT64_C(0xdeadc0de)", [])
@@ -3621,6 +4306,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                 ]
                 @ prev
               )
+          | CT_variant _ when is_stack_ctyp ctx ctyp ->
+              let gs = ngensym () in
+              ( sgen_name gs,
+                [sprintf "struct %s %s = {0};" (sgen_ctyp_name ctyp) (sgen_name gs)]
+              )
+          | CT_fvector _ when is_stack_ctyp ctx ctyp ->
+              let gs = ngensym () in
+              (sgen_name gs, [sprintf "%s %s = {0};" (sgen_ctyp ctyp) (sgen_name gs)])
           | CT_ref _ -> ("NULL", [])
           | ctyp -> c_error ("Cannot create undefined value for type: " ^ string_of_ctyp ctyp)
         in
@@ -3706,6 +4399,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           StaticFunctionDefinition enum_undefined;
         ]
     | CTD_enum (id, []) -> c_error ("Cannot compile empty enum " ^ string_of_id id)
+    | CTD_abbrev (_, ctyp) when Config.optimized_model && not (is_stack_ctyp ctx ctyp) ->
+        (* Transparent source aliases do not allocate storage themselves.  Do
+           not leak an otherwise-unused generic alias such as [sail_int] into
+           the fixed optimized ABI; any concrete use of it is diagnosed by
+           the representation validator before code generation. *)
+        []
     | CTD_abbrev (id, ctyp) ->
         [
           TypeDeclaration
@@ -3756,9 +4455,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             ^^ surround 2 0 lbrace (separate_map (semi ^^ hardline) struct_field ctors ^^ semi) rbrace
             ^^ semi
             );
-          StaticFunctionDefinition struct_copy;
         ]
-        @ ( if not (is_stack_ctyp ctx struct_ctyp) then
+        @
+        ( if Config.optimized_model && is_stack_ctyp ctx struct_ctyp then []
+          else [StaticFunctionDefinition struct_copy]
+        )
+        @ ( if (not Config.optimized_model) || not (is_stack_ctyp ctx struct_ctyp) then
               [
                 StaticFunctionDefinition (derive sail_create);
                 StaticFunctionDefinition (derive sail_recreate);
@@ -3768,6 +4470,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           )
         @ [StaticFunctionDefinition struct_eq]
     | CTD_variant (id, _, tus) ->
+        let variant_ctyp = CT_variant (id, []) in
+        let stack_variant = is_stack_ctyp ctx variant_ctyp in
         let codegen_tu (ctor_id, ctyp) =
           separate space [string "struct"; lbrace; string (sgen_ctyp ctyp); codegen_id ctor_id ^^ semi; rbrace]
         in
@@ -3811,19 +4515,30 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         in
         let codegen_ctor (ctor_id, ctyp) =
           let ctor_args = Printf.sprintf "%s op" (sgen_const_ctyp ctyp) in
-          c_function ~return:"static void"
-            (ksprintf string "%s(%sstruct %s *rop, %s)" (sgen_function_id ctor_id) (extra_params ()) (sgen_id id)
-               ctor_args
-            )
-            ([each_ctor "rop->" (clear_field "rop") tus; string ("rop->kind = Kind_" ^ sgen_id ctor_id) ^^ semi]
-            @
-            if is_stack_ctyp ctx ctyp then [ksprintf string "rop->variants.%s = op;" (sgen_id ctor_id)]
-            else
+          if Config.optimized_model && stack_variant then
+            let n = sgen_id id in
+            c_function ~return:("static struct " ^ n)
+              (ksprintf string "%s(%s%s)" (sgen_function_id ctor_id) (extra_params ()) ctor_args)
               [
-                sail_create ~suffix:";" (sgen_ctyp_name ctyp) "&rop->variants.%s" (sgen_id ctor_id);
-                sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&rop->variants.%s, op" (sgen_id ctor_id);
+                ksprintf string "struct %s result;" n;
+                string ("result.kind = Kind_" ^ sgen_id ctor_id) ^^ semi;
+                ksprintf string "result.variants.%s = op;" (sgen_id ctor_id);
+                c_return (string "result");
               ]
-            )
+          else
+            c_function ~return:"static void"
+              (ksprintf string "%s(%sstruct %s *rop, %s)" (sgen_function_id ctor_id) (extra_params ()) (sgen_id id)
+                 ctor_args
+              )
+              ([each_ctor "rop->" (clear_field "rop") tus; string ("rop->kind = Kind_" ^ sgen_id ctor_id) ^^ semi]
+              @
+              if is_stack_ctyp ctx ctyp then [ksprintf string "rop->variants.%s = op;" (sgen_id ctor_id)]
+              else
+                [
+                  sail_create ~suffix:";" (sgen_ctyp_name ctyp) "&rop->variants.%s" (sgen_id ctor_id);
+                  sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&rop->variants.%s, op" (sgen_id ctor_id);
+                ]
+              )
         in
         let codegen_setter =
           let n = sgen_id id in
@@ -3894,16 +4609,28 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                  rbrace
             ^^ semi
             );
-          StaticFunctionDefinition codegen_init;
-          StaticFunctionDefinition codegen_reinit;
-          StaticFunctionDefinition codegen_clear;
-          StaticFunctionDefinition codegen_setter;
-          StaticFunctionDefinition codegen_eq;
         ]
+        @ ( if Config.optimized_model && stack_variant then []
+            else
+              [
+                StaticFunctionDefinition codegen_init;
+                StaticFunctionDefinition codegen_reinit;
+                StaticFunctionDefinition codegen_clear;
+                StaticFunctionDefinition codegen_setter;
+              ]
+          )
+        @ [StaticFunctionDefinition codegen_eq]
         @ List.map (fun tu -> StaticFunctionDefinition (codegen_ctor tu)) tus
         (* If this is the exception type, then we setup up some global variables to deal with exceptions. *)
         @
-        if string_of_id id = "exception" then
+        if string_of_id id = "exception" && Config.optimized_model then
+          [
+            VariableDeclaration (ksprintf string "extern struct %s current_exception;" (sgen_id id));
+            VariableDefinition (ksprintf string "struct %s current_exception = {0};" (sgen_id id));
+            VariableDeclaration (string "extern bool have_exception;");
+            VariableDefinition (string "bool have_exception = false;");
+          ]
+        else if string_of_id id = "exception" then
           [
             VariableDeclaration (ksprintf string "extern struct %s *current_exception;" (sgen_id id));
             VariableDefinition (ksprintf string "struct %s *current_exception = NULL;" (sgen_id id));
@@ -4961,7 +5688,11 @@ static inline sail_u256 u256_of_fbits(const uint64_t value) {
   result.limbs[0] = value;
   return result;
 }
-
+|}
+      in
+      let string_helpers =
+        string
+          {|
 static inline void string_of_u256(sail_string *result, const sail_u256 value) {
   sail_free(*result);
   const int bytes = asprintf(
@@ -5041,6 +5772,7 @@ static inline sail_u256 u256_of_sail_int(const sail_int value) {
       in
       let helpers =
         base_helpers
+        ^^ (if Config.optimized_model then empty else string_helpers)
         ^^ (if !emit_generic_lbits_helpers then generic_lbits_helpers else empty)
         ^^ if !emit_generic_sail_int_helpers then generic_sail_int_helpers else empty
       in
@@ -5568,9 +6300,7 @@ static inline void u320_unsigned(sail_int *result, const sail_u320 value) {
 }
 |}
       in
-      let helpers =
-        base_helpers ^^ if !emit_generic_sail_int_helpers then generic_sail_int_helpers else empty
-      in
+      let helpers = base_helpers ^^ if !emit_generic_sail_int_helpers then generic_sail_int_helpers else empty in
       [TypeDeclaration typedef; StaticFunctionDefinition helpers]
     )
 
@@ -5856,6 +6586,174 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     )
 
   (* Generate functions for working with non-bit vectors of some specific type. *)
+  let codegen_fixed_vector ctx length ctyp =
+    let open Printf in
+    let vector_ctyp = CT_fvector (length, ctyp) in
+    let key = mk_id (string_of_ctyp vector_ctyp) in
+    let id = if Config.no_mangle then mk_id (readable_ctyp_name vector_ctyp) else key in
+    if IdSet.mem key !generated then []
+    else (
+      let name = sgen_id id in
+      let stack_elem = is_stack_ctyp ctx ctyp in
+      let guard = "SAIL_FIXED_VECTOR_" ^ String.uppercase_ascii name ^ "_DEFINED" in
+      let typedef =
+        ksprintf string "#ifndef %s\n#define %s\n" guard guard
+        ^^ ksprintf string "typedef struct %s {\n  size_t len;\n  %s data[%d];\n} %s;\n#endif" name (sgen_ctyp ctyp)
+             length name
+      in
+      let fill index elem =
+        if stack_elem then ksprintf c_stmt "vec->data[%s] = %s" index elem
+        else sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&vec->data[%s], %s" index elem
+      in
+      let initialize_elements =
+        if stack_elem then []
+        else
+          [c_for (ksprintf string "(size_t i = 0; i < %d; ++i)" length)
+             [sail_create ~suffix:";" (sgen_ctyp_name ctyp) "&rop->data[i]"]]
+      in
+      let clear_elements =
+        if stack_elem then []
+        else
+          [c_for (ksprintf string "(size_t i = 0; i < %d; ++i)" length)
+             [sail_kill ~suffix:";" (sgen_ctyp_name ctyp) "&rop->data[i]"]]
+      in
+      let create =
+        c_function ~return:"static void" (sail_create name "%s *rop" name)
+          ([ksprintf c_stmt "rop->len = %d" length] @ initialize_elements)
+      in
+      let clear = c_function ~return:"static void" (sail_kill name "%s *rop" name) clear_elements in
+      let recreate =
+        c_function ~return:"static void" (sail_recreate name "%s *rop" name)
+          [sail_kill ~suffix:";" name "rop"; sail_create ~suffix:";" name "rop"]
+      in
+      let copy =
+        c_function ~return:"static void" (sail_copy name "%s *rop, const %s op" name name)
+          ( if stack_elem then [c_stmt "*rop = op"]
+            else
+              [c_stmt "rop->len = op.len";
+               c_for (ksprintf string "(size_t i = 0; i < %d; ++i)" length)
+                 [sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&rop->data[i], op.data[i]"]]
+          )
+      in
+      let init name_suffix length_type length_expr =
+        if stack_elem then
+          c_function ~return:("static " ^ name)
+            (ksprintf string "%s_%s(const %s n, %s elem)" name_suffix name length_type (sgen_ctyp ctyp))
+            [ksprintf c_stmt "%s vec" name; c_stmt ("size_t m = (size_t)" ^ length_expr); c_stmt "vec.len = m";
+             c_for (string "(size_t i = 0; i < m; ++i)") [c_stmt "vec.data[i] = elem"]; c_stmt "return vec"]
+        else
+          c_function ~return:"static void"
+            (ksprintf string "%s_%s(%s *vec, const %s n, %s elem)" name_suffix name name length_type
+               (sgen_ctyp ctyp))
+            [c_stmt ("size_t m = (size_t)" ^ length_expr); c_stmt "vec->len = m";
+             c_for (string "(size_t i = 0; i < m; ++i)") [fill "i" "elem"]]
+      in
+      let vector_init =
+        c_function ~return:"static void"
+          (ksprintf string "vector_init_%s(%s *vec, sail_int n, %s elem)" name name (sgen_ctyp ctyp))
+          [c_stmt "size_t m = (size_t)sail_int_get_ui(n)"; c_stmt "vec->len = m";
+           c_for (string "(size_t i = 0; i < m; ++i)") [fill "i" "elem"]]
+      in
+      let update function_name index_type index_expr =
+        if stack_elem then
+          c_function ~return:("static " ^ name)
+            (ksprintf string "%s_%s(%s op, const %s n, %s elem)" function_name name name index_type
+               (sgen_ctyp ctyp))
+            [c_stmt ("size_t m = (size_t)" ^ index_expr); c_stmt "op.data[m] = elem"; c_stmt "return op"]
+        else
+          c_function ~return:"static void"
+            (ksprintf string "%s_%s(%s *rop, %s op, const %s n, %s elem)" function_name name name name index_type
+               (sgen_ctyp ctyp))
+            [sail_copy ~suffix:";" name "rop, op"; c_stmt ("size_t m = (size_t)" ^ index_expr);
+             sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&rop->data[m], elem"]
+      in
+      let vector_update =
+        c_function ~return:"static void"
+          (ksprintf string "vector_update_%s(%s *rop, %s op, sail_int n, %s elem)" name name name (sgen_ctyp ctyp))
+          ([if stack_elem then c_stmt "*rop = op" else sail_copy ~suffix:";" name "rop, op";
+            c_stmt "size_t m = (size_t)sail_int_get_ui(n)"]
+          @ [if stack_elem then c_stmt "rop->data[m] = elem"
+             else sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&rop->data[m], elem"])
+      in
+      let access function_name index_type =
+        if stack_elem then
+          c_function ~return:("static " ^ sgen_ctyp ctyp)
+            (ksprintf string "%s_%s(%s op, %s n)" function_name name name index_type)
+            [c_stmt "return op.data[(size_t)n]"]
+        else
+          c_function ~return:"static void"
+            (ksprintf string "%s_%s(%s *rop, %s op, %s n)" function_name name (sgen_ctyp ctyp) name index_type)
+            [sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "rop, op.data[(size_t)n]"]
+      in
+      let vector_access =
+        if stack_elem then
+          c_function ~return:("static " ^ sgen_ctyp ctyp)
+            (ksprintf string "vector_access_%s(%s op, sail_int n)" name name)
+            [c_stmt "return op.data[(size_t)sail_int_get_ui(n)]"]
+        else
+          c_function ~return:"static void"
+            (ksprintf string "vector_access_%s(%s *rop, %s op, sail_int n)" name (sgen_ctyp ctyp) name)
+            [sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "rop, op.data[(size_t)sail_int_get_ui(n)]"]
+      in
+      let internal_init =
+        if stack_elem then
+          c_function ~return:("static " ^ name)
+            (ksprintf string "internal_vector_init_%s(const int64_t len)" name)
+            [ksprintf c_stmt "%s rop" name; c_stmt "rop.len = (size_t)len"; c_stmt "return rop"]
+        else
+          c_function ~return:"static void"
+            (ksprintf string "internal_vector_init_%s(%s *rop, const int64_t len)" name name)
+            [c_stmt "rop->len = (size_t)len"]
+      in
+      let internal_update = update "internal_vector_update" "int64_t" "n" in
+      let equal =
+        c_function ~return:"static bool" (sail_equal name "const %s op1, const %s op2" name name)
+          [c_stmt "if (op1.len != op2.len) return false"; c_stmt "bool result = true";
+           c_for (string "(size_t i = 0; i < op1.len; ++i)")
+             [c_assign (string "result") "&=" (codegen_equal ctyp "op1.data[i]" "op2.data[i]")];
+           c_stmt "return result"]
+      in
+      let undefined =
+        c_function ~return:"static void"
+          (ksprintf string "undefined_vector_%s(%s *rop, sail_int len, %s elem)" name name (sgen_ctyp ctyp))
+          [c_stmt "size_t m = (size_t)sail_int_get_ui(len)"; c_stmt "rop->len = m";
+           c_for (string "(size_t i = 0; i < m; ++i)")
+             [if stack_elem then c_stmt "rop->data[i] = elem"
+              else sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&rop->data[i], elem"]]
+      in
+      let vector_length =
+        c_function ~return:"static void" (ksprintf string "length_%s(sail_int *rop, %s op)" name name)
+          [c_stmt "mpz_set_ui(*rop, (unsigned long int)op.len)"]
+      in
+      let static_helper helper_name doc =
+        if Config.optimized_model && stack_elem then DemandedStaticFunctionDefinition (helper_name, doc)
+        else StaticFunctionDefinition doc
+      in
+      generated := IdSet.add key !generated;
+      [TypeDeclaration typedef]
+      @ (if stack_elem then [] else List.map (fun d -> StaticFunctionDefinition d) [create; clear; recreate; copy])
+      @ (if !emit_generic_sail_int_helpers then
+           List.map (fun d -> StaticFunctionDefinition d) [vector_init; vector_access; vector_update; undefined; vector_length]
+         else [])
+      @ [
+          static_helper ("fast_vector_init_" ^ name) (init "fast_vector_init" "int64_t" "n");
+          static_helper
+            ("fast_unsigned_vector_init_" ^ name)
+            (init "fast_unsigned_vector_init" "uint64_t" "n");
+          static_helper ("fast_vector_access_" ^ name) (access "fast_vector_access" "int64_t");
+          static_helper
+            ("fast_unsigned_vector_access_" ^ name)
+            (access "fast_unsigned_vector_access" "uint64_t");
+          static_helper ("fast_vector_update_" ^ name) (update "fast_vector_update" "int64_t" "n");
+          static_helper
+            ("fast_unsigned_vector_update_" ^ name)
+            (update "fast_unsigned_vector_update" "uint64_t" "n");
+          static_helper ("eq_" ^ name) equal;
+          static_helper ("internal_vector_update_" ^ name) internal_update;
+          static_helper ("internal_vector_init_" ^ name) internal_init;
+        ]
+    )
+
   let codegen_vector ctx ctyp =
     let open Printf in
     let id = mk_id (string_of_ctyp (CT_vector ctyp)) in
@@ -6145,13 +7043,20 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
               );
             definition;
           ]
-    | CDEF_val (id, _, arg_ctyps, ret_ctyp, _) ->
-        if ctx_is_extern id ctx then []
+    | CDEF_val (id, _, arg_ctyps, ret_ctyp, extern) ->
+        let external_name =
+          match extern with
+          | Some external_name -> Some external_name
+          | None when ctx_is_extern id ctx -> Some (ctx_get_extern id ctx)
+          | None -> None
+        in
+        let function_name = Option.value ~default:(sgen_function_id id) external_name in
+        if Option.is_some external_name && not Config.optimized_model then []
         else if is_stack_ctyp ctx ret_ctyp then
           [
             FunctionDeclaration
               (string
-                 (Printf.sprintf "%s %s(%s%s);" (sgen_ctyp ret_ctyp) (sgen_function_id id) (extra_params ())
+                 (Printf.sprintf "%s %s(%s%s);" (sgen_ctyp ret_ctyp) function_name (extra_params ())
                     (Util.string_of_list ", " sgen_const_ctyp arg_ctyps)
                  )
               );
@@ -6160,7 +7065,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           [
             FunctionDeclaration
               (string
-                 (Printf.sprintf "void %s(%s%s *rop, %s);" (sgen_function_id id) (extra_params ()) (sgen_ctyp ret_ctyp)
+                 (Printf.sprintf "void %s(%s%s *rop, %s);" function_name (extra_params ()) (sgen_ctyp ret_ctyp)
                     (Util.string_of_list ", " sgen_const_ctyp arg_ctyps)
                  )
               );
@@ -6221,7 +7126,11 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
               );
           ]
         )
-    | CDEF_type ctype_def -> codegen_type_def ctx ctype_def
+    | CDEF_type ctype_def ->
+        let docs = codegen_type_def ctx ctype_def in
+        if Config.optimized_model && Bindings.mem (ctype_def_id ctype_def) Config.external_types then
+          List.filter (function TypeDeclaration _ -> false | _ -> true) docs
+        else docs
     | CDEF_startup (id, instrs) ->
         let startup_header =
           string (Printf.sprintf "void %sstartup_%s(void)" (class_impl_prefix ()) (sgen_function_id id))
@@ -6257,6 +7166,12 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             bindings
           ^^ hardline
         in
+        let variable_decls =
+          separate_map hardline
+            (fun (id, ctyp) -> string (Printf.sprintf "extern %s %s;" (sgen_ctyp ctyp) (sgen_id id)))
+            bindings
+          ^^ hardline
+        in
         let function_decls =
           string (Printf.sprintf "void create_letbind_%d(void);" number)
           ^^ hardline
@@ -6276,7 +7191,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           ^^ hardline ^^ string "}"
         in
 
-        [VariableDefinition variable_defs; FunctionDeclaration function_decls; FunctionDefinition impl]
+        (if Config.optimized_model then [VariableDeclaration variable_decls] else [])
+        @ [VariableDefinition variable_defs; FunctionDeclaration function_decls; FunctionDefinition impl]
     | CDEF_pragma _ -> []
 
   (** As we generate C we need to generate specialized version of tuple, list, and vector type. These must be generated
@@ -6292,6 +7208,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     | CTG_tup of ctyp list
     | CTG_list of ctyp
     | CTG_vector of ctyp
+    | CTG_fixed_vector of int * ctyp
 
   let rec ctyp_dependencies = function
     | CT_fint _ | CT_fuint _ -> [CTG_native_int_conversion_failure]
@@ -6301,7 +7218,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     | ctyp when is_c_repr_fixed_bytes ctyp -> [CTG_fixed_bytes (Option.get (c_repr_fixed_bytes_length ctyp))]
     | CT_tup ctyps -> List.concat (List.map ctyp_dependencies ctyps) @ [CTG_tup ctyps]
     | CT_list ctyp -> ctyp_dependencies ctyp @ [CTG_list ctyp]
-    | CT_vector ctyp | CT_fvector (_, ctyp) -> ctyp_dependencies ctyp @ [CTG_vector ctyp]
+    | CT_vector ctyp -> ctyp_dependencies ctyp @ [CTG_vector ctyp]
+    | CT_fvector (length, ctyp) -> ctyp_dependencies ctyp @ [CTG_fixed_vector (length, ctyp)]
     | CT_ref ctyp -> ctyp_dependencies ctyp
     | CT_struct (_, ctyps) | CT_variant (_, ctyps) -> List.concat (List.map ctyp_dependencies ctyps)
     | CT_lint | CT_lbits | CT_fbits _ | CT_sbits _ | CT_unit | CT_bool | CT_real | CT_string | CT_enum _ | CT_poly _
@@ -6317,6 +7235,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     | CTG_u320 -> codegen_u320 ()
     | CTG_fixed_bytes length -> codegen_fixed_bytes length
     | CTG_vector ctyp -> codegen_vector ctx ctyp
+    | CTG_fixed_vector (length, ctyp) -> codegen_fixed_vector ctx length ctyp
     | CTG_tup ctyps -> codegen_tup ctx ctyps
     | CTG_list ctyp -> codegen_list ctx ctyp
 
@@ -6340,6 +7259,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         | VariableDeclaration doc -> { acc with var_decl = acc.var_decl ^^ doc ^^ twice hardline }
         | VariableDefinition doc -> { acc with var_def = acc.var_def ^^ doc ^^ twice hardline }
         | StaticFunctionDefinition doc -> { acc with static_func_def = acc.static_func_def ^^ doc ^^ twice hardline }
+        | DemandedStaticFunctionDefinition (_, doc) ->
+            { acc with static_func_def = acc.static_func_def ^^ doc ^^ twice hardline }
         )
       {
         type_decl = empty;
@@ -6355,7 +7276,9 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       required. *)
   let codegen_def ctx def =
     match def with
-    | CDEF_aux ((CDEF_val (id, _, _, _, _) | CDEF_fundef (id, _, _, _)), _) when ctx_is_extern id ctx -> []
+    | CDEF_aux ((CDEF_val (id, _, _, _, _) | CDEF_fundef (id, _, _, _)), _)
+      when ctx_is_extern id ctx && not Config.optimized_model ->
+        []
     | _ ->
         let ctyps = cdef_ctyps def |> CTSet.elements in
         (* We should have erased any polymorphism introduced by variants at this point! *)
@@ -6393,16 +7316,18 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     |> IdSet.of_list
 
   let jib_of_ast env effect_info ast =
+    optimize_stack_aggregates := Config.optimized_model;
     let module Jibc = Make (C_config (struct
       let branch_coverage = Config.branch_coverage
       let assert_to_exception = Config.assert_to_exception
       let preserve_types = Config.preserve_types
-      let c_repr_uint64 = Config.c_repr_uint64
-      let c_repr_int64 = Config.c_repr_int64
+      let c_repr_unsigned = Config.c_repr_unsigned
+      let c_repr_signed = Config.c_repr_signed
       let c_repr_u256 = Config.c_repr_u256
       let c_repr_fixed_bytes = Config.c_repr_fixed_bytes
       let specialize_c = Config.specialize_c
       let require_bounded_int = Config.require_bounded_int
+      let optimized_model = Config.optimized_model
     end))
     in
     let ctx = initial_ctx env effect_info in
@@ -6481,11 +7406,12 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
 
     let init_config_id = mk_id "__InitConfig" in
 
+    let model_init_name = if Config.optimized_model then Config.package_name ^ "_model_init" else "model_init" in
     let model_init =
       separate hardline
         (List.map string
-           ([Printf.sprintf "void %smodel_init(void)" (class_impl_prefix ()); "{"; "  setup_rts();"]
-           @ fst exn_boilerplate
+           ([Printf.sprintf "void %s%s(void)" (class_impl_prefix ()) model_init_name; "{"]
+           @ (if Config.optimized_model then ["  have_exception = false;"] else ["  setup_rts();"] @ fst exn_boilerplate)
            @ List.concat (List.map (fun r -> fst (register_init_clear r)) early_regs)
            @ set_abstract_types @ startup cdefs @ letbind_initializers
            @ List.concat (List.map (fun r -> fst (register_init_clear r)) regs)
@@ -6511,7 +7437,9 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         )
     in
 
-    [FunctionDefinition model_init; FunctionDefinition model_fini]
+    if Config.optimized_model then
+      [FunctionDeclaration (Printf.ksprintf string "void %s(void);" model_init_name); FunctionDefinition model_init]
+    else [FunctionDefinition model_init; FunctionDefinition model_fini]
 
   (* For C++ generate a constructor and destructor to allocate and free abstract
      types that aren't handled in model_init() and model_fini(). These
@@ -6639,13 +7567,11 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
   let self_dependent_assignments ast =
     let assignments = ref Util.StringSet.empty in
     let read_ids exp =
-      let alg =
-        { (Rewriter.pure_exp_alg IdSet.empty IdSet.union) with e_id = IdSet.singleton }
-      in
+      let alg = { (Rewriter.pure_exp_alg IdSet.empty IdSet.union) with e_id = IdSet.singleton } in
       Rewriter.fold_exp alg exp
     in
     let rewrite_exp rewriters (E_aux (aux, _) as exp) =
-      (match aux with
+      ( match aux with
       | E_assign (LE_aux (LE_id target, _), rhs) when IdSet.mem target (read_ids rhs) ->
           assignments := Util.StringSet.add (string_of_id target) !assignments
       | _ -> ()
@@ -6674,6 +7600,11 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       (* let cdefs', _ = Jib_optimize.remove_tuples cdefs ctx in *)
       let cdefs = insert_heap_returns ctx Bindings.empty cdefs in
 
+      let cdefs, fixed_bitvector_fusions =
+        if Config.specialize_c then fuse_fixed_bitvector_webs cdefs else (cdefs, 0)
+      in
+      log_phase "fused fixed-bitvector webs=%d" fixed_bitvector_fusions;
+
       let recursive_functions = get_recursive_functions cdefs in
       log_phase "optimizing JIB definitions=%d recursive-functions=%d" (List.length cdefs)
         (IdSet.cardinal recursive_functions);
@@ -6694,9 +7625,65 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
          calls left, then use the final program to decide whether compatibility
          helpers for generic runtime values are needed at all. *)
       let cdefs = remove_uncalled_specialized_wrappers cdefs in
+      if Config.optimized_model && not (Bindings.is_empty Config.external_types) then (
+        let type_definitions =
+          List.fold_left
+            (fun definitions -> function
+              | CDEF_aux (CDEF_type ctype_def, _) ->
+                  Bindings.add (ctype_def_id ctype_def) ctype_def definitions
+              | _ -> definitions
+            )
+            Bindings.empty cdefs
+        in
+        Bindings.iter
+          (fun id _ ->
+            match Bindings.find_opt id type_definitions with
+            | None ->
+                c_error
+                  (Printf.sprintf
+                     "external optimized-model type %s does not name a concrete type retained after specialization"
+                     (string_of_id id)
+                  )
+            | Some (CTD_abstract _) ->
+                c_error
+                  (Printf.sprintf "abstract Sail type %s cannot reuse an external C declaration" (string_of_id id))
+            | Some (CTD_struct (_, params, _) | CTD_variant (_, params, _))
+              when not (Util.list_empty params) ->
+                c_error
+                  (Printf.sprintf
+                     "polymorphic Sail type %s cannot reuse one external C declaration; map each concrete specialization"
+                     (string_of_id id)
+                  )
+            | Some _ -> ()
+          )
+          Config.external_types
+      );
       let has_sail_int = cdefs_contain ctx (function CT_lint -> true | _ -> false) cdefs in
       let has_lbits = cdefs_contain ctx (function CT_lbits -> true | _ -> false) cdefs in
       let has_sail_config = cdefs_contain ctx (function CT_json | CT_json_key -> true | _ -> false) cdefs in
+      let is_managed_ctyp = function
+        | CT_lint | CT_lbits | CT_real | CT_string | CT_list _ | CT_vector _ | CT_memory_writes | CT_json
+        | CT_json_key | CT_ref _ ->
+            true
+        | _ -> false
+      in
+      let has_managed_representation =
+        cdefs_contain ctx is_managed_ctyp cdefs
+      in
+      let managed_ctyp_names cdef =
+        let names = ref Util.StringSet.empty in
+        let collect =
+          object
+            inherit empty_jib_visitor
+
+            method! vctyp ctyp =
+              if is_managed_ctyp ctyp then names := Util.StringSet.add (string_of_ctyp ctyp) !names;
+              DoChildren
+          end
+        in
+        ignore (visit_cdefs collect [cdef]);
+        Util.StringSet.elements !names
+      in
       if Config.require_bounded_int && has_sail_int then (
         let owner, loc, lifecycle_hint =
           List.find_map
@@ -6708,58 +7695,50 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
               in
               let polymorphic_container =
                 match cdef with
-                | CDEF_type (CTD_struct (_, params, _) | CTD_variant (_, params, _)) ->
-                    not (Util.list_empty params)
+                | CDEF_type (CTD_struct (_, params, _) | CTD_variant (_, params, _)) -> not (Util.list_empty params)
                 | _ -> false
               in
               let transparent_alias = match cdef with CDEF_type (CTD_abbrev _) -> true | _ -> false in
               if
-                (not omitted_extern)
-                && not polymorphic_container
-                && not transparent_alias
+                (not omitted_extern) && (not polymorphic_container) && (not transparent_alias)
                 && cdef_has_ctyp (ctyp_contains (function CT_lint -> true | _ -> false)) annotated
               then (
-                (if !Jib_compile.opt_debug_function_representations then
-                   match cdef with
-                   | CDEF_let (_, bindings, instrs) ->
-                       Printf.eprintf "C representation specialization: unresolved top-level let [%s]\n%!"
-                         (Util.string_of_list ", "
-                            (fun (id, ctyp) -> string_of_id id ^ " : " ^ string_of_ctyp ctyp)
-                            bindings
-                         );
-                       List.iter
-                         (fun instr -> Printf.eprintf "  %s\n%!" (string_of_instr instr))
-                         instrs
-                   | CDEF_fundef (id, _, params, instrs) ->
-                       Printf.eprintf "C representation specialization: unresolved function %s params=[%s]\n%!"
-                         (string_of_id id)
-                         (Util.string_of_list ", " (fun param -> string_of_name ~zencode:false param) params);
-                       List.iter
-                         (fun instr -> Printf.eprintf "  %s\n%!" (string_of_instr instr))
-                         instrs
-                   | _ -> ()
+                if !Jib_compile.opt_debug_function_representations then (
+                  match cdef with
+                  | CDEF_let (_, bindings, instrs) ->
+                      Printf.eprintf "C representation specialization: unresolved top-level let [%s]\n%!"
+                        (Util.string_of_list ", "
+                           (fun (id, ctyp) -> string_of_id id ^ " : " ^ string_of_ctyp ctyp)
+                           bindings
+                        );
+                      List.iter (fun instr -> Printf.eprintf "  %s\n%!" (string_of_instr instr)) instrs
+                  | CDEF_fundef (id, _, params, instrs) ->
+                      Printf.eprintf "C representation specialization: unresolved function %s params=[%s]\n%!"
+                        (string_of_id id)
+                        (Util.string_of_list ", " (fun param -> string_of_name ~zencode:false param) params);
+                      List.iter (fun instr -> Printf.eprintf "  %s\n%!" (string_of_instr instr)) instrs
+                  | _ -> ()
                 );
                 let owner =
                   match cdef with
-                  | CDEF_val (id, _, _, _, _) | CDEF_fundef (id, _, _, _)
-                  | CDEF_startup (id, _) | CDEF_finish (id, _) ->
+                  | CDEF_val (id, _, _, _, _) | CDEF_fundef (id, _, _, _) | CDEF_startup (id, _) | CDEF_finish (id, _)
+                    ->
                       "definition " ^ string_of_id id
                   | CDEF_register (name, _, _) -> "register " ^ string_of_name ~zencode:false name
                   | CDEF_let (index, bindings, _) ->
                       let names = Util.string_of_list ", " (fun (id, _) -> string_of_id id) bindings in
-                      if names = "" then "top-level let " ^ string_of_int index
-                      else "top-level let " ^ names
+                      if names = "" then "top-level let " ^ string_of_int index else "top-level let " ^ names
                   | CDEF_type ctyp_def -> "type definition " ^ string_of_id (ctype_def_id ctyp_def)
                   | CDEF_pragma (name, _) -> "pragma " ^ name
                 in
                 let lifecycle_hint =
                   match cdef with
                   | CDEF_register (name, _, _)
-                    when Util.StringSet.mem
-                           (string_of_name ~zencode:false name)
-                           self_dependent_assignments ->
+                    when Util.StringSet.mem (string_of_name ~zencode:false name) self_dependent_assignments ->
                       Some
-                        " This register has a self-dependent accumulator update, so two independently bounded operands do not prove that the sum remains in range; use a finite signed range and narrow the sum at the semantic update boundary."
+                        " This register has a self-dependent accumulator update, so two independently bounded operands \
+                         do not prove that the sum remains in range; use a finite signed range and narrow the sum at \
+                         the semantic update boundary."
                   | _ -> None
                 in
                 Some (owner, def_annot.loc, lifecycle_hint)
@@ -6772,8 +7751,56 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         raise
           (Reporting.err_general loc
              (Printf.sprintf
-                "C backend: cannot select a native integer representation for %s; add a finite semantic bound to the corresponding Sail type, parameter, result, local value, or container element.%s (Omit --c-require-bounded-int when arbitrary precision is intentional.)"
-                owner (Option.value ~default:"" lifecycle_hint)
+                "C backend: cannot select a native integer representation for %s; add a finite semantic bound to the \
+                 corresponding Sail type, parameter, result, local value, or container element.%s (Omit \
+                 --c-require-bounded-int when arbitrary precision is intentional.)"
+                owner
+                (Option.value ~default:"" lifecycle_hint)
+             )
+          )
+      );
+      if Config.optimized_model && has_managed_representation then (
+        let owner, loc, managed_types =
+          List.find_map
+            (fun (CDEF_aux (cdef, def_annot) as annotated) ->
+              let ignored =
+                match cdef with
+                | CDEF_type (CTD_struct (_, params, _) | CTD_variant (_, params, _)) ->
+                    not (Util.list_empty params)
+                | CDEF_type (CTD_abbrev _) -> true
+                | CDEF_val (id, _, _, _, _) | CDEF_fundef (id, _, _, _) -> ctx_is_extern id ctx
+                | _ -> false
+              in
+              if (not ignored) && cdef_has_ctyp (ctyp_contains is_managed_ctyp) annotated then
+                let owner =
+                  match cdef with
+                  | CDEF_val (id, _, _, _, _) | CDEF_fundef (id, _, _, _) | CDEF_startup (id, _)
+                  | CDEF_finish (id, _) ->
+                      "definition " ^ string_of_id id
+                  | CDEF_register (name, _, _) -> "register " ^ string_of_name ~zencode:false name
+                  | CDEF_let (index, bindings, _) ->
+                      let names = Util.string_of_list ", " (fun (id, _) -> string_of_id id) bindings in
+                      if names = "" then "top-level let " ^ string_of_int index else "top-level let " ^ names
+                  | CDEF_type ctyp_def -> "type definition " ^ string_of_id (ctype_def_id ctyp_def)
+                  | CDEF_pragma (name, _) -> "pragma " ^ name
+                in
+                Some (owner, def_annot.loc, managed_ctyp_names annotated)
+              else None
+            )
+            cdefs
+          |> Option.value ~default:("the generated model", Parse_ast.Unknown, [])
+        in
+        raise
+          (Reporting.err_general loc
+             (Printf.sprintf
+                "C backend: --c-optimized-model requires every generated value to have a fixed, unmanaged C \n\
+                 representation, but %s still contains an unbounded integer, dynamic bitvector/container, string, \n\
+                 real, JSON value, memory-write log, or reference after specialization.%s"
+                owner
+                (match managed_types with
+                | [] -> ""
+                | types -> " Managed JIB representation(s): " ^ String.concat ", " types ^ "."
+                )
              )
           )
       );
@@ -6788,6 +7815,20 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           || Option.is_some Config.specialization_obligations_coq
         then (
           let ids ids = IdSet.elements ids |> List.map string_of_id |> String.concat "," in
+          let ids_at_width width bindings =
+            Bindings.bindings bindings
+            |> List.filter_map (fun (id, configured_width) -> if configured_width = width then Some id else None)
+            |> IdSet.of_list |> ids
+          in
+          let non_64_native_reprs key bindings =
+            let reprs =
+              Bindings.bindings bindings
+              |> List.filter_map (fun (id, width) ->
+                     if width = 64 then None else Some (string_of_id id ^ ":" ^ string_of_int width)
+                 )
+            in
+            match reprs with [] -> [] | _ -> [key ^ "=" ^ String.concat "," reprs]
+          in
           let fixed_bytes =
             Bindings.bindings Config.c_repr_fixed_bytes
             |> List.map (fun (id, length) -> string_of_id id ^ ":" ^ string_of_int length)
@@ -6795,15 +7836,19 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           in
           let configuration =
             String.concat ";"
-              [
-                "specialize_c=" ^ string_of_bool Config.specialize_c;
-                "require_bounded_int=" ^ string_of_bool Config.require_bounded_int;
-                "preserved_calls=" ^ ids (IdSet.of_list (Specialize.get_initial_calls ()));
-                "c_repr_uint64=" ^ ids Config.c_repr_uint64;
-                "c_repr_int64=" ^ ids Config.c_repr_int64;
-                "c_repr_u256=" ^ ids Config.c_repr_u256;
-                "c_repr_fixed_bytes=" ^ fixed_bytes;
-              ]
+              (
+                [
+                  "specialize_c=" ^ string_of_bool Config.specialize_c;
+                  "require_bounded_int=" ^ string_of_bool Config.require_bounded_int;
+                  "preserved_calls=" ^ ids (IdSet.of_list (Specialize.get_initial_calls ()));
+                  "c_repr_uint64=" ^ ids_at_width 64 Config.c_repr_unsigned;
+                  "c_repr_int64=" ^ ids_at_width 64 Config.c_repr_signed;
+                  "c_repr_u256=" ^ ids Config.c_repr_u256;
+                  "c_repr_fixed_bytes=" ^ fixed_bytes;
+                ]
+                @ non_64_native_reprs "c_repr_unsigned_non64" Config.c_repr_unsigned
+                @ non_64_native_reprs "c_repr_signed_non64" Config.c_repr_signed
+              )
           in
           Some
             (Specialization_plan.create ~compiler_name:"Sail" ~compiler_version:"0.20.2" ~compiler_revision:None
@@ -6828,11 +7873,170 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       );
 
       generated := IdSet.empty;
+      emitted_external_functions := Util.StringSet.empty;
+      current_static_helper_demands := Util.StringSet.empty;
+      readable_ctyp_names := CTMap.empty;
+      readable_ctyp_names_used := Util.StringSet.empty;
+      if Config.no_mangle then (
+        let reserve_nominal_types =
+          object
+            inherit empty_jib_visitor
+
+            method! vctyp ctyp =
+              ( match ctyp with
+              | CT_struct (id, _) | CT_variant (id, _) | CT_enum id ->
+                  readable_ctyp_names_used := Util.StringSet.add (sgen_id id) !readable_ctyp_names_used
+              | _ -> ()
+              );
+              DoChildren
+          end
+        in
+        ignore (visit_cdefs reserve_nominal_types cdefs)
+      );
+
+      (* Modular C emission must choose an owner before auxiliary carrier
+         types are generated.  Otherwise the global [generated] set attaches
+         a fixed vector/tuple/byte carrier to whichever definition happens to
+         be visited first, which need not be the earliest module that uses it.
+         Compute effective ownership from the complete nominal type graph,
+         then visit definitions in stable module order. *)
+      let modular_layout =
+        match !requested_modules with
+        | None -> None
+        | Some (_, requested) ->
+            let modules = Array.of_list requested in
+            let rec filename_of_loc = function
+              | Parse_ast.Unknown -> None
+              | Parse_ast.Unique (_, loc) | Parse_ast.Generated loc -> filename_of_loc loc
+              | Parse_ast.Hint (_, loc, _) -> filename_of_loc loc
+              | Parse_ast.Range (start_pos, _) -> Some start_pos.Lexing.pos_fname
+            in
+            let same_file left right =
+              String.equal left right || String.equal (Filename.basename left) (Filename.basename right)
+            in
+            let module_index_of_loc loc =
+              match filename_of_loc loc with
+              | None -> 0
+              | Some filename ->
+                  let rec find index =
+                    if index = Array.length modules then 0
+                    else if List.exists (same_file filename) modules.(index).files then index
+                    else find (index + 1)
+                  in
+                  find 0
+            in
+            let type_owners = ref Bindings.empty in
+            let type_definitions =
+              List.filter_map
+                (function
+                  | CDEF_aux (CDEF_type ctype_def, def_annot) -> Some (ctype_def, def_annot)
+                  | _ -> None
+                )
+                cdefs
+            in
+            List.iter
+              (fun (ctype_def, (def_annot : unit def_annot)) ->
+                type_owners :=
+                  Bindings.add (ctype_def_id ctype_def) (module_index_of_loc def_annot.loc) !type_owners
+              )
+              type_definitions;
+            let type_dependencies ctype_def =
+              let contained_ctyps =
+                match ctype_def with
+                | CTD_enum _ | CTD_abstract _ -> []
+                | CTD_abbrev (_, ctyp) -> [ctyp]
+                | CTD_struct (_, _, fields) | CTD_variant (_, _, fields) -> List.map snd fields
+              in
+              List.fold_left
+                (fun ids ctyp -> IdSet.union ids (ctyp_ids ctyp))
+                IdSet.empty contained_ctyps
+            in
+            let changed = ref true in
+            while !changed do
+              changed := false;
+              List.iter
+                (fun (ctype_def, _) ->
+                  let id = ctype_def_id ctype_def in
+                  let current = Option.value ~default:0 (Bindings.find_opt id !type_owners) in
+                  let required =
+                    IdSet.fold
+                      (fun dependency owner ->
+                        max owner (Option.value ~default:0 (Bindings.find_opt dependency !type_owners))
+                      )
+                      (type_dependencies ctype_def) current
+                  in
+                  if required <> current then (
+                    type_owners := Bindings.add id required !type_owners;
+                    changed := true
+                  )
+                )
+                type_definitions
+            done;
+            let dependency_owner ctyp owner =
+              IdSet.fold
+                (fun dependency owner ->
+                  max owner (Option.value ~default:0 (Bindings.find_opt dependency !type_owners))
+                )
+                (ctyp_ids ctyp) owner
+            in
+            let module_index (CDEF_aux (cdef, def_annot) as annotated) =
+              let source_owner = module_index_of_loc def_annot.loc in
+              let nominal_owner =
+                match cdef with
+                | CDEF_type ctype_def ->
+                    Option.value ~default:source_owner (Bindings.find_opt (ctype_def_id ctype_def) !type_owners)
+                | _ -> source_owner
+              in
+              CTSet.fold dependency_owner (cdef_ctyps annotated) nominal_owner
+            in
+            Some (modules, module_index)
+      in
+      let cdefs =
+        match modular_layout with
+        | None -> cdefs
+        | Some (_, module_index) ->
+            List.stable_sort (fun left right -> Int.compare (module_index left) (module_index right)) cdefs
+      in
 
       log_phase "generating C definitions=%d" (List.length cdefs);
-      let docs = List.map (codegen_def ctx) cdefs |> List.concat in
-
-      let docs = docs @ gen_model_init_fini ctx cdefs @ gen_unit_test_defs ctx cdefs in
+      let codegen_with_helper_demands generate =
+        current_static_helper_demands := Util.StringSet.empty;
+        let docs = generate () in
+        (docs, !current_static_helper_demands)
+      in
+      let docs_by_definition =
+        List.map
+          (fun cdef ->
+            let docs, helper_demands = codegen_with_helper_demands (fun () -> codegen_def ctx cdef) in
+            (cdef, docs, helper_demands)
+          )
+          cdefs
+      in
+      let docs_by_definition =
+        if Config.optimized_model then
+          List.map
+            (fun ((CDEF_aux (cdef, _) as annotated), docs, helper_demands) ->
+              match cdef with
+              | CDEF_val (id, _, _, _, extern) when Option.is_some extern || ctx_is_extern id ctx ->
+                  let function_name = match extern with Some name -> name | None -> ctx_get_extern id ctx in
+                  if Util.StringSet.mem function_name !emitted_external_functions then
+                    (annotated, docs, helper_demands)
+                  else (annotated, [], helper_demands)
+              | CDEF_val _ -> (annotated, docs, helper_demands)
+              | _ -> (annotated, docs, helper_demands)
+            )
+            docs_by_definition
+        else docs_by_definition
+      in
+      let definition_docs = List.concat (List.map (fun (_, docs, _) -> docs) docs_by_definition) in
+      let model_docs, model_helper_demands =
+        codegen_with_helper_demands (fun () -> gen_model_init_fini ctx cdefs)
+      in
+      let unit_test_docs, unit_test_helper_demands =
+        if Config.optimized_model then ([], Util.StringSet.empty)
+        else codegen_with_helper_demands (fun () -> gen_unit_test_defs ctx cdefs)
+      in
+      let docs = definition_docs @ model_docs @ unit_test_docs in
       let docs = if Config.cpp then docs @ gen_constructor_destructor ctx cdefs else docs in
 
       let docs_by_type = docs |> merge_file_docs in
@@ -6856,9 +8060,49 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         | None -> if Config.no_rts then ([], [], []) else ([], [coverage_hook_header], [no_coverage_hook])
       in
 
+      let external_type_headers =
+        Bindings.fold
+          (fun _ header headers -> Util.StringSet.add header headers)
+          Config.external_types Util.StringSet.empty
+        |> Util.StringSet.elements
+      in
+
       let preamble in_header =
+        let configured_headers =
+          (if in_header then external_type_headers @ Config.header_includes else Config.includes)
+          |> List.fold_left
+               (fun headers header -> Util.StringSet.add header headers)
+               Util.StringSet.empty
+          |> Util.StringSet.elements
+        in
         separate hardline
-          (( if Config.no_lib then []
+          (( if Config.optimized_model then
+               [
+                 string "#include <stdbool.h>";
+                 string "#include <stddef.h>";
+                 string "#include <stdint.h>";
+                 string "#include <stdio.h>";
+                 string "#include <stdlib.h>";
+                 string "#include <string.h>";
+                 string "#ifndef SAIL_FIXED_ABI_BASE_DEFINED";
+                 string "#define SAIL_FIXED_ABI_BASE_DEFINED";
+                 string "typedef uint64_t unit;";
+                 string "#define UNIT UINT64_C(0)";
+                 string "#define EQUAL(type) eq_ ## type";
+                 string "#define UNDEFINED(type) undefined_ ## type";
+                 string "static inline bool eq_unit(unit lhs, unit rhs) { return lhs == rhs; }";
+                 string "static inline bool eq_bool(bool lhs, bool rhs) { return lhs == rhs; }";
+                 string "static inline bool eq_fbits(uint64_t lhs, uint64_t rhs) { return lhs == rhs; }";
+                 string "static inline unit undefined_unit(unit value) { return value; }";
+                 string "static inline bool undefined_bool(unit unused) { (void)unused; return false; }";
+                 string "static inline uint64_t undefined_fbits(unit unused) { (void)unused; return UINT64_C(0); }";
+                 string
+                   "static inline uint64_t safe_rshift(uint64_t value, uint64_t amount) { return amount >= UINT64_C(64) ? UINT64_C(0) : value >> amount; }";
+                 string
+                   "static inline void sail_match_failure(const char *function) { fprintf(stderr, \"Sail match failure in %s\\n\", function); abort(); }";
+                 string "#endif";
+               ]
+             else if Config.no_lib then []
              else
                [string "#include \"sail.h\""]
                @ (if has_sail_config then [string "#include \"sail_config.h\""] else [])
@@ -6868,7 +8112,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           @ coverage_include
           @ List.map
               (fun h -> string (Printf.sprintf "#include \"%s\"" h))
-              (if in_header then Config.header_includes else Config.includes)
+              configured_headers
           @ extern_cpp_begin
           @ if in_header then coverage_hook_header else coverage_hook
           )
@@ -6927,6 +8171,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
          by default and you don't need to use it - you can use SAIL_TESTS directly
          in your own custom test runner. *)
       let model_test =
+        if Config.optimized_model then empty
+        else
         ( if Config.cpp then
             [
               "void model_test(void)";
@@ -7033,9 +8279,111 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       | Some path, Some plan -> Specialization_plan.write_human ~backend_symbol:sgen_function_id path plan
       | _ -> ()
       );
+      ( match !requested_modules with
+      | None -> ()
+      | Some (package, _) ->
+          let modules, module_index = Option.get modular_layout in
+          let module_docs = Array.make (Array.length modules) [] in
+          let module_helper_demands = Array.make (Array.length modules) Util.StringSet.empty in
+          let demanded_helper_definitions =
+            List.filter_map
+              (function DemandedStaticFunctionDefinition (name, doc) -> Some (name, doc) | _ -> None)
+              docs
+          in
+          let ordinary_docs =
+            List.filter (function DemandedStaticFunctionDefinition _ -> false | _ -> true) docs
+          in
+          List.iter
+            (fun (annotated, docs, helper_demands) ->
+              let index = module_index annotated in
+              let docs =
+                List.filter (function DemandedStaticFunctionDefinition _ -> false | _ -> true) docs
+              in
+              module_docs.(index) <- List.rev_append docs module_docs.(index);
+              module_helper_demands.(index) <-
+                Util.StringSet.union helper_demands module_helper_demands.(index)
+            )
+            docs_by_definition;
+          Array.iteri (fun index docs -> module_docs.(index) <- List.rev docs) module_docs;
+          if Array.length modules > 0 then (
+            module_docs.(Array.length modules - 1) <- module_docs.(Array.length modules - 1) @ model_docs @ unit_test_docs;
+            module_helper_demands.(Array.length modules - 1) <-
+              Util.StringSet.union model_helper_demands
+                (Util.StringSet.union unit_test_helper_demands
+                   module_helper_demands.(Array.length modules - 1)
+                )
+          );
+          let all_static = (merge_file_docs ordinary_docs).static_func_def in
+          let include_module stem = ksprintf string "#include \"%s/spec/%s.h\"" package stem in
+          let find_required name =
+            Array.to_list modules
+            |> List.find_opt (fun (mdl : c_module) -> String.equal mdl.name name)
+          in
+          let output_for index (mdl : c_module) =
+            let split = merge_file_docs module_docs.(index) in
+            let required_static =
+              demanded_helper_definitions
+              |> List.filter_map (fun (name, doc) ->
+                     if Util.StringSet.mem name module_helper_demands.(index) then Some doc else None
+                 )
+              |> List.map (fun doc -> StaticFunctionDefinition doc)
+              |> merge_file_docs
+              |> fun docs -> docs.static_func_def
+            in
+            let required_headers =
+              List.filter_map
+                (fun name ->
+                  Option.map (fun (required : c_module) -> include_module required.file_stem) (find_required name)
+                )
+                mdl.requires
+            in
+            let header_doc =
+              string "#pragma once" ^^ twice hardline
+              ^^ separate hardline required_headers
+              ^^ (if required_headers = [] then empty else twice hardline)
+              ^^ preamble true ^^ twice hardline
+              ^^ split.type_decl ^^ split.func_decl ^^ split.var_decl
+              ^^ separate hardline extern_cpp_end ^^ hardline
+            in
+            let implementation_doc =
+              ksprintf string "#include \"%s/spec.h\"" package
+              ^^ twice hardline ^^ all_static ^^ required_static ^^ split.var_def ^^ split.func_def
+            in
+            {
+              name = mdl.name;
+              file_stem = mdl.file_stem;
+              header = Document.to_string header_doc;
+              implementation = Document.to_string implementation_doc;
+            }
+          in
+          generated_modules := Some (Array.to_list (Array.mapi output_for modules))
+      );
 
       log_phase "complete header-bytes=%d implementation-bytes=%d" (String.length header) (String.length impl);
       (header, impl)
     with Type_error.Type_error (l, err) ->
       c_error ~loc:l ("Unexpected type error when compiling to C:\n" ^ fst (Type_error.string_of_type_error err))
+
+  let compile_ast_modules env effect_info ~package (modules : c_module list) ast =
+    if modules = [] then c_error "--c-optimized-model requires a Sail project containing at least one module";
+    requested_modules := Some (package, modules);
+    generated_modules := None;
+    let _, _ =
+      Fun.protect
+        ~finally:(fun () -> requested_modules := None)
+        (fun () -> compile_ast env effect_info package ast)
+    in
+    match !generated_modules with
+    | Some outputs ->
+        let umbrella =
+          "#pragma once\n\n"
+          ^ String.concat "\n"
+              (List.map
+                 (fun output -> Printf.sprintf "#include \"%s/spec/%s.h\"" package output.file_stem)
+                 outputs
+              )
+          ^ "\n"
+        in
+        (umbrella, outputs)
+    | None -> c_error "failed to produce modular optimized-model output"
 end

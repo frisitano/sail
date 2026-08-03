@@ -21,7 +21,13 @@ else
 fi
 
 OUT="$TMP_DIR/native_checked_arithmetic"
-"$SAIL" --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
+if [ -n "${SAIL_PLUGIN:-}" ]; then
+  set -- -plugin "$SAIL_PLUGIN"
+else
+  set --
+fi
+
+"$SAIL" "$@" --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
   --c-preserve proven_u64_add_32 --c-preserve proven_u64_sub_95 \
   --c-preserve proven_u64_mul --c-preserve proven_u64_div \
   --c-preserve proven_u64_mod --c-preserve proven_i64_add \
@@ -30,12 +36,21 @@ OUT="$TMP_DIR/native_checked_arithmetic"
   --c-preserve proven_i128_add --c-preserve proven_i128_sub \
   --c-preserve proven_i128_mul --c-preserve proven_i128_div \
   --c-preserve proven_i128_mod --c-preserve mixed_i128_u64_lte \
-  --c-preserve mixed_u64_i128_lte \
+  --c-preserve mixed_u64_i128_lte --c-preserve mixed_i8_u8_lt \
+  --c-preserve bounded_signed_lt \
+  --c-preserve path_narrow_signed_lt \
   --c-preserve checked_u64_add --c-preserve checked_u64_sub \
   --c-preserve checked_u64_mul --c-preserve checked_u64_div \
   --c-preserve checked_u64_mod --c-preserve checked_i64_add \
+  --c-preserve power_two_tdiv --c-preserve power_two_tmod \
+  --c-preserve power_two_ediv --c-preserve power_two_emod \
+  --c-preserve mixed_u64_u8_div --c-preserve mixed_u64_u8_mod \
+  --c-preserve mixed_u32_negative_i8_div \
   --c-preserve checked_i64_sub --c-preserve checked_i64_mul \
   --c-preserve checked_i64_div --c-preserve checked_i64_mod \
+  --c-preserve signed_tdiv_by_eight --c-preserve signed_tmod_by_eight \
+  --c-preserve signed_ediv_by_eight --c-preserve signed_emod_by_eight \
+  --c-preserve mixed_i64_i8_div --c-preserve mixed_i64_i8_mod \
   --c-preserve signed_u64_difference \
   "$TEST_DIR/../../c/native_checked_arithmetic.sail" -o "$OUT"
 
@@ -46,30 +61,145 @@ OUT="$TMP_DIR/native_checked_arithmetic"
 
 "$OUT.bin"
 
-# Fixed-width arithmetic has no runtime overflow/division checks. Operations
-# without a source proof remain in Sail's mathematical integer domain.
+# Fixed-width arithmetic has no runtime overflow/division checks.
 if grep -Eq 'sail_checked_(u64|i64)_(add|sub|mul|div|mod)' "$OUT.c"; then
   echo "generated C contains checked fixed-width arithmetic" >&2
   exit 1
 fi
-grep -Fq 'add_int' "$OUT.c"
-grep -Fq 'mult_int' "$OUT.c"
 
-# An ABI representation is not an arithmetic proof.  The unbounded carrier
-# operations below must stay in Sail's mathematical-integer runtime even
-# though their arguments and results cross the ABI as uint64_t/int64_t.
-for target in \
-  zchecked_u64_add zchecked_u64_mul zchecked_u64_div zchecked_u64_mod \
-  zchecked_i64_add zchecked_i64_sub zchecked_i64_mul \
-  zchecked_i64_div zchecked_i64_mod
+# An ABI representation is not itself an arithmetic proof. Broad add/sub/mul
+# operations use a wider fixed carrier before converting back to the ABI;
+# they must not silently perform the operation at uint64_t/int64_t width.
+grep -Fq 'u128_add_u64' "$OUT.c"
+grep -Fq 'u128_mul_u64' "$OUT.c"
+for target in zchecked_i64_add zchecked_i64_sub zchecked_i64_mul
 do
   awk -v target="$target" '
     $0 ~ ("^.* " target "\\(") { in_function = 1 }
-    in_function && /(add_int|sub_int|mult_int|tdiv_int|tmod_int)/ { found_math = 1 }
+    in_function && /__int128/ { found_wide = 1 }
+    in_function && /sail_native_conversion_failure/ { found_checked_boundary = 1 }
+    in_function && /^}/ { exit !found_wide || !found_checked_boundary }
+    END { if (!in_function) exit 2 }
+  ' "$OUT.c"
+done
+
+# Broad signed division and remainder still include zero and MIN / -1, so
+# they remain in Sail's mathematical-integer runtime. The guarded unsigned
+# versions are checked below and lower natively on their nonzero branch.
+for target in zchecked_i64_div zchecked_i64_mod
+do
+  awk -v target="$target" '
+    $0 ~ ("^.* " target "\\(") { in_function = 1 }
+    in_function && /(tdiv_int|tmod_int)/ { found_math = 1 }
     in_function && /^}/ { exit !found_math }
     END { if (!in_function) exit 2 }
   ' "$OUT.c"
 done
+
+# An exact semantic divisor range and a nonnegative dividend prove that both
+# truncating and Euclidean division by eight have unsigned shift/mask semantics.
+# The explicit proof-carrying JIB operations omit the divisor entirely.
+for target in zpower_two_tdiv zpower_two_ediv
+do
+  awk -v target="$target" '
+    $0 ~ ("^.* " target "\\(") { in_function = 1 }
+    in_function && />> 3/ { found_shift = 1 }
+    in_function && /[[:space:]]\/[[:space:]]/ { found_divide = 1 }
+    in_function && /^}/ { exit !found_shift || found_divide }
+    END { if (!in_function) exit 2 }
+  ' "$OUT.c"
+done
+for target in zpower_two_tmod zpower_two_emod
+do
+  awk -v target="$target" '
+    $0 ~ ("^.* " target "\\(") { in_function = 1 }
+    in_function && /& .*UINT64_C\(7\)/ { found_mask = 1 }
+    in_function && /[[:space:]]%[[:space:]]/ { found_remainder = 1 }
+    in_function && /^}/ { exit !found_mask || found_remainder }
+    END { if (!in_function) exit 2 }
+  ' "$OUT.c"
+done
+
+# A fixed signed representation does not prove a nonnegative dividend.
+# Truncating operations keep C's signed rounding semantics, while Euclidean
+# operations retain their mathematical helpers rather than being rewritten.
+awk '
+  /^int64_t zsigned_tdiv_by_eight\(/ { in_function = 1 }
+  in_function && /\(int64_t\)zvalue.*\/.*\(int64_t\)zdivisor/ { found_divide = 1 }
+  in_function && /integer_operand/ { found_widened_operand = 1 }
+  in_function && />> 3/ { found_shift = 1 }
+  in_function && /^}/ { exit !found_divide || found_widened_operand || found_shift }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+awk '
+  /^int64_t zsigned_tmod_by_eight\(/ { in_function = 1 }
+  in_function && /\(int64_t\)zvalue.*%.*\(int64_t\)zdivisor/ { found_remainder = 1 }
+  in_function && /integer_operand/ { found_widened_operand = 1 }
+  in_function && /UINT64_C\(7\)/ { found_mask = 1 }
+  in_function && /^}/ { exit !found_remainder || found_widened_operand || found_mask }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+for target in zsigned_ediv_by_eight zsigned_emod_by_eight
+do
+  awk -v target="$target" '
+    $0 ~ ("^.* " target "\\(") { in_function = 1 }
+    in_function && /(ediv_int|emod_int)/ { found_math = 1 }
+    in_function && /(>> 3|UINT64_C\(7\))/ { found_strength_reduction = 1 }
+    in_function && /^}/ { exit !found_math || found_strength_reduction }
+    END { if (!in_function) exit 2 }
+  ' "$OUT.c"
+done
+
+# Mixed fixed operands retain their independently proved ABI widths. The
+# operation records a separate semantic result carrier: the u64 quotient stays
+# u64, while the remainder bounded by the u8 divisor is computed into u8.
+grep -Fq 'uint64_t zmixed_u64_u8_div(uint64_t, uint8_t);' "$OUT.h"
+grep -Fq 'uint64_t zmixed_u64_u8_mod(uint64_t, uint8_t);' "$OUT.h"
+awk '
+  /^uint64_t zmixed_u64_u8_div\(/ { in_function = 1 }
+  in_function && /\(uint64_t\)zleft.*\/.*\(uint64_t\)zright/ { found_mixed_divide = 1 }
+  in_function && /uint64_t .*integer_operand/ { found_widened_operand = 1 }
+  in_function && /^}/ { exit !found_mixed_divide || found_widened_operand }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+awk '
+  /^uint64_t zmixed_u64_u8_mod\(/ { in_function = 1 }
+  in_function && /\(uint64_t\)zleft.*%.*\(uint64_t\)zright/ { found_mixed_remainder = 1 }
+  in_function && /= \(\(uint8_t\)\(\(\(uint64_t\)zleft\).*%/ { found_narrow_result = 1 }
+  in_function && /uint64_t .*integer_operand/ { found_widened_operand = 1 }
+  in_function && /^}/ { exit !found_mixed_remainder || !found_narrow_result || found_widened_operand }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+
+grep -Fq 'int64_t zmixed_i64_i8_div(int64_t, int8_t);' "$OUT.h"
+grep -Fq 'int64_t zmixed_i64_i8_mod(int64_t, int8_t);' "$OUT.h"
+awk '
+  /^int64_t zmixed_i64_i8_div\(/ { in_function = 1 }
+  in_function && /\(int64_t\)zleft.*\/.*\(int64_t\)zright/ { found_mixed_divide = 1 }
+  in_function && /int64_t .*integer_operand/ { found_widened_operand = 1 }
+  in_function && /^}/ { exit !found_mixed_divide || found_widened_operand }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+awk '
+  /^int64_t zmixed_i64_i8_mod\(/ { in_function = 1 }
+  in_function && /\(int64_t\)zleft.*%.*\(int64_t\)zright/ { found_mixed_remainder = 1 }
+  in_function && /= \(\(int8_t\)\(\(\(int64_t\)zleft\).*%/ { found_narrow_result = 1 }
+  in_function && /int64_t .*integer_operand/ { found_widened_operand = 1 }
+  in_function && /^}/ { exit !found_mixed_remainder || !found_narrow_result || found_widened_operand }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+
+# A negative signed operand cannot be converted to an equally wide unsigned
+# arithmetic carrier without changing its semantic value.  Keep the fixed
+# representations, but fall back to a sufficiently wide signed operation.
+grep -Fq 'int64_t zmixed_u32_negative_i8_div(uint32_t, int8_t);' "$OUT.h"
+awk '
+  /^int64_t zmixed_u32_negative_i8_div\(/ { in_function = 1 }
+  in_function && index($0, "(((int64_t) zleft) / ((int64_t) zright))") { found_exact_signed = 1 }
+  in_function && /[[:space:]]\/[[:space:]]/ && /uint(32|64)_t/ { found_inexact_unsigned = 1 }
+  in_function && /^}/ { exit !found_exact_signed || found_inexact_unsigned }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
 
 # A mathematical result remains mathematical even when both operands use a
 # represented uint64 ABI. The subtraction must happen after widening.
@@ -87,7 +217,7 @@ awk '
 grep -Fq 'uint64_t zproven_u64_add_32(uint64_t);' "$OUT.h"
 awk '
   /^uint64_t zproven_u64_add_32\(/ { in_function = 1 }
-  in_function && /\+ UINT64_C\(32\)/ { found_add = 1 }
+  in_function && /\+ .*UINT64_C\(32\)/ { found_add = 1 }
   in_function && /^}/ { exit !found_add }
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
@@ -95,26 +225,26 @@ awk '
 grep -Fq 'uint64_t zproven_u64_sub_95(uint64_t);' "$OUT.h"
 awk '
   /^uint64_t zproven_u64_sub_95\(/ { in_function = 1 }
-  in_function && /- UINT64_C\(95\)/ { found_sub = 1 }
+  in_function && /- .*UINT64_C\(95\)/ { found_sub = 1 }
   in_function && /^}/ { exit !found_sub }
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
 
-grep -Fq 'uint64_t zproven_u64_mul(uint64_t, uint64_t);' "$OUT.h"
+grep -Fq 'uint16_t zproven_u64_mul(uint8_t, uint8_t);' "$OUT.h"
 grep -Fq ' = (zleft * zright);' "$OUT.c"
 
 # Division and modulo additionally require a proof that the divisor is nonzero;
 # signed division must also exclude INT64_MIN / -1.
-grep -Fq 'void zproven_u64_div(sail_int *rop, uint64_t, uint64_t);' "$OUT.h"
-grep -Fq 'void zproven_u64_mod(sail_int *rop, uint64_t, uint64_t);' "$OUT.h"
+grep -Fq 'void zproven_u64_div(sail_int *rop, uint8_t, uint8_t);' "$OUT.h"
+grep -Fq 'void zproven_u64_mod(sail_int *rop, uint8_t, uint8_t);' "$OUT.h"
 grep -Fq '(zleft / zright)' "$OUT.c"
 grep -Fq '(zleft % zright)' "$OUT.c"
 
-grep -Fq 'int64_t zproven_i64_add(int64_t, int64_t);' "$OUT.h"
-grep -Fq 'int64_t zproven_i64_sub(int64_t, int64_t);' "$OUT.h"
-grep -Fq 'int64_t zproven_i64_mul(int64_t, int64_t);' "$OUT.h"
-grep -Fq 'void zproven_i64_div(sail_int *rop, int64_t, int64_t);' "$OUT.h"
-grep -Fq 'void zproven_i64_mod(sail_int *rop, int64_t, int64_t);' "$OUT.h"
+grep -Fq 'int16_t zproven_i64_add(int8_t, int8_t);' "$OUT.h"
+grep -Fq 'int16_t zproven_i64_sub(int8_t, int8_t);' "$OUT.h"
+grep -Fq 'int16_t zproven_i64_mul(int8_t, int8_t);' "$OUT.h"
+grep -Fq 'void zproven_i64_div(sail_int *rop, int8_t, int8_t);' "$OUT.h"
+grep -Fq 'void zproven_i64_mod(sail_int *rop, int8_t, int8_t);' "$OUT.h"
 grep -Fq ' = (zleft + zright);' "$OUT.c"
 grep -Fq ' = (zleft - zright);' "$OUT.c"
 grep -Fq ' = (zleft * zright);' "$OUT.c"
@@ -155,6 +285,22 @@ if awk '
   echo "mixed u64/i128 comparison used arbitrary-precision integers" >&2
   exit 1
 fi
+grep -Fq 'bool zmixed_i8_u8_lt(int8_t, uint8_t);' "$OUT.h"
+awk '
+  /^bool zmixed_i8_u8_lt\(/ { in_function = 1 }
+  in_function && /zleft < zright/ { found_native_comparison = 1 }
+  in_function && /(sail_int|cmp_int)/ { found_math = 1 }
+  in_function && /^}/ { exit !found_native_comparison || found_math }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
+grep -Fq 'bool zpath_narrow_signed_lt(int64_t, int64_t);' "$OUT.h"
+awk '
+  /^bool zpath_narrow_signed_lt\(/ { in_function = 1 }
+  in_function && /zbounded_signed_lt.*\(int8_t\).*zleft.*\(int8_t\).*zright/ { found_narrow_call = 1 }
+  in_function && /sail_native_conversion_failure/ { found_checked_conversion = 1 }
+  in_function && /^}/ { exit !found_narrow_call || found_checked_conversion }
+  END { if (!in_function) exit 2 }
+' "$OUT.c"
 if grep -Fq 'if (u128_is_zero(divisor))' "$OUT.c"; then
   echo "u128 division retained a runtime zero-divisor check" >&2
   exit 1

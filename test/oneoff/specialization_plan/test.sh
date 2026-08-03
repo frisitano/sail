@@ -21,7 +21,7 @@ else
 fi
 
 cd "$ROOT"
-MODEL="test/oneoff/c_function_representation_specialization/model.sail"
+MODEL="$TEST_DIR/model.sail"
 COMMON_ARGS="--no-color --no-memo-z3 -O --Oconstant-fold -c --c-specialize --c-no-main"
 
 compile_core() {

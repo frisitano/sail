@@ -108,11 +108,13 @@ module type CODEGEN_CONFIG = sig
 
   val preserve_types : Ast_compare.IdSet.t
 
-  (** Newtype or transparent-alias identifiers annotated with [$[c_repr uint64]]. *)
-  val c_repr_uint64 : Ast_compare.IdSet.t
+  (** Native unsigned C integer widths, keyed by newtype or transparent-alias identifiers annotated with
+      [$[c_repr uintN]]. *)
+  val c_repr_unsigned : int Ast_compare.Bindings.t
 
-  (** Newtype or transparent-alias identifiers annotated with [$[c_repr int64]]. *)
-  val c_repr_int64 : Ast_compare.IdSet.t
+  (** Native signed C integer widths, keyed by newtype or transparent-alias identifiers annotated with [$[c_repr intN]].
+  *)
+  val c_repr_signed : int Ast_compare.Bindings.t
 
   (** Newtype or transparent-alias identifiers annotated with [$[c_repr u256]]. *)
   val c_repr_u256 : Ast_compare.IdSet.t
@@ -132,6 +134,16 @@ module type CODEGEN_CONFIG = sig
   val specialization_obligations_lean : string option
   val specialization_obligations_coq : string option
 
+  (** Generate the strict, allocation-free optimized-model ABI. *)
+  val optimized_model : bool
+
+  (** Nominal Sail types whose final C declaration is supplied by an external
+      header in an optimized-model build. *)
+  val external_types : string Ast_compare.Bindings.t
+
+  (** Package prefix for strict optimized-model entry points. *)
+  val package_name : string
+
   (** If set generate a C++ class for the model instead of global C functions/variables. *)
   val cpp : bool
 
@@ -146,6 +158,22 @@ module type CODEGEN_CONFIG = sig
 end
 
 module Codegen (Config : CODEGEN_CONFIG) : sig
+  type c_module = {
+    name : string;
+    file_stem : string;
+    files : string list;
+    requires : string list;
+  }
+
+  type c_module_output = {
+    name : string;
+    file_stem : string;
+    header : string;
+    implementation : string;
+  }
+
   val jib_of_ast : Env.t -> Effects.side_effect_info -> typed_ast -> cdef list * Jib_compile.ctx
   val compile_ast : Env.t -> Effects.side_effect_info -> string -> typed_ast -> string * string
+  val compile_ast_modules :
+    Env.t -> Effects.side_effect_info -> package:string -> c_module list -> typed_ast -> string * c_module_output list
 end

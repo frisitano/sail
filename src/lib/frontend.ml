@@ -448,4 +448,14 @@ let initial_rewrite effect_info type_envs ast =
   let _, ast, _, _ = rewrite_ast_initial effect_info type_envs ast in
   (* Recheck after descattering so that the internal type environments
      always have complete variant types *)
-  Type_error.check Type_check.initial_env (Type_check.strip_ast ast)
+  let ast, env = Type_error.check Type_check.initial_env (Type_check.strip_ast ast) in
+  (* Loading a .sail_project attaches its module graph to the initial
+     environment.  Rechecking from [initial_env] above is intentional, but it
+     must not discard that project metadata: targets run their pre-rewrite
+     hooks after this point and need the graph to preserve module boundaries. *)
+  let env =
+    match Type_check.Env.get_modules type_envs with
+    | Some project -> Type_check.Env.set_modules project env
+    | None -> env
+  in
+  (ast, env)

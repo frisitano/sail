@@ -397,6 +397,7 @@ module Verilog_config (C : JIB_CONFIG) : Jib_compile.CONFIG = struct
   let tuple_value = false
   let track_throw = false
   let assert_to_exception = C.assert_to_exception
+  let erase_assert_messages = false
   let branch_coverage = None
   let use_real = false
   let use_void = false

@@ -133,9 +133,14 @@ let splice ctx ast file =
   let defs2 = filter_replacements specs_found types_found repl_ast in
   { ast with defs = defs1 @ defs2 }
 
-let splice_files ctx ast files =
+let splice_files ctx env ast files =
   let spliced_ast = List.fold_left (fun ast file -> splice ctx ast file) ast files in
-  let checked_ast, env = Type_error.check Type_check.initial_env (Type_check.strip_ast spliced_ast) in
+  let checked_ast, checked_env = Type_error.check Type_check.initial_env (Type_check.strip_ast spliced_ast) in
+  let checked_env =
+    match Type_check.Env.get_modules env with
+    | Some project -> Type_check.Env.set_modules project checked_env
+    | None -> checked_env
+  in
   (* Move replacement functions into place and top-sort, in case dependencies have changed *)
   let sorted_ast = Callgraph.top_sort_defs (move_replacement_fundefs checked_ast) in
-  (sorted_ast, env)
+  (sorted_ast, checked_env)

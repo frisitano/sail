@@ -172,9 +172,132 @@ val limb_shift_right : (bits(64), range(0, 128)) -> bits(64)
 
 function limb_shift_right(value, amount) = sail_shiftright(value, amount)
 
+/* These tighter semantic bounds discharge the C shift-count obligation.  The
+   generated operations therefore need neither the >= 64 branch nor the safe
+   shift helper retained by the wider-range controls above. */
+val limb_shift_left_in_range : (bits(64), range(0, 63)) -> bits(64)
+
+function limb_shift_left_in_range(value, amount) = sail_shiftleft(value, amount)
+
+val limb_shift_right_in_range : (bits(64), range(0, 63)) -> bits(64)
+
+function limb_shift_right_in_range(value, amount) = sail_shiftright(value, amount)
+
+/* Equal-width zero extension is a value-preserving semantic conversion and
+   should disappear before C emission. */
+val byte_widen_identity : bits(8) -> bits(8)
+
+function byte_widen_identity(value) = sail_zero_extend(value, 8)
+
+/* Signed-value preservation and low-bit truncation are separate semantic
+   obligations even though all of these values use the same C carrier. */
+val byte_sign_identity : bits(8) -> bits(8)
+
+function byte_sign_identity(value) = sail_sign_extend(value, 8)
+
+val byte_truncate_identity : bits(8) -> bits(8)
+
+function byte_truncate_identity(value) = truncate(value, 8)
+
+/* Both extension kinds preserve the original low bits.  The final truncation
+   can therefore return the original byte, including through multiple
+   immutable conversion bindings. */
+val byte_unsigned_extend_truncate_roundtrip : bits(8) -> bits(8)
+
+function byte_unsigned_extend_truncate_roundtrip(value) =
+  truncate(sail_zero_extend(sail_zero_extend(value, 16), 32), 8)
+
+val byte_sign_extend_truncate_roundtrip : bits(8) -> bits(8)
+
+function byte_sign_extend_truncate_roundtrip(value) =
+  truncate(sail_sign_extend(sail_sign_extend(value, 16), 32), 8)
+
+/* Controls: genuine narrowing must keep its low-bit mask, while a wider sign
+   extension must retain sign propagation.  Truncating an extended byte to a
+   different width is not a round trip and must preserve both operations. */
+val word_truncate_byte : bits(16) -> bits(8)
+
+function word_truncate_byte(value) = truncate(value, 8)
+
+val byte_sign_widen : bits(8) -> bits(16)
+
+function byte_sign_widen(value) = sail_sign_extend(value, 16)
+
+val byte_unsigned_extend_truncate_seven : bits(8) -> bits(7)
+
+function byte_unsigned_extend_truncate_seven(value) =
+  truncate(sail_zero_extend(value, 16), 7)
+
+val byte_sign_extend_truncate_nine : bits(8) -> bits(9)
+
+function byte_sign_extend_truncate_nine(value) =
+  truncate(sail_sign_extend(value, 16), 9)
+
 val byte_arith_shift_right : (bits(8), range(0, 16)) -> bits(8)
 
 function byte_arith_shift_right(value, amount) = sail_arith_shiftright(value, amount)
+
+/* Result-bound certificates from masks, slices, concatenation and fixed bit
+   insertion must survive a same-ABI function boundary.  The generic helper is
+   valid for arbitrary 64-bit operands, but these callers demand narrower body
+   specializations from their actual value web. */
+val multiply_bit_words : (bits(64), bits(64)) -> range(0, 340282366920938463426481119284349108225)
+
+function multiply_bit_words(left, right) = unsigned(left) * unsigned(right)
+
+val multiply_masked_bytes : bits(64) -> range(0, 340282366920938463426481119284349108225)
+
+function multiply_masked_bytes(value) = {
+  let mask : bits(64) = 0x00000000000000FF;
+  multiply_bit_words(value & mask, sail_shiftright(value, 8) & mask)
+}
+
+/* A non-contiguous mask is not a low-bit slice certificate.  It must remain
+   an ordinary shift-and-mask web even though its shift count is defined. */
+val shift_noncontiguous_mask : bits(64) -> bits(64)
+
+function shift_noncontiguous_mask(value) =
+  sail_shiftright(value, 8) & 0x00000000000000F5
+
+val multiply_sliced_bytes : bits(64) -> range(0, 340282366920938463426481119284349108225)
+
+function multiply_sliced_bytes(value) =
+  multiply_bit_words(sail_zero_extend(value[7 .. 0], 64), sail_zero_extend(value[15 .. 8], 64))
+
+val multiply_concatenated_bytes : bits(64) -> range(0, 340282366920938463426481119284349108225)
+
+function multiply_concatenated_bytes(value) = {
+  let joined : bits(16) = append(value[7 .. 0], value[15 .. 8]);
+  multiply_bit_words(sail_zero_extend(joined, 64), sail_zero_extend(joined, 64))
+}
+
+/* The fixed-bitvector web fusion must not merge slices from distinct semantic
+   sources, even when their widths and constant offsets otherwise line up. */
+val concatenate_distinct_sources : (bits(64), bits(64)) -> bits(16)
+
+function concatenate_distinct_sources(left, right) =
+  append(left[7 .. 0], right[15 .. 8])
+
+val multiply_inserted_byte : bits(8) -> range(0, 340282366920938463426481119284349108225)
+
+function multiply_inserted_byte(value) = {
+  let inserted : bits(64) = set_slice_bits(64, 8, sail_zeros(64), 8, value);
+  multiply_bit_words(inserted, inserted)
+}
+
+/* A bounded dynamic position is just as safe as a literal insertion point.
+   The optimized backend should use the same native mask/shift operation. */
+val insert_byte_at : (bits(64), range(0, 56), bits(8)) -> bits(64)
+
+function insert_byte_at(base, start, value) =
+  set_slice_bits(64, 8, base, start, value)
+
+/* This position range does not prove that the inserted byte remains inside
+   the carrier, so it must retain the generic checked Sail implementation. */
+val insert_byte_at_unproven : (bits(64), range(0, 57), bits(8)) -> bits(64)
+
+function insert_byte_at_unproven(base, start, value) =
+  set_slice_bits(64, 8, base, start, value)
 
 val address_equal : (address, address) -> bool
 

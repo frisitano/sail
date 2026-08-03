@@ -190,6 +190,11 @@ let string_of_op = function
   | Bvshiftl -> "@bvshiftl"
   | Bvshiftr -> "@bvshiftr"
   | Bvarith_shiftr -> "@bvarith_shiftr"
+  | Proven_bvshiftl n -> "@proven_bvshiftl::<" ^ string_of_int n ^ ">"
+  | Proven_bvshiftr n -> "@proven_bvshiftr::<" ^ string_of_int n ^ ">"
+  | Proven_bvarith_shiftr n -> "@proven_bvarith_shiftr::<" ^ string_of_int n ^ ">"
+  | Bvrotr (width, amount) ->
+      "@bvrotr::<" ^ string_of_int width ^ "," ^ string_of_int amount ^ ">"
   | Bvaccess -> "@bvaccess"
   | Ilt -> "@lt"
   | Igt -> "@gt"
@@ -201,6 +206,15 @@ let string_of_op = function
   | Proven_imul -> "@proven_imul"
   | Proven_idiv -> "@proven_idiv"
   | Proven_imod -> "@proven_imod"
+  | Power_of_two_idiv n -> "@power_of_two_idiv::<" ^ string_of_int n ^ ">"
+  | Power_of_two_imod n -> "@power_of_two_imod::<" ^ string_of_int n ^ ">"
+  | Mixed_proven_idiv _ -> "@mixed_proven_idiv"
+  | Mixed_proven_imod _ -> "@mixed_proven_imod"
+  | Widening_iadd (n, _) -> "@widening_iadd::<" ^ string_of_int n ^ ">"
+  | Widening_imul (n, _) -> "@widening_imul::<" ^ string_of_int n ^ ">"
+  | Wrapping_iadd n -> "@wrapping_iadd::<" ^ string_of_int n ^ ">"
+  | Wrapping_isub n -> "@wrapping_isub::<" ^ string_of_int n ^ ">"
+  | Wrapping_imul n -> "@wrapping_imul::<" ^ string_of_int n ^ ">"
   | Isub -> "@isub"
   | Imul -> "@imul"
   | Idiv -> "@idiv"
@@ -210,6 +224,8 @@ let string_of_op = function
   | Zero_extend n -> "@zero_extend::<" ^ string_of_int n ^ ">"
   | Sign_extend n -> "@sign_extend::<" ^ string_of_int n ^ ">"
   | Slice n -> "@slice::<" ^ string_of_int n ^ ">"
+  | Proven_slice (n, carrier) ->
+      "@proven_slice::<" ^ string_of_int n ^ "," ^ string_of_int carrier ^ ">"
   | Sslice n -> "@sslice::<" ^ string_of_int n ^ ">"
   | Replicate n -> "@replicate::<" ^ string_of_int n ^ ">"
   | Set_slice -> "@set_slice"
@@ -217,6 +233,7 @@ let string_of_op = function
   | Ite -> "@ite"
   | String_eq -> "@string_eq"
   | Index n -> "@index::<" ^ string_of_int n ^ ">"
+  | Proven_vector_access n -> "@proven_vector_access::<" ^ string_of_int n ^ ">"
 
 (* String representation of ctyps here is only for debugging and
    intermediate language pretty-printer. *)
@@ -417,17 +434,13 @@ let ijson_key l id parts = I_aux (I_init (CT_json_key, id, Init_json_key parts),
 
 let iif l cval then_instrs else_instrs = I_aux (I_if (cval, then_instrs, else_instrs), (instr_number (), l))
 
-let ifuncall_with_bounds l bounds clexp id cvals =
-  I_aux (I_funcall (CR_one clexp, Call bounds, id, cvals), (instr_number (), l))
+let ifuncall_with_bounds ?(semantic_proofs = []) l bounds clexp id cvals =
+  I_aux (I_funcall (CR_one clexp, Call (bounds, semantic_proofs), id, cvals), (instr_number (), l))
 
-let ifuncall l clexp id cvals =
-  ifuncall_with_bounds l (List.map (fun _ -> None) cvals, None) clexp id cvals
+let ifuncall l clexp id cvals = ifuncall_with_bounds l (List.map (fun _ -> None) cvals, None) clexp id cvals
 
 let ifuncall_multi l clexps id cvals =
-  I_aux
-    ( I_funcall (CR_multi clexps, Call (List.map (fun _ -> None) cvals, None), id, cvals),
-      (instr_number (), l)
-    )
+  I_aux (I_funcall (CR_multi clexps, Call ((List.map (fun _ -> None) cvals, None), []), id, cvals), (instr_number (), l))
 
 let iextern ?return_ctyp l clexp id cvals =
   let return_ctyp = match return_ctyp with None -> clexp_ctyp clexp | Some ctyp -> ctyp in
@@ -1125,9 +1138,18 @@ let rec infer_call op vs =
   | (Eq | Neq), _ -> CT_bool
   | Bvnot, [v] -> cval_ctyp v
   | Bvaccess, _ -> CT_fbits 1
-  | (Bvor | Bvand | Bvxor | Bvadd | Bvsub | Bvshiftl | Bvshiftr | Bvarith_shiftr), [v; _] -> cval_ctyp v
+  | ( ( Bvor | Bvand | Bvxor | Bvadd | Bvsub | Bvshiftl | Bvshiftr | Bvarith_shiftr | Proven_bvshiftl _
+      | Proven_bvshiftr _ | Proven_bvarith_shiftr _ ),
+      [v; _] ) ->
+      cval_ctyp v
+  | Bvrotr (width, _), [_] -> CT_fbits width
   | (Ilt | Igt | Ilteq | Igteq), _ -> CT_bool
-  | (Iadd | Proven_iadd | Proven_isub | Proven_imul | Proven_idiv | Proven_imod | Isub | Imul | Idiv | Imod), [v; _] ->
+  | (Widening_iadd (_, result_ctyp) | Widening_imul (_, result_ctyp)), [_; _] -> result_ctyp
+  | (Power_of_two_idiv _ | Power_of_two_imod _), [v] -> cval_ctyp v
+  | (Mixed_proven_idiv (_, result_ctyp) | Mixed_proven_imod (_, result_ctyp)), [_; _] -> result_ctyp
+  | ( ( Iadd | Proven_iadd | Proven_isub | Proven_imul | Proven_idiv | Proven_imod | Wrapping_iadd _ | Wrapping_isub _
+      | Wrapping_imul _ | Isub | Imul | Idiv | Imod ),
+      [v; _] ) ->
       cval_ctyp v
   | Unsigned n, _ -> CT_fuint n
   | Signed n, _ -> CT_fint n
@@ -1136,11 +1158,10 @@ let rec infer_call op vs =
       | CT_fbits _ | CT_sbits _ -> CT_fbits n
       | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Invalid type for zero/sign_extend argument"
     )
-  | Slice n, [vec; _] -> (
+  | (Slice n | Proven_slice (n, _)), [vec; _] -> (
       match cval_ctyp vec with
       | CT_fbits _ | CT_sbits _ | CT_fuint _ -> CT_fbits n
-      | CT_struct (id, [])
-        when string_of_id id = "__sail_c_repr_u128" || string_of_id id = "__sail_c_repr_u256" ->
+      | CT_struct (id, []) when string_of_id id = "__sail_c_repr_u128" || string_of_id id = "__sail_c_repr_u256" ->
           CT_fbits n
       | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Invalid type for extract argument"
     )
@@ -1169,6 +1190,11 @@ let rec infer_call op vs =
       match cval_ctyp v with
       | CT_fvector (_, ctyp) -> ctyp
       | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Invalid type for index argument"
+    )
+  | Proven_vector_access length, [vector; _] -> (
+      match cval_ctyp vector with
+      | CT_fvector (actual_length, ctyp) when length = actual_length -> ctyp
+      | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Invalid proved fixed-vector access"
     )
   | _, _ -> Reporting.unreachable Parse_ast.Unknown __POS__ ("Invalid call to function " ^ string_of_op op)
 

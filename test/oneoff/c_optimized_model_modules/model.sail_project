@@ -1,0 +1,18 @@
+Base {
+  files base.sail
+}
+
+HostContracts {
+  requires Base
+  files host_contracts.sail
+}
+
+Machine {
+  requires Base, HostContracts
+  files machine.sail
+}
+
+Entry {
+  requires Base, Machine
+  files entry.sail
+}

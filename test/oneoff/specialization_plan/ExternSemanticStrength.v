@@ -28,7 +28,7 @@ Definition empty_extern_downstream : Semantics :=
      sem_lifetime_compatible := fun _ _ _ => True |}.
 
 Theorem extern_requires_execution :
-  ~ obligation_4e81ef1ad207ac8ec4288e2a2826812a empty_extern_downstream.
+  ~ obligation_cfa887618ae50fd81658d418638415d6 empty_extern_downstream.
 Proof.
   intro obligation.
   destruct (obligation [] tt I)
@@ -37,7 +37,7 @@ Proof.
 Qed.
 
 Theorem extern_call_requires_jib_execution :
-  ~ obligation_957a1e45102c495c424852247c6bd899 empty_extern_downstream.
+  ~ obligation_7f90599935e30f34f3effd3005354d2e empty_extern_downstream.
 Proof.
   intro obligation.
   destruct (obligation [] tt I)
@@ -50,7 +50,7 @@ Theorem complete_requires_extern_call_representation :
 Proof.
   intro complete.
   destruct
-    (proof_4e81ef1ad207ac8ec4288e2a2826812a
+    (proof_cfa887618ae50fd81658d418638415d6
       empty_extern_downstream complete [] tt I)
     as [represented_args [extern_outcome [call_representation _]]].
   exact call_representation.
@@ -84,7 +84,7 @@ Definition missing_extern_execution : Semantics :=
   extern_observation False True.
 
 Theorem extern_requires_extern_execution :
-  ~ obligation_4e81ef1ad207ac8ec4288e2a2826812a missing_extern_execution.
+  ~ obligation_cfa887618ae50fd81658d418638415d6 missing_extern_execution.
 Proof.
   intro obligation.
   destruct (obligation [] tt I)
@@ -96,7 +96,7 @@ Definition missing_extern_outcome_refinement : Semantics :=
   extern_observation True False.
 
 Theorem extern_requires_outcome_refinement :
-  ~ obligation_4e81ef1ad207ac8ec4288e2a2826812a
+  ~ obligation_cfa887618ae50fd81658d418638415d6
       missing_extern_outcome_refinement.
 Proof.
   intro obligation.

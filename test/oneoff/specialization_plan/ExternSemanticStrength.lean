@@ -26,13 +26,13 @@ def emptyExternDownstream : Semantics where
   lifetimeCompatible := fun _ _ _ => True
 
 theorem externRequiresExecution :
-    ¬ obligation_4e81ef1ad207ac8ec4288e2a2826812a emptyExternDownstream := by
+    ¬ obligation_cfa887618ae50fd81658d418638415d6 emptyExternDownstream := by
   intro obligation
   obtain ⟨_, _, callRepresentation, _, _⟩ := obligation [] () trivial
   exact callRepresentation
 
 theorem externCallRequiresJibExecution :
-    ¬ obligation_957a1e45102c495c424852247c6bd899 emptyExternDownstream := by
+    ¬ obligation_7f90599935e30f34f3effd3005354d2e emptyExternDownstream := by
   intro obligation
   obtain ⟨_, _, callRepresentation, _, _⟩ := obligation [] () trivial
   exact callRepresentation
@@ -41,7 +41,7 @@ theorem completeRequiresExternCallRepresentation :
     ¬ Complete emptyExternDownstream := by
   intro complete
   obtain ⟨_, _, callRepresentation, _, _⟩ :=
-    complete.proof_4e81ef1ad207ac8ec4288e2a2826812a [] () trivial
+    complete.proof_cfa887618ae50fd81658d418638415d6 [] () trivial
   exact callRepresentation
 
 def missingExternExecution : Semantics :=
@@ -49,7 +49,7 @@ def missingExternExecution : Semantics :=
     callArgumentsRepresent := fun _ _ _ => True }
 
 theorem externRequiresExternExecution :
-    ¬ obligation_4e81ef1ad207ac8ec4288e2a2826812a missingExternExecution := by
+    ¬ obligation_cfa887618ae50fd81658d418638415d6 missingExternExecution := by
   intro obligation
   obtain ⟨_, _, _, externExecution, _⟩ := obligation [] () trivial
   exact externExecution
@@ -60,7 +60,7 @@ def missingExternOutcomeRefinement : Semantics :=
     outcomesRefine := fun _ _ => False }
 
 theorem externRequiresOutcomeRefinement :
-    ¬ obligation_4e81ef1ad207ac8ec4288e2a2826812a missingExternOutcomeRefinement := by
+    ¬ obligation_cfa887618ae50fd81658d418638415d6 missingExternOutcomeRefinement := by
   intro obligation
   obtain ⟨_, _, _, _, refinement⟩ := obligation [] () trivial
   exact refinement

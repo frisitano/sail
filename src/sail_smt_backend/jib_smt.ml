@@ -1308,6 +1308,7 @@ end) : Jib_compile.CONFIG = struct
   let branch_coverage = None
   let track_throw = false
   let assert_to_exception = false
+  let erase_assert_messages = false
   let use_void = false
   let eager_control_flow = true
   let preserve_types = IdSet.empty

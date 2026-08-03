@@ -65,7 +65,8 @@ val iinit : l -> ctyp -> name -> cval -> instr
 val ijson_key : l -> name -> string list -> instr
 val iif : l -> cval -> instr list -> instr list -> instr
 val ifuncall : l -> clexp -> id * ctyp list -> cval list -> instr
-val ifuncall_with_bounds : l -> callsite_bounds -> clexp -> id * ctyp list -> cval list -> instr
+val ifuncall_with_bounds :
+  ?semantic_proofs:semantic_proof list -> l -> callsite_bounds -> clexp -> id * ctyp list -> cval list -> instr
 val ifuncall_multi : l -> clexp list -> id * ctyp list -> cval list -> instr
 val iextern : ?return_ctyp:ctyp -> l -> clexp -> id * ctyp list -> cval list -> instr
 val icopy : l -> clexp -> cval -> instr
