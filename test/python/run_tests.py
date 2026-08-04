@@ -412,6 +412,13 @@ def pydantic_record_checks(module: Any) -> None:
         ),
     )
 
+    renamed = module.make_renamed_record_quantifier(module.Uint(5), 5)
+    assert renamed.count == 5
+    assert renamed.validity.maximum == 5
+    updated = module.update_renamed_record_quantifier(renamed, module.Uint(3))
+    assert updated.count == 3
+    assert updated.validity.maximum == 5
+
 
 def source_projection(source: str) -> str:
     tree = ast.parse(source)

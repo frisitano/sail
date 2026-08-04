@@ -39,3 +39,19 @@ function make_conditional_profile(fork, denominator) =
     denominator = denominator,
     limit = if fork < 11 then 0 else 256 * denominator,
   }
+
+type ItemCount('maximum : Int) = range(0, 'maximum)
+
+struct RenamedRecordQuantifier('maximum : Int) = {
+  count : ItemCount('maximum),
+}
+
+val make_renamed_record_quantifier : forall 'limit.
+  ItemCount('limit) -> RenamedRecordQuantifier('limit)
+function make_renamed_record_quantifier(count) =
+  struct { count = count }
+
+val update_renamed_record_quantifier : forall 'limit.
+  (RenamedRecordQuantifier('limit), ItemCount('limit)) -> RenamedRecordQuantifier('limit)
+function update_renamed_record_quantifier(record, count) =
+  { record with count = count }

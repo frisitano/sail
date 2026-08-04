@@ -1268,11 +1268,31 @@ let construct_record_value ctx env typ value =
       construct_with "int" value
   | _ -> construct_value ctx env typ value
 
-let record_field_type ctx record_id field_id =
+let instantiate_record_field_type ~loc ctx record_id type_args typ =
+  match Bindings.find_opt record_id ctx.record_quants with
+  | None -> typ
+  | Some typq ->
+      let rec instantiate typ quantifiers args =
+        match (quantifiers, args) with
+        | [], [] -> typ
+        | quantifier :: quantifiers, arg :: args ->
+            instantiate (typ_subst (kopt_kid quantifier) arg typ) quantifiers args
+        | _ -> backend_error ~loc ("record type arguments do not match quantifiers for " ^ id_string record_id)
+      in
+      instantiate typ (quant_kopts typq) type_args
+
+let record_field_types ~loc ctx record_id type_args field_id =
   match Bindings.find_opt record_id ctx.record_fields with
   | None -> None
   | Some fields ->
-      Option.map snd (List.find_opt (fun (candidate, _) -> Id.compare candidate field_id = 0) fields)
+      Option.map
+        (fun (_, typ) -> (typ, instantiate_record_field_type ~loc ctx record_id type_args typ))
+        (List.find_opt (fun (candidate, _) -> Id.compare candidate field_id = 0) fields)
+
+let construct_record_field_value ctx env declared_typ instantiated_typ value =
+  match representation_class ctx env instantiated_typ with
+  | Some _ -> construct_with (python_typ ctx declared_typ) value
+  | None -> construct_record_value ctx env instantiated_typ value
 
 let python_bit = function Bit.B0 -> "0" | Bit.B1 -> "1"
 
@@ -1904,8 +1924,9 @@ and lower_value ctx (E_aux (exp_aux, (l, _)) as exp) =
           (fun (lines, fields) (FE_aux (FE_fexp (id, value), _)) ->
             let before, value = lower_value ctx value in
             let value =
-              match record_field_type ctx record_id id with
-              | Some typ -> construct_record_value ctx (env_of exp) typ value
+              match record_field_types ~loc:l ctx record_id type_args id with
+              | Some (declared_typ, instantiated_typ) ->
+                  construct_record_field_value ctx (env_of exp) declared_typ instantiated_typ value
               | None -> value
             in
             (lines @ before, fields @ [py_id id ^ "=" ^ value])
@@ -1922,15 +1943,16 @@ and lower_value ctx (E_aux (exp_aux, (l, _)) as exp) =
       in
       (lines, record ^ "(" ^ String.concat ", " fields ^ ")")
   | E_struct_update (base_exp, fields) ->
-      let owner = record_id ctx l base_exp in
+      let owner, type_args = record_application ctx l base_exp in
       let before, base = lower_value ctx base_exp in
       let lines, fields =
         List.fold_left
           (fun (lines, fields) (FE_aux (FE_fexp (id, value), _)) ->
             let value_lines, value = lower_value ctx value in
             let value =
-              match record_field_type ctx owner id with
-              | Some typ -> construct_record_value ctx (env_of exp) typ value
+              match record_field_types ~loc:l ctx owner type_args id with
+              | Some (declared_typ, instantiated_typ) ->
+                  construct_record_field_value ctx (env_of exp) declared_typ instantiated_typ value
               | None -> value
             in
             (lines @ value_lines, fields @ [py_id id ^ "=" ^ value])
