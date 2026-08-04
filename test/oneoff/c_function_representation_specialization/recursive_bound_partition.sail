@@ -23,4 +23,14 @@ termination_measure ascending_to_eight(value) = 8 - value
 function low_countup(value : range(0, 1)) -> unit =
   ascending_to_eight(value)
 
+val widening_countup : forall 'value, 0 <= 'value <= 511.
+  atom('value) -> unit
+
+function widening_countup(value) =
+  if value == 511 then () else widening_countup(value + 1)
+termination_measure widening_countup(value) = 511 - value
+
+function low_widening_countup(value : range(0, 255)) -> unit =
+  widening_countup(value)
+
 function main() -> unit = ()

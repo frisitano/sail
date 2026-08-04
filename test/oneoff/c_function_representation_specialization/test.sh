@@ -193,11 +193,43 @@ GMP_CFLAGS=$(${PKG_CONFIG:-pkg-config} --cflags gmp)
   --c-preserve positive_countdown \
   --c-preserve ascending_to_eight \
   --c-preserve low_countup \
+  --c-preserve widening_countup \
+  --c-preserve low_widening_countup \
   "$TEST_DIR/recursive_bound_partition.sail" -o "$TMP_DIR/recursive_bound_partition"
 test "$(grep -Ec 'unit zdescending_to_zzero.*repr.*\(uint8_t\);' \
   "$TMP_DIR/recursive_bound_partition.h")" -eq 2
 test "$(grep -Ec 'unit zascending_to_eight.*repr.*\(uint8_t\);' \
   "$TMP_DIR/recursive_bound_partition.h")" -eq 2
+grep -Eq 'unit zwidening_countup.*repr.*\(uint8_t\);' \
+  "$TMP_DIR/recursive_bound_partition.h"
+grep -Eq 'unit zwidening_countup.*repr.*\(uint16_t\);' \
+  "$TMP_DIR/recursive_bound_partition.h"
+if grep -Eq '[^[:alnum:]_]zwidening_countup\(' "$TMP_DIR/recursive_bound_partition.c"; then
+  grep -Eq '^unit zwidening_countup\(' "$TMP_DIR/recursive_bound_partition.c"
+fi
+GMP_CFLAGS=$(${PKG_CONFIG:-pkg-config} --cflags gmp)
+"${CC:-cc}" ${CFLAGS:-} $GMP_CFLAGS -std=c11 -Wall -Werror=implicit-function-declaration \
+  -I "$TEST_DIR/../../../lib" -c "$TMP_DIR/recursive_bound_partition.c" \
+  -o "$TMP_DIR/recursive_bound_partition.o"
+
+# Conversions from proof-backed wide unsigned carriers to a signed native
+# result use the wide carrier's low-limb helper.  Generic conversion names for
+# these pairs do not exist and would leave an undefined symbol at link time.
+"$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c --c-specialize --c-no-main \
+  --c-preserve signed_from_u128 \
+  --c-preserve signed_from_u256 \
+  --c-preserve signed_from_u320 \
+  "$TEST_DIR/wide_to_signed.sail" -o "$TMP_DIR/wide_to_signed"
+grep -Fq 'u128_to_u64(' "$TMP_DIR/wide_to_signed.c"
+grep -Fq 'u256_to_u64(' "$TMP_DIR/wide_to_signed.c"
+grep -Fq 'u320_to_u64(' "$TMP_DIR/wide_to_signed.c"
+if grep -Eq '_convert_mach_int_of_u(128|256|320)' "$TMP_DIR/wide_to_signed.c"; then
+  echo 'wide unsigned carrier used a non-existent signed conversion helper' >&2
+  exit 1
+fi
+"${CC:-cc}" ${CFLAGS:-} $GMP_CFLAGS -std=c11 -Wall -Werror=implicit-function-declaration \
+  -I "$TEST_DIR/../../../lib" -c "$TMP_DIR/wide_to_signed.c" \
+  -o "$TMP_DIR/wide_to_signed.o"
 
 # A terminating zero guard is part of the source proof context.  Preserve it
 # across ANF/JIB lowering so non-negative Euclidean division can use the native

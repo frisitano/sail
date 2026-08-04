@@ -3956,7 +3956,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         ksprintf string "  %s = u320_of_u128(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, from_typ when is_c_repr_u320 to_typ && is_c_repr_u256 from_typ ->
         ksprintf string "  %s = u320_of_u256(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
-    | CT_fuint _, from_typ when is_c_repr_u320 from_typ ->
+    | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u320 from_typ ->
         ksprintf string "  %s = u320_to_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, from_typ when is_c_repr_u256 to_typ && is_c_repr_u320 from_typ ->
         ksprintf string "  %s = u256_of_u320(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
@@ -3988,7 +3988,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         ksprintf string "  %s = u256_of_fbits(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, from_typ when is_c_repr_u256 to_typ && is_c_repr_u128 from_typ ->
         ksprintf string "  %s = u256_of_u128(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
-    | CT_fuint _, from_typ when is_c_repr_u256 from_typ ->
+    | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u256 from_typ ->
         ksprintf string "  %s = u256_to_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, CT_fuint _ when is_c_repr_u128 to_typ ->
         ksprintf string "  %s = u128_of_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
@@ -3997,7 +3997,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           (sgen_clexp_pure l clexp) (sgen_cval cval) (sgen_cval cval)
     | to_typ, CT_lint when is_c_repr_u128 to_typ ->
         ksprintf string "  %s = u128_of_sail_int(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
-    | CT_fuint _, from_typ when is_c_repr_u128 from_typ ->
+    | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u128 from_typ ->
         ksprintf string "  %s = u128_to_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, from_typ when is_c_repr_u128 to_typ && is_c_repr_u256 from_typ ->
         ksprintf string "  %s = u128_of_u256(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)

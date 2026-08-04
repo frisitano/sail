@@ -7449,6 +7449,16 @@ module Make (C : CONFIG) = struct
     let roots =
       List.fold_left (fun roots id -> IdGraphNS.add id roots) IdGraphNS.empty (Specialize.get_initial_calls ())
     in
+    (* Every generated clone remains in the emitted translation unit, even
+       when demand merging leaves it without a reachable caller.  Treat those
+       emitted bodies as roots while deciding whether a canonical fallback is
+       still required; otherwise an orphaned clone can retain a call to an
+       original which this pass removes, leaving an undefined link symbol. *)
+    let roots =
+      List.fold_left
+        (fun roots -> function CDEF_aux (CDEF_fundef (id, _, _, _), _) -> IdGraphNS.add id roots | _ -> roots)
+        roots generated
+    in
     let roots = ref roots in
     let add_top_level_calls = function
       | CDEF_aux
