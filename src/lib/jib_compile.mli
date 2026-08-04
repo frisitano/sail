@@ -175,6 +175,25 @@ module type CONFIG = sig
   (** Optionally replace the compiled payload of a nominal newtype. *)
   val specialize_newtype_payload : id -> ctyp -> ctyp
 
+  (** Optionally replace the backend representation of a record field.  This
+      changes only the JIB/backend carrier; the source-language field keeps
+      its original semantic type. *)
+  val specialize_struct_field : id -> id -> ctyp -> ctyp
+
+  (** Optionally select backend representations for source-declared function
+      arguments and results. The source type has already passed Sail's type
+      checker; this hook changes only the JIB/backend carrier. *)
+  val specialize_declared_function_argument : id -> int -> ctyp -> ctyp
+  val specialize_declared_function_result : id -> ctyp -> ctyp
+
+  (** Whether an ANF temporary whose semantic type is [semantic] may retain
+      [represented] even when the temporary is marked mutable by ANF
+      construction.  This is intentionally narrower than
+      [representation_refines]: most mutable source values require
+      whole-lifetime analysis, while representation-preserving address
+      arithmetic must not immediately convert a pointer back to an integer. *)
+  val propagate_anf_temporary_representation : semantic:ctyp -> represented:ctyp -> bool
+
   (** Return true when [represented] is a backend-specific, lossless representation of [semantic]. This keeps such
       values in their native representation while compiling newtype destructuring and local bindings, until a real
       semantic-type boundary requires conversion. *)

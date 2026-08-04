@@ -113,10 +113,13 @@ let c_repr_u128_id = mk_id "__sail_c_repr_u128"
 let c_repr_u256_id = mk_id "__sail_c_repr_u256"
 let c_repr_u320_id = mk_id "__sail_c_repr_u320"
 let c_repr_fixed_bytes_id = mk_id "__sail_c_repr_fixed_bytes"
+let c_repr_byte_pointer_prefix = "__sail_c_repr_byte_pointer_"
+let direct_byte_pointer_adapter = "__direct"
 let c_repr_u128_ctyp = CT_struct (c_repr_u128_id, [])
 let c_repr_u256_ctyp = CT_struct (c_repr_u256_id, [])
 let c_repr_u320_ctyp = CT_struct (c_repr_u320_id, [])
 let c_repr_fixed_bytes_ctyp n = CT_struct (c_repr_fixed_bytes_id, [CT_constant (Big_int.of_int n)])
+let c_repr_byte_pointer_ctyp adapter = CT_struct (mk_id (c_repr_byte_pointer_prefix ^ adapter), [])
 
 let is_c_repr_u128 = function CT_struct (id, []) -> Id.compare id c_repr_u128_id = 0 | _ -> false
 
@@ -131,8 +134,23 @@ let c_repr_fixed_bytes_length = function
   | _ -> None
 
 let is_c_repr_fixed_bytes ctyp = Option.is_some (c_repr_fixed_bytes_length ctyp)
+
+let c_repr_byte_pointer_adapter = function
+  | CT_struct (id, []) ->
+      let name = string_of_id id in
+      if String.starts_with ~prefix:c_repr_byte_pointer_prefix name then
+        Some
+          (String.sub name (String.length c_repr_byte_pointer_prefix)
+             (String.length name - String.length c_repr_byte_pointer_prefix)
+          )
+      else None
+  | _ -> None
+
+let is_c_repr_byte_pointer ctyp = Option.is_some (c_repr_byte_pointer_adapter ctyp)
+
 let is_c_repr_value ctyp =
   is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_u320 ctyp || is_c_repr_fixed_bytes ctyp
+  || is_c_repr_byte_pointer ctyp
 
 let rec ctyp_suprema_for_c specialize = function
   | ctyp when specialize && is_c_repr_value ctyp -> ctyp
@@ -311,6 +329,9 @@ module C_config (Opts : sig
   val c_repr_signed : int Bindings.t
   val c_repr_u256 : IdSet.t
   val c_repr_fixed_bytes : int Bindings.t
+  val byte_pointer_fields : (id * id * string) list
+  val byte_pointer_types : string Bindings.t
+  val byte_pointer_signatures : (string option list * string option) Bindings.t
   val specialize_c : bool
   val require_bounded_int : bool
   val optimized_model : bool
@@ -357,6 +378,19 @@ end) : CONFIG = struct
       )
     | _ -> None
 
+  let rec find_c_repr_byte_pointer env (Typ_aux (typ_aux, _)) =
+    match typ_aux with
+    | Typ_id id -> (
+        match Bindings.find_opt id Opts.byte_pointer_types with
+        | Some adapter -> Some adapter
+        | None -> (
+            match Bindings.find_opt id (Env.get_typ_synonyms env) with
+            | Some ([], A_aux (A_typ typ, _)) -> find_c_repr_byte_pointer env typ
+            | _ -> None
+          )
+      )
+    | _ -> None
+
   let ctyp_suprema = ctyp_suprema_for_c Opts.specialize_c
 
   let specialize_newtype_payload id ctyp =
@@ -373,6 +407,31 @@ end) : CONFIG = struct
         )
     )
 
+  let specialize_struct_field record_id field_id ctyp =
+    match
+      List.find_opt
+        (fun (configured_record, configured_field, _) ->
+          Id.compare record_id configured_record = 0 && Id.compare field_id configured_field = 0
+        )
+        Opts.byte_pointer_fields
+    with
+    | Some (_, _, adapter) when Opts.optimized_model -> c_repr_byte_pointer_ctyp adapter
+    | Some _ | None -> ctyp
+
+  let specialize_declared_function_argument function_id index ctyp =
+    match Bindings.find_opt function_id Opts.byte_pointer_signatures with
+    | Some (arguments, _) -> (
+        match List.nth_opt arguments index with
+        | Some (Some adapter) when Opts.optimized_model -> c_repr_byte_pointer_ctyp adapter
+        | Some (Some _) | Some None | None -> ctyp
+      )
+    | None -> ctyp
+
+  let specialize_declared_function_result function_id ctyp =
+    match Bindings.find_opt function_id Opts.byte_pointer_signatures with
+    | Some (_, Some adapter) when Opts.optimized_model -> c_repr_byte_pointer_ctyp adapter
+    | Some (_, Some _) | Some (_, None) | None -> ctyp
+
   let specializes_narrow_fixed_integer ~semantic ~represented =
     match (semantic, represented) with
     | (CT_fint semantic_width | CT_fuint semantic_width), (CT_fint represented_width | CT_fuint represented_width) ->
@@ -381,6 +440,7 @@ end) : CONFIG = struct
 
   let rec representation_refines ~semantic ~represented =
     match (semantic, represented) with
+    | (CT_lint | CT_fint _ | CT_fuint _ | CT_constant _), represented when is_c_repr_byte_pointer represented -> true
     | semantic, represented when specializes_narrow_fixed_integer ~semantic ~represented -> true
     | CT_lint, (CT_fint _ | CT_fuint _) -> true
     | CT_lint, represented when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented
@@ -398,6 +458,9 @@ end) : CONFIG = struct
         || representation_refines ~semantic:semantic_element ~represented:represented_element
     | _ -> false
 
+  let propagate_anf_temporary_representation ~semantic ~represented =
+    representation_refines ~semantic ~represented && is_c_repr_byte_pointer represented
+
   (* The Sail typechecker has already proved the actual argument inhabits the
      semantic parameter type.  When its selected fixed representation is
      strictly narrower, retain it by cloning the local function instead of
@@ -407,6 +470,7 @@ end) : CONFIG = struct
     && (specializes_narrow_fixed_integer ~semantic ~represented
        ||
        match (semantic, represented) with
+       | (CT_lint | CT_fint _ | CT_fuint _ | CT_constant _), represented when is_c_repr_byte_pointer represented -> true
        | CT_lint, (CT_fint _ | CT_fuint _) -> true
        | CT_lint, represented
          when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
@@ -430,6 +494,7 @@ end) : CONFIG = struct
     && (specializes_narrow_fixed_integer ~semantic ~represented
        ||
        match (semantic, represented) with
+       | (CT_lint | CT_fint _ | CT_fuint _ | CT_constant _), represented when is_c_repr_byte_pointer represented -> true
        | CT_lint, (CT_fint _ | CT_fuint _) -> true
        | CT_lint, represented
          when is_c_repr_u128 represented || is_c_repr_u256 represented || is_c_repr_u320 represented ->
@@ -491,6 +556,8 @@ end) : CONFIG = struct
            || representation_refines ~semantic:semantic_element ~represented:represented_element ->
         Some represented
     | _ when specializes_narrow_fixed_integer ~semantic:expected ~represented -> Some expected
+    | _, (CT_lint | CT_fint _ | CT_fuint _ | CT_constant _), represented, _ when is_c_repr_byte_pointer represented ->
+        Some expected
     | _ -> None
 
   let function_argument_narrowing_allowed ~expected ~source:_ ~represented =
@@ -521,6 +588,7 @@ end) : CONFIG = struct
 
   let preserve_aval_representation ~semantic ~represented =
     match semantic with
+    | CT_lint | CT_fint _ | CT_fuint _ | CT_constant _ when is_c_repr_byte_pointer represented -> true
     | CT_lint -> (
         match represented with
         | CT_fint _ | CT_fuint _ -> true
@@ -566,13 +634,21 @@ end) : CONFIG = struct
           true
       | _ -> false
     in
-    match (string_of_id id, arg_ctyps, semantic) with
-    | "from_bytes_le", [(CT_fint _ | CT_fuint _); bytes], CT_lbits when fixed_bytes_at_most_32 bytes -> c_repr_u256_ctyp
-    | _ -> (
-        match (preserves_first_argument, arg_ctyps) with
-        | true, represented :: _ when representation_refines ~semantic ~represented -> represented
-        | _ -> semantic
-      )
+    let declared = specialize_declared_function_result id semantic in
+    if not (ctyp_equal declared semantic) then declared
+    else
+      match (string_of_id id, arg_ctyps, semantic) with
+      | "add_int", [pointer; (CT_fint _ | CT_fuint _ | CT_constant _)], _ when is_c_repr_byte_pointer pointer ->
+          pointer
+      | "add_int", [(CT_fint _ | CT_fuint _ | CT_constant _); pointer], _ when is_c_repr_byte_pointer pointer ->
+          pointer
+      | "from_bytes_le", [(CT_fint _ | CT_fuint _); bytes], CT_lbits when fixed_bytes_at_most_32 bytes ->
+          c_repr_u256_ctyp
+      | _ -> (
+          match (preserves_first_argument, arg_ctyps) with
+          | true, represented :: _ when representation_refines ~semantic ~represented -> represented
+          | _ -> semantic
+        )
 
   let specialize_call_destination ctx id arg_ctyps ~semantic ~represented =
     let external_name = if ctx_is_extern id ctx then ctx_get_extern id ctx else string_of_id id in
@@ -607,6 +683,9 @@ end) : CONFIG = struct
       match arg_ctyps with [left; right] -> is_c_repr_fixed_bytes left && ctyp_equal left right | _ -> false
     in
     match (external_name, return_ctyp, index, semantic, represented) with
+    | _, _, _, (CT_lint | CT_fint _ | CT_fuint _ | CT_constant _), represented
+      when is_c_repr_byte_pointer represented ->
+        true
     | "eq_anything", CT_bool, (0 | 1), (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), represented
       when arguments_share_fixed_bytes && is_c_repr_fixed_bytes represented ->
         true
@@ -693,12 +772,14 @@ end) : CONFIG = struct
     let c_repr_signed = find_c_repr_integer Opts.c_repr_signed ctx.local_env typ in
     let c_repr_u256 = has_c_repr_u256 ctx.local_env typ in
     let c_repr_fixed_bytes = find_c_repr_fixed_bytes ctx.local_env typ in
+    let c_repr_byte_pointer = find_c_repr_byte_pointer ctx.local_env typ in
     let (Typ_aux (typ_aux, l) as typ) = Env.expand_synonyms ctx.local_env typ in
     match typ_aux with
     | _ when Option.is_some c_repr_unsigned -> CT_fuint (Option.get c_repr_unsigned)
     | _ when Option.is_some c_repr_signed -> CT_fint (Option.get c_repr_signed)
     | _ when c_repr_u256 -> c_repr_u256_ctyp
     | _ when Option.is_some c_repr_fixed_bytes -> c_repr_fixed_bytes_ctyp (Option.get c_repr_fixed_bytes)
+    | _ when Option.is_some c_repr_byte_pointer -> c_repr_byte_pointer_ctyp (Option.get c_repr_byte_pointer)
     | Typ_id id when string_of_id id = "bool" -> CT_bool
     | Typ_id id when string_of_id id = "int" -> CT_lint
     | Typ_id id when string_of_id id = "nat" -> CT_lint
@@ -897,6 +978,13 @@ end) : CONFIG = struct
   let rec c_aval ctx = function
     | AV_lit (lit, typ) as v -> (
         match literal_to_fragment (convert_typ ctx typ) lit with Some cval -> AV_cval (cval, typ) | None -> v
+      )
+    | AV_cval (V_field (record, field, _), typ) -> (
+        match cval_ctyp record with
+        | CT_struct _ as record_ctyp ->
+            let _, field_ctyp = struct_fields (id_loc field) ctx record_ctyp in
+            AV_cval (V_field (record, field, field_ctyp field), typ)
+        | _ -> AV_cval (V_field (record, field, convert_typ ctx typ), typ)
       )
     | AV_cval (cval, typ) -> AV_cval (cval, typ)
     (* An id can be converted to a C fragment if its type can be
@@ -1592,6 +1680,12 @@ end) : CONFIG = struct
         | ctyp when is_c_repr_u256 ctyp -> AE_val (AV_cval (V_call (Neq, [v1; v2]), typ))
         | _ -> no_change
       )
+    | "eq_int", [AV_cval (v1, _); AV_cval (v2, _)]
+      when is_c_repr_byte_pointer (cval_ctyp v1) && ctyp_equal (cval_ctyp v1) (cval_ctyp v2) ->
+        AE_val (AV_cval (V_call (Eq, [v1; v2]), typ))
+    | "neq_int", [AV_cval (v1, _); AV_cval (v2, _)]
+      when is_c_repr_byte_pointer (cval_ctyp v1) && ctyp_equal (cval_ctyp v1) (cval_ctyp v2) ->
+        AE_val (AV_cval (V_call (Neq, [v1; v2]), typ))
     | "eq_int", [AV_cval (v1, _); AV_cval (v2, _)] -> native_integer_binary_or_no_change Eq v1 v2
     | "neq_int", [AV_cval (v1, _); AV_cval (v2, _)] -> native_integer_binary_or_no_change Neq v1 v2
     | "eq_bit", [AV_cval (v1, _); AV_cval (v2, _)] -> AE_val (AV_cval (V_call (Eq, [v1; v2]), typ))
@@ -1657,6 +1751,12 @@ end) : CONFIG = struct
           )
         | _ -> no_change
       )
+    | ("lteq" | "gteq" | "lt" | "gt") as comparison, [AV_cval (v1, _); AV_cval (v2, _)]
+      when is_c_repr_byte_pointer (cval_ctyp v1) && ctyp_equal (cval_ctyp v1) (cval_ctyp v2) ->
+        let op =
+          match comparison with "lteq" -> Ilteq | "gteq" -> Igteq | "lt" -> Ilt | "gt" -> Igt | _ -> assert false
+        in
+        AE_val (AV_cval (V_call (op, [v1; v2]), typ))
     | "lteq", [AV_cval (v1, _); AV_cval (v2, _)] -> native_integer_binary_or_no_change Ilteq v1 v2
     | "gteq", [AV_cval (v1, _); AV_cval (v2, _)] -> native_integer_binary_or_no_change Igteq v1 v2
     | "lt", [AV_cval (v1, _); AV_cval (v2, _)] -> native_integer_binary_or_no_change Ilt v1 v2
@@ -1808,6 +1908,17 @@ end) : CONFIG = struct
           )
         | None -> no_change
       )
+    | "add_int", [AV_cval (pointer, _); AV_cval (offset, _)]
+      when is_c_repr_byte_pointer (cval_ctyp pointer)
+           && match cval_ctyp offset with CT_fint _ | CT_fuint _ | CT_constant _ -> true | _ -> false ->
+        AE_val (AV_cval (V_call (Iadd, [pointer; offset]), typ))
+    | "add_int", [AV_cval (offset, _); AV_cval (pointer, _)]
+      when is_c_repr_byte_pointer (cval_ctyp pointer)
+           && match cval_ctyp offset with CT_fint _ | CT_fuint _ | CT_constant _ -> true | _ -> false ->
+        AE_val (AV_cval (V_call (Iadd, [pointer; offset]), typ))
+    | "sub_int", [AV_cval (left, _); AV_cval (right, _)]
+      when is_c_repr_byte_pointer (cval_ctyp left) && ctyp_equal (cval_ctyp left) (cval_ctyp right) ->
+        AE_app (Pure_extern (mk_id "__sail_byte_pointer_diff", Some typ), args, typ)
     | (("add_int" | "sub_int" | "mult_int" | "tdiv_int" | "tmod_int") as f), [AV_cval (op1, _); AV_cval (op2, _)] ->
         let op =
           match f with
@@ -2754,6 +2865,9 @@ module type CODEGEN_CONFIG = sig
   val specialization_obligations_coq : string option
   val optimized_model : bool
   val external_types : string Bindings.t
+  val byte_pointer_fields : (id * id * string) list
+  val byte_pointer_types : string Bindings.t
+  val byte_pointer_signatures : (string option list * string option) Bindings.t
   val package_name : string
   val cpp : bool
   val cpp_class_name : string
@@ -2892,6 +3006,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let readable_ctyp_names_used = ref Util.StringSet.empty
 
   let rec readable_ctyp_stem = function
+    | ctyp when is_c_repr_byte_pointer ctyp ->
+        "byte_pointer_" ^ Option.get (c_repr_byte_pointer_adapter ctyp)
     | ctyp when is_c_repr_u320 ctyp -> "u320"
     | ctyp when is_c_repr_u256 ctyp -> "u256"
     | ctyp when is_c_repr_fixed_bytes ctyp ->
@@ -2945,6 +3061,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let is_native_unsigned_integer = function CT_fuint width -> width <= 64 | _ -> false
   let is_native_signed_integer = function CT_fint width -> width <= 64 | _ -> false
   let rec sgen_ctyp = function
+    | ctyp when is_c_repr_byte_pointer ctyp -> "uint8_t *"
     | ctyp when is_c_repr_u128 ctyp -> "sail_u128"
     | ctyp when is_c_repr_u256 ctyp -> "sail_u256"
     | ctyp when is_c_repr_u320 ctyp -> "sail_u320"
@@ -2977,6 +3094,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CT_poly _ -> "POLY" (* c_error "Tried to generate code for non-monomorphic type" *)
 
   let rec sgen_ctyp_name = function
+    | ctyp when is_c_repr_byte_pointer ctyp ->
+        "byte_pointer_" ^ Option.get (c_repr_byte_pointer_adapter ctyp)
     | ctyp when is_c_repr_u128 ctyp -> "u128"
     | ctyp when is_c_repr_u256 ctyp -> "u256"
     | ctyp when is_c_repr_u320 ctyp -> "u320"
@@ -3174,6 +3293,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | List_is_empty, [v] -> sprintf "(%s == NULL)" (sgen_cval v)
     | Eq, [v1; v2] -> (
         match (cval_ctyp v1, cval_ctyp v2) with
+        | left, right when is_c_repr_byte_pointer left && ctyp_equal left right ->
+            sprintf "(%s == %s)" (sgen_cval v1) (sgen_cval v2)
         | CT_sbits _, _ -> sprintf "eq_sbits(%s, %s)" (sgen_cval v1) (sgen_cval v2)
         | left, right when is_c_repr_u320 left || is_c_repr_u320 right ->
             sprintf "eq_u320(%s, %s)" (u320_of v1) (u320_of v2)
@@ -3191,6 +3312,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       )
     | Neq, [v1; v2] -> (
         match (cval_ctyp v1, cval_ctyp v2) with
+        | left, right when is_c_repr_byte_pointer left && ctyp_equal left right ->
+            sprintf "(%s != %s)" (sgen_cval v1) (sgen_cval v2)
         | CT_sbits _, _ -> sprintf "neq_sbits(%s, %s)" (sgen_cval v1) (sgen_cval v2)
         | left, right when is_c_repr_u320 left || is_c_repr_u320 right ->
             sprintf "(!eq_u320(%s, %s))" (u320_of v1) (u320_of v2)
@@ -3287,6 +3410,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       )
     | Iadd, [v1; v2] -> (
         match (cval_ctyp v1, cval_ctyp v2) with
+        | left, (CT_fint _ | CT_fuint _ | CT_constant _) when is_c_repr_byte_pointer left ->
+            sprintf "(%s + %s)" (sgen_cval v1) (sgen_cval v2)
         | left, right when is_c_repr_u320 left || is_c_repr_u320 right ->
             sprintf "u320_add(%s, %s)" (u320_of v1) (u320_of v2)
         | left, right when is_c_repr_u256 left && is_c_repr_u128 right ->
@@ -3681,6 +3806,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let codegen_equal ctyp arg1 arg2 =
     match ctyp with
+    | ctyp when is_c_repr_byte_pointer ctyp -> ksprintf string "(%s == %s)" arg1 arg2
     | CT_ref _ -> ksprintf string "(%s == %s)" arg1 arg2
     | CT_fint _ | CT_fuint _ -> ksprintf string "(%s == %s)" arg1 arg2
     | ctyp ->
@@ -3800,6 +3926,18 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | _, _ when ctyp_equal ctyp_to ctyp_from ->
         if is_stack_ctyp ctx ctyp_to then ksprintf string "  %s = %s;" (sgen_clexp_pure l clexp) (sgen_cval cval)
         else sail_copy ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp_to) "%s, %s" (sgen_clexp l clexp) (sgen_cval cval)
+    | to_typ, (CT_fint _ | CT_fuint _ | CT_constant _) when is_c_repr_byte_pointer to_typ ->
+        let adapter = Option.get (c_repr_byte_pointer_adapter to_typ) in
+        if adapter = direct_byte_pointer_adapter then
+          match cval with
+          | V_lit (VL_int value, _) when Big_int.equal value Big_int.zero ->
+              ksprintf string "  %s = NULL;" (sgen_clexp_pure l clexp)
+          | _ ->
+              raise
+                (Reporting.err_general l
+                   "C backend: an adapter-free $[c_repr byte_pointer] value cannot be constructed from a semantic integer other than literal zero"
+                )
+        else ksprintf string "  %s = %s((uint64_t)(%s));" (sgen_clexp_pure l clexp) adapter (sgen_cval cval)
     | (CT_fint _ | CT_fuint _), (CT_fint _ | CT_fuint _) ->
         (* Most width changes are proved refinements selected from semantic
            ranges.  Explicit [$[c_repr]] newtypes are also represented by this
@@ -4236,7 +4374,16 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         current_static_helper_demands := Util.StringSet.add fname !current_static_helper_demands;
         if is_extern && raw_fname <> "__sail_fixed_assert" && fname <> "reg_deref" then
           emitted_external_functions := Util.StringSet.add fname !emitted_external_functions;
-        if raw_fname = "__sail_fixed_assert" then (
+        if raw_fname = "__sail_byte_pointer_diff" then (
+          match args with
+          | [left; right]
+            when is_c_repr_byte_pointer (cval_ctyp left)
+                 && ctyp_equal (cval_ctyp left) (cval_ctyp right) ->
+              ksprintf string "  %s = (%s)(%s - %s);" (sgen_clexp_pure l x) (sgen_ctyp ctyp)
+                (sgen_cval left) (sgen_cval right)
+          | _ -> c_error ~loc:l "byte-pointer difference marker with incompatible operands"
+        )
+        else if raw_fname = "__sail_fixed_assert" then (
           match args with
           | [condition] ->
               ksprintf string "  if (!(%s)) __builtin_trap();\n  %s = UNIT;" (sgen_cval condition)
@@ -4278,6 +4425,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | I_undefined ctyp ->
         let rec codegen_exn_return ctyp =
           match ctyp with
+          | ctyp when is_c_repr_byte_pointer ctyp -> ("NULL", [])
           | ctyp when is_c_repr_u320 ctyp -> ("u320_zero()", [])
           | ctyp when is_c_repr_u256 ctyp -> ("u256_zero()", [])
           | ctyp when is_c_repr_fixed_bytes ctyp -> (sprintf "%s_zero()" (sgen_ctyp_name ctyp), [])
@@ -7230,6 +7378,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     | CTG_fixed_vector of int * ctyp
 
   let rec ctyp_dependencies = function
+    | ctyp when is_c_repr_byte_pointer ctyp -> []
     | CT_fint _ | CT_fuint _ -> [CTG_native_int_conversion_failure]
     | ctyp when is_c_repr_u128 ctyp -> [CTG_native_int_conversion_failure; CTG_u128]
     | ctyp when is_c_repr_u256 ctyp -> [CTG_native_int_conversion_failure; CTG_u256]
@@ -7344,6 +7493,9 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       let c_repr_signed = Config.c_repr_signed
       let c_repr_u256 = Config.c_repr_u256
       let c_repr_fixed_bytes = Config.c_repr_fixed_bytes
+      let byte_pointer_fields = Config.byte_pointer_fields
+      let byte_pointer_types = Config.byte_pointer_types
+      let byte_pointer_signatures = Config.byte_pointer_signatures
       let specialize_c = Config.specialize_c
       let require_bounded_int = Config.require_bounded_int
       let optimized_model = Config.optimized_model
@@ -7676,6 +7828,31 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             | Some _ -> ()
           )
           Config.external_types
+        ;
+        List.iter
+          (fun (record_id, field_id, adapter) ->
+            match Bindings.find_opt record_id type_definitions with
+            | Some (CTD_struct (_, _, fields)) -> (
+                match List.find_opt (fun (candidate, _) -> Id.compare field_id candidate = 0) fields with
+                | Some (_, field_ctyp) when ctyp_equal field_ctyp (c_repr_byte_pointer_ctyp adapter) -> ()
+                | Some _ ->
+                    c_error
+                      (Printf.sprintf "optimized byte-pointer field %s.%s is not represented as a byte pointer"
+                         (string_of_id record_id) (string_of_id field_id)
+                      )
+                | None ->
+                    c_error
+                      (Printf.sprintf "optimized byte-pointer field %s.%s does not exist (available fields: %s)"
+                         (string_of_id record_id) (string_of_id field_id)
+                         (String.concat ", " (List.map (fun (id, _) -> string_of_id id) fields))
+                      )
+              )
+            | Some _ ->
+                c_error
+                  (Printf.sprintf "optimized byte-pointer owner %s is not a record" (string_of_id record_id))
+            | None -> ()
+          )
+          Config.byte_pointer_fields
       );
       let has_sail_int = cdefs_contain ctx (function CT_lint -> true | _ -> false) cdefs in
       let has_lbits = cdefs_contain ctx (function CT_lbits -> true | _ -> false) cdefs in

@@ -133,6 +133,28 @@ sail -c --c-optimized-model \
     Compile the generated sources with the same root on the C include path,
     for example `-I ffi/optimized/include`.
 
+* `--c-optimized-byte-pointer-field TYPE.FIELD=ADAPTER` represents an integer
+    field of a generated or externally owned record as `uint8_t *` in
+    optimized C. The
+    source Sail field remains an integer, so other backends and proof
+    extraction retain its semantic representation. Generated construction
+    converts an integer offset with `ADAPTER((uint64_t) offset)`; field
+    equality, ordering, addition, and subtraction operate directly on the C
+    pointer representation. This repeatable option requires
+    `--c-optimized-model`. When `TYPE` is also supplied by
+    `--c-optimized-external-type TYPE=HEADER`, that header must declare
+    `FIELD` as `uint8_t *`. In either case the optimized include surface must
+    declare the adapter function.
+
+* `--c-optimized-byte-pointer-type TYPE=ADAPTER` gives every occurrence of a
+    nominal integer `TYPE` the `uint8_t *` representation in optimized C. Use
+    this for abstract handles whose optimized backend representation is a
+    borrowed byte pointer, including direct extern arguments and results. The
+    Sail type and all non-C backends retain the integer semantics. Integer
+    values crossing into the pointer representation are converted with
+    `ADAPTER((uint64_t) value)`, while zero is emitted as `NULL`. This
+    repeatable option requires `--c-optimized-model`.
+
 The structured `$target_name` directive can override a source identifier's
 generated spelling for one backend. The C backend currently supports it with
 `backend = "c"`; directives for other backends are ignored. For example:

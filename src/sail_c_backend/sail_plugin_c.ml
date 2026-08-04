@@ -74,14 +74,91 @@ let opt_optimized_model = ref false
 let opt_c_optimized_source_root = ref None
 let opt_c_optimized_include_dir = ref None
 let opt_c_external_types : string Bindings.t ref = ref Bindings.empty
+let opt_c_byte_pointer_fields : (Ast.id * Ast.id * string) list ref = ref []
+let opt_c_byte_pointer_types : string Bindings.t ref = ref Bindings.empty
 let opt_c_package = ref "model"
 let opt_c_output_dir = ref None
 let opt_cpp_class_name = ref "Model"
 let opt_cpp_namespace = ref "model"
 let opt_cpp_derive_from = ref None
 let input_project = ref None
+let direct_byte_pointer_adapter = "__direct"
+let input_c_repr_byte_pointer_types = ref IdSet.empty
+let input_byte_pointer_signatures : (string option list * string option) Bindings.t ref = ref Bindings.empty
 
-let remember_input_project _ _ env = input_project := Type_check.Env.get_modules env
+let reset_input_byte_pointer_signatures () =
+  input_c_repr_byte_pointer_types := IdSet.empty;
+  input_byte_pointer_signatures := Bindings.empty
+
+let remember_input_byte_pointer_signatures ast =
+  let open Ast in
+  let open Ast_defs in
+  let open Ast_util in
+  input_c_repr_byte_pointer_types :=
+    List.fold_left
+      (fun types (DEF_aux (def, def_annot)) ->
+        match get_def_attribute "c_repr" def_annot with
+        | Some (_, Some data) -> (
+            match attribute_data_string_with_loc data with
+            | Some ("byte_pointer", _) -> (
+                match def with
+                | DEF_type (TD_aux (TD_variant (id, _, _, _), _))
+                | DEF_type (TD_aux (TD_abbrev (id, _, _), _)) ->
+                    IdSet.add id types
+                | _ -> types
+              )
+            | Some _ | None -> types
+          )
+        | Some (_, None) | None -> types
+      )
+      IdSet.empty ast.defs;
+  let byte_pointer_adapter (Typ_aux (typ_aux, _)) =
+    match typ_aux with
+    | Typ_id id -> (
+        match Bindings.find_opt id !opt_c_byte_pointer_types with
+        | Some _ as adapter -> adapter
+        | None when IdSet.mem id !input_c_repr_byte_pointer_types -> Some direct_byte_pointer_adapter
+        | None -> None
+      )
+    | _ -> None
+  in
+  input_byte_pointer_signatures :=
+    List.fold_left
+      (fun signatures -> function
+        | DEF_aux
+            ( DEF_val
+                (VS_aux
+                  ( VS_val_spec
+                      (TypSchm_aux (TypSchm_ts (_, Typ_aux (Typ_fn (arguments, result), _)), _), id, extern),
+                    _
+                  )
+                ),
+              _ ) ->
+            let arguments = List.map byte_pointer_adapter arguments in
+            let result = byte_pointer_adapter result in
+            if List.exists Option.is_some arguments || Option.is_some result then (
+              let signature = (arguments, result) in
+              let signatures = Bindings.add id signature signatures in
+              match Ast_util.extern_assoc "c" extern with
+              | Some external_name -> Bindings.add (mk_id external_name) signature signatures
+              | None -> signatures
+            )
+            else signatures
+        | DEF_aux (DEF_let (P_aux (P_typ (typ, pat), _), _), _) -> (
+            match (byte_pointer_adapter typ, IdSet.elements (Ast_util.pat_ids pat)) with
+            | Some adapter, [id] -> Bindings.add id ([], Some adapter) signatures
+            | Some _, _ | None, _ -> signatures
+          )
+        | _ -> signatures
+      )
+      !input_byte_pointer_signatures ast.defs
+
+let remember_input_project ast _ env =
+  input_project := Type_check.Env.get_modules env;
+  (* Splices are applied after the initial-check hook.  Rescan the typed AST so
+     optimized-only declarations introduced by a splice retain configured
+     byte-pointer argument and result representations. *)
+  remember_input_byte_pointer_signatures ast
 
 let c_options =
   [
@@ -182,6 +259,77 @@ let c_options =
                 else opt_c_external_types := Bindings.add id header !opt_c_external_types
         ),
       "reuse TYPE from HEADER instead of emitting its C declaration in an optimized-model build"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"TYPE.FIELD=ADAPTER" "optimized_byte_pointer_field",
+      Arg.String
+        (fun mapping ->
+          match String.index_opt mapping '=' with
+          | None -> raise (Arg.Bad "--c-optimized-byte-pointer-field expects TYPE.FIELD=ADAPTER")
+          | Some separator ->
+              let field_name = String.sub mapping 0 separator |> String.trim in
+              let adapter =
+                String.sub mapping (separator + 1) (String.length mapping - separator - 1) |> String.trim
+              in
+              (match String.rindex_opt field_name '.' with
+              | None -> raise (Arg.Bad "--c-optimized-byte-pointer-field expects TYPE.FIELD=ADAPTER")
+              | Some field_separator ->
+                  let type_name = String.sub field_name 0 field_separator |> String.trim in
+                  let field =
+                    String.sub field_name (field_separator + 1) (String.length field_name - field_separator - 1)
+                    |> String.trim
+                  in
+                  let valid_c_identifier name =
+                    let valid_start = function 'A' .. 'Z' | 'a' .. 'z' | '_' -> true | _ -> false in
+                    let valid_rest = function 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> true | _ -> false in
+                    String.length name > 0 && valid_start name.[0]
+                    && String.for_all valid_rest name
+                  in
+                  if type_name = "" || field = "" || not (valid_c_identifier adapter) then
+                    raise
+                      (Arg.Bad
+                         "--c-optimized-byte-pointer-field expects non-empty TYPE.FIELD and a C identifier ADAPTER"
+                      )
+                  else
+                    let record_id = mk_id type_name in
+                    let field_id = mk_id field in
+                    if
+                      List.exists
+                        (fun (configured_record, configured_field, _) ->
+                          Id.compare record_id configured_record = 0 && Id.compare field_id configured_field = 0
+                        )
+                        !opt_c_byte_pointer_fields
+                    then raise (Arg.Bad ("duplicate optimized byte-pointer field " ^ field_name))
+                    else opt_c_byte_pointer_fields := (record_id, field_id, adapter) :: !opt_c_byte_pointer_fields)
+        ),
+      "represent integer TYPE.FIELD as uint8_t * and convert semantic offsets with ADAPTER"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"TYPE=ADAPTER" "optimized_byte_pointer_type",
+      Arg.String
+        (fun mapping ->
+          match String.index_opt mapping '=' with
+          | None -> raise (Arg.Bad "--c-optimized-byte-pointer-type expects TYPE=ADAPTER")
+          | Some separator ->
+              let type_name = String.sub mapping 0 separator |> String.trim in
+              let adapter =
+                String.sub mapping (separator + 1) (String.length mapping - separator - 1) |> String.trim
+              in
+              let valid_c_identifier name =
+                let valid_start = function 'A' .. 'Z' | 'a' .. 'z' | '_' -> true | _ -> false in
+                let valid_rest = function 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> true | _ -> false in
+                String.length name > 0 && valid_start name.[0] && String.for_all valid_rest name
+              in
+              if type_name = "" || not (valid_c_identifier adapter) then
+                raise
+                  (Arg.Bad
+                     "--c-optimized-byte-pointer-type expects a non-empty TYPE and a C identifier ADAPTER"
+                  )
+              else
+                let id = mk_id type_name in
+                if Bindings.mem id !opt_c_byte_pointer_types then
+                  raise (Arg.Bad ("duplicate optimized byte-pointer type " ^ type_name))
+                else opt_c_byte_pointer_types := Bindings.add id adapter !opt_c_byte_pointer_types
+        ),
+      "represent integer TYPE as uint8_t * throughout optimized C and convert semantic offsets with ADAPTER"
     );
     ( Flag.create ~prefix:["c"] ~arg:"package" "package",
       Arg.Set_string opt_c_package,
@@ -294,6 +442,7 @@ let collect_c_name_info ast (mode : c_backend_mode) =
   let c_repr_unsigned = ref Bindings.empty in
   let c_repr_signed = ref Bindings.empty in
   let c_repr_u256 = ref IdSet.empty in
+  let c_repr_byte_pointer = ref IdSet.empty in
   let c_repr_fixed_bytes = ref Bindings.empty in
   let c_repr_error loc message = raise (Reporting.err_general loc ("C backend: $[c_repr] " ^ message)) in
   let native_integer_representations =
@@ -308,7 +457,10 @@ let collect_c_name_info ast (mode : c_backend_mode) =
       ("int64", (`Signed, 64));
     ]
   in
-  let supported_c_repr = List.map fst native_integer_representations @ ["u256"; "fixed_bytes"] in
+  let supported_c_repr =
+    List.map fst native_integer_representations
+    @ ["u256"; "byte_pointer"; "fixed_bytes"]
+  in
   let collect_c_repr def def_annot =
     match get_def_attribute "c_repr" def_annot with
     | None -> ()
@@ -345,6 +497,13 @@ let collect_c_name_info ast (mode : c_backend_mode) =
                   )
                 | _ -> false
               in
+              let is_integer_payload = function
+                | Typ_aux (Typ_id payload_id, _) ->
+                    let payload = string_of_id payload_id in
+                    payload = "int" || payload = "nat"
+                | Typ_aux (Typ_app (range_id, [_; _]), _) -> string_of_id range_id = "range"
+                | _ -> false
+              in
               let native_integer_representation = List.assoc_opt repr native_integer_representations in
               match (native_integer_representation, repr, payload) with
               | Some (`Unsigned, width), _, Typ_aux (Typ_id payload_id, _)
@@ -356,6 +515,8 @@ let collect_c_name_info ast (mode : c_backend_mode) =
               | None, "u256", payload
                 when is_bits 256 payload || is_unsigned_range 256 declared_payload || is_unsigned_range 256 payload ->
                   c_repr_u256 := IdSet.add id !c_repr_u256
+              | None, "byte_pointer", payload when is_integer_payload payload ->
+                  c_repr_byte_pointer := IdSet.add id !c_repr_byte_pointer
               | ( None,
                   "fixed_bytes",
                   Typ_aux (Typ_app (vector_id, [A_aux (A_nexp length, _); A_aux (A_typ elem_typ, _)]), _) )
@@ -374,6 +535,8 @@ let collect_c_name_info ast (mode : c_backend_mode) =
               | Some (`Signed, _), _, _ -> c_repr_error attr_loc (repr ^ " requires a mathematical int payload")
               | None, "u256", _ ->
                   c_repr_error attr_loc "u256 requires an exact bits(256) or range(0, 2^256 - 1) payload"
+              | None, "byte_pointer", _ ->
+                  c_repr_error attr_loc "byte_pointer requires a mathematical int, nat, or range payload"
               | None, "fixed_bytes", _ ->
                   c_repr_error attr_loc
                     (Printf.sprintf "fixed_bytes requires a statically sized vector of byte elements as its %s" kind)
@@ -413,9 +576,24 @@ let collect_c_name_info ast (mode : c_backend_mode) =
       | _ -> ()
     )
     ast.defs;
-  (!reserved, !overrides, !c_repr_unsigned, !c_repr_signed, !c_repr_u256, !c_repr_fixed_bytes)
+  ( !reserved,
+    !overrides,
+    !c_repr_unsigned,
+    !c_repr_signed,
+    !c_repr_u256,
+    !c_repr_byte_pointer,
+    !c_repr_fixed_bytes
+  )
 
 let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_sail_dir; _ } =
+  if
+    (not (Util.list_empty !opt_c_byte_pointer_fields) || not (Bindings.is_empty !opt_c_byte_pointer_types))
+    && not !opt_optimized_model
+  then
+    raise
+      (Reporting.err_general Parse_ast.Unknown
+         "optimized byte-pointer representations require --c-optimized-model"
+      );
   if not (Bindings.is_empty !opt_c_external_types) then (
     if not !opt_optimized_model then
       raise
@@ -478,8 +656,29 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
       (Reporting.err_general Parse_ast.Unknown
          "--c-optimized-source-root requires --c-optimized-model"
       );
-  let reserveds, overrides, c_repr_unsigned, c_repr_signed, c_repr_u256, c_repr_fixed_bytes =
+  let reserveds, overrides, c_repr_unsigned, c_repr_signed, c_repr_u256, c_repr_byte_pointer,
+      c_repr_fixed_bytes =
     collect_c_name_info ast mode
+  in
+  if not (IdSet.is_empty c_repr_byte_pointer) && not !opt_optimized_model then
+    raise
+      (Reporting.err_general Parse_ast.Unknown
+         "$[c_repr byte_pointer] requires --c-optimized-model"
+      );
+  let byte_pointer_types =
+    IdSet.fold
+      (fun id types ->
+        if Bindings.mem id types then
+          raise
+            (Reporting.err_general Parse_ast.Unknown
+               (Printf.sprintf
+                  "type %s has both $[c_repr byte_pointer] and --c-optimized-byte-pointer-type"
+                  (string_of_id id)
+               )
+            )
+        else Bindings.add id direct_byte_pointer_adapter types
+      )
+      c_repr_byte_pointer !opt_c_byte_pointer_types
   in
   let c_repr_unsigned = if !opt_specialize_c then c_repr_unsigned else Bindings.empty in
   let c_repr_signed = if !opt_specialize_c then c_repr_signed else Bindings.empty in
@@ -510,6 +709,9 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let specialization_obligations_coq = !opt_specialization_obligations_coq
     let optimized_model = !opt_optimized_model
     let external_types = !opt_c_external_types
+    let byte_pointer_fields = !opt_c_byte_pointer_fields
+    let byte_pointer_types = byte_pointer_types
+    let byte_pointer_signatures = !input_byte_pointer_signatures
     let package_name = !opt_c_package
 
     (* TODO: Convert `cpp` to use `c_backend_mode` instead of `bool`. *)
@@ -726,10 +928,14 @@ let _ =
   Pragma.register "c_reserved";
   Pragma.register "c_override";
   ignore
-    (Target.register ~name:"c" ~options:c_options ~pre_rewrites_hook:remember_input_project ~rewrites:(c_cpp_rewrites C) ~supports_abstract_types:true
+    (Target.register ~name:"c" ~options:c_options ~pre_parse_hook:reset_input_byte_pointer_signatures
+       ~post_initial_check_hook:remember_input_byte_pointer_signatures ~pre_rewrites_hook:remember_input_project
+       ~rewrites:(c_cpp_rewrites C) ~supports_abstract_types:true
        ~supports_runtime_config:true (c_target C)
     );
   ignore
-    (Target.register ~name:"cpp" ~options:cpp_options ~pre_rewrites_hook:remember_input_project ~rewrites:(c_cpp_rewrites Cpp) ~supports_abstract_types:true
+    (Target.register ~name:"cpp" ~options:cpp_options ~pre_parse_hook:reset_input_byte_pointer_signatures
+       ~post_initial_check_hook:remember_input_byte_pointer_signatures ~pre_rewrites_hook:remember_input_project
+       ~rewrites:(c_cpp_rewrites Cpp) ~supports_abstract_types:true
        ~supports_runtime_config:true (c_target Cpp)
     )

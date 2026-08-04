@@ -141,6 +141,21 @@ module type CODEGEN_CONFIG = sig
       header in an optimized-model build. *)
   val external_types : string Ast_compare.Bindings.t
 
+  (** Record fields represented by byte pointers in optimized C, together
+      with the C adapter that maps the semantic integer offset to its backing
+      region. The record may be generated or supplied as an external type. *)
+  val byte_pointer_fields : (Ast.id * Ast.id * string) list
+
+  (** Nominal integer types represented by byte pointers throughout optimized
+      C. Each value is either the adapter that maps semantic offsets to their
+      backing region, or the internal direct-pointer marker selected by
+      [$[c_repr byte_pointer]]. *)
+  val byte_pointer_types : string Ast_compare.Bindings.t
+
+  (** Source function arguments and results that use configured nominal
+      byte-pointer types, captured before rewriting expands type aliases. *)
+  val byte_pointer_signatures : (string option list * string option) Ast_compare.Bindings.t
+
   (** Package prefix for strict optimized-model entry points. *)
   val package_name : string
 

@@ -374,6 +374,10 @@ module Verilog_config (C : JIB_CONFIG) : Jib_compile.CONFIG = struct
 
   let ctyp_suprema = Jib_util.ctyp_suprema
   let specialize_newtype_payload _ ctyp = ctyp
+  let specialize_struct_field _ _ ctyp = ctyp
+  let specialize_declared_function_argument _ _ ctyp = ctyp
+  let specialize_declared_function_result _ ctyp = ctyp
+  let propagate_anf_temporary_representation ~semantic:_ ~represented:_ = false
   let representation_refines ~semantic:_ ~represented:_ = false
   let specialize_function_argument_representation ~semantic:_ ~represented:_ = false
   let specialize_function_result_representation ~semantic:_ ~represented:_ = false

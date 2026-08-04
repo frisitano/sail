@@ -44,6 +44,8 @@
 (*  SPDX-License-Identifier: BSD-2-Clause                                   *)
 (****************************************************************************)
 
+open Ast
+open Ast_util
 open Ast_defs
 open Type_check
 open Interactive.State
@@ -55,6 +57,7 @@ type target = {
   options : (Flag.t * Arg.spec * string) list;
   pre_parse_hook : unit -> unit;
   pre_initial_check_hook : string list -> unit;
+  post_initial_check_hook : untyped_ast -> unit;
   pre_rewrites_hook : typed_ast -> Effects.side_effect_info -> Env.t -> unit;
   skip_initial_rewrite : bool;
   rewrites : (string * Rewrites.rewriter_arg list) list;
@@ -71,6 +74,8 @@ let run_pre_parse_hook tgt = tgt.pre_parse_hook
 let run_pre_rewrites_hook tgt = tgt.pre_rewrites_hook
 
 let run_pre_initial_check_hook tgt = tgt.pre_initial_check_hook
+
+let run_post_initial_check_hook tgt = tgt.post_initial_check_hook
 
 let action tgt = tgt.action
 
@@ -90,7 +95,8 @@ let targets = ref StringMap.empty
 let the_target = ref None
 
 let register ~name ?flag ?description:desc ?(options = []) ?(pre_parse_hook = fun () -> ())
-    ?(pre_initial_check_hook = fun _ -> ()) ?(pre_rewrites_hook = fun _ _ _ -> ()) ?(skip_initial_rewrite = false)
+    ?(pre_initial_check_hook = fun _ -> ()) ?(post_initial_check_hook = fun _ -> ())
+    ?(pre_rewrites_hook = fun _ _ _ -> ()) ?(skip_initial_rewrite = false)
     ?(rewrites = []) ?(asserts_termination = false) ?(supports_abstract_types = false)
     ?(supports_runtime_config = false) action =
   let set_target () =
@@ -108,6 +114,7 @@ let register ~name ?flag ?description:desc ?(options = []) ?(pre_parse_hook = fu
       options = (Flag.create ~prefix:[flag] "", Arg.Unit set_target, desc) :: options;
       pre_parse_hook;
       pre_initial_check_hook;
+      post_initial_check_hook;
       pre_rewrites_hook;
       skip_initial_rewrite;
       rewrites;

@@ -50,6 +50,8 @@
     various frontend behaviours. A target therefore specifies what kind of output Sail will produce. For example, we
     provide default plugins that define targets to output Lem, C, OCaml, Coq, and so on. *)
 
+open Ast
+open Ast_util
 open Ast_defs
 open Type_check
 
@@ -62,6 +64,8 @@ val name : target -> string
 val run_pre_parse_hook : target -> unit -> unit
 
 val run_pre_initial_check_hook : target -> string list -> unit
+
+val run_post_initial_check_hook : target -> untyped_ast -> unit
 
 val run_pre_rewrites_hook : target -> typed_ast -> Effects.side_effect_info -> Env.t -> unit
 
@@ -95,6 +99,7 @@ val skip_initial_rewrite : target -> bool
     @param ?options Additional options for the Sail executable
     @param ?pre_parse_hook A function to call right at the start, before parsing
     @param ?pre_initial_check_hook A function to call after parsing, but before de-sugaring
+    @param ?post_initial_check_hook A function to call after de-sugaring, but before type checking
     @param ?pre_rewrites_hook A function to call before doing any rewrites
     @param ?skip_initial_rewrite Skips the initial rewriting pass
     @param ?rewrites A sequence of Sail to Sail rewrite passes for the target
@@ -111,6 +116,7 @@ val register :
   ?options:(Flag.t * Arg.spec * string) list ->
   ?pre_parse_hook:(unit -> unit) ->
   ?pre_initial_check_hook:(string list -> unit) ->
+  ?post_initial_check_hook:(untyped_ast -> unit) ->
   ?pre_rewrites_hook:(typed_ast -> Effects.side_effect_info -> Env.t -> unit) ->
   ?skip_initial_rewrite:bool ->
   ?rewrites:(string * Rewrites.rewriter_arg list) list ->

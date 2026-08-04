@@ -349,6 +349,10 @@ module type CONFIG = sig
   val convert_typ : ctx -> typ -> ctyp
   val ctyp_suprema : ctyp -> ctyp
   val specialize_newtype_payload : id -> ctyp -> ctyp
+  val specialize_struct_field : id -> id -> ctyp -> ctyp
+  val specialize_declared_function_argument : id -> int -> ctyp -> ctyp
+  val specialize_declared_function_result : id -> ctyp -> ctyp
+  val propagate_anf_temporary_representation : semantic:ctyp -> represented:ctyp -> bool
   val representation_refines : semantic:ctyp -> represented:ctyp -> bool
   val specialize_function_argument_representation : semantic:ctyp -> represented:ctyp -> bool
 
@@ -1739,24 +1743,67 @@ module Make (C : CONFIG) = struct
     match aexp_aux with
     | AE_let (mut, id, binding_typ, binding, (AE_aux (_, { env = body_env; _ }) as body), body_typ) ->
         let semantic_binding_ctyp = ctyp_of_typ { ctx with local_env = body_env } binding_typ in
+        let represented_aval local_representations ctx = function
+          | AV_id (id, _) | AV_cval (V_id (id, _), _) as aval -> (
+              match NameMap.find_opt id local_representations with
+              | Some represented -> represented
+              | None -> represented_aval_ctyp ctx aval
+            )
+          | aval -> represented_aval_ctyp ctx aval
+        in
+        let rec represented_expression local_representations semantic = function
+          | AE_aux (AE_typ (body, _), _) -> represented_expression local_representations semantic body
+          | AE_aux (AE_let (_, id, binding_typ, binding, body, _), { env; _ }) ->
+              let binding_semantic = ctyp_of_typ { ctx with local_env = env } binding_typ in
+              let binding_represented = represented_expression local_representations binding_semantic binding in
+              let local_representations =
+                if C.representation_refines ~semantic:binding_semantic ~represented:binding_represented then
+                  NameMap.add id binding_represented local_representations
+                else local_representations
+              in
+              represented_expression local_representations semantic body
+          | AE_aux (AE_block (_, body, _), _) -> represented_expression local_representations semantic body
+          | AE_aux (AE_val aval, _) ->
+              let represented = represented_aval local_representations ctx aval in
+              if C.representation_refines ~semantic ~represented then represented else semantic
+          | AE_aux (AE_app (call, args, _), _) -> (
+              match external_call_id ctx call with
+              | Some id ->
+                  C.specialize_call_result id (List.map (represented_aval local_representations ctx) args) semantic
+              | None -> semantic
+            )
+          | AE_aux (AE_field (record, field, _), { env; loc; _ }) -> (
+              let field_ctx = { ctx with local_env = env } in
+              match represented_aval local_representations field_ctx record with
+              | CT_struct _ as record_ctyp ->
+                  let _, field_ctyp = struct_fields loc field_ctx record_ctyp in
+                  let represented = field_ctyp field in
+                  if C.representation_refines ~semantic ~represented then represented else semantic
+              | _ -> semantic
+            )
+          | _ -> semantic
+        in
+        let represented_binding () = represented_expression NameMap.empty semantic_binding_ctyp binding in
         let binding_ctyp =
           match mut with
-          | Mutable -> semantic_binding_ctyp
+          | Mutable -> (
+              (* ANF introduces mutable temporaries for nested primitive calls
+                 even when the source expression is pure.  Preserve the same
+                 proved representation choices here as for immutable lets;
+                 otherwise a field-derived byte pointer is immediately
+                 converted back to its semantic integer coordinate before it
+                 reaches the enclosing function call. *)
+              let represented = represented_binding () in
+              if
+                C.propagate_anf_temporary_representation
+                  ~semantic:semantic_binding_ctyp ~represented
+              then represented
+              else semantic_binding_ctyp
+            )
           | Immutable -> (
               match demanded_newtype_representation body_env id semantic_binding_ctyp body with
               | Some represented -> represented
-              | None -> (
-                  match (semantic_binding_ctyp, binding) with
-                  | semantic, AE_aux (AE_val aval, _) ->
-                      let represented = represented_aval_ctyp ctx aval in
-                      if C.representation_refines ~semantic ~represented then represented else semantic
-                  | semantic, AE_aux (AE_app (call, args, _), _) -> (
-                      match external_call_id ctx call with
-                      | Some id -> C.specialize_call_result id (List.map (represented_aval_ctyp ctx) args) semantic
-                      | None -> semantic
-                    )
-                  | _ -> semantic_binding_ctyp
-                )
+              | None -> represented_binding ()
             )
         in
         let setup, call, cleanup = compile_aexp ctx binding in
@@ -2375,7 +2422,10 @@ module Make (C : CONFIG) = struct
         let record_ctx = { ctx with local_env = Env.add_typquant l typq ctx.local_env } in
         let ctors =
           List.fold_left
-            (fun ctors ((id, typ), _) -> Bindings.add id (fast_int (ctyp_of_typ record_ctx typ)) ctors)
+            (fun ctors ((field_id, typ), _) ->
+              let ctyp = fast_int (ctyp_of_typ record_ctx typ) in
+              Bindings.add field_id (C.specialize_struct_field id field_id ctyp) ctors
+            )
             Bindings.empty ctors
         in
         let params = quant_kopts typq |> List.filter is_typ_kopt |> List.map kopt_kid in
@@ -2682,8 +2732,14 @@ module Make (C : CONFIG) = struct
 
     let ctx = { ctx with local_env = Env.add_typquant (id_loc id) quant ctx.tc_env } in
 
-    let arg_ctyps = List.mapi (fun n typ -> (name (mk_id ("a" ^ string_of_int n)), ctyp_of_typ ctx typ)) arg_typs in
-    let ret_ctyp = ctyp_of_typ ctx ret_typ in
+    let arg_ctyps =
+      List.mapi
+        (fun n typ ->
+          (name (mk_id ("a" ^ string_of_int n)), C.specialize_declared_function_argument id n (ctyp_of_typ ctx typ))
+        )
+        arg_typs
+    in
+    let ret_ctyp = C.specialize_declared_function_result id (ctyp_of_typ ctx ret_typ) in
 
     let num_args = List.length arg_ctyps in
 
@@ -2793,8 +2849,10 @@ module Make (C : CONFIG) = struct
     let ctx = { ctx with local_env = Env.add_typquant (id_loc id) quant ctx.local_env } in
     let ctx = update_coverage_override_def def_annot ctx in
 
-    let arg_ctyps = List.map (ctyp_of_typ ctx) arg_typs in
-    let ret_ctyp = ctyp_of_typ ctx ret_typ in
+    let arg_ctyps =
+      List.mapi (fun index typ -> C.specialize_declared_function_argument id index (ctyp_of_typ ctx typ)) arg_typs
+    in
+    let ret_ctyp = C.specialize_declared_function_result id (ctyp_of_typ ctx ret_typ) in
 
     (* Now we have enough information to compute the return context for this compilation step. *)
     let return_ctx =
@@ -2947,7 +3005,12 @@ module Make (C : CONFIG) = struct
         in
         let generic_signature = generic_signature quant arg_typs ret_typ in
         let ctx' = { ctx with local_env = Env.add_typquant (id_loc id) quant ctx.local_env } in
-        let arg_ctyps, ret_ctyp = (List.map (ctyp_of_typ ctx') arg_typs, ctyp_of_typ ctx' ret_typ) in
+        let arg_ctyps =
+          List.mapi
+            (fun index typ -> C.specialize_declared_function_argument id index (ctyp_of_typ ctx' typ))
+            arg_typs
+        in
+        let ret_ctyp = C.specialize_declared_function_result id (ctyp_of_typ ctx' ret_typ) in
         ( Compiled [CDEF_aux (CDEF_val (id, params, arg_ctyps, ret_ctyp, extern), def_annot)],
           {
             ctx with
@@ -2974,10 +3037,16 @@ module Make (C : CONFIG) = struct
         (Compiled (List.map (fun tdef -> CDEF_aux (CDEF_type tdef, def_annot)) (Option.to_list tdef_opt)), ctx)
     | DEF_let (pat, exp) ->
         let debug_attr = get_def_attribute "jib_debug" def_annot in
-        let ctyp = ctyp_of_typ ctx (typ_of_pat pat) in
+        let apat = anf_pat ~global:true pat in
+        let globals = apat_globals apat in
+        let ctyp =
+          let semantic = ctyp_of_typ ctx (typ_of_pat pat) in
+          match globals with
+          | [(id, _, _)] -> C.specialize_declared_function_result id semantic
+          | _ -> semantic
+        in
         let aexp = C.optimize_anf ctx (no_shadow (letbind_ids ctx) (anf exp)) in
         let setup, call, cleanup = compile_aexp ctx aexp in
-        let apat = anf_pat ~global:true pat in
         let gs = ngensym ~source_name:"let_value" ~source_type:(string_of_typ (typ_of_pat pat)) () in
         let end_label = label "let_end_" in
         let pre_destructure, destructure, destructure_cleanup, _ =
@@ -2985,7 +3054,12 @@ module Make (C : CONFIG) = struct
         in
         let gs_setup, gs_cleanup = ([idecl (exp_loc exp) ctyp gs], [iclear ctyp gs]) in
         let bindings =
-          List.map (fun (id, env, typ) -> (id, ctyp_of_typ { ctx with local_env = env } typ)) (apat_globals apat)
+          List.map
+            (fun (id, env, typ) ->
+              let semantic = ctyp_of_typ { ctx with local_env = env } typ in
+              (id, C.specialize_declared_function_result id semantic)
+            )
+            globals
         in
         let n = !letdef_count in
         incr letdef_count;
@@ -7079,6 +7153,19 @@ module Make (C : CONFIG) = struct
       | CDEF_aux (CDEF_let (index, bindings, body), def_annot) ->
           let owner = match bindings with (id, _) :: _ -> id | [] -> mk_id "top_level_let" in
           let lifetime_ranges, lifetime_writes = infer_integer_lifetimes ctx owner [] [] [] body in
+          let declared_replacements =
+            List.fold_left
+              (fun replacements (id, represented) ->
+                let name = name id in
+                match NameMap.find_opt name lifetime_writes with
+                | Some semantic
+                  when not (ctyp_equal semantic represented)
+                       && C.representation_refines ~semantic ~represented ->
+                    NameMap.add name represented replacements
+                | Some _ | None -> replacements
+              )
+              NameMap.empty bindings
+          in
           let replacements =
             NameMap.fold
               (fun name semantic replacements ->
@@ -7100,7 +7187,7 @@ module Make (C : CONFIG) = struct
                   )
                 | _ -> replacements
               )
-              lifetime_writes NameMap.empty
+              lifetime_writes declared_replacements
           in
           top_level_representations :=
             NameMap.fold

@@ -152,6 +152,7 @@ let instantiate_abstract_types tgt config insts ast =
   )
 
 type parse_continuation = {
+  ast : untyped_ast;
   check : Type_check.Env.t -> Type_check.typed_ast * Type_check.Env.t;
   vs_ids : IdSet.t;
   regs : (Ast.id * Ast.typ) list;
@@ -207,6 +208,8 @@ module type FILE_HANDLER = sig
 
   val uninitialized_registers : processed -> (Ast.id * Ast.typ) list
 
+  val untyped_ast : processed -> untyped_ast
+
   val process :
     default_sail_dir:string ->
     target_name:string option ->
@@ -230,6 +233,8 @@ module SailHandler : FILE_HANDLER = struct
   let defines_functions ast = val_spec_ids ast.defs
 
   let uninitialized_registers ast = Initial_check.get_uninitialized_registers ast.defs
+
+  let untyped_ast ast = ast
 
   let process ~default_sail_dir ~target_name ~options ctx (filename, comments, defs) =
     let defs = Preprocess.preprocess default_sail_dir target_name options defs in
@@ -263,6 +268,7 @@ let parse_file ?loc ~target_name ~default_sail_dir ~options filename =
   let cont ctx =
     let processed, ctx = Handler.process ~target_name ~default_sail_dir ~options ctx parsed in
     {
+      ast = Handler.untyped_ast processed;
       check = (fun env -> Handler.check env processed);
       vs_ids = Handler.defines_functions processed;
       regs = Handler.uninitialized_registers processed;
@@ -271,15 +277,17 @@ let parse_file ?loc ~target_name ~default_sail_dir ~options filename =
   in
   File { filename; cont }
 
-let process_files ~target_name ~default_sail_dir ~options ctx vs_ids regs files =
+let process_files ~target ~target_name ~default_sail_dir ~options ctx vs_ids regs files =
   Util.fold_left_map
     (fun (ctx, vs_ids, regs) -> function
       | File { filename; cont } ->
           let cont = cont ctx in
+          Option.iter (fun target -> Target.run_post_initial_check_hook target cont.ast) target;
           ((cont.ctx, IdSet.union vs_ids cont.vs_ids, regs @ cont.regs), ProcessedFile { filename; cont = cont.check })
       | Generated defs ->
           let defs = Preprocess.preprocess default_sail_dir target_name options defs in
           let ast, ctx = Initial_check.process_ast ctx (Parse_ast.Defs [(None, defs)]) in
+          Option.iter (fun target -> Target.run_post_initial_check_hook target ast) target;
           ((ctx, vs_ids, regs), ProcessedGenerated ast.defs)
       )
     (ctx, vs_ids, regs) files
@@ -347,7 +355,7 @@ let load_modules ?target default_sail_dir options env proj root_mod_ids =
     Util.fold_left_map
       (fun (ctx, vs_ids, regs) parsed_module ->
         let (ctx, vs_ids, regs), processed =
-          process_files ~target_name ~default_sail_dir ~options ctx vs_ids regs parsed_module.files
+          process_files ~target ~target_name ~default_sail_dir ~options ctx vs_ids regs parsed_module.files
         in
         (* If the module isn't being included we don't want to generate things for it's registers *)
         ((ctx, vs_ids, if is_included parsed_module.id then regs else []), processed)
@@ -383,7 +391,7 @@ let load_files ?target default_sail_dir options env files =
     target;
 
   let (ctx, vs_ids, regs), processed =
-    process_files ~target_name ~default_sail_dir ~options Initial_check.initial_ctx IdSet.empty [] parsed_files
+    process_files ~target ~target_name ~default_sail_dir ~options Initial_check.initial_ctx IdSet.empty [] parsed_files
   in
   let processed =
     [ProcessedGenerated (Initial_check.generate_undefineds vs_ids)]

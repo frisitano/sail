@@ -9,7 +9,14 @@ TMP_ROOT=${AGENT_TMPDIR:-"$TEST_DIR/../../../.agent-tmp"}
 
 mkdir -p "$TMP_ROOT"
 TMP_DIR=$(mktemp -d "$TMP_ROOT/c_optimized_model_modules.XXXXXX")
-trap 'rm -rf "$TMP_DIR"' EXIT
+cleanup() {
+  if [ "${KEEP_TEST_TMP:-0}" = 1 ]; then
+    printf 'preserved test output: %s\n' "$TMP_DIR" >&2
+  else
+    rm -rf "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT
 
 if [ -n "${SAIL_PLUGIN:-}" ]; then
   set -- -plugin "$SAIL_PLUGIN"
@@ -27,9 +34,22 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-optimized-model --c-package evmsail --c-output-dir "$TMP_DIR/ffi/optimized" \
   --c-optimized-include-dir "$TMP_DIR/ffi/optimized/include" \
   --c-optimized-external-type pair=evmsail/host/types.h \
-  --c-preserve-type pair --c-preserve-type four_bytes --c-preserve-type fixed_ids \
+  --c-optimized-external-type byte_slice=evmsail/host/types.h \
+  --c-optimized-external-type byte_slice_small=evmsail/host/types.h \
+  --c-optimized-byte-pointer-field byte_slice.bytes=test_bytes_at \
+  --c-optimized-byte-pointer-field byte_slice_small.bytes=test_bytes_at \
+  --c-optimized-byte-pointer-field analyzed_code.bytes=test_bytes_at \
+  --c-optimized-byte-pointer-type jump_table_index=test_jumpdests_at \
+  --c-preserve-type pair --c-preserve-type byte_slice --c-preserve-type byte_slice_small \
+  --c-preserve-type analyzed_code \
+  --c-preserve-type four_bytes --c-preserve-type fixed_ids \
   --c-preserve-type fixed_ids_box \
   --c-preserve pair_sum \
+  --c-preserve byte_slice_at --c-preserve byte_slice_small_at --c-preserve byte_slice_same_start \
+  --c-preserve byte_slice_next --c-preserve byte_slice_advance --c-preserve byte_slice_distance \
+  --c-preserve jumpdest_from_offset --c-preserve empty_jumpdest --c-preserve empty_direct_jumpdest \
+  --c-preserve allocated_jumpdest \
+  --c-preserve analyzed_code_at --c-preserve analyzed_code_copy \
   --c-preserve run --c-preserve step --c-preserve pick_fixed_id --c-preserve pick_initialized_id \
   --c-preserve pick_guarded_id \
   --c-preserve machine_pick_zero \
@@ -52,8 +72,38 @@ grep -Fq '#include "evmsail/spec/base.h"' "$SPEC_INCLUDE/evmsail/spec.h"
 grep -Fq '#include "evmsail/host/types.h"' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint8_t' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint16_t pair_sum(struct pair);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'struct byte_slice byte_slice_at(uint8_t, uint8_t);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'test_bytes_at((uint64_t)(off))' "$SPEC_SOURCE/base.c"
+grep -Fq 'struct analyzed_code {' "$SPEC_INCLUDE/evmsail/spec/base.h"
+test "$(grep -Fc 'uint8_t *' "$SPEC_INCLUDE/evmsail/spec/base.h")" -ge 2
+grep -Fq 'test_jumpdests_at((uint64_t)(off))' "$SPEC_SOURCE/base.c"
+grep -Eq 'uint8_t \* *jumpdest_from_offset\(uint8_t\);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Eq 'extern uint8_t \* *EMPTY_DIRECT_JUMP_TABLE;' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Eq 'uint8_t \* *empty_direct_jumpdest\(unit\);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Eq '= NULL;' "$SPEC_SOURCE/base.c"
+grep -Eq 'EMPTY_DIRECT_JUMP_TABLE = z[[:alnum:]]+;' "$SPEC_SOURCE/base.c"
+if grep -Eq '__direct\)|__direct\(' "$SPEC_SOURCE/base.c"; then
+  echo 'adapter-free byte pointer emitted a synthetic offset adapter call' >&2
+  exit 1
+fi
+grep -Eq 'uint8_t \* *allocated_jumpdest\(uint8_t\);' "$SPEC_INCLUDE/evmsail/spec/host_contracts.h"
+grep -Fq 'test_jumpdest_alloc(off)' "$SPEC_SOURCE/host_contracts.c"
+grep -Fq '= (off +' "$SPEC_SOURCE/base.c"
+grep -Eq 'z[[:alnum:]]+ - z[[:alnum:]]+\)' "$SPEC_SOURCE/base.c"
+if grep -Fq 'CONVERT_OF(mach_uint, byte_pointer_test_bytes_at)' "$SPEC_SOURCE/base.c"; then
+  echo 'optimized extraction converted a byte pointer back to its semantic integer offset' >&2
+  exit 1
+fi
 if grep -REq 'struct pair[[:space:]]*\{' "$SPEC_INCLUDE/evmsail/spec"; then
   echo 'optimized extraction redefined an externally owned struct' >&2
+  exit 1
+fi
+if grep -REq 'struct byte_slice[[:space:]]*\{' "$SPEC_INCLUDE/evmsail/spec"; then
+  echo 'optimized extraction redefined the externally owned byte-pointer struct' >&2
+  exit 1
+fi
+if grep -REq 'struct byte_slice_small[[:space:]]*\{' "$SPEC_INCLUDE/evmsail/spec"; then
+  echo 'optimized extraction redefined the second externally owned byte-pointer struct' >&2
   exit 1
 fi
 grep -Fq 'uint8_t data[4]' "$SPEC_INCLUDE/evmsail/spec/base.h"
