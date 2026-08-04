@@ -444,6 +444,8 @@ let collect_c_name_info ast (mode : c_backend_mode) =
   let c_repr_u256 = ref IdSet.empty in
   let c_repr_byte_pointer = ref IdSet.empty in
   let c_repr_fixed_bytes = ref Bindings.empty in
+  let c_repr_fixed_bytes_u64_lanes = ref Bindings.empty in
+  let c_repr_fixed_bytes_u64_lane_alias_lengths = ref [] in
   let c_repr_error loc message = raise (Reporting.err_general loc ("C backend: $[c_repr] " ^ message)) in
   let native_integer_representations =
     [
@@ -459,7 +461,7 @@ let collect_c_name_info ast (mode : c_backend_mode) =
   in
   let supported_c_repr =
     List.map fst native_integer_representations
-    @ ["u256"; "byte_pointer"; "fixed_bytes"]
+    @ ["u256"; "byte_pointer"; "fixed_bytes"; "fixed_bytes_u64_lanes"]
   in
   let collect_c_repr def def_annot =
     match get_def_attribute "c_repr" def_annot with
@@ -477,7 +479,7 @@ let collect_c_name_info ast (mode : c_backend_mode) =
                       (String.concat ", " supported_c_repr)
                    )
                 );
-            let collect_payload id payload kind =
+            let collect_payload id payload kind ~transparent_alias =
               let declared_payload = payload in
               let payload = Type_check.Env.expand_synonyms def_annot.env payload in
               let is_bits width = function
@@ -518,18 +520,27 @@ let collect_c_name_info ast (mode : c_backend_mode) =
               | None, "byte_pointer", payload when is_integer_payload payload ->
                   c_repr_byte_pointer := IdSet.add id !c_repr_byte_pointer
               | ( None,
-                  "fixed_bytes",
+                  (("fixed_bytes" | "fixed_bytes_u64_lanes") as byte_repr),
                   Typ_aux (Typ_app (vector_id, [A_aux (A_nexp length, _); A_aux (A_typ elem_typ, _)]), _) )
                 when string_of_id vector_id = "vector" -> (
                   let elem_typ = Type_check.Env.expand_synonyms def_annot.env elem_typ in
                   if not (is_bits 8 elem_typ) then
-                    c_repr_error attr_loc "fixed_bytes requires a vector of byte (bits(8)) elements";
+                    c_repr_error attr_loc (byte_repr ^ " requires a vector of byte (bits(8)) elements");
                   match nexp_simp length with
                   | Nexp_aux (Nexp_constant length, _) when Big_int.less_equal (Big_int.of_int 1) length -> (
-                      try c_repr_fixed_bytes := Bindings.add id (Big_int.to_int length) !c_repr_fixed_bytes
-                      with _ -> c_repr_error attr_loc "fixed_bytes length is too large for the C backend"
+                      try
+                        let length = Big_int.to_int length in
+                        if byte_repr = "fixed_bytes" then
+                          c_repr_fixed_bytes := Bindings.add id length !c_repr_fixed_bytes
+                        else (
+                          c_repr_fixed_bytes_u64_lanes := Bindings.add id length !c_repr_fixed_bytes_u64_lanes;
+                          if transparent_alias then
+                            c_repr_fixed_bytes_u64_lane_alias_lengths :=
+                              length :: !c_repr_fixed_bytes_u64_lane_alias_lengths
+                        )
+                      with _ -> c_repr_error attr_loc (byte_repr ^ " length is too large for the C backend")
                     )
-                  | _ -> c_repr_error attr_loc "fixed_bytes requires a statically sized, positive vector payload"
+                  | _ -> c_repr_error attr_loc (byte_repr ^ " requires a statically sized, positive vector payload")
                 )
               | Some (`Unsigned, _), _, _ -> c_repr_error attr_loc (repr ^ " requires a mathematical int or nat payload")
               | Some (`Signed, _), _, _ -> c_repr_error attr_loc (repr ^ " requires a mathematical int payload")
@@ -540,12 +551,18 @@ let collect_c_name_info ast (mode : c_backend_mode) =
               | None, "fixed_bytes", _ ->
                   c_repr_error attr_loc
                     (Printf.sprintf "fixed_bytes requires a statically sized vector of byte elements as its %s" kind)
+              | None, "fixed_bytes_u64_lanes", _ ->
+                  c_repr_error attr_loc
+                    (Printf.sprintf
+                       "fixed_bytes_u64_lanes requires a statically sized vector of byte elements as its %s" kind
+                    )
               | _ -> assert false
             in
             match def with
             | DEF_type (TD_aux (TD_variant (id, [], [Tu_aux (Tu_ty_id (payload, _), _)], true), _)) ->
-                collect_payload id payload "payload"
-            | DEF_type (TD_aux (TD_abbrev (id, [], A_aux (A_typ payload, _)), _)) -> collect_payload id payload "alias"
+                collect_payload id payload "payload" ~transparent_alias:false
+            | DEF_type (TD_aux (TD_abbrev (id, [], A_aux (A_typ payload, _)), _)) ->
+                collect_payload id payload "alias" ~transparent_alias:true
             | DEF_type (TD_aux (TD_variant (_, _, _, false), _)) -> c_repr_error attr_loc "is only valid on a newtype"
             | DEF_type (TD_aux (TD_variant (_, _ :: _, _, true), _)) ->
                 c_repr_error attr_loc "does not yet support type parameters"
@@ -582,7 +599,9 @@ let collect_c_name_info ast (mode : c_backend_mode) =
     !c_repr_signed,
     !c_repr_u256,
     !c_repr_byte_pointer,
-    !c_repr_fixed_bytes
+    !c_repr_fixed_bytes,
+    !c_repr_fixed_bytes_u64_lanes,
+    List.sort_uniq Int.compare !c_repr_fixed_bytes_u64_lane_alias_lengths
   )
 
 let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_sail_dir; _ } =
@@ -657,7 +676,7 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
          "--c-optimized-source-root requires --c-optimized-model"
       );
   let reserveds, overrides, c_repr_unsigned, c_repr_signed, c_repr_u256, c_repr_byte_pointer,
-      c_repr_fixed_bytes =
+      c_repr_fixed_bytes, c_repr_fixed_bytes_u64_lanes, c_repr_fixed_bytes_u64_lane_alias_lengths =
     collect_c_name_info ast mode
   in
   if not (IdSet.is_empty c_repr_byte_pointer) && not !opt_optimized_model then
@@ -684,6 +703,12 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
   let c_repr_signed = if !opt_specialize_c then c_repr_signed else Bindings.empty in
   let c_repr_u256 = if !opt_specialize_c then c_repr_u256 else IdSet.empty in
   let c_repr_fixed_bytes = if !opt_specialize_c then c_repr_fixed_bytes else Bindings.empty in
+  let c_repr_fixed_bytes_u64_lanes =
+    if !opt_specialize_c then c_repr_fixed_bytes_u64_lanes else Bindings.empty
+  in
+  let c_repr_fixed_bytes_u64_lane_alias_lengths =
+    if !opt_specialize_c then c_repr_fixed_bytes_u64_lane_alias_lengths else []
+  in
 
   let module Codegen = C_backend.Codegen (struct
     let includes = !opt_includes_c
@@ -701,6 +726,8 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let c_repr_signed = c_repr_signed
     let c_repr_u256 = c_repr_u256
     let c_repr_fixed_bytes = c_repr_fixed_bytes
+    let c_repr_fixed_bytes_u64_lanes = c_repr_fixed_bytes_u64_lanes
+    let c_repr_fixed_bytes_u64_lane_alias_lengths = c_repr_fixed_bytes_u64_lane_alias_lengths
     let specialize_c = !opt_specialize_c
     let require_bounded_int = !opt_require_bounded_int
     let specialization_plan_json = !opt_specialization_plan_json

@@ -122,6 +122,15 @@ module type CODEGEN_CONFIG = sig
   (** Fixed byte-array representation lengths, keyed by annotated type. *)
   val c_repr_fixed_bytes : int Ast_compare.Bindings.t
 
+  (** Fixed byte-array representation lengths stored in native 64-bit lanes,
+      keyed by annotated type. *)
+  val c_repr_fixed_bytes_u64_lanes : int Ast_compare.Bindings.t
+
+  (** Widths of transparent byte-vector aliases represented as native
+      64-bit lanes. Transparent aliases are erased before JIB lowering, so
+      their representation is necessarily structural at that byte width. *)
+  val c_repr_fixed_bytes_u64_lane_alias_lengths : int list
+
   (** Preserve fixed integer representations through generic specialization. *)
   val specialize_c : bool
 

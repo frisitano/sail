@@ -113,12 +113,15 @@ let c_repr_u128_id = mk_id "__sail_c_repr_u128"
 let c_repr_u256_id = mk_id "__sail_c_repr_u256"
 let c_repr_u320_id = mk_id "__sail_c_repr_u320"
 let c_repr_fixed_bytes_id = mk_id "__sail_c_repr_fixed_bytes"
+let c_repr_fixed_bytes_u64_lanes_id = mk_id "__sail_c_repr_fixed_bytes_u64_lanes"
 let c_repr_byte_pointer_prefix = "__sail_c_repr_byte_pointer_"
 let direct_byte_pointer_adapter = "__direct"
 let c_repr_u128_ctyp = CT_struct (c_repr_u128_id, [])
 let c_repr_u256_ctyp = CT_struct (c_repr_u256_id, [])
 let c_repr_u320_ctyp = CT_struct (c_repr_u320_id, [])
 let c_repr_fixed_bytes_ctyp n = CT_struct (c_repr_fixed_bytes_id, [CT_constant (Big_int.of_int n)])
+let c_repr_fixed_bytes_u64_lanes_ctyp n =
+  CT_struct (c_repr_fixed_bytes_u64_lanes_id, [CT_constant (Big_int.of_int n)])
 let c_repr_byte_pointer_ctyp adapter = CT_struct (mk_id (c_repr_byte_pointer_prefix ^ adapter), [])
 
 let is_c_repr_u128 = function CT_struct (id, []) -> Id.compare id c_repr_u128_id = 0 | _ -> false
@@ -127,11 +130,25 @@ let is_c_repr_u256 = function CT_struct (id, []) -> Id.compare id c_repr_u256_id
 
 let is_c_repr_u320 = function CT_struct (id, []) -> Id.compare id c_repr_u320_id = 0 | _ -> false
 
-let c_repr_fixed_bytes_length = function
+let c_repr_plain_fixed_bytes_length = function
   | CT_struct (id, [CT_constant n]) when Id.compare id c_repr_fixed_bytes_id = 0 -> (
       try Some (Big_int.to_int n) with _ -> None
     )
   | _ -> None
+
+let c_repr_fixed_bytes_u64_lanes_length = function
+  | CT_struct (id, [CT_constant n]) when Id.compare id c_repr_fixed_bytes_u64_lanes_id = 0 -> (
+      try Some (Big_int.to_int n) with _ -> None
+    )
+  | _ -> None
+
+let c_repr_fixed_bytes_length ctyp =
+  match c_repr_plain_fixed_bytes_length ctyp with
+  | Some _ as length -> length
+  | None -> c_repr_fixed_bytes_u64_lanes_length ctyp
+
+let is_c_repr_fixed_bytes_u64_lanes ctyp =
+  Option.is_some (c_repr_fixed_bytes_u64_lanes_length ctyp)
 
 let is_c_repr_fixed_bytes ctyp = Option.is_some (c_repr_fixed_bytes_length ctyp)
 
@@ -329,6 +346,8 @@ module C_config (Opts : sig
   val c_repr_signed : int Bindings.t
   val c_repr_u256 : IdSet.t
   val c_repr_fixed_bytes : int Bindings.t
+  val c_repr_fixed_bytes_u64_lanes : int Bindings.t
+  val c_repr_fixed_bytes_u64_lane_alias_lengths : int list
   val byte_pointer_fields : (id * id * string) list
   val byte_pointer_types : string Bindings.t
   val byte_pointer_signatures : (string option list * string option) Bindings.t
@@ -378,6 +397,19 @@ end) : CONFIG = struct
       )
     | _ -> None
 
+  let rec find_c_repr_fixed_bytes_u64_lanes env (Typ_aux (typ_aux, _)) =
+    match typ_aux with
+    | Typ_id id -> (
+        match Bindings.find_opt id Opts.c_repr_fixed_bytes_u64_lanes with
+        | Some length -> Some length
+        | None -> (
+            match Bindings.find_opt id (Env.get_typ_synonyms env) with
+            | Some ([], A_aux (A_typ typ, _)) -> find_c_repr_fixed_bytes_u64_lanes env typ
+            | _ -> None
+          )
+      )
+    | _ -> None
+
   let rec find_c_repr_byte_pointer env (Typ_aux (typ_aux, _)) =
     match typ_aux with
     | Typ_id id -> (
@@ -397,15 +429,19 @@ end) : CONFIG = struct
     if Opts.specialize_c && Bindings.mem id Opts.c_repr_unsigned then CT_fuint (Bindings.find id Opts.c_repr_unsigned)
     else if Opts.specialize_c && Bindings.mem id Opts.c_repr_signed then CT_fint (Bindings.find id Opts.c_repr_signed)
     else if Opts.specialize_c && IdSet.mem id Opts.c_repr_u256 then c_repr_u256_ctyp
-    else (
-      match Bindings.find_opt id Opts.c_repr_fixed_bytes with
-      | Some length when Opts.specialize_c -> c_repr_fixed_bytes_ctyp length
+    else
+      match Bindings.find_opt id Opts.c_repr_fixed_bytes_u64_lanes with
+      | Some length when Opts.specialize_c -> c_repr_fixed_bytes_u64_lanes_ctyp length
       | _ -> (
-          match ctyp with
-          | CT_fvector (length, CT_fbits 8) when Opts.specialize_c && length > 0 -> c_repr_fixed_bytes_ctyp length
-          | _ -> ctyp
+          match Bindings.find_opt id Opts.c_repr_fixed_bytes with
+          | Some length when Opts.specialize_c -> c_repr_fixed_bytes_ctyp length
+          | _ -> (
+              match ctyp with
+              | CT_fvector (length, CT_fbits 8) when Opts.specialize_c && length > 0 ->
+                  c_repr_fixed_bytes_ctyp length
+              | _ -> ctyp
+            )
         )
-    )
 
   let specialize_struct_field record_id field_id ctyp =
     match
@@ -617,9 +653,13 @@ end) : CONFIG = struct
       )
     || (IdSet.mem id Opts.c_repr_u256 && is_c_repr_u256 represented)
     ||
-    match Bindings.find_opt id Opts.c_repr_fixed_bytes with
-    | Some length when Opts.specialize_c -> ctyp_equal represented (c_repr_fixed_bytes_ctyp length)
-    | _ -> false
+    match Bindings.find_opt id Opts.c_repr_fixed_bytes_u64_lanes with
+    | Some length when Opts.specialize_c -> ctyp_equal represented (c_repr_fixed_bytes_u64_lanes_ctyp length)
+    | _ -> (
+        match Bindings.find_opt id Opts.c_repr_fixed_bytes with
+        | Some length when Opts.specialize_c -> ctyp_equal represented (c_repr_fixed_bytes_ctyp length)
+        | _ -> false
+      )
 
   let specialize_call_result id arg_ctyps semantic =
     let fixed_bytes_at_most_32 = function
@@ -772,12 +812,15 @@ end) : CONFIG = struct
     let c_repr_signed = find_c_repr_integer Opts.c_repr_signed ctx.local_env typ in
     let c_repr_u256 = has_c_repr_u256 ctx.local_env typ in
     let c_repr_fixed_bytes = find_c_repr_fixed_bytes ctx.local_env typ in
+    let c_repr_fixed_bytes_u64_lanes = find_c_repr_fixed_bytes_u64_lanes ctx.local_env typ in
     let c_repr_byte_pointer = find_c_repr_byte_pointer ctx.local_env typ in
     let (Typ_aux (typ_aux, l) as typ) = Env.expand_synonyms ctx.local_env typ in
     match typ_aux with
     | _ when Option.is_some c_repr_unsigned -> CT_fuint (Option.get c_repr_unsigned)
     | _ when Option.is_some c_repr_signed -> CT_fint (Option.get c_repr_signed)
     | _ when c_repr_u256 -> c_repr_u256_ctyp
+    | _ when Option.is_some c_repr_fixed_bytes_u64_lanes ->
+        c_repr_fixed_bytes_u64_lanes_ctyp (Option.get c_repr_fixed_bytes_u64_lanes)
     | _ when Option.is_some c_repr_fixed_bytes -> c_repr_fixed_bytes_ctyp (Option.get c_repr_fixed_bytes)
     | _ when Option.is_some c_repr_byte_pointer -> c_repr_byte_pointer_ctyp (Option.get c_repr_byte_pointer)
     | Typ_id id when string_of_id id = "bool" -> CT_bool
@@ -904,7 +947,12 @@ end) : CONFIG = struct
         | Nexp_aux (Nexp_constant length, _)
           when Opts.specialize_c && ctyp_equal elem_ctyp (CT_fbits 8) && Big_int.less_equal (Big_int.of_int 1) length
           -> (
-            try c_repr_fixed_bytes_ctyp (Big_int.to_int length) with _ -> CT_vector elem_ctyp
+            try
+              let length = Big_int.to_int length in
+              if List.mem length Opts.c_repr_fixed_bytes_u64_lane_alias_lengths then
+                c_repr_fixed_bytes_u64_lanes_ctyp length
+              else c_repr_fixed_bytes_ctyp length
+            with _ -> CT_vector elem_ctyp
           )
         | Nexp_aux (Nexp_constant length, _)
           when Opts.specialize_c && Big_int.less_equal (Big_int.of_int 1) length -> (
@@ -2857,6 +2905,8 @@ module type CODEGEN_CONFIG = sig
   val c_repr_signed : int Bindings.t
   val c_repr_u256 : IdSet.t
   val c_repr_fixed_bytes : int Bindings.t
+  val c_repr_fixed_bytes_u64_lanes : int Bindings.t
+  val c_repr_fixed_bytes_u64_lane_alias_lengths : int list
   val specialize_c : bool
   val require_bounded_int : bool
   val specialization_plan_json : string option
@@ -3010,6 +3060,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         "byte_pointer_" ^ Option.get (c_repr_byte_pointer_adapter ctyp)
     | ctyp when is_c_repr_u320 ctyp -> "u320"
     | ctyp when is_c_repr_u256 ctyp -> "u256"
+    | ctyp when is_c_repr_fixed_bytes_u64_lanes ctyp ->
+        "fixed_bytes_u64_lanes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_u64_lanes_length ctyp))
     | ctyp when is_c_repr_fixed_bytes ctyp ->
         "fixed_bytes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_length ctyp))
     | CT_unit -> "unit"
@@ -3065,6 +3117,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | ctyp when is_c_repr_u128 ctyp -> "sail_u128"
     | ctyp when is_c_repr_u256 ctyp -> "sail_u256"
     | ctyp when is_c_repr_u320 ctyp -> "sail_u320"
+    | ctyp when is_c_repr_fixed_bytes_u64_lanes ctyp ->
+        "sail_fixed_bytes_u64_lanes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_u64_lanes_length ctyp))
     | ctyp when is_c_repr_fixed_bytes ctyp ->
         "sail_fixed_bytes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_length ctyp))
     | CT_unit -> "unit"
@@ -3099,6 +3153,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | ctyp when is_c_repr_u128 ctyp -> "u128"
     | ctyp when is_c_repr_u256 ctyp -> "u256"
     | ctyp when is_c_repr_u320 ctyp -> "u320"
+    | ctyp when is_c_repr_fixed_bytes_u64_lanes ctyp ->
+        "fixed_bytes_u64_lanes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_u64_lanes_length ctyp))
     | ctyp when is_c_repr_fixed_bytes ctyp ->
         "fixed_bytes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_length ctyp))
     | CT_unit -> "unit"
@@ -4004,11 +4060,23 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | to_typ, (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)) when is_c_repr_fixed_bytes to_typ ->
         let length = Option.get (c_repr_fixed_bytes_length to_typ) in
         let i = ngensym () in
-        ksprintf string "  for (size_t %s = 0; %s < %d; ++%s) {" (sgen_name i) (sgen_name i) length (sgen_name i)
-        ^^ hardline
-        ^^ ksprintf string "    %s.bytes[%s] = (uint8_t)(%s.data[%s] & UINT64_C(0xff));" (sgen_clexp_pure l clexp)
-             (sgen_name i) (sgen_cval cval) (sgen_name i)
-        ^^ hardline ^^ string "  }"
+        if is_c_repr_fixed_bytes_u64_lanes to_typ then
+          ksprintf string "  %s = %s_zero();" (sgen_clexp_pure l clexp) (sgen_ctyp_name to_typ)
+          ^^ hardline
+          ^^ ksprintf string "  for (size_t %s = 0; %s < %d; ++%s) {" (sgen_name i) (sgen_name i) length
+               (sgen_name i)
+          ^^ hardline
+          ^^ ksprintf string "    %s = fast_unsigned_vector_update_%s(%s, %s, %s.data[%s]);"
+               (sgen_clexp_pure l clexp) (sgen_ctyp_name to_typ) (sgen_clexp_pure l clexp) (sgen_name i)
+               (sgen_cval cval) (sgen_name i)
+          ^^ hardline ^^ string "  }"
+        else
+          ksprintf string "  for (size_t %s = 0; %s < %d; ++%s) {" (sgen_name i) (sgen_name i) length
+               (sgen_name i)
+          ^^ hardline
+          ^^ ksprintf string "    %s.bytes[%s] = (uint8_t)(%s.data[%s] & UINT64_C(0xff));"
+               (sgen_clexp_pure l clexp) (sgen_name i) (sgen_cval cval) (sgen_name i)
+          ^^ hardline ^^ string "  }"
     | (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), from_typ when is_c_repr_fixed_bytes from_typ ->
         let length = Option.get (c_repr_fixed_bytes_length from_typ) in
         let i = ngensym () in
@@ -4019,8 +4087,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         ^^ hardline
         ^^ ksprintf string "  for (size_t %s = 0; %s < %d; ++%s) {" (sgen_name i) (sgen_name i) length (sgen_name i)
         ^^ hardline
-        ^^ ksprintf string "    %s.data[%s] = (uint64_t)%s.bytes[%s];" (sgen_clexp_pure l clexp) (sgen_name i)
-             (sgen_cval cval) (sgen_name i)
+        ^^ (if is_c_repr_fixed_bytes_u64_lanes from_typ then
+              ksprintf string "    %s.data[%s] = fast_unsigned_vector_access_%s(%s, %s);"
+                (sgen_clexp_pure l clexp) (sgen_name i) (sgen_ctyp_name from_typ) (sgen_cval cval)
+                (sgen_name i)
+            else
+              ksprintf string "    %s.data[%s] = (uint64_t)%s.bytes[%s];" (sgen_clexp_pure l clexp)
+                (sgen_name i) (sgen_cval cval) (sgen_name i)
+           )
         ^^ hardline ^^ string "  }"
     | CT_ref _, _ -> codegen_conversion l ctx (CL_addr clexp) cval
     | ( (CT_vector ctyp_elem_to | CT_fvector (_, ctyp_elem_to)),
@@ -4200,13 +4274,13 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
               match List.nth_opt args 1 with
               | Some arg -> (
                   match c_repr_fixed_bytes_length (cval_ctyp arg) with
-                  | Some length -> sprintf "u256_from_fixed_bytes_%d" length
+                  | Some _ -> sprintf "u256_from_%s" (sgen_ctyp_name (cval_ctyp arg))
                   | None -> c_error "native from_bytes_le specialization without fixed-byte argument"
                 )
               | None -> c_error "native from_bytes_le specialization without fixed-byte argument"
             )
           | "__sail_to_bytes_le_u256_fixed", ctyp when is_c_repr_fixed_bytes ctyp ->
-              sprintf "fixed_bytes_%d_from_u256" (Option.get (c_repr_fixed_bytes_length ctyp))
+              sprintf "%s_from_u256" (sgen_ctyp_name ctyp)
           | "__sail_u256_addmod", ctyp when is_c_repr_u256 ctyp -> "u256_addmod"
           | "__sail_u256_mulmod", ctyp when is_c_repr_u256 ctyp -> "u256_mulmod"
           | "internal_pick", _ -> sprintf "pick_%s" (sgen_ctyp_name ctyp)
@@ -6623,6 +6697,188 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       [TypeDeclaration typedef; StaticFunctionDefinition helpers]
     )
 
+  let codegen_fixed_bytes_u64_lanes length =
+    let id = mk_id ("__sail_c_repr_fixed_bytes_u64_lanes_" ^ string_of_int length) in
+    if IdSet.mem id !generated then []
+    else (
+      generated := IdSet.add id !generated;
+      let lane_count = (length + 7) / 8 in
+      let tail_bytes = length mod 8 in
+      let tail_mask =
+        if tail_bytes = 0 then "UINT64_MAX"
+        else sprintf "(UINT64_MAX >> %d)" (64 - (tail_bytes * 8))
+      in
+      let ctyp = sprintf "sail_fixed_bytes_u64_lanes_%d" length in
+      let type_name = sprintf "fixed_bytes_u64_lanes_%d" length in
+      let guard = sprintf "SAIL_FIXED_BYTES_U64_LANES_%d_DEFINED" length in
+      let typedef =
+        ksprintf string
+          "#ifndef %s\n#define %s\ntypedef struct { uint64_t lanes[%d]; } %s;\n#endif"
+          guard guard lane_count ctyp
+      in
+      let base_helpers =
+        ksprintf string
+          {|
+static inline %s %s_zero(void) {
+  %s result = {{0}};
+  return result;
+}
+
+static inline bool eq_%s(const %s lhs, const %s rhs) {
+  for (size_t i = 0; i + 1 < %d; ++i) {
+    if (lhs.lanes[i] != rhs.lanes[i]) return false;
+  }
+  return ((lhs.lanes[%d] ^ rhs.lanes[%d]) & %s) == UINT64_C(0);
+}
+|}
+          ctyp type_name ctyp type_name ctyp ctyp lane_count (lane_count - 1) (lane_count - 1) tail_mask
+      in
+      let byte_u256_helpers =
+        if length > 32 then empty
+        else
+          ksprintf string
+            {|
+
+#ifndef SAIL_U256_DEFINED
+#define SAIL_U256_DEFINED
+typedef struct { uint64_t limbs[4]; } sail_u256;
+#endif
+
+static inline sail_u256 u256_from_%s(const %s value) {
+  sail_u256 result = {{0}};
+  for (size_t i = 0; i < %d; ++i) result.limbs[i] = value.lanes[i];
+  result.limbs[%d] &= %s;
+  return result;
+}
+
+static inline %s %s_from_u256(const sail_u256 value) {
+  %s result = {{0}};
+  for (size_t i = 0; i < %d; ++i) result.lanes[i] = value.limbs[i];
+  result.lanes[%d] &= %s;
+  return result;
+}
+|}
+            type_name ctyp lane_count (lane_count - 1) tail_mask ctyp type_name ctyp lane_count
+            (lane_count - 1) tail_mask
+      in
+      let generic_helpers =
+        ksprintf string
+          {|
+
+static inline %s vector_init_%s(const sail_int length_arg, const uint64_t elem) {
+  (void)length_arg;
+  %s result;
+  const uint64_t fill = UINT64_C(0x0101010101010101) * (uint8_t)elem;
+  for (size_t i = 0; i < %d; ++i) result.lanes[i] = fill;
+  result.lanes[%d] &= %s;
+  return result;
+}
+
+static inline %s undefined_vector_%s(const sail_int length_arg, const uint64_t elem) {
+  return vector_init_%s(length_arg, elem);
+}
+
+static inline %s vector_update_%s(%s value, const sail_int index, const uint64_t elem) {
+  const uint64_t i = sail_int_get_ui(index);
+  if (i < %d) {
+    const uint64_t shift = (i & UINT64_C(7)) * UINT64_C(8);
+    const uint64_t mask = UINT64_C(0xff) << shift;
+    value.lanes[i >> 3] = (value.lanes[i >> 3] & ~mask) | (((uint64_t)(uint8_t)elem) << shift);
+  }
+  return value;
+}
+
+static inline uint64_t vector_access_%s(const %s value, const sail_int index) {
+  const uint64_t i = sail_int_get_ui(index);
+  return i < %d ? ((value.lanes[i >> 3] >> ((i & UINT64_C(7)) * UINT64_C(8))) & UINT64_C(0xff))
+                : UINT64_C(0);
+}
+
+static inline void length_%s(sail_int *result, const %s value) {
+  (void)value;
+  mpz_set_ui(*result, %d);
+}
+|}
+          ctyp type_name ctyp lane_count (lane_count - 1) tail_mask ctyp type_name type_name ctyp type_name ctyp
+          length type_name ctyp length type_name ctyp length
+      in
+      let native_signed_index_helpers =
+        ksprintf string
+          {|
+static inline %s internal_vector_init_%s(const int64_t length_arg) {
+  (void)length_arg;
+  return %s_zero();
+}
+
+static inline %s internal_vector_update_%s(
+    %s value, const int64_t index, const uint64_t elem) {
+  if (index >= 0 && index < %d) {
+    const uint64_t i = (uint64_t)index;
+    const uint64_t shift = (i & UINT64_C(7)) * UINT64_C(8);
+    const uint64_t mask = UINT64_C(0xff) << shift;
+    value.lanes[i >> 3] = (value.lanes[i >> 3] & ~mask) | (((uint64_t)(uint8_t)elem) << shift);
+  }
+  return value;
+}
+
+static inline uint64_t fast_vector_access_%s(const %s value, const int64_t index) {
+  if (index < 0 || index >= %d) return UINT64_C(0);
+  const uint64_t i = (uint64_t)index;
+  return (value.lanes[i >> 3] >> ((i & UINT64_C(7)) * UINT64_C(8))) & UINT64_C(0xff);
+}
+|}
+          ctyp type_name type_name ctyp type_name ctyp length type_name ctyp length
+      in
+      let native_unsigned_index_helpers =
+        ksprintf string
+          {|
+static inline %s fast_unsigned_vector_update_%s(
+    %s value, const uint64_t index, const uint64_t elem) {
+  if (index < %d) {
+    const uint64_t shift = (index & UINT64_C(7)) * UINT64_C(8);
+    const uint64_t mask = UINT64_C(0xff) << shift;
+    value.lanes[index >> 3] =
+        (value.lanes[index >> 3] & ~mask) | (((uint64_t)(uint8_t)elem) << shift);
+  }
+  return value;
+}
+
+static inline uint64_t fast_unsigned_vector_access_%s(
+    const %s value, const uint64_t index) {
+  return index < %d
+             ? ((value.lanes[index >> 3] >> ((index & UINT64_C(7)) * UINT64_C(8))) & UINT64_C(0xff))
+             : UINT64_C(0);
+}
+|}
+          ctyp type_name ctyp length type_name ctyp length
+      in
+      let native_init_helpers =
+        ksprintf string
+          {|
+static inline %s fast_vector_init_%s(const int64_t length_arg, const uint64_t elem) {
+  (void)length_arg;
+  %s result;
+  const uint64_t fill = UINT64_C(0x0101010101010101) * (uint8_t)elem;
+  for (size_t i = 0; i < %d; ++i) result.lanes[i] = fill;
+  result.lanes[%d] &= %s;
+  return result;
+}
+
+static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const uint64_t elem) {
+  (void)length_arg;
+  return fast_vector_init_%s((int64_t)length_arg, elem);
+}
+|}
+          ctyp type_name ctyp lane_count (lane_count - 1) tail_mask ctyp type_name type_name
+      in
+      let helpers =
+        base_helpers ^^ byte_u256_helpers
+        ^^ (if !emit_generic_sail_int_helpers then generic_helpers else empty)
+        ^^ native_signed_index_helpers ^^ native_unsigned_index_helpers ^^ native_init_helpers
+      in
+      [TypeDeclaration typedef; StaticFunctionDefinition helpers]
+    )
+
   let codegen_tup ctx ctyps =
     let id = mk_id ("tuple_" ^ string_of_ctyp (CT_tup ctyps)) in
     if IdSet.mem id !generated then []
@@ -7374,6 +7630,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     | CTG_u256
     | CTG_u320
     | CTG_fixed_bytes of int
+    | CTG_fixed_bytes_u64_lanes of int
     | CTG_tup of ctyp list
     | CTG_list of ctyp
     | CTG_vector of ctyp
@@ -7385,6 +7642,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     | ctyp when is_c_repr_u128 ctyp -> [CTG_native_int_conversion_failure; CTG_u128]
     | ctyp when is_c_repr_u256 ctyp -> [CTG_native_int_conversion_failure; CTG_u256]
     | ctyp when is_c_repr_u320 ctyp -> [CTG_native_int_conversion_failure; CTG_u320]
+    | ctyp when is_c_repr_fixed_bytes_u64_lanes ctyp ->
+        [CTG_fixed_bytes_u64_lanes (Option.get (c_repr_fixed_bytes_u64_lanes_length ctyp))]
     | ctyp when is_c_repr_fixed_bytes ctyp -> [CTG_fixed_bytes (Option.get (c_repr_fixed_bytes_length ctyp))]
     | CT_tup ctyps -> List.concat (List.map ctyp_dependencies ctyps) @ [CTG_tup ctyps]
     | CT_list ctyp -> ctyp_dependencies ctyp @ [CTG_list ctyp]
@@ -7403,6 +7662,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     | CTG_u128 -> codegen_u128 ()
     | CTG_u256 -> codegen_u256 ()
     | CTG_u320 -> codegen_u320 ()
+    | CTG_fixed_bytes_u64_lanes length -> codegen_fixed_bytes_u64_lanes length
     | CTG_fixed_bytes length -> codegen_fixed_bytes length
     | CTG_vector ctyp -> codegen_vector ctx ctyp
     | CTG_fixed_vector (length, ctyp) -> codegen_fixed_vector ctx length ctyp
@@ -7495,6 +7755,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       let c_repr_signed = Config.c_repr_signed
       let c_repr_u256 = Config.c_repr_u256
       let c_repr_fixed_bytes = Config.c_repr_fixed_bytes
+      let c_repr_fixed_bytes_u64_lanes = Config.c_repr_fixed_bytes_u64_lanes
+      let c_repr_fixed_bytes_u64_lane_alias_lengths = Config.c_repr_fixed_bytes_u64_lane_alias_lengths
       let byte_pointer_fields = Config.byte_pointer_fields
       let byte_pointer_types = Config.byte_pointer_types
       let byte_pointer_signatures = Config.byte_pointer_signatures

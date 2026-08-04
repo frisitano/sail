@@ -30,7 +30,7 @@ expect_error() {
   grep -Fq "$expected" "$output.result"
 }
 
-expect_error unsupported.sail 'C backend: unsupported representation "u32" in $[c_repr]; supported representations are uint8, uint16, uint32, uint64, int8, int16, int32, int64, u256, fixed_bytes'
+expect_error unsupported.sail 'C backend: unsupported representation "u32" in $[c_repr]; supported representations are uint8, uint16, uint32, uint64, int8, int16, int32, int64, u256, byte_pointer, fixed_bytes, fixed_bytes_u64_lanes'
 expect_error wrong_target.sail 'C backend: $[c_repr] is only valid on a newtype'
 expect_error wrong_payload.sail 'C backend: $[c_repr] uint64 requires a mathematical int or nat payload'
 expect_error missing_argument.sail 'C backend: $[c_repr] requires a representation name'
