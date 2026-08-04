@@ -6193,10 +6193,22 @@ module Make (C : CONFIG) = struct
               let instr =
                 I_aux (I_funcall (creturn, Call (bounds, semantic_proofs), (id, []), args), (n, l))
               in
-              let eligible =
+              let representation_eligible =
                 specialization_is_eligible l id param_ctyps ret_ctyp actual_ctyps actual_ret_ctyp
-                || semantic_bounds_specialize_body id generic_signature actual_ctyps bounds
               in
+              let bounds_eligible = semantic_bounds_specialize_body id generic_signature actual_ctyps bounds in
+              let same_representation =
+                List.for_all2 ctyp_equal param_ctyps actual_ctyps && ctyp_equal ret_ctyp actual_ret_ctyp
+              in
+              (* Bounds-only clones rewrite the canonical JIB body using the
+                 call site's parameter representations.  That is sound only
+                 when those representations already match the callee ABI;
+                 otherwise an earlier fixed-width lowering in the body can
+                 become ill-typed (for example [Slice] over [CT_lint]).  Keep
+                 the canonical callee in that case.  The precise-call pass
+                 below still consumes [bounds] and inserts the proved edge
+                 conversion. *)
+              let eligible = representation_eligible || (bounds_eligible && same_representation) in
               if eligible then (
                 let specialized_id =
                   match current_specialization with

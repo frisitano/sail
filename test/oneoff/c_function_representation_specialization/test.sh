@@ -155,6 +155,35 @@ fi
 grep -Fq 'Function budgeted_square requires more than 1 C representation specializations' \
   "$TMP_DIR/specialization_limit.log"
 
+# A path-refined mathematical integer can call a fixed-width helper without
+# asking bounds specialization to clone the already-lowered helper body with
+# the wider caller representation.  The precise-call pass inserts the proved
+# conversion at the edge while the native Slice remains over uint8_t.
+"$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c --c-specialize --c-no-main \
+  --c-preserve from_wide \
+  "$TEST_DIR/bounds_only_widening.sail" -o "$TMP_DIR/bounds_only_widening"
+grep -Fq 'uint64_t zlowered_byte(uint8_t);' "$TMP_DIR/bounds_only_widening.h"
+grep -Fq 'CONVERT_OF(mach_uint, sail_int)(zvalue)' "$TMP_DIR/bounds_only_widening.c"
+if grep -Eq 'zlowered_byte.*repr' "$TMP_DIR/bounds_only_widening.h"; then
+  echo 'bounds-only specialization cloned a fixed-width helper with a wider representation' >&2
+  exit 1
+fi
+
+# Fixed-vector helpers use the same return convention as their call sites.
+# In the standard backend a fixed vector is managed even when its elements are
+# copyable, so internal construction must retain the output-parameter ABI.
+"$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c --c-specialize --c-no-main \
+  --c-preserve zero_bytes32 \
+  "$TEST_DIR/standard_fixed_vector.sail" -o "$TMP_DIR/standard_fixed_vector"
+grep -Eq 'static void internal_vector_init_.*\([^,]+ \*rop, const int64_t len\)' \
+  "$TMP_DIR/standard_fixed_vector.c"
+grep -Eq 'internal_vector_init_.*\(&[^,]+, INT64_C\(32\)\);' \
+  "$TMP_DIR/standard_fixed_vector.c"
+GMP_CFLAGS=$(${PKG_CONFIG:-pkg-config} --cflags gmp)
+"${CC:-cc}" ${CFLAGS:-} $GMP_CFLAGS -std=c11 -Wall -Werror=implicit-function-declaration \
+  -I "$TEST_DIR/../../../lib" -c "$TMP_DIR/standard_fixed_vector.c" \
+  -o "$TMP_DIR/standard_fixed_vector.o"
+
 # A recursive clone may reuse itself only when the recursive call remains
 # inside the bounds which justified that clone's pruned branches.  Starting at
 # 1..8 removes the zero branch, but the recursive edge reaches 0..7 and must

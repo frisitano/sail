@@ -6762,6 +6762,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     else (
       let name = sgen_id id in
       let stack_elem = is_stack_ctyp ctx ctyp in
+      let stack_vector = is_stack_ctyp ctx vector_ctyp in
       let guard = "SAIL_FIXED_VECTOR_" ^ String.uppercase_ascii name ^ "_DEFINED" in
       let typedef =
         ksprintf string "#ifndef %s\n#define %s\n" guard guard
@@ -6803,7 +6804,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           )
       in
       let init name_suffix length_type length_expr =
-        if stack_elem then
+        if stack_vector then
           c_function ~return:("static " ^ name)
             (ksprintf string "%s_%s(const %s n, %s elem)" name_suffix name length_type (sgen_ctyp ctyp))
             [ksprintf c_stmt "%s vec" name; c_stmt ("size_t m = (size_t)" ^ length_expr); c_stmt "vec.len = m";
@@ -6822,7 +6823,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
            c_for (string "(size_t i = 0; i < m; ++i)") [fill "i" "elem"]]
       in
       let update function_name index_type index_expr =
-        if stack_elem then
+        if stack_vector then
           c_function ~return:("static " ^ name)
             (ksprintf string "%s_%s(%s op, const %s n, %s elem)" function_name name name index_type
                (sgen_ctyp ctyp))
@@ -6832,7 +6833,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             (ksprintf string "%s_%s(%s *rop, %s op, const %s n, %s elem)" function_name name name name index_type
                (sgen_ctyp ctyp))
             [sail_copy ~suffix:";" name "rop, op"; c_stmt ("size_t m = (size_t)" ^ index_expr);
-             sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&rop->data[m], elem"]
+             if stack_elem then c_stmt "rop->data[m] = elem"
+             else sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&rop->data[m], elem"]
       in
       let vector_update =
         c_function ~return:"static void"
@@ -6863,7 +6865,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             [sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "rop, op.data[(size_t)sail_int_get_ui(n)]"]
       in
       let internal_init =
-        if stack_elem then
+        if stack_vector then
           c_function ~return:("static " ^ name)
             (ksprintf string "internal_vector_init_%s(const int64_t len)" name)
             [ksprintf c_stmt "%s rop" name; c_stmt "rop.len = (size_t)len"; c_stmt "return rop"]
@@ -6893,12 +6895,12 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           [c_stmt "mpz_set_ui(*rop, (unsigned long int)op.len)"]
       in
       let static_helper helper_name doc =
-        if Config.optimized_model && stack_elem then DemandedStaticFunctionDefinition (helper_name, doc)
+        if Config.optimized_model && stack_vector then DemandedStaticFunctionDefinition (helper_name, doc)
         else StaticFunctionDefinition doc
       in
       generated := IdSet.add key !generated;
       [TypeDeclaration typedef]
-      @ (if stack_elem then [] else List.map (fun d -> StaticFunctionDefinition d) [create; clear; recreate; copy])
+      @ (if stack_vector then [] else List.map (fun d -> StaticFunctionDefinition d) [create; clear; recreate; copy])
       @ (if !emit_generic_sail_int_helpers then
            List.map (fun d -> StaticFunctionDefinition d) [vector_init; vector_access; vector_update; undefined; vector_length]
          else [])
