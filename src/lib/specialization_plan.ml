@@ -17,7 +17,13 @@ type representation_choice = {
   conversion : string;
 }
 
-type conversion = { conversion_id : string; source_type : string; destination_type : string; reason : string }
+type conversion = {
+  conversion_id : string;
+  source_type : string;
+  destination_type : string;
+  validation : string;
+  reason : string;
+}
 
 type call_edge = {
   call_id : string;
@@ -69,6 +75,7 @@ type t = {
   compiler_version : string;
   compiler_revision : string option;
   configuration_identity : string;
+  narrowing_policy : string;
   inputs : input list;
   clones : clone list;
   json : Yojson.Safe.t;
@@ -196,6 +203,7 @@ let conversion_json conversion =
       ("id", `String conversion.conversion_id);
       ("source_type", `String conversion.source_type);
       ("destination_type", `String conversion.destination_type);
+      ("validation", `String conversion.validation);
       ("reason", `String conversion.reason);
     ]
 
@@ -220,10 +228,10 @@ let obligation_json obligation =
       ("evidence", `String obligation.evidence);
     ]
 
-let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~input_locations traces =
+let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~narrowing_policy ~input_locations traces =
   let configuration_identity =
     digest_string "configuration"
-      ("specialization-plan-schema=1.0.0;representation-policy=c-specialize-v1;backend-symbols=excluded;"
+        ("specialization-plan-schema=1.1.0;representation-policy=c-specialize-v1;backend-symbols=excluded;"
      ^ configuration
       )
   in
@@ -277,14 +285,32 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~i
     in
     let conversions =
       trace.conversions
-      |> List.map (fun (source, destination) -> (string_of_ctyp source, string_of_ctyp destination))
+      |> List.map (fun (source, destination, proven) ->
+             let validation =
+               match (narrowing_policy, proven) with
+               | "checked", _ -> "checked"
+               | ("proven" | "all"), true -> "proven"
+               | "proven", false -> "checked"
+               | "all", false -> "assumed"
+               | _, _ -> invalid_arg ("Unknown narrowing policy: " ^ narrowing_policy)
+             in
+             (string_of_ctyp source, string_of_ctyp destination, validation)
+         )
       |> unique_sorted Stdlib.compare
-      |> List.map (fun (source, destination) ->
+      |> List.map (fun (source, destination, validation) ->
           {
-            conversion_id = digest_string "conversion" (String.concat "\x1f" [base.clone_identity; source; destination]);
+            conversion_id =
+              digest_string "conversion"
+                (String.concat "\x1f" [base.clone_identity; source; destination; validation]);
             source_type = source;
             destination_type = destination;
-            reason = "typed JIB assignment boundary";
+            validation;
+            reason =
+              (match validation with
+              | "checked" -> "runtime-checked typed JIB assignment boundary"
+              | "proven" -> "range-proved typed JIB assignment boundary"
+              | "assumed" -> "unchecked typed JIB assignment boundary; refinement proof required"
+              | _ -> assert false);
           }
       )
       |> List.sort (fun left right -> String.compare left.conversion_id right.conversion_id)
@@ -337,6 +363,7 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~i
         (fun choice -> (not (String.equal choice.position "result")) && Option.is_some choice.inferred_bound)
         representation_choices
     in
+    let has_assumed_conversion = List.exists (fun conversion -> conversion.validation = "assumed") conversions in
     let obligations =
       [
         make_obligation base.clone_identity Representation_adequacy "signature" Reconstructible
@@ -344,8 +371,9 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~i
         make_obligation base.clone_identity Operation_refinement "body" Requires_proof
           "specialized primitive operations refine mathematical Sail operations";
         make_obligation base.clone_identity Conversion_correctness "typed boundaries"
-          (if conversions = [] then Not_applicable else Requires_proof)
+          (if conversions = [] then Not_applicable else if has_assumed_conversion then Unresolved else Requires_proof)
           ( if conversions = [] then "clone has no typed conversion boundary"
+            else if has_assumed_conversion then "unchecked narrowing assumptions require a refinement proof"
             else "every recorded conversion preserves its source value"
           );
         make_obligation base.clone_identity Call_compatibility "call edges"
@@ -408,6 +436,11 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~i
       ]
   in
   let clone_jsons = List.map clone_json clones in
+  let has_assumed_conversion =
+    List.exists
+      (fun clone -> List.exists (fun conversion -> conversion.validation = "assumed") clone.conversions)
+      clones
+  in
   let unresolved =
     clone_jsons
     |> List.concat_map (fun clone -> Yojson.Safe.Util.member "obligations" clone |> Yojson.Safe.Util.to_list)
@@ -417,11 +450,42 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~i
     |> List.map (fun obligation -> Yojson.Safe.Util.member "id" obligation)
     |> List.sort (fun left right -> String.compare (Yojson.Safe.Util.to_string left) (Yojson.Safe.Util.to_string right))
   in
+  let has_extern_contract =
+    List.exists (fun clone -> List.exists (fun call -> call.is_extern) clone.calls) clones
+  in
+  let assumptions =
+    (if has_assumed_conversion then
+       [
+         `Assoc
+           [
+             ("id", `String (digest_string "assumption" "unchecked-narrowing"));
+             ("kind", `String "unchecked_narrowing");
+             ("text", `String "Unchecked narrowing conversions preserve the source Sail value.");
+           ];
+       ]
+     else [])
+    @
+    if unresolved <> [] && has_extern_contract then
+      [
+        `Assoc
+          [
+            ("id", `String (digest_string "assumption" "extern-contracts"));
+            ("kind", `String "extern_contract");
+            ("text", `String "Extern implementations refine their declared Sail contracts.");
+          ];
+      ]
+    else []
+    |> List.sort (fun left right ->
+           String.compare
+             (Yojson.Safe.Util.member "id" left |> Yojson.Safe.Util.to_string)
+             (Yojson.Safe.Util.member "id" right |> Yojson.Safe.Util.to_string)
+       )
+  in
   let json =
     `Assoc
       [
         ("schema", `String "https://sail-lang.org/schemas/specialization-plan/v1");
-        ("schema_version", `String "1.0.0");
+        ("schema_version", `String "1.1.0");
         ( "purpose",
           `String
             "Backend-neutral provenance for checking that representation-specialized JIB clones refine their Sail \
@@ -458,6 +522,7 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~i
             [
               ("id", `String configuration_identity);
               ("representation_policy", `String "c-specialize-v1");
+              ("narrowing_policy", `String narrowing_policy);
               ("backend_symbol_policy", `String "excluded-from-machine-plan");
             ]
         );
@@ -465,20 +530,7 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~i
           `List (List.map (fun input -> `Assoc [("id", `String input.digest); ("path", `String input.path)]) inputs)
         );
         ("clones", `List clone_jsons);
-        ( "assumptions",
-          `List
-            ( if unresolved = [] then []
-              else
-                [
-                  `Assoc
-                    [
-                      ("id", `String (digest_string "assumption" "extern-contracts"));
-                      ("kind", `String "extern_contract");
-                      ("text", `String "Extern implementations refine their declared Sail contracts.");
-                    ];
-                ]
-            )
-        );
+        ("assumptions", `List assumptions);
         ("unresolved_obligations", `List unresolved);
         ("diagnostics", `List []);
         ( "canonicalization",
@@ -491,7 +543,7 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~i
         );
       ]
   in
-  { compiler_name; compiler_version; compiler_revision; configuration_identity; inputs; clones; json }
+  { compiler_name; compiler_version; compiler_revision; configuration_identity; narrowing_policy; inputs; clones; json }
 
 let write_string path contents =
   let channel = open_out_bin path in
@@ -504,9 +556,10 @@ let write_human ~backend_symbol path plan =
   let line format = Printf.ksprintf (fun value -> Buffer.add_string buffer (value ^ "\n")) format in
   line "# Sail Specialization Plan";
   line "";
-  line "Schema: `1.0.0`  ";
+  line "Schema: `1.1.0`  ";
   line "Producer: `%s %s`  " plan.compiler_name plan.compiler_version;
   line "Configuration identity: `%s`" plan.configuration_identity;
+  line "Narrowing policy: `%s`" plan.narrowing_policy;
   line "";
   line "> Machine identities exclude backend symbols. The C symbols below are descriptive review aids only.";
   List.iter
@@ -712,6 +765,7 @@ let obligation_proposition clone obligation =
                            string_literal conversion.conversion_id;
                            string_literal conversion.source_type;
                            string_literal conversion.destination_type;
+                           string_literal conversion.validation;
                            variable "semanticValue";
                            variable "representedValue";
                          ];
@@ -936,7 +990,7 @@ let write_lean path plan =
   line "  represents : String → String → Value → Value → Prop";
   line "  sailEval : String → List Value → Outcome → Prop";
   line "  jibEval : String → List Value → Outcome → Prop";
-  line "  conversionEval : String → String → String → Value → Value → Prop";
+  line "  conversionEval : String → String → String → String → Value → Value → Prop";
   line "  callArgumentsRepresent : String → List Value → List Value → Prop";
   line "  sailCall : String → String → List Value → Outcome → Prop";
   line "  jibCall : String → String → String → List Value → Outcome → Prop";
@@ -1020,7 +1074,7 @@ let write_coq path plan =
   line "  sem_represents : string -> string -> sem_value -> sem_value -> Prop;";
   line "  sem_sail_eval : string -> list sem_value -> sem_outcome -> Prop;";
   line "  sem_jib_eval : string -> list sem_value -> sem_outcome -> Prop;";
-  line "  sem_conversion_eval : string -> string -> string -> sem_value -> sem_value -> Prop;";
+  line "  sem_conversion_eval : string -> string -> string -> string -> sem_value -> sem_value -> Prop;";
   line "  sem_call_arguments_represent : string -> list sem_value -> list sem_value -> Prop;";
   line "  sem_sail_call : string -> string -> list sem_value -> sem_outcome -> Prop;";
   line "  sem_jib_call : string -> string -> string -> list sem_value -> sem_outcome -> Prop;";

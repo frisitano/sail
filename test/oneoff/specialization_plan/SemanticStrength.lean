@@ -14,7 +14,7 @@ def emptyDownstream : Semantics where
   represents := fun _ _ _ _ => True
   sailEval := fun _ _ _ => True
   jibEval := fun _ _ _ => False
-  conversionEval := fun _ _ _ _ _ => False
+  conversionEval := fun _ _ _ _ _ _ => False
   callArgumentsRepresent := fun _ _ _ => False
   sailCall := fun _ _ _ _ => True
   jibCall := fun _ _ _ _ _ => False
@@ -50,7 +50,7 @@ theorem completeRequiresForwardExecution : ¬ Complete emptyDownstream := by
 def missingCallRepresentation : Semantics :=
   { emptyDownstream with
     jibEval := fun _ _ _ => True
-    conversionEval := fun _ _ _ _ _ => True }
+    conversionEval := fun _ _ _ _ _ _ => True }
 
 theorem completeRequiresCallRepresentation :
     ¬ Complete missingCallRepresentation := by
@@ -92,7 +92,7 @@ def splitOutcomeConditions : Semantics where
   represents := fun _ _ _ _ => True
   sailEval := fun _ _ outcome => outcome = false
   jibEval := fun _ _ _ => True
-  conversionEval := fun _ _ _ _ _ => True
+  conversionEval := fun _ _ _ _ _ _ => True
   callArgumentsRepresent := fun _ _ _ => True
   sailCall := fun _ _ _ _ => True
   jibCall := fun _ _ _ _ _ => True

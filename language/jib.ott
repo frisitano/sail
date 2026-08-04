@@ -179,6 +179,11 @@ op :: '' ::=
   | mod               :: :: imod
   | unsigned nat      :: :: unsigned
   | signed nat        :: :: signed
+% A value-preserving integer representation conversion discharged by Sail's
+% interval/path analysis.  The target [ctyp] is retained explicitly so C
+% backends can distinguish this proof-backed conversion from an unchecked
+% low-limb projection selected by backend policy.
+  | proven_narrow ctyp :: :: proven_narrow
 % Bitvector ops
   | bvnot             :: :: bvnot
   | bvor              :: :: bvor

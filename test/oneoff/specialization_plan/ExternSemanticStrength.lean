@@ -14,7 +14,7 @@ def emptyExternDownstream : Semantics where
   represents := fun _ _ _ _ => True
   sailEval := fun _ _ _ => True
   jibEval := fun _ _ _ => True
-  conversionEval := fun _ _ _ _ _ => True
+  conversionEval := fun _ _ _ _ _ _ => True
   callArgumentsRepresent := fun _ _ _ => False
   sailCall := fun _ _ _ _ => True
   jibCall := fun _ _ _ _ _ => False

@@ -53,7 +53,7 @@ grep -Fq 'u128_mod_u256(zleft, zright)' "$OUT.c"
 # wider representation through the arithmetic expression.
 sed -n '/^u128 zsub_128_256(/,/^}/p' "$OUT.c" > "$TMP_DIR/sub_128_256.c"
 grep -Fq 'u128_lt_u256(zleft, zright)' "$TMP_DIR/sub_128_256.c"
-grep -Fq 'u128_of_u256(zright)' "$TMP_DIR/sub_128_256.c"
+grep -Fq 'u128_of_u256_unchecked(zright)' "$TMP_DIR/sub_128_256.c"
 grep -Fq 'u128_sub(zleft,' "$TMP_DIR/sub_128_256.c"
 if grep -Fq 'sail_int' "$TMP_DIR/sub_128_256.c"; then
   echo 'path-refined fixed-width subtraction retained sail_int' >&2
@@ -75,6 +75,19 @@ if grep -Fq 'sail_int' "$TMP_DIR/add_widen_256.c"; then
 fi
 if grep -Fq 'u256_add(' "$TMP_DIR/add_widen_256.c"; then
   echo '257-bit mathematical addition was silently lowered as modular u256' >&2
+  exit 1
+fi
+
+# The extraction default is proof-backed narrowing.  An explicit checked
+# policy must retain the same semantic proof but still validate the boundary
+# at runtime.
+CHECKED="$TMP_DIR/checked"
+"$SAIL" "$@" --no-color --no-memo-z3 -c --c-specialize --c-narrowing=checked --c-no-main \
+  --c-preserve sub_128_256 "$TEST_DIR/model.sail" -o "$CHECKED"
+sed -n '/^u128 zsub_128_256(/,/^}/p' "$CHECKED.c" > "$TMP_DIR/sub_128_256_checked.c"
+grep -Fq 'u128_of_u256(zright)' "$TMP_DIR/sub_128_256_checked.c"
+if grep -Fq 'u128_of_u256_unchecked(zright)' "$TMP_DIR/sub_128_256_checked.c"; then
+  echo 'checked narrowing unexpectedly elided its runtime validation' >&2
   exit 1
 fi
 

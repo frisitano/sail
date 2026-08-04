@@ -67,6 +67,7 @@ let opt_preserve_types = ref IdSet.empty
 let opt_specialize_c = ref false
 let opt_require_bounded_int = ref false
 let opt_const_match_tables = ref false
+let opt_narrowing_policy : C_backend.narrowing_policy option ref = ref None
 let opt_specialization_plan_json = ref None
 let opt_specialization_plan_human = ref None
 let opt_specialization_obligations_lean = ref None
@@ -329,6 +330,17 @@ let c_options =
     ( Flag.create ~prefix:["c"] "inline_attr",
       Arg.Set C_backend.optimize_inline_attr,
       "inline calls to $[c_inline]-annotated Sail functions in generated C"
+    );
+    ( Flag.create ~prefix:["c"] "narrowing",
+      Arg.Symbol
+        ( ["checked"; "proven"; "all"],
+          function
+          | "checked" -> opt_narrowing_policy := Some C_backend.Narrowing_checked
+          | "proven" -> opt_narrowing_policy := Some C_backend.Narrowing_proven
+          | "all" -> opt_narrowing_policy := Some C_backend.Narrowing_all
+          | _ -> assert false
+        ),
+      "select checked, proof-backed, or unchecked fixed-integer narrowing"
     );
     ( Flag.create ~prefix:["c"] ~arg:"filename" "specialization_plan",
       Arg.String (fun path -> opt_specialization_plan_json := Some path),
@@ -1020,6 +1032,13 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
   let fixed_bytes_u64_lanes_signatures =
     collect_fixed_bytes_signatures "fixed_bytes_u64_lanes" c_repr_fixed_bytes_u64_lanes
   in
+  let narrowing_policy =
+    match !opt_narrowing_policy with
+    | Some policy -> policy
+    | None when !opt_optimized_model -> C_backend.Narrowing_all
+    | None when !opt_specialize_c -> C_backend.Narrowing_proven
+    | None -> C_backend.Narrowing_checked
+  in
 
   let module Codegen = C_backend.Codegen (struct
     let includes = !opt_includes_c
@@ -1047,6 +1066,7 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let specialize_c = !opt_specialize_c
     let require_bounded_int = !opt_require_bounded_int
     let const_match_tables = !opt_const_match_tables
+    let narrowing_policy = narrowing_policy
     let specialization_plan_json = !opt_specialization_plan_json
     let specialization_plan_human = !opt_specialization_plan_human
     let specialization_obligations_lean = !opt_specialization_obligations_lean

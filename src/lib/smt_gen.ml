@@ -385,7 +385,7 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
     | Set_slice, _ -> failwith "set_slice"
     | Replicate _, _ -> failwith "replicate"
     | List_hd, [arg] -> Fn ("hd", [arg])
-    | (Unsigned _ | Signed _), [arg] -> arg
+    | (Unsigned _ | Signed _ | Proven_narrow _), [arg] -> arg
     | op, _ -> failwith (string_of_op op)
 
   let smt_conversion ~into:to_ctyp ~from:from_ctyp x =

@@ -221,6 +221,7 @@ let string_of_op = function
   | Imod -> "@imod"
   | Unsigned n -> "@unsigned::<" ^ string_of_int n ^ ">"
   | Signed n -> "@signed::<" ^ string_of_int n ^ ">"
+  | Proven_narrow _ -> "@proven_narrow"
   | Zero_extend n -> "@zero_extend::<" ^ string_of_int n ^ ">"
   | Sign_extend n -> "@sign_extend::<" ^ string_of_int n ^ ">"
   | Slice n -> "@slice::<" ^ string_of_int n ^ ">"
@@ -1153,6 +1154,7 @@ let rec infer_call op vs =
       cval_ctyp v
   | Unsigned n, _ -> CT_fuint n
   | Signed n, _ -> CT_fint n
+  | Proven_narrow ctyp, [_] -> ctyp
   | (Zero_extend n | Sign_extend n), [v] -> (
       match cval_ctyp v with
       | CT_fbits _ | CT_sbits _ -> CT_fbits n

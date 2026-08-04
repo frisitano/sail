@@ -9,6 +9,7 @@ val create :
   compiler_version:string ->
   compiler_revision:string option ->
   configuration:string ->
+  narrowing_policy:string ->
   input_locations:Ast.l list ->
   Jib_compile.representation_specialization list ->
   t

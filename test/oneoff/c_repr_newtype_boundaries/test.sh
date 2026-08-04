@@ -59,3 +59,16 @@ expect_boundary_failure overflow 'Sail C backend: integer value is outside the u
 expect_boundary_failure nat_overflow 'Sail C backend: integer value is outside the uint64_t domain'
 expect_boundary_failure negative_u8 'Sail C backend: negative integer cannot be represented as uint8_t'
 expect_boundary_failure overflow_u8 'Sail C backend: integer value is outside the uint8_t domain'
+
+# `all` is the explicit extraction escape hatch: every narrowing is a
+# low-limb projection, including boundaries without reconstructed evidence.
+ALL_OUTPUT="$TMP_DIR/overflow_all"
+run_sail --no-color -O -c --c-specialize --c-narrowing=all \
+  "$TEST_DIR/overflow.sail" -o "$ALL_OUTPUT"
+# Word splitting is intentional for user/compiler and pkg-config flags.
+# shellcheck disable=SC2086
+"$CC" ${CFLAGS:-} $GMP_CFLAGS "$ALL_OUTPUT.c" "$SAIL_DIR"/lib/*.c -I "$SAIL_DIR/lib" $GMP_LIBS -o "$ALL_OUTPUT.bin"
+"$ALL_OUTPUT.bin" > "$ALL_OUTPUT.result" 2> "$ALL_OUTPUT.err"
+grep -Fq 'unreachable = 0' "$ALL_OUTPUT.result"
+test ! -s "$ALL_OUTPUT.err"
+grep -Fq 'u128_to_u64_unchecked' "$ALL_OUTPUT.c"

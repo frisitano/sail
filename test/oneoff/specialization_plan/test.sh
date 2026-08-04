@@ -12,7 +12,8 @@ TMP_ROOT=${AGENT_TMPDIR:-"$ROOT/.agent-tmp"}
 mkdir -p "$TMP_ROOT"
 TMP_DIR=$(mktemp -d "$TMP_ROOT/specialization_plan.XXXXXX")
 trap 'rm -rf "$TMP_DIR"' EXIT
-mkdir -p "$TMP_DIR/with" "$TMP_DIR/repeated" "$TMP_DIR/readable" "$TMP_DIR/configured" "$TMP_DIR/without"
+mkdir -p "$TMP_DIR/with" "$TMP_DIR/repeated" "$TMP_DIR/readable" "$TMP_DIR/configured" \
+  "$TMP_DIR/policy-checked" "$TMP_DIR/policy-all" "$TMP_DIR/policy-assumed" "$TMP_DIR/without"
 
 if [ -n "${SAIL_PLUGIN:-}" ]; then
   set -- -plugin "$SAIL_PLUGIN"
@@ -80,6 +81,27 @@ for name, path in zip(("lean", "coq"), sys.argv[1:]):
 PY
 cmp "$TEST_DIR/expected-native-obligation-digests.txt" "$TMP_DIR/native-obligation-digests.txt"
 
+test "$(jq -r '.configuration.narrowing_policy' "$TMP_DIR/plan-a.json")" = proven
+test "$(jq '[.clones[].conversions[] | select(.validation == "proven" or .validation == "checked")] | length' "$TMP_DIR/plan-a.json")" -gt 0
+
+# The strict normative schema must evolve with the emitted plan. Validate it
+# when the optional Python package is available, without making it a compiler
+# test dependency.
+python3 - "$ROOT/doc/specialization-plan/schema-v1.json" "$TMP_DIR/plan-a.json" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    import jsonschema
+except ModuleNotFoundError:
+    raise SystemExit(0)
+
+schema = json.loads(pathlib.Path(sys.argv[1]).read_text())
+plan = json.loads(pathlib.Path(sys.argv[2]).read_text())
+jsonschema.Draft202012Validator(schema).validate(plan)
+PY
+
 # C naming is descriptive only and may not perturb the machine plan.
 compile_core "$TMP_DIR/readable/model" "$@" --c-no-mangle \
   --c-specialization-plan "$TMP_DIR/plan-readable.json" \
@@ -96,6 +118,42 @@ compile_core "$TMP_DIR/configured/model" "$@" --c-require-bounded-int \
 test \
   "$(jq -r '.configuration.id' "$TMP_DIR/plan-a.json")" != \
   "$(jq -r '.configuration.id' "$TMP_DIR/plan-configured.json")"
+
+# Narrowing policy is part of the effective configuration and every recorded
+# conversion states whether it is checked, proven, or assumed.
+compile_core "$TMP_DIR/policy-checked/model" "$@" --c-narrowing=checked \
+  --c-specialization-plan "$TMP_DIR/plan-checked.json" \
+  --c-specialization-obligations-lean "$TMP_DIR/CheckedObligations.lean" \
+  --c-specialization-obligations-coq "$TMP_DIR/CheckedObligations.v"
+compile_core "$TMP_DIR/policy-all/model" "$@" --c-narrowing=all \
+  --c-specialization-plan "$TMP_DIR/plan-all.json"
+test "$(jq -r '.configuration.narrowing_policy' "$TMP_DIR/plan-checked.json")" = checked
+test "$(jq -r '.configuration.narrowing_policy' "$TMP_DIR/plan-all.json")" = all
+test \
+  "$(jq -r '.configuration.id' "$TMP_DIR/plan-checked.json")" != \
+  "$(jq -r '.configuration.id' "$TMP_DIR/plan-all.json")"
+grep -Fq '"checked" semanticValue representedValue' "$TMP_DIR/CheckedObligations.lean"
+grep -Fq '"checked" semanticValue representedValue' "$TMP_DIR/CheckedObligations.v"
+grep -Fq '"proven" semanticValue representedValue' "$TMP_DIR/SpecializationObligationsA.lean"
+grep -Fq '"proven" semanticValue representedValue' "$TMP_DIR/SpecializationObligationsA.v"
+"$LEAN" -o "$TMP_DIR/CheckedObligations.olean" "$TMP_DIR/CheckedObligations.lean"
+"$COQC" -Q "$TMP_DIR" "" "$TMP_DIR/CheckedObligations.v"
+
+# An explicitly narrow representation with no range proof is recorded as an
+# assumption only in all mode; proof-backed conversions remain proven.
+"$SAIL" "$@" --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
+  --c-narrowing=all \
+  --c-preserve compact_word_boundary \
+  --c-specialization-plan "$TMP_DIR/plan-assumed.json" \
+  --c-specialization-obligations-lean "$TMP_DIR/AssumedObligations.lean" \
+  --c-specialization-obligations-coq "$TMP_DIR/AssumedObligations.v" \
+  "$TEST_DIR/assumed_model.sail" -o "$TMP_DIR/policy-assumed/model"
+test "$(jq '[.clones[].conversions[] | select(.validation == "assumed")] | length' "$TMP_DIR/plan-assumed.json")" -gt 0
+test "$(jq '[.assumptions[] | select(.kind == "unchecked_narrowing")] | length' "$TMP_DIR/plan-assumed.json")" -eq 1
+grep -Fq '"assumed" semanticValue representedValue' "$TMP_DIR/AssumedObligations.lean"
+grep -Fq '"assumed" semanticValue representedValue' "$TMP_DIR/AssumedObligations.v"
+"$LEAN" -o "$TMP_DIR/AssumedObligations.olean" "$TMP_DIR/AssumedObligations.lean"
+"$COQC" -Q "$TMP_DIR" "" "$TMP_DIR/AssumedObligations.v"
 
 # With emission disabled, generated C and headers are unchanged.
 compile_core "$TMP_DIR/without/model" "$@"

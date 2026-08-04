@@ -25,7 +25,7 @@
       "const": "https://sail-lang.org/schemas/specialization-plan/v1"
     },
     "schema_version": {
-      "const": "1.0.0"
+      "const": "1.1.0"
     },
     "purpose": {
       "type": "string",
@@ -164,6 +164,7 @@
       "required": [
         "id",
         "representation_policy",
+        "narrowing_policy",
         "backend_symbol_policy"
       ],
       "properties": {
@@ -173,6 +174,13 @@
         },
         "representation_policy": {
           "const": "c-specialize-v1"
+        },
+        "narrowing_policy": {
+          "enum": [
+            "checked",
+            "proven",
+            "all"
+          ]
         },
         "backend_symbol_policy": {
           "const": "excluded-from-machine-plan"
@@ -280,6 +288,7 @@
         "id",
         "source_type",
         "destination_type",
+        "validation",
         "reason"
       ],
       "properties": {
@@ -294,6 +303,13 @@
         "destination_type": {
           "type": "string",
           "minLength": 1
+        },
+        "validation": {
+          "enum": [
+            "checked",
+            "proven",
+            "assumed"
+          ]
         },
         "reason": {
           "type": "string",

@@ -16,7 +16,7 @@ Definition empty_extern_downstream : Semantics :=
      sem_represents := fun _ _ _ _ => True;
      sem_sail_eval := fun _ _ _ => True;
      sem_jib_eval := fun _ _ _ => True;
-     sem_conversion_eval := fun _ _ _ _ _ => True;
+     sem_conversion_eval := fun _ _ _ _ _ _ => True;
      sem_call_arguments_represent := fun _ _ _ => False;
      sem_sail_call := fun _ _ _ _ => True;
      sem_jib_call := fun _ _ _ _ _ => False;
@@ -69,7 +69,7 @@ Definition extern_observation
      sem_represents := fun _ _ _ _ => True;
      sem_sail_eval := fun _ _ _ => True;
      sem_jib_eval := fun _ _ _ => True;
-     sem_conversion_eval := fun _ _ _ _ _ => True;
+     sem_conversion_eval := fun _ _ _ _ _ _ => True;
      sem_call_arguments_represent := fun _ _ _ => True;
      sem_sail_call := fun _ _ _ _ => True;
      sem_jib_call := fun _ _ _ _ _ => True;

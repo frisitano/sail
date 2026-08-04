@@ -51,6 +51,8 @@ open Type_check
 
 (** Global compilation options *)
 
+type narrowing_policy = Narrowing_checked | Narrowing_proven | Narrowing_all
+
 (** Ordinarily we use plain z-encoding to name-mangle generated Sail identifiers into a form suitable for C. If
     opt_prefix is set, then the "z" which is added on the front of each generated C function will be replaced by
     opt_prefix. E.g. opt_prefix := "sail_" would give sail_my_function rather than zmy_function. *)
@@ -153,6 +155,9 @@ module type CODEGEN_CONFIG = sig
       indexed by the dense selector tag, and additionally recognize literal-selector ladders over small fixed unsigned
       integers as switch families. *)
   val const_match_tables : bool
+
+  (** Runtime policy for conversions into a smaller fixed integer carrier. *)
+  val narrowing_policy : narrowing_policy
 
   (** Optional backend-neutral representation-specialization plan outputs. *)
   val specialization_plan_json : string option

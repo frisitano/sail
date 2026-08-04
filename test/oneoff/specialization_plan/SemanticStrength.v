@@ -17,7 +17,7 @@ Definition empty_downstream : Semantics :=
      sem_represents := fun _ _ _ _ => True;
      sem_sail_eval := fun _ _ _ => True;
      sem_jib_eval := fun _ _ _ => False;
-     sem_conversion_eval := fun _ _ _ _ _ => False;
+     sem_conversion_eval := fun _ _ _ _ _ _ => False;
      sem_call_arguments_represent := fun _ _ _ => False;
      sem_sail_call := fun _ _ _ _ => True;
      sem_jib_call := fun _ _ _ _ _ => False;
@@ -72,7 +72,7 @@ Definition missing_call_representation : Semantics :=
      sem_represents := fun _ _ _ _ => True;
      sem_sail_eval := fun _ _ _ => True;
      sem_jib_eval := fun _ _ _ => True;
-     sem_conversion_eval := fun _ _ _ _ _ => True;
+     sem_conversion_eval := fun _ _ _ _ _ _ => True;
      sem_call_arguments_represent := fun _ _ _ => False;
      sem_sail_call := fun _ _ _ _ => True;
      sem_jib_call := fun _ _ _ _ _ => False;
@@ -107,7 +107,7 @@ Definition call_observation
      sem_represents := fun _ _ _ _ => True;
      sem_sail_eval := fun _ _ _ => True;
      sem_jib_eval := fun _ _ _ => True;
-     sem_conversion_eval := fun _ _ _ _ _ => True;
+     sem_conversion_eval := fun _ _ _ _ _ _ => True;
      sem_call_arguments_represent := fun _ _ _ => True;
      sem_sail_call := fun _ _ _ _ => True;
      sem_jib_call := fun _ _ _ _ _ => jib_call_holds;
@@ -154,7 +154,7 @@ Definition split_outcome_conditions : Semantics :=
      sem_represents := fun _ _ _ _ => True;
      sem_sail_eval := fun _ _ outcome => outcome = false;
      sem_jib_eval := fun _ _ _ => True;
-     sem_conversion_eval := fun _ _ _ _ _ => True;
+     sem_conversion_eval := fun _ _ _ _ _ _ => True;
      sem_call_arguments_represent := fun _ _ _ => True;
      sem_sail_call := fun _ _ _ _ => True;
      sem_jib_call := fun _ _ _ _ _ => True;
@@ -212,7 +212,7 @@ Definition source_unbounded : Semantics :=
      sem_represents := fun _ _ _ _ => True;
      sem_sail_eval := fun _ _ _ => True;
      sem_jib_eval := fun _ _ _ => False;
-     sem_conversion_eval := fun _ _ _ _ _ => False;
+     sem_conversion_eval := fun _ _ _ _ _ _ => False;
      sem_call_arguments_represent := fun _ _ _ => True;
      sem_sail_call := fun _ _ _ _ => True;
      sem_jib_call := fun _ _ _ _ _ => False;

@@ -16,7 +16,7 @@ names.
   reconstructs semantic obligations from the machine plan.
 - Consumers: structural validation, Lean/Coq adapters, regression tests, and
   human review.
-- Schema: `1.0.0`, identified by
+- Schema: `1.1.0`, identified by
   `https://sail-lang.org/schemas/specialization-plan/v1`.
 - Non-goals: certifying the compiler, making JIB display names or C symbols
   stable, or proving an extern implementation without an independent contract.
@@ -54,6 +54,7 @@ Plan emission is optional and has no effect when disabled:
 
 ```sh
 sail -c --c-specialize \
+  --c-narrowing=proven \
   --c-specialization-plan model.specialization.json \
   --c-specialization-plan-human model.specialization.md \
   --c-specialization-obligations-lean SpecializationObligations.lean \
@@ -76,10 +77,26 @@ Lean/Coq syntax differs. The generated files are likewise byte-identical across
 repeated compilations.
 
 The configuration identity covers the versioned representation-specialization
-policy, bounded-integer enforcement, preserved specialization roots, and the
-effective per-type representation settings. Input-local representation
-annotations are also covered by the input digests. Backend naming and output
-paths are deliberately excluded because they cannot affect proof identity.
+policy, narrowing policy, bounded-integer enforcement, preserved specialization
+roots, and the effective per-type representation settings. Input-local
+representation annotations are also covered by the input digests. Backend
+naming and output paths are deliberately excluded because they cannot affect
+proof identity.
+
+`--c-narrowing` controls conversions into smaller native integer carriers:
+
+- `checked` validates every narrowing at runtime;
+- `proven` elides validation only when Sail's interval and path analysis has
+  reconstructed a range proof, and checks every other narrowing; and
+- `all` projects the low limbs at every narrowing boundary. This is the default
+  for `--c-optimized-model`; it is an explicit refinement assumption for any
+  boundary without reconstructed evidence.
+
+Plain C generation defaults to `checked`, while `--c-specialize` defaults to
+`proven`. An explicit `--c-narrowing` always takes precedence. Each recorded
+conversion is classified as `checked`, `proven`, or `assumed`; `assumed`
+conversions add an `unchecked_narrowing` assumption and make conversion
+correctness unresolved until a downstream refinement proof discharges it.
 
 ## Obligations
 
@@ -110,7 +127,9 @@ ownership/lifetime obligations are universal safety statements over every
 represented Sail/JIB execution pair whose outcomes refine, so both properties
 apply to the same execution witnesses established by operation refinement.
 Conversion obligations likewise require a represented result for every
-well-typed source value. Consequently, missing representations, empty
+well-typed source value. The conversion relation receives the recorded
+`checked`, `proven`, or `assumed` validation class, so Lean and Coq consumers
+can give each trust path distinct semantics. Consequently, missing representations, empty
 downstream execution relations, or incompatible side-condition witnesses cannot
 satisfy `Complete` merely by vacuity.
 

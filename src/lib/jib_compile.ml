@@ -78,7 +78,7 @@ type representation_specialization = {
   argument_bounds : (Big_int.num * Big_int.num) option list;
   result_bound : (Big_int.num * Big_int.num) option;
   calls : (id * ctyp list * ctyp * bool) list;
-  conversions : (ctyp * ctyp) list;
+  conversions : (ctyp * ctyp * bool) list;
   recursive : bool;
 }
 
@@ -3720,7 +3720,7 @@ module Make (C : CONFIG) = struct
                  ~inserted:inserted_bounds
              )
           )
-    | V_call ((Unsigned _ | Zero_extend _), [source]) -> cval_integer_lifetime ranges source
+    | V_call ((Unsigned _ | Proven_narrow _ | Zero_extend _), [source]) -> cval_integer_lifetime ranges source
     | V_call (op, [left; right]) as call -> (
         let left = cval_integer_lifetime ranges left in
         let right = cval_integer_lifetime ranges right in
@@ -4444,17 +4444,16 @@ module Make (C : CONFIG) = struct
     map_instr (fun instr -> f (instruction_lifetime_ranges global_ranges path_ranges instr) instr)
 
   let proven_fixed_integer_conversion represented interval value =
-    let conversion =
-      match (represented, cval_ctyp value) with
-      | CT_fuint width, (CT_fint _ | CT_fuint _ | CT_constant _ | CT_fbits _) -> Some (Unsigned width)
-      | CT_fint 64, CT_fbits _ -> Some (Signed 64)
-      | CT_fint width, (CT_fint _ | CT_fuint _ | CT_constant _) -> Some (Signed width)
-      | _ -> None
+    let source_has_integer_representation =
+      Option.is_some (C.integer_representation_bounds (cval_ctyp value))
+      || match cval_ctyp value with CT_fbits _ -> true | _ -> false
     in
-    match (conversion, C.integer_representation_bounds represented, interval) with
-    | Some conversion, Some (represented_lower, represented_upper), Some (lower, upper)
-      when Big_int.less_equal represented_lower lower && Big_int.less_equal upper represented_upper ->
-        Some (V_call (conversion, [value]))
+    match (C.integer_representation_bounds represented, interval) with
+    | Some (represented_lower, represented_upper), Some (lower, upper)
+      when source_has_integer_representation
+           && Big_int.less_equal represented_lower lower
+           && Big_int.less_equal upper represented_upper ->
+        Some (V_call (Proven_narrow represented, [value]))
     | _ -> None
 
   let prune_proved_unreachable path_ranges path_decisions body =
@@ -6551,14 +6550,55 @@ module Make (C : CONFIG) = struct
       proven_fixed_integer_conversion represented (integer_lifetime_interval lifetime) value
     in
     let specialize_proven_integer_conversion lifetime_ranges = function
-      | I_aux (I_copy (result, value), aux) as instr ->
+      | I_aux (I_init (represented, name, Init_cval value), aux) as instr -> (
+          let source = cval_ctyp value in
+          if ctyp_equal source represented then instr
+          else (
+            let lifetime = cval_integer_lifetime lifetime_ranges value in
+            let converted = proven_native_conversion represented lifetime value in
+            if !opt_debug_function_representations then
+              Printf.eprintf
+                "C representation specialization: conversion source=%s destination=%s interval=%s proof=%b\n%!"
+                (string_of_ctyp source) (string_of_ctyp represented)
+                (string_of_integer_interval (integer_lifetime_interval lifetime))
+                (Option.is_some converted);
+            Option.fold ~none:instr
+              ~some:(fun value -> I_aux (I_init (represented, name, Init_cval value), aux))
+              converted
+          )
+        )
+      | I_aux (I_reinit (represented, name, value), aux) as instr -> (
+          let source = cval_ctyp value in
+          if ctyp_equal source represented then instr
+          else (
+            let lifetime = cval_integer_lifetime lifetime_ranges value in
+            let converted = proven_native_conversion represented lifetime value in
+            if !opt_debug_function_representations then
+              Printf.eprintf
+                "C representation specialization: conversion source=%s destination=%s interval=%s proof=%b\n%!"
+                (string_of_ctyp source) (string_of_ctyp represented)
+                (string_of_integer_interval (integer_lifetime_interval lifetime))
+                (Option.is_some converted);
+            Option.fold ~none:instr
+              ~some:(fun value -> I_aux (I_reinit (represented, name, value), aux))
+              converted
+          )
+        )
+      | I_aux (I_copy (result, value), aux) as instr -> (
           let represented = clexp_ctyp result in
           let source = cval_ctyp value in
           if ctyp_equal source represented then instr
-          else
-            Option.fold ~none:instr
-              ~some:(fun value -> I_aux (I_copy (result, value), aux))
-              (proven_native_conversion represented (cval_integer_lifetime lifetime_ranges value) value)
+          else (
+            let lifetime = cval_integer_lifetime lifetime_ranges value in
+            let converted = proven_native_conversion represented lifetime value in
+            if !opt_debug_function_representations then
+              Printf.eprintf "C representation specialization: conversion source=%s destination=%s interval=%s proof=%b\n%!"
+                (string_of_ctyp source) (string_of_ctyp represented)
+                (string_of_integer_interval (integer_lifetime_interval lifetime))
+                (Option.is_some converted);
+            Option.fold ~none:instr ~some:(fun value -> I_aux (I_copy (result, value), aux)) converted
+          )
+        )
       | instr -> instr
     in
     let specialize_proven_bitvector_shift lifetime_ranges = function
@@ -6672,6 +6712,12 @@ module Make (C : CONFIG) = struct
               match represented_integer_lifetime ctx carrier_lifetime with
               | Some ((CT_fint _ | CT_fuint _) as carrier) when not (ctyp_equal (clexp_ctyp result) carrier) ->
                   let l = snd aux in
+                  log_progress
+                    "structural-primitive carrier=%s left=%s(%s) right=%s(%s)"
+                    (string_of_ctyp carrier) (string_of_ctyp (cval_ctyp left))
+                    (string_of_integer_interval (integer_lifetime_interval left_lifetime))
+                    (string_of_ctyp (cval_ctyp right))
+                    (string_of_integer_interval (integer_lifetime_interval right_lifetime));
                   let promote lifetime value =
                     if ctyp_equal (cval_ctyp value) carrier then ([], value, [])
                     else (
@@ -6998,11 +7044,15 @@ module Make (C : CONFIG) = struct
                     let preserve_native_operands =
                       Option.is_some power_of_two_operation || Option.is_some mixed_fixed_operation
                     in
-                    log_progress "primitive=%s carrier=%s result=%s left=%s right=%s preserve-mixed=%b"
-                      (string_of_id id) (string_of_ctyp carrier)
+                    log_progress
+                      "primitive=%s carrier=%s result=%s left=%s(%s) right=%s(%s) preserve-mixed=%b"
+                      (string_of_id id)
+                      (string_of_ctyp carrier)
                       (Option.fold ~none:"?" ~some:string_of_ctyp result_carrier)
                       (string_of_ctyp (cval_ctyp left))
+                      (string_of_integer_interval (integer_lifetime_interval left_lifetime))
                       (string_of_ctyp (cval_ctyp right))
+                      (string_of_integer_interval (integer_lifetime_interval right_lifetime))
                       (Option.is_some proven_mixed_operands || preserve_native_operands);
                     let promote lifetime value =
                       if ctyp_equal (cval_ctyp value) carrier then ([], value, [])
@@ -7197,6 +7247,14 @@ module Make (C : CONFIG) = struct
                      )
                 |> List.map
                      (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges specialize_integer_primitive)
+                (* Structural and primitive specialization can introduce a
+                   fresh wide-to-narrow copy.  Mark that generated boundary
+                   only after it exists so the backend can distinguish a
+                   proved projection from an unchecked assumption. *)
+                |> List.map
+                     (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                        specialize_proven_integer_conversion
+                     )
                 |> remove_unused_literal_temporaries
                 |> List.map
                      (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges rewrite_non_recursive_call)
@@ -7315,6 +7373,10 @@ module Make (C : CONFIG) = struct
                      )
                 |> List.map
                      (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges specialize_integer_primitive)
+                |> List.map
+                     (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                        specialize_proven_integer_conversion
+                     )
                 |> remove_unused_literal_temporaries
                 |> List.map
                      (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges (fun lifetime_ranges ->
@@ -7330,6 +7392,22 @@ module Make (C : CONFIG) = struct
           let specialized_fundef = CDEF_aux (CDEF_fundef (specialized_id, heap_return, params, body), fundef_annot) in
           let calls = ref [] in
           let conversions = ref [] in
+          let record_conversion source destination proven =
+            if not (ctyp_equal source destination) then
+              conversions := (source, destination, proven) :: !conversions
+          in
+          let conversion_visitor =
+            object
+              inherit empty_jib_visitor
+
+              method! vcval = function
+                | V_call (Proven_narrow destination, [source]) ->
+                    record_conversion (cval_ctyp source) destination true;
+                    DoChildren
+                | _ -> DoChildren
+            end
+          in
+          List.iter (fun instr -> ignore (visit_instr conversion_visitor instr)) body;
           List.iter
             (iter_instr (function
               | I_aux (I_funcall (creturn, call_kind, (callee, ctyps), _), _) ->
@@ -7341,9 +7419,10 @@ module Make (C : CONFIG) = struct
                     )
                     :: !calls
               | I_aux (I_copy (destination, value), _) ->
-                  let source = cval_ctyp value in
-                  let destination = clexp_ctyp destination in
-                  if not (ctyp_equal source destination) then conversions := (source, destination) :: !conversions
+                  record_conversion (cval_ctyp value) (clexp_ctyp destination) false
+              | I_aux (I_init (destination, _, Init_cval value), _)
+              | I_aux (I_reinit (destination, _, value), _) ->
+                  record_conversion (cval_ctyp value) destination false
               | _ -> ()
               ))
             body;
@@ -7469,6 +7548,7 @@ module Make (C : CONFIG) = struct
             |> List.map (map_instr (specialize_structural_integer_primitive lifetime_ranges))
             |> List.map (map_instr specialize_literal_assignment)
             |> List.map (map_instr (specialize_integer_primitive lifetime_ranges))
+            |> List.map (map_instr (specialize_proven_integer_conversion lifetime_ranges))
             |> List.map (map_instr (specialize_proven_fixed_vector_access lifetime_ranges))
           in
           CDEF_aux (CDEF_let (index, List.map represented_binding bindings, body), def_annot)
@@ -7990,12 +8070,36 @@ module Make (C : CONFIG) = struct
                 @ cleanup @ tail
               )
               else instr :: tail
-          | Call (((argument_intervals, result_interval), _) as callsite_info) -> (
+          | Call (((argument_intervals, result_interval), semantic_proofs) as callsite_info) -> (
               match get_function_typ id with
               | Some (param_ctyps, ret_ctyp) when C.make_call_precise ctx id param_ctyps ret_ctyp ->
                   if List.compare_lengths args param_ctyps <> 0 then
                     Reporting.unreachable (id_loc id) __POS__
                       ("Function call found with incorrect arity: " ^ string_of_id id);
+                  (* Semantic call proofs can make a conversion exact even
+                     when the independently inferred argument interval is
+                     wider.  In particular, [right <= left] on subtraction
+                     bounds a wide right operand by a native-width left
+                     operand.  Refine the binary call intervals before
+                     inserting argument casts so that exact casts retain an
+                     explicit [Proven_narrow] marker. *)
+                  let refine_argument_le left right intervals =
+                    if Jib_semantics.has_argument_le ~left ~right semantic_proofs then
+                      match (List.nth_opt intervals left, List.nth_opt intervals right) with
+                      | Some (Some (left_lower, left_upper)), Some (Some (right_lower, right_upper)) ->
+                          List.mapi
+                            (fun index interval ->
+                              if index = left then Some (left_lower, Big_int.min left_upper right_upper)
+                              else if index = right then Some (Big_int.max right_lower left_lower, right_upper)
+                              else interval
+                            )
+                            intervals
+                      | _ -> intervals
+                    else intervals
+                  in
+                  let argument_intervals =
+                    argument_intervals |> refine_argument_le 0 1 |> refine_argument_le 1 0
+                  in
                   let casted_args =
                     List.mapi
                       (fun index (arg, param_ctyp) ->
@@ -8012,8 +8116,17 @@ module Make (C : CONFIG) = struct
                               (Option.value ~default:None (List.nth_opt argument_intervals index))
                               arg
                           with
-                          | Some arg -> ([], arg, [])
+                          | Some converted ->
+                              if !opt_debug_function_representations then
+                                Printf.eprintf
+                                  "C representation specialization: precise-call function=%s argument=%d source=%s destination=%s proof=true\n%!"
+                                  (string_of_id id) index (string_of_ctyp arg_ctyp) (string_of_ctyp param_ctyp);
+                              ([], converted, [])
                           | None ->
+                              if !opt_debug_function_representations then
+                                Printf.eprintf
+                                  "C representation specialization: precise-call function=%s argument=%d source=%s destination=%s proof=false\n%!"
+                                  (string_of_id id) index (string_of_ctyp arg_ctyp) (string_of_ctyp param_ctyp);
                               let gs = ngensym () in
                               let cast = [idecl l param_ctyp gs; icopy l (CL_id (gs, param_ctyp)) arg] in
                               let cleanup = [iclear ~loc:l param_ctyp gs] in

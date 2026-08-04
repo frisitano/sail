@@ -550,8 +550,10 @@ awk '
   printing { print }
   printing && /^}/ { printing = 0 }
 ' "$SPEC_SOURCE/base.c" > "$TMP_DIR/narrow_wide_byte.c"
-grep -Fq '(uint8_t)u256_to_u64(' "$TMP_DIR/narrow_wide_byte.c"
-if grep -Eq '= u256_to_u64\(' "$TMP_DIR/narrow_wide_byte.c"; then
+# The optimized model defaults to unchecked narrowing, so the proved
+# wide-to-native projection keeps its direct low-limb form.
+grep -Fq '(uint8_t)u256_to_u64_unchecked(' "$TMP_DIR/narrow_wide_byte.c"
+if grep -Eq '= u256_to_u64(_unchecked)?\(' "$TMP_DIR/narrow_wide_byte.c"; then
   echo 'optimized extraction retained an implicit wide-to-native integer narrowing' >&2
   exit 1
 fi
@@ -705,7 +707,10 @@ awk '
   printing && /^}/ { printing = 0 }
 ' "$SPEC_SOURCE/host_contracts.c" > "$TMP_DIR/guarded_wide_offset.c"
 grep -Eq 'if \(u256_lt_u64\(off, UINT[0-9]+_C\(256\)\)\)' "$TMP_DIR/guarded_wide_offset.c"
-grep -Fq 'return host_mix_exact(value, tag);' "$TMP_DIR/guarded_wide_offset.c"
+# The guarded projection reaches the host call directly, either through the
+# source-named temporary or as the inlined proved low-limb projection.
+grep -Eq 'return host_mix_exact\(value, (tag|\(uint8_t\)u256_to_u64(_unchecked)?\(off\))\);' \
+  "$TMP_DIR/guarded_wide_offset.c"
 
 awk '
   /^uint8_t masked_high_nibble\(/ { printing = 1 }

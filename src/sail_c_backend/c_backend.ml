@@ -63,6 +63,13 @@ open Anf
 
 module Big_int = Nat_big_num
 
+type narrowing_policy = Narrowing_checked | Narrowing_proven | Narrowing_all
+
+let string_of_narrowing_policy = function
+  | Narrowing_checked -> "checked"
+  | Narrowing_proven -> "proven"
+  | Narrowing_all -> "all"
+
 let opt_prefix = ref "z"
 let opt_extra_params = ref None
 let opt_extra_arguments = ref None
@@ -4929,7 +4936,7 @@ let bit_literal_integer bits =
 let rec integer_literal_value = function
   | V_lit (VL_int value, _) -> Some value
   | V_lit (VL_bits bits, _) -> bit_literal_integer bits
-  | V_call ((Unsigned _ | Zero_extend _), [value]) -> integer_literal_value value
+  | V_call ((Unsigned _ | Proven_narrow _ | Zero_extend _), [value]) -> integer_literal_value value
   | _ -> None
 
 let rec integer_cval_bounds = function
@@ -4942,6 +4949,15 @@ let rec integer_cval_bounds = function
       | _ -> Some (Big_int.zero, max_uint width)
     )
   | V_call (Signed width, [_]) -> Some (min_int width, max_int width)
+  (* A proved narrowing is exact, so the source bounds survive it; the
+     destination carrier can only tighten them further. *)
+  | V_call (Proven_narrow ctyp, [value]) -> (
+      match (integer_cval_bounds value, integer_ctyp_bounds ctyp) with
+      | Some (lower, upper), Some (carrier_lower, carrier_upper) ->
+          Some (Big_int.max lower carrier_lower, Big_int.min upper carrier_upper)
+      | Some bounds, None -> Some bounds
+      | None, bounds -> bounds
+    )
   | V_call (Bvand, [left; right]) -> (
       match (integer_literal_value left, integer_literal_value right) with
       | _, Some mask when Big_int.greater_equal mask Big_int.zero -> integer_mask_bounds left mask
@@ -5251,6 +5267,7 @@ module type CODEGEN_CONFIG = sig
   val specialize_c : bool
   val require_bounded_int : bool
   val const_match_tables : bool
+  val narrowing_policy : narrowing_policy
   val specialization_plan_json : string option
   val specialization_plan_human : string option
   val specialization_obligations_lean : string option
@@ -5945,6 +5962,85 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       | CT_fuint unsigned_width, CT_fint signed_width -> compare_unsigned_signed unsigned_width signed_width left right
       | _ -> None
     in
+    let proven_narrow target value =
+      let source = cval_ctyp value in
+      let rendered = sgen_cval value in
+      let checked_helper checked unchecked =
+        if Config.narrowing_policy = Narrowing_checked then checked else unchecked
+      in
+      let low_u64 () =
+        if is_c_repr_u320 source then
+          sprintf "%s(%s)" (checked_helper "u320_to_u64" "u320_to_u64_unchecked") rendered
+        else if is_c_repr_u256 source then
+          sprintf "%s(%s)" (checked_helper "u256_to_u64" "u256_to_u64_unchecked") rendered
+        else if is_c_repr_u128 source then
+          sprintf "%s(%s)" (checked_helper "u128_to_u64" "u128_to_u64_unchecked") rendered
+        else
+          match source with
+          (* Only a source wider than the projection needs an explicit
+             truncation; a native source already converts implicitly wherever
+             this projection is consumed. *)
+          | CT_fint width | CT_fuint width when width > 64 -> sprintf "((uint64_t)(%s))" rendered
+          | CT_fint _ | CT_fuint _ | CT_constant _ -> rendered
+          | _ -> c_error (sprintf "Cannot project proved integer representation %s" (string_of_ctyp source))
+      in
+      let as_u128 () =
+        if is_c_repr_u320 source then
+          sprintf "%s(%s)" (checked_helper "u128_of_u320" "u128_of_u320_unchecked") rendered
+        else if is_c_repr_u256 source then
+          sprintf "%s(%s)" (checked_helper "u128_of_u256" "u128_of_u256_unchecked") rendered
+        else if is_c_repr_u128 source then rendered
+        else
+          match source with
+          | CT_fint width | CT_fuint width when width > 64 ->
+              sprintf "((u128){{(uint64_t)(%s), (uint64_t)(((unsigned __int128)(%s)) >> 64)}})" rendered rendered
+          | CT_fint _ | CT_fuint _ | CT_constant _ -> sprintf "u128_of_u64(%s)" (low_u64 ())
+          | _ -> c_error (sprintf "Cannot narrow %s to u128" (string_of_ctyp source))
+      in
+      let as_u256 () =
+        if is_c_repr_u320 source then
+          sprintf "%s(%s)" (checked_helper "u256_of_u320" "u256_of_u320_unchecked") rendered
+        else if is_c_repr_u256 source then rendered
+        else if is_c_repr_u128 source then sprintf "u256_of_u128(%s)" rendered
+        else
+          match source with
+          | CT_fint width | CT_fuint width when width > 64 -> sprintf "u256_of_u128(%s)" (as_u128 ())
+          | CT_fint _ | CT_fuint _ | CT_constant _ -> sprintf "u256_of_fbits(%s)" (low_u64 ())
+          | _ -> c_error (sprintf "Cannot narrow %s to u256" (string_of_ctyp source))
+      in
+      if is_c_repr_u320 target then (
+        if is_c_repr_u320 source then rendered
+        else if is_c_repr_u256 source then sprintf "u320_of_u256(%s)" rendered
+        else if is_c_repr_u128 source then sprintf "u320_of_u128(%s)" rendered
+        else
+          match source with
+          | CT_fint width | CT_fuint width when width > 64 -> sprintf "u320_of_u128(%s)" (as_u128 ())
+          | CT_fint _ | CT_fuint _ | CT_constant _ -> sprintf "u320_of_u64(%s)" (low_u64 ())
+          | _ -> c_error (sprintf "Cannot narrow %s to u320" (string_of_ctyp source))
+      )
+      else if is_c_repr_u256 target then as_u256 ()
+      else if is_c_repr_u128 target then as_u128 ()
+      else
+        match target with
+        (* Only a wide carrier needs an explicit low-limb projection. A native
+           source keeps the ordinary represented-cast renderer, which
+           distributes a widening cast over proven arithmetic and retains the
+           sign-extension helper for bitvector sources. *)
+        | (CT_fint _ | CT_fuint _) when is_c_repr_u320 source || is_c_repr_u256 source || is_c_repr_u128 source ->
+            sprintf "(%s)%s" (sgen_ctyp target) (low_u64 ())
+        | CT_fint width -> (
+            match source with
+            | CT_fbits bits when width = 64 -> sprintf "fast_signed(%s, %d)" rendered bits
+            | CT_fint _ | CT_fuint _ | CT_constant _ -> sgen_cval_as target value
+            | _ -> c_error (sprintf "Cannot lower proved signed conversion from %s" (string_of_ctyp source))
+          )
+        | CT_fuint width -> (
+            match value with
+            | V_lit (VL_int literal, _) -> sgen_value (CT_fuint width) (VL_int literal)
+            | _ -> sgen_cval_as target value
+          )
+        | _ -> c_error (sprintf "Invalid proved integer narrowing target %s" (string_of_ctyp target))
+    in
     match (op, cvals) with
     | Bnot, [V_lit (VL_bool value, _)] -> if value then "false" else "true"
     | Bnot, [V_call (Bnot, [value])] -> sgen_cval value
@@ -6289,6 +6385,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | CT_fint _ | CT_fuint _ | CT_constant _ -> sgen_cval_as (CT_fint width) value
         | ctyp -> c_error (sprintf "Cannot lower proved signed conversion from %s" (string_of_ctyp ctyp))
       )
+    | Proven_narrow target, [value] -> proven_narrow target value
     | Bvand, [v1; v2] -> (
         match cval_ctyp v1 with
         | CT_fbits _ -> sprintf "(%s & %s)" (sgen_cval v1) (sgen_cval v2)
@@ -6595,6 +6692,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     let negative_target () = sprintf "negative integer cannot be represented as %s" (sgen_ctyp ctyp_to) in
     let fits_unsigned width = integer_cval_fits Big_int.zero (max_uint width) cval in
     let fits_signed width = integer_cval_fits (min_int width) (max_int width) cval in
+    if Config.narrowing_policy = Narrowing_all then assignment
+    else
     match (ctyp_to, ctyp_from) with
     | CT_fuint to_width, CT_fuint from_width ->
         let to_width = storage_width to_width in
@@ -6718,6 +6817,30 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let rec codegen_conversion l ctx clexp cval =
     let ctyp_to = clexp_ctyp clexp in
     let ctyp_from = cval_ctyp cval in
+    let equal_representation_assignment () =
+      if is_stack_ctyp ctx ctyp_to then
+        ksprintf string "  %s = %s;" (sgen_clexp_pure l clexp) (sgen_cval_in_value_context cval)
+      else
+        sail_copy ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp_to) "%s, %s" (sgen_clexp l clexp)
+          (sgen_cval_in_value_context cval)
+    in
+    match (ctyp_to, ctyp_from) with
+    (* In checked mode, deliberately discard the proof marker and run the
+       ordinary boundary conversion.  In proven/all modes the marker's target
+       type makes the following equal-representation case emit its direct
+       projection expression. *)
+    | _, _ when Config.narrowing_policy = Narrowing_checked -> (
+        match cval with
+        | V_call (Proven_narrow target, [source]) when ctyp_equal target ctyp_to ->
+            codegen_conversion l ctx clexp source
+        | _ when ctyp_equal ctyp_to ctyp_from -> equal_representation_assignment ()
+        | _ -> codegen_conversion_nontrivial l ctx clexp cval ctyp_to ctyp_from
+      )
+    (* When both types are equal, we don't need any conversion. *)
+    | _, _ when ctyp_equal ctyp_to ctyp_from -> equal_representation_assignment ()
+    | _ -> codegen_conversion_nontrivial l ctx clexp cval ctyp_to ctyp_from
+
+  and codegen_conversion_nontrivial l ctx clexp cval ctyp_to ctyp_from =
     let assign_u64_call helper =
       let call = sprintf "%s(%s)" helper (sgen_cval cval) in
       let value =
@@ -6725,14 +6848,10 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       in
       ksprintf string "  %s = %s;" (sgen_clexp_pure l clexp) value
     in
+    let unchecked checked_helper unchecked_helper =
+      if Config.narrowing_policy = Narrowing_all then unchecked_helper else checked_helper
+    in
     match (ctyp_to, ctyp_from) with
-    (* When both types are equal, we don't need any conversion. *)
-    | _, _ when ctyp_equal ctyp_to ctyp_from ->
-        if is_stack_ctyp ctx ctyp_to then
-          ksprintf string "  %s = %s;" (sgen_clexp_pure l clexp) (sgen_cval_in_value_context cval)
-        else
-          sail_copy ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp_to) "%s, %s" (sgen_clexp l clexp)
-            (sgen_cval_in_value_context cval)
     | to_typ, (CT_fint _ | CT_fuint _ | CT_constant _) when is_c_repr_byte_pointer to_typ ->
         let adapter = Option.get (c_repr_byte_pointer_adapter to_typ) in
         if adapter = direct_byte_pointer_adapter then (
@@ -6765,11 +6884,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         ksprintf string "  %s = u320_of_u128(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, from_typ when is_c_repr_u320 to_typ && is_c_repr_u256 from_typ ->
         ksprintf string "  %s = u320_of_u256(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
-    | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u320 from_typ -> assign_u64_call "u320_to_u64"
+    | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u320 from_typ ->
+        assign_u64_call (unchecked "u320_to_u64" "u320_to_u64_unchecked")
     | to_typ, from_typ when is_c_repr_u256 to_typ && is_c_repr_u320 from_typ ->
-        ksprintf string "  %s = u256_of_u320(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+        ksprintf string "  %s = %s(%s);" (sgen_clexp_pure l clexp)
+          (unchecked "u256_of_u320" "u256_of_u320_unchecked") (sgen_cval cval)
     | to_typ, from_typ when is_c_repr_u128 to_typ && is_c_repr_u320 from_typ ->
-        ksprintf string "  %s = u128_of_u320(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+        ksprintf string "  %s = %s(%s);" (sgen_clexp_pure l clexp)
+          (unchecked "u128_of_u320" "u128_of_u320_unchecked") (sgen_cval cval)
     | to_typ, CT_lbits when is_c_repr_u256 to_typ ->
         ksprintf string "  %s = u256_of_lbits(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | CT_lbits, from_typ when is_c_repr_u256 from_typ ->
@@ -6796,7 +6918,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         ksprintf string "  %s = u256_of_fbits(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, from_typ when is_c_repr_u256 to_typ && is_c_repr_u128 from_typ ->
         ksprintf string "  %s = u256_of_u128(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
-    | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u256 from_typ -> assign_u64_call "u256_to_u64"
+    | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u256 from_typ ->
+        assign_u64_call (unchecked "u256_to_u64" "u256_to_u64_unchecked")
     | to_typ, CT_fuint _ when is_c_repr_u128 to_typ ->
         ksprintf string "  %s = u128_of_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, CT_fint width when is_c_repr_u128 to_typ && width > 64 ->
@@ -6804,9 +6927,11 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           (sgen_clexp_pure l clexp) (sgen_cval cval) (sgen_cval cval)
     | to_typ, CT_lint when is_c_repr_u128 to_typ ->
         ksprintf string "  %s = u128_of_sail_int(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
-    | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u128 from_typ -> assign_u64_call "u128_to_u64"
+    | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u128 from_typ ->
+        assign_u64_call (unchecked "u128_to_u64" "u128_to_u64_unchecked")
     | to_typ, from_typ when is_c_repr_u128 to_typ && is_c_repr_u256 from_typ ->
-        ksprintf string "  %s = u128_of_u256(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+        ksprintf string "  %s = %s(%s);" (sgen_clexp_pure l clexp)
+          (unchecked "u128_of_u256" "u128_of_u256_unchecked") (sgen_cval cval)
     | to_typ, (CT_vector (CT_fbits 8 | CT_fuint 8) | CT_fvector (_, (CT_fbits 8 | CT_fuint 8)))
       when is_c_repr_fixed_bytes to_typ ->
         codegen_fixed_bytes_vector_conversion l clexp cval to_typ ~initialize:true
@@ -7258,7 +7383,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | V_member _ -> true
     (* Proved representation conversions of literals render as literal
        constants ([integer_literal_value] recurses only through them). *)
-    | V_call ((Unsigned _ | Zero_extend _), [_]) as conversion -> Option.is_some (integer_literal_value conversion)
+    | V_call ((Unsigned _ | Proven_narrow _ | Zero_extend _), [_]) as conversion ->
+        Option.is_some (integer_literal_value conversion)
     | V_struct (fields, _) -> List.for_all (fun (_, field_value) -> constant_table_value field_value) fields
     | V_tuple members -> List.for_all constant_table_value members
     | _ -> false
@@ -8751,11 +8877,15 @@ static inline u128 u128_of_u64(const uint64_t value) {
   return result;
 }
 
+static inline uint64_t u128_to_u64_unchecked(const u128 value) {
+  return value.limbs[0];
+}
+
 static inline uint64_t u128_to_u64(const u128 value) {
   if (value.limbs[1] != UINT64_C(0)) {
     sail_native_conversion_failure("integer value is outside the uint64_t domain");
   }
-  return value.limbs[0];
+  return u128_to_u64_unchecked(value);
 }
 
 static inline uint64_t u128_extract_u64(const u128 value, const uint64_t start) {
@@ -9094,12 +9224,20 @@ static inline u256 u256_of_u128(const u128 value) {
   return result;
 }
 
+static inline u128 u128_of_u256_unchecked(const u256 value) {
+  u128 result = {{value.limbs[0], value.limbs[1]}};
+  return result;
+}
+
 static inline u128 u128_of_u256(const u256 value) {
   if (value.limbs[2] != UINT64_C(0) || value.limbs[3] != UINT64_C(0)) {
     sail_native_conversion_failure("integer value is outside the uint128_t domain");
   }
-  u128 result = {{value.limbs[0], value.limbs[1]}};
-  return result;
+  return u128_of_u256_unchecked(value);
+}
+
+static inline uint64_t u256_to_u64_unchecked(const u256 value) {
+  return value.limbs[0];
 }
 
 static inline uint64_t u256_to_u64(const u256 value) {
@@ -9108,7 +9246,7 @@ static inline uint64_t u256_to_u64(const u256 value) {
       || value.limbs[3] != UINT64_C(0)) {
     sail_native_conversion_failure("integer value is outside the uint64_t domain");
   }
-  return value.limbs[0];
+  return u256_to_u64_unchecked(value);
 }
 
 static inline bool eq_u256(const u256 op1, const u256 op2) {
@@ -9968,19 +10106,33 @@ static inline u320 u320_of_u256(const u256 value) {
   return result;
 }
 
+static inline uint64_t u320_to_u64_unchecked(const u320 value) {
+  return value.limbs[0];
+}
+
 static inline uint64_t u320_to_u64(const u320 value) {
   if ((value.limbs[1] | value.limbs[2] | value.limbs[3] | value.limbs[4])
       != UINT64_C(0)) {
     sail_native_conversion_failure("integer value is outside the uint64_t domain");
   }
-  return value.limbs[0];
+  return u320_to_u64_unchecked(value);
+}
+
+static inline u128 u128_of_u320_unchecked(const u320 value) {
+  u128 result = {{value.limbs[0], value.limbs[1]}};
+  return result;
 }
 
 static inline u128 u128_of_u320(const u320 value) {
   if ((value.limbs[2] | value.limbs[3] | value.limbs[4]) != UINT64_C(0)) {
     sail_native_conversion_failure("integer value is outside the uint128_t domain");
   }
-  u128 result = {{value.limbs[0], value.limbs[1]}};
+  return u128_of_u320_unchecked(value);
+}
+
+static inline u256 u256_of_u320_unchecked(const u320 value) {
+  u256 result = {{
+      value.limbs[0], value.limbs[1], value.limbs[2], value.limbs[3]}};
   return result;
 }
 
@@ -9988,9 +10140,7 @@ static inline u256 u256_of_u320(const u320 value) {
   if (value.limbs[4] != UINT64_C(0)) {
     sail_native_conversion_failure("integer value is outside the uint256_t domain");
   }
-  u256 result = {{
-      value.limbs[0], value.limbs[1], value.limbs[2], value.limbs[3]}};
-  return result;
+  return u256_of_u320_unchecked(value);
 }
 
 static inline bool eq_u320(const u320 lhs, const u320 rhs) {
@@ -11505,7 +11655,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             | Some value -> Some value
             | None -> NameMap.find_opt source known_globals
           )
-        | V_call ((Unsigned _ | Signed _ | Zero_extend _ | Sign_extend _), [value]) -> (
+        | V_call ((Unsigned _ | Signed _ | Proven_narrow _ | Zero_extend _ | Sign_extend _), [value]) -> (
             match resolve value with Some (Static_scalar _ as value) -> Some value | _ -> None
           )
         | _ -> None
@@ -13332,6 +13482,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
               ([
                  "specialize_c=" ^ string_of_bool Config.specialize_c;
                  "require_bounded_int=" ^ string_of_bool Config.require_bounded_int;
+                 "narrowing_policy=" ^ string_of_narrowing_policy Config.narrowing_policy;
                  "preserved_calls=" ^ ids (IdSet.of_list (Specialize.get_initial_calls ()));
                  "c_repr_uint64=" ^ ids_at_width 64 Config.c_repr_unsigned;
                  "c_repr_int64=" ^ ids_at_width 64 Config.c_repr_signed;
@@ -13344,7 +13495,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           in
           Some
             (Specialization_plan.create ~compiler_name:"Sail" ~compiler_version:"0.20.2" ~compiler_revision:None
-               ~configuration
+               ~configuration ~narrowing_policy:(string_of_narrowing_policy Config.narrowing_policy)
                ~input_locations:(List.map (fun (DEF_aux (_, annot)) -> annot.loc) ast.defs)
                !Jib_compile.representation_specializations
             )
