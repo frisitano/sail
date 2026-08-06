@@ -293,6 +293,10 @@ let rec options =
       );
       ("-no_warn", Arg.Clear Reporting.opt_warnings, " do not print warnings");
       ("-all_warnings", Arg.Set Reporting.opt_all_warnings, " print all warning messages");
+      ( "-lint_readability",
+        Arg.Tuple [Arg.Set Lint.opt_readability; Arg.Set Jib_compile.opt_lint_readability],
+        " emit opt-in source and post-Jib readability diagnostics"
+      );
       ( "-strict_var",
         Arg.Tuple [Arg.Unit (fun () -> Preprocess.add_symbol "STRICT_VAR"); Arg.Set Type_check.opt_strict_var],
         " require var expressions for variable declarations"

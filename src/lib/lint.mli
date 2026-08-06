@@ -46,6 +46,15 @@
 
 open Ast_defs
 
+(** Enable opt-in, source-located readability diagnostics.  These diagnostics
+    are deliberately not part of Sail's default warning set. *)
+val opt_readability : bool ref
+
 val warn_unmodified_variables : ('a, 'b) ast -> unit
 
 val warn_unused_variables : Type_check.typed_ast -> unit
+
+(** Warn about type-safe source constructs whose simpler spelling preserves
+    evaluation count and order.  The side-effect information is accepted here
+    so future rules cannot accidentally treat effectful calls as pure. *)
+val warn_readability : Effects.side_effect_info -> Type_check.typed_ast -> unit

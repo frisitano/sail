@@ -85,22 +85,39 @@ let input_project = ref None
 let direct_byte_pointer_adapter = "__direct"
 let input_c_repr_byte_pointer_types = ref IdSet.empty
 let input_byte_pointer_signatures : (string option list * string option) Bindings.t ref = ref Bindings.empty
+let input_c_repr_fixed_bytes_types : string Bindings.t ref = ref Bindings.empty
+let input_fixed_bytes_type_signatures : (Ast.id option list * Ast.id option) Bindings.t ref = ref Bindings.empty
 
 let reset_input_byte_pointer_signatures () =
   input_c_repr_byte_pointer_types := IdSet.empty;
-  input_byte_pointer_signatures := Bindings.empty
+  input_byte_pointer_signatures := Bindings.empty;
+  input_c_repr_fixed_bytes_types := Bindings.empty;
+  input_fixed_bytes_type_signatures := Bindings.empty
 
 let remember_input_byte_pointer_signatures ast =
   let open Ast in
   let open Ast_defs in
   let open Ast_util in
+  let c_repr_name data =
+    match attribute_data_string_with_loc data with
+    | Some (name, _) -> Some name
+    | None -> (
+        match data with
+        | AD_aux (AD_object fields, _) -> (
+            match List.assoc_opt "representation" fields with
+            | Some data -> Option.map fst (attribute_data_string_with_loc data)
+            | None -> None
+          )
+        | _ -> None
+      )
+  in
   input_c_repr_byte_pointer_types :=
     List.fold_left
       (fun types (DEF_aux (def, def_annot)) ->
         match get_def_attribute "c_repr" def_annot with
         | Some (_, Some data) -> (
-            match attribute_data_string_with_loc data with
-            | Some ("byte_pointer", _) -> (
+            match c_repr_name data with
+            | Some "byte_pointer" -> (
                 match def with
                 | DEF_type (TD_aux (TD_variant (id, _, _, _), _))
                 | DEF_type (TD_aux (TD_abbrev (id, _, _), _)) ->
@@ -112,6 +129,21 @@ let remember_input_byte_pointer_signatures ast =
         | Some (_, None) | None -> types
       )
       IdSet.empty ast.defs;
+  input_c_repr_fixed_bytes_types :=
+    List.fold_left
+      (fun types (DEF_aux (def, def_annot)) ->
+        match get_def_attribute "c_repr" def_annot with
+        | Some (_, Some data) -> (
+            match (c_repr_name data, def) with
+            | ( Some (("fixed_bytes" | "fixed_bytes_u64_lanes") as representation),
+                (DEF_type (TD_aux (TD_variant (id, _, _, _), _))
+                | DEF_type (TD_aux (TD_abbrev (id, _, _), _))) ) ->
+                Bindings.add id representation types
+            | _ -> types
+          )
+        | Some (_, None) | None -> types
+      )
+      !input_c_repr_fixed_bytes_types ast.defs;
   let byte_pointer_adapter (Typ_aux (typ_aux, _)) =
     match typ_aux with
     | Typ_id id -> (
@@ -151,7 +183,88 @@ let remember_input_byte_pointer_signatures ast =
           )
         | _ -> signatures
       )
-      !input_byte_pointer_signatures ast.defs
+      !input_byte_pointer_signatures ast.defs;
+  let fixed_bytes_alias (Typ_aux (typ_aux, _)) =
+    match typ_aux with
+    | Typ_id id when Bindings.mem id !input_c_repr_fixed_bytes_types -> Some id
+    | _ -> None
+  in
+  let rec pattern_arguments (P_aux (pat_aux, _)) =
+    match pat_aux with
+    | P_typ (Typ_aux (Typ_tuple types, _), P_aux (P_tuple _, _)) -> List.map fixed_bytes_alias types
+    | P_typ (typ, _) -> [fixed_bytes_alias typ]
+    | P_tuple patterns -> List.concat_map pattern_arguments patterns
+    | P_as (pattern, _) | P_var (pattern, _) -> pattern_arguments pattern
+    | _ -> [None]
+  in
+  let clause_signature (FCL_aux (FCL_funcl (id, pexp), _)) =
+    let clause_pattern = function
+      | Pat_aux (Pat_exp (pattern, _), _) | Pat_aux (Pat_when (pattern, _, _), _) -> pattern
+    in
+    (id, pattern_arguments (clause_pattern pexp))
+  in
+  let merge_signature (new_arguments, new_result) = function
+    | None -> (new_arguments, new_result)
+    | Some (old_arguments, old_result) ->
+        let arguments =
+          if List.length old_arguments = List.length new_arguments then
+            List.map2 (fun old new_ -> match old with Some _ -> old | None -> new_) old_arguments new_arguments
+          else new_arguments
+        in
+        (arguments, match old_result with Some _ -> old_result | None -> new_result)
+  in
+  input_fixed_bytes_type_signatures :=
+    List.fold_left
+      (fun signatures -> function
+        | DEF_aux
+            ( DEF_val
+                (VS_aux
+                  ( VS_val_spec
+                      (TypSchm_aux (TypSchm_ts (_, Typ_aux (Typ_fn (arguments, result), _)), _), id, extern),
+                    _
+                  )
+                ),
+              _ ) ->
+            let arguments = List.map fixed_bytes_alias arguments in
+            let result = fixed_bytes_alias result in
+            if List.exists Option.is_some arguments || Option.is_some result then (
+              let signature = (arguments, result) in
+              let signatures = Bindings.add id signature signatures in
+              match Ast_util.extern_assoc "c" extern with
+              | Some external_name -> Bindings.add (mk_id external_name) signature signatures
+              | None -> signatures
+            )
+            else signatures
+        | DEF_aux
+            ( DEF_fundef
+                (FD_aux
+                  ( FD_function
+                      ( _,
+                        Typ_annot_opt_aux (return_annotation, _),
+                        (first_clause :: _ as _clauses)
+                      ),
+                    _
+                  )
+                ),
+              _ ) ->
+            let id, arguments = clause_signature first_clause in
+            let result =
+              match return_annotation with
+              | Typ_annot_opt_some (_, typ) -> fixed_bytes_alias typ
+              | Typ_annot_opt_none -> None
+            in
+            if List.exists Option.is_some arguments || Option.is_some result then
+              let signature = merge_signature (arguments, result) (Bindings.find_opt id signatures) in
+              Bindings.add id signature signatures
+            else signatures
+        | DEF_aux (DEF_let (P_aux (P_typ (typ, pat), _), _), _) -> (
+            match (fixed_bytes_alias typ, IdSet.elements (Ast_util.pat_ids pat)) with
+            | Some alias, [id] -> Bindings.add id ([], Some alias) signatures
+            | Some _, _ | None, _ -> signatures
+          )
+        | _ -> signatures
+      )
+      !input_fixed_bytes_type_signatures ast.defs
 
 let remember_input_project ast _ env =
   input_project := Type_check.Env.get_modules env;
@@ -446,6 +559,7 @@ let collect_c_name_info ast (mode : c_backend_mode) =
   let c_repr_fixed_bytes = ref Bindings.empty in
   let c_repr_fixed_bytes_u64_lanes = ref Bindings.empty in
   let c_repr_fixed_bytes_u64_lane_alias_lengths = ref [] in
+  let c_repr_fixed_bytes_names = ref [] in
   let c_repr_error loc message = raise (Reporting.err_general loc ("C backend: $[c_repr] " ^ message)) in
   let native_integer_representations =
     [
@@ -468,9 +582,31 @@ let collect_c_name_info ast (mode : c_backend_mode) =
     | None -> ()
     | Some (attr_loc, None) -> c_repr_error attr_loc "requires a representation name"
     | Some (attr_loc, Some data) -> (
-        match attribute_data_string_with_loc data with
-        | None -> c_repr_error attr_loc "requires a representation name"
-        | Some (repr, repr_loc) -> (
+        let repr, repr_loc, c_name =
+          match data with
+          | AD_aux (AD_string repr, repr_loc) -> (repr, repr_loc, None)
+          | AD_aux (AD_object fields, _) -> (
+              let string_field key =
+                match List.assoc_opt key fields with
+                | Some data -> (
+                    match attribute_data_string_with_loc data with
+                    | Some value -> value
+                    | None -> c_repr_error attr_loc (Printf.sprintf "%s must be a C identifier" key)
+                  )
+                | None -> c_repr_error attr_loc (Printf.sprintf "requires a %s field" key)
+              in
+              let repr, repr_loc = string_field "representation" in
+              let name, name_loc = string_field "name" in
+              let valid_first = function 'a' .. 'z' | 'A' .. 'Z' | '_' -> true | _ -> false in
+              let valid_rest = function 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true | _ -> false in
+              if String.length name = 0 || not (valid_first name.[0])
+                 || not (String.for_all valid_rest name)
+              then raise (Reporting.err_general name_loc "C backend: $[c_repr] name must be a C identifier");
+              (repr, repr_loc, Some name)
+            )
+          | _ -> c_repr_error attr_loc "requires a representation name or {representation = ..., name = ...}"
+        in
+        (
             if not (List.mem repr supported_c_repr) then
               raise
                 (Reporting.err_general repr_loc
@@ -479,6 +615,11 @@ let collect_c_name_info ast (mode : c_backend_mode) =
                       (String.concat ", " supported_c_repr)
                    )
                 );
+            (match c_name with
+            | Some _ when repr <> "fixed_bytes" && repr <> "fixed_bytes_u64_lanes" ->
+                c_repr_error attr_loc "an explicit name is currently supported only for fixed-byte representations"
+            | _ -> ()
+            );
             let collect_payload id payload kind ~transparent_alias =
               let declared_payload = payload in
               let payload = Type_check.Env.expand_synonyms def_annot.env payload in
@@ -524,12 +665,29 @@ let collect_c_name_info ast (mode : c_backend_mode) =
                   Typ_aux (Typ_app (vector_id, [A_aux (A_nexp length, _); A_aux (A_typ elem_typ, _)]), _) )
                 when string_of_id vector_id = "vector" -> (
                   let elem_typ = Type_check.Env.expand_synonyms def_annot.env elem_typ in
-                  if not (is_bits 8 elem_typ) then
-                    c_repr_error attr_loc (byte_repr ^ " requires a vector of byte (bits(8)) elements");
+                  if not (is_bits 8 elem_typ || is_unsigned_range 8 elem_typ) then
+                    c_repr_error attr_loc
+                      (Printf.sprintf "%s requires a vector of byte (bits(8)) elements, but its element type is %s"
+                         byte_repr (string_of_typ elem_typ)
+                      );
                   match nexp_simp length with
                   | Nexp_aux (Nexp_constant length, _) when Big_int.less_equal (Big_int.of_int 1) length -> (
                       try
                         let length = Big_int.to_int length in
+                        (match c_name with
+                        | Some name -> (
+                            match List.assoc_opt length !c_repr_fixed_bytes_names with
+                            | Some existing when existing <> name ->
+                                c_repr_error attr_loc
+                                  (Printf.sprintf
+                                     "byte width %d already has explicit C name %s (cannot also name it %s)"
+                                     length existing name
+                                  )
+                            | Some _ -> ()
+                            | None -> c_repr_fixed_bytes_names := (length, name) :: !c_repr_fixed_bytes_names
+                          )
+                        | None -> ()
+                        );
                         if byte_repr = "fixed_bytes" then
                           c_repr_fixed_bytes := Bindings.add id length !c_repr_fixed_bytes
                         else (
@@ -601,7 +759,8 @@ let collect_c_name_info ast (mode : c_backend_mode) =
     !c_repr_byte_pointer,
     !c_repr_fixed_bytes,
     !c_repr_fixed_bytes_u64_lanes,
-    List.sort_uniq Int.compare !c_repr_fixed_bytes_u64_lane_alias_lengths
+    List.sort_uniq Int.compare !c_repr_fixed_bytes_u64_lane_alias_lengths,
+    List.sort (fun (left, _) (right, _) -> Int.compare left right) !c_repr_fixed_bytes_names
   )
 
 let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_sail_dir; _ } =
@@ -666,7 +825,10 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
         opt_no_lib := true;
         opt_no_rts := true;
         opt_no_mangle := true;
-        C_backend.optimize_primops := true
+        C_backend.optimize_primops := true;
+        C_backend.optimize_unit_results := true;
+        C_backend.optimize_pure_copies := true;
+        C_backend.optimize_dead_letbinds := true
     | Cpp ->
         raise (Reporting.err_general Parse_ast.Unknown "--c-optimized-model is only supported by the C target")
   );
@@ -676,7 +838,8 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
          "--c-optimized-source-root requires --c-optimized-model"
       );
   let reserveds, overrides, c_repr_unsigned, c_repr_signed, c_repr_u256, c_repr_byte_pointer,
-      c_repr_fixed_bytes, c_repr_fixed_bytes_u64_lanes, c_repr_fixed_bytes_u64_lane_alias_lengths =
+      c_repr_fixed_bytes, c_repr_fixed_bytes_u64_lanes, c_repr_fixed_bytes_u64_lane_alias_lengths,
+      c_repr_fixed_bytes_names =
     collect_c_name_info ast mode
   in
   if not (IdSet.is_empty c_repr_byte_pointer) && not !opt_optimized_model then
@@ -709,6 +872,102 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
   let c_repr_fixed_bytes_u64_lane_alias_lengths =
     if !opt_specialize_c then c_repr_fixed_bytes_u64_lane_alias_lengths else []
   in
+  let c_repr_fixed_bytes_names = if !opt_specialize_c then c_repr_fixed_bytes_names else [] in
+  let c_static_evaluators =
+    if !opt_optimized_model then
+      let open Ast in
+      List.fold_left
+        (fun evaluators (DEF_aux (def, def_annot)) ->
+          match get_def_attribute "c_static_eval" def_annot with
+          | None -> evaluators
+          | Some (attr_loc, None) ->
+              raise (Reporting.err_general attr_loc "C backend: $[c_static_eval] requires an operation name")
+          | Some (attr_loc, Some data) -> (
+              match (attribute_data_string_with_loc data, def) with
+              | Some ("word_to_fixed_bytes", _),
+                DEF_val (VS_aux (VS_val_spec (_, function_id, extern), _)) ->
+                  let evaluators = Bindings.add function_id "word_to_fixed_bytes" evaluators in
+                  (match Ast_util.extern_assoc "c" extern with
+                  | Some external_name -> Bindings.add (mk_id external_name) "word_to_fixed_bytes" evaluators
+                  | None -> evaluators
+                  )
+              | Some (operation, operation_loc), DEF_val _ ->
+                  raise
+                    (Reporting.err_general operation_loc
+                       (Printf.sprintf "C backend: unsupported $[c_static_eval] operation %S" operation)
+                    )
+              | Some _, _ ->
+                  raise (Reporting.err_general attr_loc "C backend: $[c_static_eval] is only valid on a val declaration")
+              | None, _ ->
+                  raise (Reporting.err_general attr_loc "C backend: $[c_static_eval] operation must be a string")
+            )
+        )
+        Bindings.empty ast.defs
+    else Bindings.empty
+  in
+  let collect_fixed_bytes_signatures representation_name representations =
+    let open Ast in
+    let input_signatures =
+      Bindings.fold
+        (fun function_id (arguments, result) signatures ->
+          let resolve = function
+            | Some alias -> (
+                match Bindings.find_opt alias !input_c_repr_fixed_bytes_types with
+                | Some name when name = representation_name -> Bindings.find_opt alias representations
+                | Some _ | None -> None
+              )
+            | None -> None
+          in
+          let arguments = List.map resolve arguments in
+          let result = resolve result in
+          if List.exists Option.is_some arguments || Option.is_some result then
+            Bindings.add function_id (arguments, result) signatures
+          else signatures
+        )
+        !input_fixed_bytes_type_signatures Bindings.empty
+    in
+    let rec representation_length (Typ_aux (typ_aux, _)) =
+      match typ_aux with
+      | Typ_id id -> (
+          match Bindings.find_opt id representations with
+          | Some _ as length -> length
+          | None -> (
+              match Bindings.find_opt id (Type_check.Env.get_typ_synonyms env) with
+              | Some ([], A_aux (A_typ typ, _)) -> representation_length typ
+              | _ -> None
+            )
+        )
+      | _ -> None
+    in
+    List.fold_left
+      (fun signatures -> function
+        | DEF_aux
+            ( DEF_val
+                (VS_aux
+                  ( VS_val_spec
+                      (TypSchm_aux (TypSchm_ts (_, Typ_aux (Typ_fn (arguments, result), _)), _), id, extern),
+                    _
+                  )
+                ),
+              _ ) ->
+            let arguments = List.map representation_length arguments in
+            let result = representation_length result in
+            if List.exists Option.is_some arguments || Option.is_some result then (
+              let signature = (arguments, result) in
+              let signatures = Bindings.add id signature signatures in
+              match Ast_util.extern_assoc "c" extern with
+              | Some external_name -> Bindings.add (mk_id external_name) signature signatures
+              | None -> signatures
+            )
+            else signatures
+        | _ -> signatures
+      )
+      input_signatures ast.defs
+  in
+  let fixed_bytes_signatures = collect_fixed_bytes_signatures "fixed_bytes" c_repr_fixed_bytes in
+  let fixed_bytes_u64_lanes_signatures =
+    collect_fixed_bytes_signatures "fixed_bytes_u64_lanes" c_repr_fixed_bytes_u64_lanes
+  in
 
   let module Codegen = C_backend.Codegen (struct
     let includes = !opt_includes_c
@@ -728,6 +987,8 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let c_repr_fixed_bytes = c_repr_fixed_bytes
     let c_repr_fixed_bytes_u64_lanes = c_repr_fixed_bytes_u64_lanes
     let c_repr_fixed_bytes_u64_lane_alias_lengths = c_repr_fixed_bytes_u64_lane_alias_lengths
+    let c_repr_fixed_bytes_names = c_repr_fixed_bytes_names
+    let c_static_evaluators = c_static_evaluators
     let specialize_c = !opt_specialize_c
     let require_bounded_int = !opt_require_bounded_int
     let specialization_plan_json = !opt_specialization_plan_json
@@ -739,6 +1000,8 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let byte_pointer_fields = !opt_c_byte_pointer_fields
     let byte_pointer_types = byte_pointer_types
     let byte_pointer_signatures = !input_byte_pointer_signatures
+    let fixed_bytes_signatures = fixed_bytes_signatures
+    let fixed_bytes_u64_lanes_signatures = fixed_bytes_u64_lanes_signatures
     let package_name = !opt_c_package
 
     (* TODO: Convert `cpp` to use `c_backend_mode` instead of `bool`. *)
@@ -920,8 +1183,12 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     ensure_directory include_spec;
     ensure_directory source_spec;
     clean_previous_optimized_outputs include_spec source_spec;
-    let umbrella, outputs = Codegen.compile_ast_modules env effect_info ~package:!opt_c_package modules ast in
+    let umbrella, base, support, outputs =
+      Codegen.compile_ast_modules env effect_info ~package:!opt_c_package modules ast
+    in
     write_file (Filename.concat include_root "spec.h") umbrella;
+    write_file (Filename.concat include_spec "abi.h") base;
+    write_file (Filename.concat include_spec "support.h") support;
     List.iter
       (fun (output : Codegen.c_module_output) ->
         let header_path = Filename.concat include_spec (output.file_stem ^ ".h") in

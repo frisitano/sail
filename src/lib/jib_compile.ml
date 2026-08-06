@@ -65,6 +65,7 @@ let opt_memo_cache = ref false
    progress trace opt-in so ordinary backends remain quiet while allowing the
    C backend to expose actionable worklist and bound progress. *)
 let opt_debug_function_representations = ref false
+let opt_lint_readability = ref false
 
 type representation_specialization = {
   source_id : id;
@@ -88,6 +89,128 @@ let reset_representation_specializations () = representation_specializations := 
    the budget is an explicit extraction error, so callers either receive the
    specialization justified by their semantic facts or compilation stops. *)
 let opt_max_function_specializations = ref 64
+
+let jib_readability_warning rule l message =
+  if not (is_gen_loc l) then Reporting.warn ("Jib readability lint [" ^ rule ^ "]") l message
+
+let same_name lhs rhs = Name.compare lhs rhs = 0
+
+let rec cval_read_count name = function
+  | V_id (id, _) -> if same_name name id then 1 else 0
+  | V_lit _ | V_member _ -> 0
+  | V_field (value, _, _) | V_tuple_member (value, _, _) | V_ctor_kind (value, _)
+  | V_ctor_unwrap (value, _, _) ->
+      cval_read_count name value
+  | V_call (_, values) | V_tuple values ->
+      List.fold_left (fun count value -> count + cval_read_count name value) 0 values
+  | V_struct (fields, _) ->
+      List.fold_left (fun count (_, value) -> count + cval_read_count name value) 0 fields
+
+let init_read_count name = function Init_cval value -> cval_read_count name value | Init_static _ | Init_json_key _ -> 0
+
+let rec clexp_read_count name = function
+  | CL_id _ | CL_void _ -> 0
+  | CL_rmw (read, _, _) -> if same_name name read then 1 else 0
+  | CL_field (lexp, _, _) | CL_tuple (lexp, _) | CL_addr lexp -> clexp_read_count name lexp
+
+let creturn_read_count name = function
+  | CR_one lexp -> clexp_read_count name lexp
+  | CR_multi lexps -> List.fold_left (fun count lexp -> count + clexp_read_count name lexp) 0 lexps
+
+let rec instr_read_count name (I_aux (instr, _)) =
+  match instr with
+  | I_decl _ | I_clear _ | I_undefined _ | I_exit _ | I_comment _ | I_raw _ | I_label _ | I_goto _ | I_reset _ -> 0
+  | I_init (_, _, init) -> init_read_count name init
+  | I_jump (value, _) | I_throw value | I_return value | I_reinit (_, _, value) -> cval_read_count name value
+  | I_funcall (returns, _, _, args) ->
+      creturn_read_count name returns
+      + List.fold_left (fun count value -> count + cval_read_count name value) 0 args
+  | I_copy (lexp, value) -> clexp_read_count name lexp + cval_read_count name value
+  | I_end id -> if same_name name id then 1 else 0
+  | I_if (condition, then_instrs, else_instrs) ->
+      cval_read_count name condition + instrs_read_count name then_instrs + instrs_read_count name else_instrs
+  | I_block instrs | I_try_block instrs -> instrs_read_count name instrs
+
+and instrs_read_count name instrs =
+  List.fold_left (fun count instr -> count + instr_read_count name instr) 0 instrs
+
+let is_generated_temporary = function Gen (_, _, _, Some _, _) -> true | _ -> false
+
+let rec collect_jump_targets targets (I_aux (instr, _)) =
+  match instr with
+  | I_jump (_, label) | I_goto label -> Util.StringSet.add label targets
+  | I_if (_, then_instrs, else_instrs) ->
+      List.fold_left collect_jump_targets (List.fold_left collect_jump_targets targets then_instrs) else_instrs
+  | I_block instrs | I_try_block instrs -> List.fold_left collect_jump_targets targets instrs
+  | _ -> targets
+
+let lint_jib_instrs instrs =
+  let targets = List.fold_left collect_jump_targets Util.StringSet.empty instrs in
+  let rec scan instrs =
+    ( match instrs with
+    | I_aux (I_decl (ctyp, declared), (_, l)) :: I_aux (next, _) :: _ -> (
+        let assigned =
+          match next with
+          | I_copy (CL_id (destination, _), _) -> same_name declared destination
+          | I_funcall (CR_one (CL_id (destination, _)), _, _, _) -> same_name declared destination
+          | _ -> false
+        in
+        if assigned then
+          jib_readability_warning "jib-declaration-assignment-split" l
+            "Lowering separated a local declaration from its immediate initialization.";
+        if ctyp = CT_unit then
+          jib_readability_warning "jib-unit-plumbing" l
+            "Lowering introduced a unit-valued local that a backend can erase."
+      )
+    | I_aux (I_decl (CT_unit, _), (_, l)) :: _ ->
+        jib_readability_warning "jib-unit-plumbing" l "Lowering introduced a unit-valued local that a backend can erase."
+    | I_aux (I_init (_, name, Init_cval _), (_, l)) :: rest
+      when is_generated_temporary name && instrs_read_count name rest = 1 ->
+        let is_rewritten = List.exists (instr_references ~write:name ~direct:false) rest in
+        if not is_rewritten then
+          jib_readability_warning "jib-single-use-pure-temporary" l
+            "Lowering introduced a single-use pure temporary that can be inlined without reordering effects."
+    | I_aux (I_goto target, (_, l)) :: I_aux (I_label label, _) :: _ when String.equal target label ->
+        jib_readability_warning "jib-redundant-join" l "A jump to the immediately following label is redundant."
+    | _ -> ()
+    );
+    List.iter
+      (fun (I_aux (instr, (_, l))) ->
+        ( match instr with
+        | I_block ([] | [_]) ->
+            jib_readability_warning "jib-redundant-scope" l "Lowering introduced an empty or single-instruction block."
+        | I_label label when not (Util.StringSet.mem label targets) ->
+            jib_readability_warning "jib-dead-label" l "Lowering introduced a label with no incoming jump."
+        | I_decl (_, Gen (_, _, _, None, _)) | I_init (_, Gen (_, _, _, None, _), _) ->
+            jib_readability_warning "jib-lost-source-name" l
+              "A generated local has no retained Sail source-name provenance."
+        | _ -> ()
+        );
+        match instr with
+        | I_if (_, then_instrs, else_instrs) ->
+            scan then_instrs;
+            scan else_instrs
+        | I_block nested | I_try_block nested -> scan nested
+        | _ -> ()
+      )
+      instrs
+  in
+  scan instrs
+
+let lint_jib_cdefs cdefs =
+  List.iter
+    (function
+      | CDEF_aux
+          ( ( CDEF_register (_, _, instrs)
+            | CDEF_let (_, _, instrs)
+            | CDEF_fundef (_, _, _, instrs)
+            | CDEF_startup (_, instrs)
+            | CDEF_finish (_, instrs) ),
+            _ ) ->
+          lint_jib_instrs instrs
+      | _ -> ()
+    )
+    cdefs
 
 let optimize_aarch64_fast_struct = ref false
 
@@ -8057,5 +8180,6 @@ module Make (C : CONFIG) = struct
     let cdefs = make_calls_precise ctx cdefs in
     let cdefs = sort_ctype_defs ctx false cdefs in
     let cdefs = lift_statics cdefs in
+    if !opt_lint_readability then lint_jib_cdefs cdefs;
     (cdefs, ctx)
 end

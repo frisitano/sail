@@ -75,6 +75,9 @@ val optimize_hoist_allocations : bool ref
 val optimize_alias : bool ref
 val optimize_fixed_int : bool ref
 val optimize_fixed_bits : bool ref
+val optimize_unit_results : bool ref
+val optimize_pure_copies : bool ref
+val optimize_dead_letbinds : bool ref
 
 module type CODEGEN_CONFIG = sig
   (** A list of includes for the generated C file *)
@@ -131,6 +134,13 @@ module type CODEGEN_CONFIG = sig
       their representation is necessarily structural at that byte width. *)
   val c_repr_fixed_bytes_u64_lane_alias_lengths : int list
 
+  (** Explicit C carrier names for structurally represented fixed-byte widths. *)
+  val c_repr_fixed_bytes_names : (int * string) list
+
+  (** Pure functions explicitly authorized by the typed Sail AST for static
+      evaluation of top-level represented constants. *)
+  val c_static_evaluators : string Ast_compare.Bindings.t
+
   (** Preserve fixed integer representations through generic specialization. *)
   val specialize_c : bool
 
@@ -164,6 +174,11 @@ module type CODEGEN_CONFIG = sig
   (** Source function arguments and results that use configured nominal
       byte-pointer types, captured before rewriting expands type aliases. *)
   val byte_pointer_signatures : (string option list * string option) Ast_compare.Bindings.t
+
+  (** Source function arguments and results that use fixed-byte nominal
+      aliases, captured from the typed AST before rewriting expands them. *)
+  val fixed_bytes_signatures : (int option list * int option) Ast_compare.Bindings.t
+  val fixed_bytes_u64_lanes_signatures : (int option list * int option) Ast_compare.Bindings.t
 
   (** Package prefix for strict optimized-model entry points. *)
   val package_name : string
@@ -199,5 +214,10 @@ module Codegen (Config : CODEGEN_CONFIG) : sig
   val jib_of_ast : Env.t -> Effects.side_effect_info -> typed_ast -> cdef list * Jib_compile.ctx
   val compile_ast : Env.t -> Effects.side_effect_info -> string -> typed_ast -> string * string
   val compile_ast_modules :
-    Env.t -> Effects.side_effect_info -> package:string -> c_module list -> typed_ast -> string * c_module_output list
+    Env.t ->
+    Effects.side_effect_info ->
+    package:string ->
+    c_module list ->
+    typed_ast ->
+    string * string * string * c_module_output list
 end

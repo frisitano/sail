@@ -70,6 +70,10 @@ val opt_memo_cache : bool ref
     [--c-specialize-log]. *)
 val opt_debug_function_representations : bool ref
 
+(** Emit opt-in diagnostics for readability artifacts introduced by the
+    common AST-to-Jib lowering. *)
+val opt_lint_readability : bool ref
+
 (** Backend-neutral provenance captured when representation-specialized
     function clones are generated. Names are diagnostic only; consumers use
     the content-derived identities emitted by [Specialization_plan]. *)

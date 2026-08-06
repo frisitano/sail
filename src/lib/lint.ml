@@ -49,6 +49,21 @@ open Ast_compare
 open Ast_defs
 open Ast_util
 
+let opt_readability = ref false
+
+let readability_warning rule l message =
+  if not (is_gen_loc l) then Reporting.warn ("Readability lint [" ^ rule ^ "]") l message
+
+let rec strip_typ = function E_aux (E_typ (_, exp), _) -> strip_typ exp | exp -> exp
+
+let bool_literal exp =
+  match strip_typ exp with
+  | E_aux (E_lit (L_aux (L_true, _)), _) -> Some true
+  | E_aux (E_lit (L_aux (L_false, _)), _) -> Some false
+  | _ -> None
+
+let is_app named id = String.equal (string_of_id id) named
+
 module Scan (F : sig
   type t
   val do_exp : t exp -> unit
@@ -107,6 +122,47 @@ end = struct
     | DEF_instantiation _ ->
         ()
 end
+
+let warn_readability effect_info ast =
+  (* Attach the inferred transitive effects before scanning.  The current
+     rules preserve evaluation count even for effectful expressions, but
+     keeping the information on every node is a hard constraint on future
+     temporary/branch rules. *)
+  let ast = Effects.rewrite_attach_effects effect_info ast in
+  let inspect (e_aux, annot) =
+    let exp = E_aux (e_aux, annot) in
+    let l = exp_loc exp in
+    ( match e_aux with
+    | E_app (id, [E_aux (E_app (inner, [_]), _)]) when is_app "not_bool" id && is_app "not_bool" inner ->
+        readability_warning "sail-redundant-bool" l "Double boolean negation can be removed."
+    | E_app (id, [lhs; rhs]) when is_app "eq_bool" id -> (
+        match (bool_literal lhs, bool_literal rhs) with
+        | Some _, _ | _, Some _ ->
+            readability_warning "sail-redundant-bool" l
+              "A boolean comparison with true or false can be written directly (or negated)."
+        | _ -> ()
+      )
+    | E_if (_, then_exp, else_exp) -> (
+        match (bool_literal then_exp, bool_literal else_exp) with
+        | Some true, Some false | Some false, Some true ->
+            readability_warning "sail-identity-conditional" l
+              "This conditional is the condition itself (or its negation)."
+        | _ -> ()
+      )
+    | E_let (P_aux (P_id bound, _), _, E_aux (E_id result, _)) when Id.compare bound result = 0 ->
+        readability_warning "sail-trivial-alias" l
+          "This binding is returned unchanged; return the bound expression directly."
+    | _ -> ()
+    );
+    exp
+  in
+  let alg = { Rewriter.id_exp_alg with e_aux = inspect } in
+  let module S = Scan (struct
+    type t = Type_check.tannot
+    let do_exp exp = ignore (Rewriter.fold_exp alg exp)
+    let do_funcl_pexp = None
+  end) in
+  List.iter S.in_def ast.defs
 
 let warn_unmodified_variables (type a) (ast : (a, 'b) ast) : unit =
   let warn_unmodified (lexp, bind, exp) =

@@ -78,6 +78,7 @@ let optimize_alias = ref false
 let optimize_fixed_int = ref false
 let optimize_fixed_bits = ref false
 let optimize_stack_aggregates = ref false
+let optimize_unit_results = ref false
 
 let ngensym = symbol_generator ()
 
@@ -322,21 +323,25 @@ let c_if_else cond then_block else_block =
 
 let c_return exp = string "return" ^^ space ^^ exp ^^ semi
 
-let c_case_block b = nest 2 (separate hardline ([lbrace] @ b @ [c_stmt "break"])) ^^ hardline ^^ rbrace
+let c_case_block ~case_break b =
+  let terminator = if case_break then [c_stmt "break"] else [] in
+  nest 2 (separate hardline ([lbrace] @ b @ terminator)) ^^ hardline ^^ rbrace
 
 (* Generate a C switch statement. If default is true, then we generate a `default: break;` case at the end. *)
-let c_switch ?(default = false) cond cases =
+let c_switch ?(default = false) ?(case_break = true) cond cases =
   match cases with
   | [] -> string "{}"
   | _ ->
       string "switch" ^^ space ^^ cond ^^ space ^^ lbrace ^^ hardline
-      ^^ separate_map hardline
-           (fun (case_exp, case_block) ->
-             string "case" ^^ space ^^ case_exp ^^ colon ^^ space ^^ c_case_block case_block
-           )
+        ^^ separate_map hardline
+             (fun (case_exp, case_block) ->
+             string "case" ^^ space ^^ case_exp ^^ colon
+             ^^ if case_block = [] && not case_break then empty
+                else space ^^ c_case_block ~case_break case_block
+             )
            cases
-      ^^ (if default then hardline ^^ string "default" ^^ colon ^^ space ^^ string "break" ^^ semi else empty)
-      ^^ hardline ^^ rbrace
+        ^^ (if default then hardline ^^ string "default" ^^ colon ^^ space ^^ string "break" ^^ semi else empty)
+        ^^ hardline ^^ rbrace
 
 module C_config (Opts : sig
   val branch_coverage : out_channel option
@@ -351,6 +356,8 @@ module C_config (Opts : sig
   val byte_pointer_fields : (id * id * string) list
   val byte_pointer_types : string Bindings.t
   val byte_pointer_signatures : (string option list * string option) Bindings.t
+  val fixed_bytes_signatures : (int option list * int option) Bindings.t
+  val fixed_bytes_u64_lanes_signatures : (int option list * int option) Bindings.t
   val specialize_c : bool
   val require_bounded_int : bool
   val optimized_model : bool
@@ -455,18 +462,44 @@ end) : CONFIG = struct
     | Some _ | None -> ctyp
 
   let specialize_declared_function_argument function_id index ctyp =
-    match Bindings.find_opt function_id Opts.byte_pointer_signatures with
+    match Bindings.find_opt function_id Opts.fixed_bytes_u64_lanes_signatures with
+    | Some (arguments, _) -> (
+        match List.nth_opt arguments index with
+        | Some (Some length) when Opts.specialize_c -> c_repr_fixed_bytes_u64_lanes_ctyp length
+        | Some (Some _) | Some None | None -> ctyp
+      )
+    | None -> (
+      match Bindings.find_opt function_id Opts.fixed_bytes_signatures with
+      | Some (arguments, _) -> (
+          match List.nth_opt arguments index with
+          | Some (Some length) when Opts.specialize_c -> c_repr_fixed_bytes_ctyp length
+          | Some (Some _) | Some None | None -> ctyp
+        )
+      | None -> (
+        match Bindings.find_opt function_id Opts.byte_pointer_signatures with
     | Some (arguments, _) -> (
         match List.nth_opt arguments index with
         | Some (Some adapter) when Opts.optimized_model -> c_repr_byte_pointer_ctyp adapter
         | Some (Some _) | Some None | None -> ctyp
       )
-    | None -> ctyp
+        | None -> ctyp
+      )
+    )
 
   let specialize_declared_function_result function_id ctyp =
-    match Bindings.find_opt function_id Opts.byte_pointer_signatures with
+    match Bindings.find_opt function_id Opts.fixed_bytes_u64_lanes_signatures with
+    | Some (_, Some length) when Opts.specialize_c -> c_repr_fixed_bytes_u64_lanes_ctyp length
+    | Some (_, Some _) | Some (_, None) -> ctyp
+    | None -> (
+      match Bindings.find_opt function_id Opts.fixed_bytes_signatures with
+      | Some (_, Some length) when Opts.specialize_c -> c_repr_fixed_bytes_ctyp length
+      | Some (_, Some _) | Some (_, None) -> ctyp
+      | None -> (
+        match Bindings.find_opt function_id Opts.byte_pointer_signatures with
     | Some (_, Some adapter) when Opts.optimized_model -> c_repr_byte_pointer_ctyp adapter
     | Some (_, Some _) | Some (_, None) | None -> ctyp
+      )
+    )
 
   let specializes_narrow_fixed_integer ~semantic ~represented =
     match (semantic, represented) with
@@ -1716,6 +1749,19 @@ end) : CONFIG = struct
           )
         | _ -> no_change
       )
+    | "not", [AV_cval (value, _)] when ctyp_equal (cval_ctyp value) CT_bool ->
+        AE_val (AV_cval (V_call (Bnot, [value]), typ))
+    | ("eq_bool" | "eq_anything"), [AV_cval (left, _); AV_cval (right, _)]
+      when ctyp_equal (cval_ctyp left) CT_bool && ctyp_equal (cval_ctyp right) CT_bool ->
+        AE_val (AV_cval (V_call (Eq, [left; right]), typ))
+    | "eq_anything", [AV_cval (left, _); AV_cval (right, _)]
+      when ctyp_equal (cval_ctyp left) (cval_ctyp right)
+           && is_c_repr_value (cval_ctyp left) ->
+        (* Representation-specialized scalar values have ordinary pure C
+           equality helpers.  Keep their equality in cval form so later
+           copy propagation can use it directly in a branch or return,
+           instead of forcing a named boolean function-call destination. *)
+        AE_val (AV_cval (V_call (Eq, [left; right]), typ))
     | "eq_bits", [AV_cval (v1, _); AV_cval (v2, _)] when ctyp_equal (cval_ctyp v1) (cval_ctyp v2) -> (
         match cval_ctyp v1 with
         | CT_fbits _ | CT_sbits _ -> AE_val (AV_cval (V_call (Eq, [v1; v2]), typ))
@@ -2841,17 +2887,2589 @@ let fuse_fixed_bitvector_webs cdefs =
   in
   (cdefs, !fusions)
 
-let optimize ~have_rts ~specialize_c ctx recursive_functions cdefs =
+(* A call whose stack-typed destination is never read disappears when Sail's
+   effect analysis proves the callee pure; otherwise it becomes a bare call
+   and the destination's declaration disappears. This keeps generated C free
+   of `word tmp = f(...);` ceremony without discarding observable effects.
+   Pure same-representation writes to unread stack locals disappear as well.
+   Representation-changing writes are retained because their generated
+   conversion may include a runtime domain check. Only local [Name]
+   destinations proven unread across the whole body are rewritten. *)
+let discard_unread_stack_results ctx (CDEF_aux (aux, def_annot)) =
+  let effect_source id =
+    List.find_map
+      (fun (trace : Jib_compile.representation_specialization) ->
+        if Id.compare trace.specialized_id id = 0 then Some trace.source_id else None
+      )
+      !Jib_compile.representation_specializations
+    |> Option.value ~default:id
+  in
+  let call_is_pure (id, _) =
+    (* The assertion marker lowers to a trap even though its source-level
+       predicate computation is otherwise pure.  Its unit result may be
+       unread, but the check itself is observable and must never disappear. *)
+    not (String.equal (string_of_id id) "__sail_fixed_assert")
+    && Effects.function_is_pure (effect_source id) ctx.effect_info
+  in
+  let rewrite_body body =
+    let locals = ref NameSet.empty in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               (match aux with
+               | I_decl (_, name) | I_init (_, name, _) -> locals := NameSet.add name !locals
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    let reads =
+      List.fold_left (fun acc instr -> NameSet.union acc (instr_reads ~direct:false instr)) NameSet.empty body
+    in
+    let unread name = NameSet.mem name !locals && not (NameSet.mem name reads) in
+    let keep_funcall = function
+      | I_aux (I_funcall (CR_one (CL_id (name, ctyp)), _, callee, _), _)
+        when is_stack_ctyp ctx ctyp && unread name && call_is_pure callee ->
+          false
+      | _ -> true
+    in
+    let body = filter_instrs keep_funcall body in
+    let rewrite_funcall = function
+      | I_aux (I_funcall (CR_one (CL_id (name, ctyp)), extern, f, args), annot)
+        when is_stack_ctyp ctx ctyp && unread name ->
+          I_aux (I_funcall (CR_one (CL_void ctyp), extern, f, args), annot)
+      | instr -> instr
+    in
+    let body = List.map (map_instr rewrite_funcall) body in
+    let keep_unread_stack_write = function
+      | I_aux (I_copy (CL_id (name, ctyp), value), _)
+        when is_stack_ctyp ctx ctyp && unread name && ctyp_equal ctyp (cval_ctyp value) ->
+          false
+      | I_aux (I_init (ctyp, name, Init_cval value), _)
+        when is_stack_ctyp ctx ctyp && unread name && ctyp_equal ctyp (cval_ctyp value) ->
+          false
+      | I_aux (I_reinit (ctyp, name, value), _)
+        when is_stack_ctyp ctx ctyp && unread name && ctyp_equal ctyp (cval_ctyp value) ->
+          false
+      | _ -> true
+    in
+    let body = filter_instrs keep_unread_stack_write body in
+    let still_written = ref NameSet.empty in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               (match aux with
+               | I_decl _ -> ()
+               | _ -> still_written := NameSet.union !still_written (instr_writes ~direct:true sub)
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    let keep = function
+      | I_aux (I_decl (ctyp, ((Name _ | Gen _) as name)), _) when is_stack_ctyp ctx ctyp ->
+          NameSet.mem name reads || NameSet.mem name !still_written
+      | _ -> true
+    in
+    filter_instrs keep body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Unit has exactly one semantic value, so an optimized C function never needs
+   to materialize or pass it.  Keep CT_unit in JIB as the proof-facing type and
+   erase only its administrative value flow immediately before C emission:
+
+     - replace every pure unit-valued read with the unique unit literal;
+     - remove standalone unit storage and assignments;
+     - remove unit call arguments while retaining the call itself.
+
+   Function signatures and unit returns are rendered as C void by Codegen.
+   Unit payloads inside records/variants deliberately remain represented: this
+   pass erases only values that have no enclosing data representation. *)
+let is_variant_constructor ctx id =
+  Bindings.exists (fun _ (_, constructors) -> Bindings.mem id constructors) ctx.variants
+
+let erase_unit_scaffolding ctx (CDEF_aux (aux, def_annot)) =
+  let erase_body body =
+    let unique_unit value =
+      if ctyp_equal (cval_ctyp value) CT_unit then V_lit (VL_unit, CT_unit) else value
+    in
+    let rewrite_call = function
+      | I_aux (I_funcall (destination, extern, callee, args), annot) ->
+          let args =
+            if is_variant_constructor ctx (fst callee) then args
+            else List.filter (fun arg -> not (ctyp_equal (cval_ctyp arg) CT_unit)) args
+          in
+          I_aux (I_funcall (destination, extern, callee, args), annot)
+      | instr -> instr
+    in
+    let body = List.map (map_instr_cval unique_unit) body |> List.map (map_instr rewrite_call) in
+    filter_instrs
+      (function
+        | I_aux
+            ( ( I_decl (CT_unit, _)
+              | I_init (CT_unit, _, _)
+              | I_reinit (CT_unit, _, _)
+              | I_reset (CT_unit, _)
+              | I_clear (CT_unit, _)
+              ),
+              _
+            ) ->
+            false
+        | I_aux (I_copy (destination, _), _) when ctyp_equal (clexp_ctyp destination) CT_unit -> false
+        | _ -> true
+        )
+      body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux (CDEF_fundef (id, ret, args, erase_body body), def_annot)
+  | CDEF_startup (id, body) -> CDEF_aux (CDEF_startup (id, erase_body body), def_annot)
+  | CDEF_finish (id, body) -> CDEF_aux (CDEF_finish (id, erase_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* A goto whose target label is the immediately following instruction has no
+   effect.  JIB cleanup lowering creates this shape inside many early-return
+   branches before jumping on to the shared function exit.  Delete only that
+   adjacent edge; the label remains available to any non-local predecessor and
+   the ordinary unused-label cleanup can remove it when this was its sole use. *)
+let remove_fallthrough_gotos (CDEF_aux (aux, def_annot)) =
+  let rewrite_lists instrs =
+    let rec rewrite = function
+      | I_aux (I_goto target, _) :: (I_aux (I_label label, _) as labelled) :: rest
+        when String.equal target label ->
+          labelled :: rewrite rest
+      | instr :: rest -> instr :: rewrite rest
+      | [] -> []
+    in
+    rewrite instrs
+  in
+  let rewrite_body body = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* For a unit-valued function, a goto to the label immediately preceding its
+   final unit return is exactly an early C [return;].  Reconstruct that
+   structured exit after cleanup/lifetime lowering has finished.  This is
+   deliberately limited to the terminal label and unit result: exception and
+   intermediate cleanup labels keep their original control flow. *)
+let return_from_terminal_unit_label ctx (CDEF_aux (aux, def_annot)) =
+  let returns_unit id =
+    match Bindings.find_opt id ctx.valspecs with
+    | Some (_, _, ret_ctyp, _) -> ctyp_equal ret_ctyp CT_unit
+    | None -> false
+  in
+  let rewrite_body id body =
+    if not (returns_unit id) then body
+    else
+      match List.rev body with
+      | (I_aux (I_return value, _) as terminal_return)
+        :: (I_aux (I_label terminal_label, _) as terminal_label_instr)
+        :: reversed
+        when ctyp_equal (cval_ctyp value) CT_unit ->
+          let rewrite_goto = function
+            | I_aux (I_goto target, annot) when String.equal target terminal_label ->
+                I_aux (I_return (V_lit (VL_unit, CT_unit)), annot)
+            | instr -> instr
+          in
+          List.rev
+            (terminal_return
+            :: terminal_label_instr
+            :: List.map (map_instr rewrite_goto) reversed
+            )
+      | _ -> body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body id body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Representation specialization can turn a return-via-pointer function into
+   an ordinary scalar-returning C function after cleanup lowering has already
+   introduced a shared [end_function] label.  When an early arm does nothing
+   except assign that scalar result and jump to the terminal return, emit the
+   return in the arm itself.  This is the stack-result analogue of
+   [return_from_terminal_unit_label]; restricting the rewrite to an assignment
+   or call followed only by untargeted cleanup labels and the jump preserves
+   any real cleanup between production of the result and the function exit. *)
+let return_from_terminal_stack_label (CDEF_aux (aux, def_annot)) =
+  let same_name left right = Name.compare left right = 0 in
+  let rewrite_body body =
+    match List.rev body with
+    | (I_aux (I_return (V_id (result, result_ctyp)), _) as terminal_return)
+      :: (I_aux (I_label terminal_label, _) as terminal_label_instr)
+      :: reversed ->
+        let targeted_labels = ref Util.StringSet.empty in
+        List.iter
+          (fun instr ->
+            ignore
+              (map_instr
+                 (fun (I_aux (aux, _) as sub) ->
+                   (match aux with
+                   | I_goto target | I_jump (_, target) ->
+                       targeted_labels := Util.StringSet.add target !targeted_labels
+                   | _ -> ()
+                   );
+                   sub
+                 )
+                 instr
+              )
+          )
+          body;
+        let rec after_terminal_jump = function
+          | I_aux (I_goto target, _) :: rest when String.equal target terminal_label -> Some rest
+          | I_aux (I_label label, _) :: rest
+            when not (Util.StringSet.mem label !targeted_labels) ->
+              after_terminal_jump rest
+          | _ -> None
+        in
+        let rewrite_lists instrs =
+          let rec rewrite = function
+            | ( I_aux
+                  ( I_copy (CL_id (destination, destination_ctyp), value),
+                    copy_aux
+                  )
+                as copy
+              )
+              :: tail
+              when same_name destination result
+                   && ctyp_equal destination_ctyp result_ctyp
+                   && ctyp_equal (cval_ctyp value) result_ctyp -> (
+                match after_terminal_jump tail with
+                | Some rest -> I_aux (I_return value, copy_aux) :: rewrite rest
+                | None -> copy :: rewrite tail
+              )
+            | ( I_aux
+                  ( I_funcall
+                      ( CR_one (CL_id (destination, destination_ctyp)),
+                        extern,
+                        callee,
+                        args
+                      ),
+                    call_aux
+                  )
+                as call
+              )
+              :: tail
+              when same_name destination result
+                   && ctyp_equal destination_ctyp result_ctyp -> (
+                match after_terminal_jump tail with
+                | Some rest ->
+                    I_aux
+                      ( I_funcall
+                          (CR_one (CL_id (Return (-1), result_ctyp)), extern, callee, args),
+                        call_aux
+                      )
+                    :: rewrite rest
+                | None -> call :: rewrite tail
+              )
+            | instr :: rest -> instr :: rewrite rest
+            | [] -> []
+          in
+          rewrite instrs
+        in
+        List.rev
+          (terminal_return
+          :: terminal_label_instr
+          :: List.map (map_instrs rewrite_lists) reversed
+          )
+        |> rewrite_lists
+    | _ -> body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Fold pure single-use copies into their consumer. A local declared and
+   immediately assigned a cval (`x = v.sender;`) is substituted into the
+   instructions that read it, removing the declaration and the copy, when it
+   is provably safe:
+
+   - every root name the cval reads is a body-declared local or an argument,
+     and none of them is written again in the remainder of the block, so the
+     substituted expression still denotes the copied value;
+   - no label sits between the copy and the final read, so no jump can land
+     inside the propagation window with different root values;
+   - the local is read exactly once (arbitrary cval), or the cval is a bare
+     variable or literal (any read count), so no work is duplicated;
+   - the local is never written again.
+
+   cvals are pure by construction, so dropping an unread copy is sound. *)
+let optimize_pure_copies = ref false
+
+(* JIB's cleanup lowering deliberately leaves a common structured-C shape:
+
+     label end_function;
+     return result;
+
+   even when no control-flow edge targets the label.  ANF fragments also put
+   a single assignment in a lexical block after their inner temporaries have
+   disappeared.  Neither artifact carries meaning at this point, but both
+   prevent the local copy propagation below from seeing adjacent producers
+   and consumers.  Remove only provably untargeted labels and declaration-free
+   singleton copy blocks; labels that participate in exception/cleanup flow
+   and blocks that still own locals remain untouched. *)
+let simplify_pure_copy_scaffolding (CDEF_aux (aux, def_annot)) =
+  let rewrite_body body =
+    let targeted_labels = ref Util.StringSet.empty in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               (match aux with
+               | I_goto target | I_jump (_, target) ->
+                   targeted_labels := Util.StringSet.add target !targeted_labels
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    let rewrite_lists instrs =
+      List.concat_map
+        (function
+          | I_aux (I_label label, _) when not (Util.StringSet.mem label !targeted_labels) -> []
+          | I_aux (I_block [], _) -> []
+          | I_aux (I_block body, _)
+            when not
+                   (List.exists
+                      (function
+                        | I_aux ((I_decl _ | I_init _ | I_reset _), _) -> true
+                        | _ -> false
+                        )
+                      body
+                   ) ->
+              body
+          | instr -> [instr]
+          )
+        instrs
+    in
+    let rec fixpoint n body =
+      let rewritten = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+      if n = 0 || rewritten = body then rewritten else fixpoint (n - 1) rewritten
+    in
+    let body = fixpoint 2 body in
+    let referenced = ref NameSet.empty in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               (match aux with
+               | I_decl _ -> ()
+               | _ -> referenced := NameSet.union !referenced (instr_ids ~direct:true sub)
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    filter_instrs
+      (function I_aux (I_decl (_, name), _) -> NameSet.mem name !referenced | _ -> true)
+      body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | CDEF_let (number, bindings, body) ->
+      CDEF_aux (CDEF_let (number, bindings, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* JIB uses lexical blocks to delimit ANF temporaries even when all of those
+   temporaries have fixed stack representations. In optimized C a block may be
+   removed when every declaration it contains has a function-unique name:
+   extending such a C local's lifetime cannot alias another local, and stack
+   values have no create/kill lifetime protocol to preserve. Flattening here
+   exposes producer/copy/consumer sequences to the ordinary copy passes below. *)
+let flatten_unique_stack_blocks ctx (CDEF_aux (aux, def_annot)) =
+  let rewrite_body body =
+    let declaration_counts = ref NameMap.empty in
+    let count_declaration name =
+      let count = Option.value ~default:0 (NameMap.find_opt name !declaration_counts) in
+      declaration_counts := NameMap.add name (count + 1) !declaration_counts
+    in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               (match aux with
+               | I_decl (_, name)
+               | I_init (_, name, _)
+               | I_reinit (_, name, _)
+               | I_reset (_, name) ->
+                   count_declaration name
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    let block_is_flattenable block =
+      let safe = ref true in
+      List.iter
+        (fun instr ->
+          ignore
+            (map_instr
+               (fun (I_aux (aux, _) as sub) ->
+                 (match aux with
+                 | I_decl (ctyp, name)
+                 | I_init (ctyp, name, _)
+                 | I_reinit (ctyp, name, _)
+                 | I_reset (ctyp, name) ->
+                     if
+                       (not (is_stack_ctyp ctx ctyp))
+                       || Option.value ~default:0 (NameMap.find_opt name !declaration_counts) <> 1
+                     then safe := false
+                 | I_clear (ctyp, _) when not (is_stack_ctyp ctx ctyp) -> safe := false
+                 | _ -> ()
+                 );
+                 sub
+               )
+               instr
+            )
+        )
+        block;
+      !safe
+    in
+    let rewrite_lists instrs =
+      List.concat_map
+        (function
+          | I_aux (I_block block, _) when block_is_flattenable block -> block
+          | instr -> [instr]
+          )
+        instrs
+    in
+    let rec fixpoint n body =
+      let rewritten = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+      if n = 0 || rewritten = body then rewritten else fixpoint (n - 1) rewritten
+    in
+    fixpoint 4 body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Recover the short-circuit boolean expression represented by JIB's ANF
+   diamond. The right operand remains under C's &&/|| short-circuit operator,
+   so this changes neither its evaluation condition nor its order. Cvals are
+   pure; effectful calls remain explicit instructions and cannot match here. *)
+let collapse_short_circuit_booleans (CDEF_aux (aux, def_annot)) =
+  let bool_literal expected = function
+    | V_lit (VL_bool actual, CT_bool) -> Bool.equal expected actual
+    | _ -> false
+  in
+  let assigned_value destination = function
+    | instrs ->
+      let rec meaningful = function
+        | I_aux (I_clear (ctyp, _), _) :: rest when ctyp_equal ctyp CT_bool ->
+            meaningful rest
+        | I_aux (I_block block, _) :: rest -> meaningful block @ meaningful rest
+        | instr :: rest -> instr :: meaningful rest
+        | [] -> []
+      in
+      match meaningful instrs with
+    | [I_aux (I_copy (CL_id (assigned, assigned_ctyp), value), _)]
+      when Name.compare destination assigned = 0 && ctyp_equal assigned_ctyp CT_bool ->
+        Some value
+    | _ -> None
+  in
+  let expression condition then_value else_value =
+    if bool_literal false else_value then Some (V_call (Band, [condition; then_value]))
+    else if bool_literal true then_value then Some (V_call (Bor, [condition; else_value]))
+    else if bool_literal false then_value then
+      Some (V_call (Band, [V_call (Bnot, [condition]); else_value]))
+    else if bool_literal true else_value then
+      Some (V_call (Bor, [V_call (Bnot, [condition]); then_value]))
+    else None
+  in
+  let rewrite_lists instrs =
+    let rec rewrite = function
+      | (I_aux (I_decl (result_ctyp, result), _) as result_declaration)
+        :: (I_aux (I_decl (temporary_ctyp, temporary), _) as temporary_declaration)
+        :: I_aux (I_if (condition, then_instrs, else_instrs), if_aux)
+        :: I_aux
+             ( I_copy
+                 ( CL_id (assigned_result, assigned_result_ctyp),
+                   V_id (source, source_ctyp)
+                 ),
+               copy_aux
+             )
+        :: rest
+        when ctyp_equal result_ctyp CT_bool
+             && ctyp_equal temporary_ctyp CT_bool
+             && Name.compare result assigned_result = 0
+             && Name.compare temporary source = 0
+             && ctyp_equal result_ctyp assigned_result_ctyp
+             && ctyp_equal temporary_ctyp source_ctyp -> (
+          match (assigned_value temporary then_instrs, assigned_value temporary else_instrs) with
+          | Some then_value, Some else_value -> (
+              match expression condition then_value else_value with
+              | Some value ->
+                  result_declaration
+                  :: I_aux (I_copy (CL_id (result, CT_bool), value), copy_aux)
+                  :: rewrite rest
+              | None ->
+                  result_declaration
+                  :: temporary_declaration
+                  :: I_aux (I_if (condition, then_instrs, else_instrs), if_aux)
+                  :: I_aux
+                       ( I_copy
+                           (CL_id (assigned_result, assigned_result_ctyp), V_id (source, source_ctyp)),
+                         copy_aux
+                       )
+                  :: rewrite rest
+            )
+          | _ ->
+              result_declaration
+              :: temporary_declaration
+              :: I_aux (I_if (condition, then_instrs, else_instrs), if_aux)
+              :: I_aux
+                   ( I_copy
+                       (CL_id (assigned_result, assigned_result_ctyp), V_id (source, source_ctyp)),
+                     copy_aux
+                   )
+              :: rewrite rest
+        )
+      | (I_aux (I_decl (declared_ctyp, destination), _) as declaration)
+        :: I_aux (I_if (condition, then_instrs, else_instrs), if_aux)
+        :: rest
+        when ctyp_equal declared_ctyp CT_bool -> (
+          match (assigned_value destination then_instrs, assigned_value destination else_instrs) with
+          | Some then_value, Some else_value -> (
+              match expression condition then_value else_value with
+              | Some value ->
+                  declaration
+                  :: I_aux (I_copy (CL_id (destination, CT_bool), value), if_aux)
+                  :: rewrite rest
+              | None ->
+                  declaration
+                  :: I_aux (I_if (condition, then_instrs, else_instrs), if_aux)
+                  :: rewrite rest
+            )
+          | _ ->
+              declaration
+              :: I_aux (I_if (condition, then_instrs, else_instrs), if_aux)
+              :: rewrite rest
+        )
+      | instr :: rest -> instr :: rewrite rest
+      | [] -> []
+    in
+    rewrite instrs
+  in
+  let rewrite_body body = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Merge repeated bodies in adjacent conditional arms while retaining C's
+   short-circuit evaluation order.  JIB commonly preserves a Sail conditional
+   ladder as
+
+     if (first) { same } else if (second) { same } else { other }
+
+   even though both conditions are already pure cvals.  Combining the tests
+   removes the duplicated body and gives the later copy/return passes one
+   branch rather than two equivalent producers.  The symmetric form, where
+   the first and final bodies are equal, becomes [!first && second].  Compare
+   instructions without their source annotations: separately lowered copies
+   of the same arm naturally carry different locations but have identical JIB
+   semantics. *)
+let merge_repeated_conditional_branches (CDEF_aux (aux, def_annot)) =
+  let call_kind_equal left right =
+    match (left, right) with
+    | Call _, Call _ -> true
+    | Extern left_ctyp, Extern right_ctyp -> ctyp_equal left_ctyp right_ctyp
+    | _ -> false
+  in
+  let uid_equal (left_id, left_ctyps) (right_id, right_ctyps) =
+    Id.compare left_id right_id = 0
+    && List.compare_lengths left_ctyps right_ctyps = 0
+    && List.for_all2 ctyp_equal left_ctyps right_ctyps
+  in
+  let call_return_equal left right =
+    match (left, right) with
+    | CR_one (CL_id (Return _, left_ctyp)), CR_one (CL_id (Return _, right_ctyp)) ->
+        ctyp_equal left_ctyp right_ctyp
+    | _ -> left = right
+  in
+  let name_equal left right =
+    match (left, right) with
+    | Gen (lv1, lv2, ln, _, _), Gen (rv1, rv2, rn, _, _) ->
+        lv1 = rv1 && lv2 = rv2 && ln = rn
+    | Name (left_id, left_ssa), Name (right_id, right_ssa) ->
+        Id.compare left_id right_id = 0 && left_ssa = right_ssa
+    | _ -> left = right
+  in
+  let cval_equal left right =
+    match (left, right) with
+    | V_id (left_name, left_ctyp), V_id (right_name, right_ctyp) ->
+        name_equal left_name right_name && ctyp_equal left_ctyp right_ctyp
+    | _ -> left = right
+  in
+  let rec instrs_equal left right =
+    List.length left = List.length right && List.for_all2 instr_equal left right
+  and instr_equal (I_aux (left, _)) (I_aux (right, _)) =
+    match (left, right) with
+    | I_funcall (left_return, left_kind, left_uid, left_args),
+      I_funcall (right_return, right_kind, right_uid, right_args) ->
+        let return_equal = call_return_equal left_return right_return in
+        let kind_equal = call_kind_equal left_kind right_kind in
+        let function_equal = uid_equal left_uid right_uid in
+        let args_equal =
+          List.compare_lengths left_args right_args = 0
+          && List.for_all2 cval_equal left_args right_args
+        in
+        return_equal && kind_equal && function_equal && args_equal
+    | I_if (left_condition, left_then, left_else),
+      I_if (right_condition, right_then, right_else) ->
+        left_condition = right_condition
+        && instrs_equal left_then right_then
+        && instrs_equal left_else right_else
+    | I_block left, I_block right | I_try_block left, I_try_block right ->
+        instrs_equal left right
+    | _ -> left = right
+  in
+  let rec exits = function
+    | [] -> false
+    | branch -> (
+        match List.rev branch with
+        | I_aux (I_exit _, _) :: _
+        | I_aux (I_return _, _) :: _
+        | I_aux (I_copy (CL_id (Return _, _), _), _) :: _
+        | I_aux (I_funcall (CR_one (CL_id (Return _, _)), _, _, _), _) :: _ ->
+            true
+        | I_aux (I_if (_, then_instrs, else_instrs), _) :: _ ->
+            exits then_instrs && exits else_instrs
+        | I_aux (I_block instrs, _) :: _ -> exits instrs
+        | _ -> false
+      )
+  in
+  let rewrite_lists instrs =
+    let rec rewrite = function
+      | I_aux (I_if (first, first_body, []), if_aux)
+        :: I_aux (I_if (second, second_body, []), _)
+        :: rest
+        when exits first_body && instrs_equal first_body second_body ->
+          I_aux (I_if (V_call (Bor, [first; second]), first_body, []), if_aux)
+          :: rewrite rest
+      | I_aux
+          ( I_if
+              ( first,
+                first_body,
+                [I_aux (I_if (second, second_body, other_body), _)]
+              ),
+            if_aux
+          )
+        :: rest
+        when instrs_equal first_body second_body ->
+          I_aux
+            (I_if (V_call (Bor, [first; second]), first_body, other_body), if_aux)
+          :: rewrite rest
+      | I_aux
+          ( I_if
+              ( first,
+                first_body,
+                [I_aux (I_if (second, second_body, final_body), _)]
+              ),
+            if_aux
+          )
+        :: rest
+        when instrs_equal first_body final_body ->
+          I_aux
+            ( I_if
+                (V_call (Band, [V_call (Bnot, [first]); second]), second_body, first_body),
+              if_aux
+            )
+          :: rewrite rest
+      | I_aux
+          ( I_if
+              ( first,
+                [I_aux (I_if (second, nested_body, middle_body), _)],
+                final_body
+              ),
+            if_aux
+          )
+        :: rest
+        when instrs_equal middle_body final_body ->
+          I_aux
+            (I_if (V_call (Band, [first; second]), nested_body, final_body), if_aux)
+          :: rewrite rest
+      | instr :: rest -> instr :: rewrite rest
+      | [] -> []
+    in
+    rewrite instrs
+  in
+  let rewrite_body body =
+    let rec fixpoint n body =
+      let rewritten = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+      if n = 0 || rewritten = body then rewritten else fixpoint (n - 1) rewritten
+    in
+    fixpoint 4 body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Representation specialization can prove a predicate after JIB has already
+   formed its control-flow graph. Remove those literal-condition branches at
+   the IR level so the ordinary copy, scope, and declaration cleanups see only
+   the path that can execute. *)
+let prune_constant_branches (CDEF_aux (aux, def_annot)) =
+  let rewrite_lists instrs =
+    List.concat_map
+      (function
+        | I_aux (I_if (V_lit (VL_bool condition, CT_bool), then_instrs, else_instrs), _) ->
+            if condition then then_instrs else else_instrs
+        | instr -> [instr]
+        )
+      instrs
+  in
+  let rewrite_body body =
+    let rec fixpoint n body =
+      let rewritten = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+      if n = 0 || rewritten = body then rewritten else fixpoint (n - 1) rewritten
+    in
+    fixpoint 4 body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Reassemble the field-by-field JIB lowering of a complete stack aggregate
+   into one pure value.  This is deliberately limited to complete records and
+   tuples whose field assignments require no conversion.  The resulting
+   [V_struct] or [V_tuple] can then participate in ordinary copy propagation,
+   which removes both aggregate-construction temporaries and their scopes. *)
+let fold_stack_aggregate_construction ctx (CDEF_aux (aux, def_annot)) =
+  let preserve_assignment_conversion target_ctyp value =
+    let source_ctyp = cval_ctyp value in
+    if ctyp_equal source_ctyp target_ctyp then Some value
+    else
+      match (target_ctyp, source_ctyp) with
+      | CT_fuint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) ->
+          Some (V_call (Unsigned width, [value]))
+      | CT_fint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) ->
+          Some (V_call (Signed width, [value]))
+      | _ -> None
+  in
+  let expected_fields = function
+    | CT_struct (id, _) -> (
+        match Bindings.find_opt id ctx.records with
+        | Some (_, fields) -> Some (List.map fst (Bindings.bindings fields))
+        | None -> None
+      )
+    | _ -> None
+  in
+  let complete expected actual =
+    let actual_count = List.length actual in
+    let expected = IdSet.of_list expected in
+    let actual = List.fold_left (fun fields (field, _) -> IdSet.add field fields) IdSet.empty actual in
+    IdSet.cardinal expected = actual_count && IdSet.equal expected actual
+  in
+  let rec reads destination = function
+    | V_id (name, _) -> Name.compare destination name = 0
+    | V_member _ | V_lit _ -> false
+    | V_call (_, values) | V_tuple values -> List.exists (reads destination) values
+    | V_field (value, _, _)
+    | V_tuple_member (value, _, _)
+    | V_ctor_kind (value, _)
+    | V_ctor_unwrap (value, _, _) ->
+        reads destination value
+    | V_struct (fields, _) -> List.exists (fun (_, value) -> reads destination value) fields
+  in
+  let collect destination destination_ctyp instrs =
+    let rec collect rev_fields = function
+      | I_aux
+          ( I_copy
+              ( CL_field (CL_id (base, base_ctyp), field, field_ctyp),
+                value
+              ),
+            _
+          )
+        :: rest
+        when Name.compare destination base = 0
+             && ctyp_equal destination_ctyp base_ctyp
+             && ctyp_equal field_ctyp (cval_ctyp value)
+             && not (reads destination value) ->
+          collect ((field, value) :: rev_fields) rest
+      | rest -> (List.rev rev_fields, rest)
+    in
+    collect [] instrs
+  in
+  let collect_tuple destination destination_ctyp length instrs =
+    let rec collect rev_fields = function
+      | I_aux
+          ( I_copy
+              ( CL_tuple (CL_id (base, base_ctyp), index),
+                value
+              ),
+            _
+          )
+        :: rest
+        when Name.compare destination base = 0
+             && ctyp_equal destination_ctyp base_ctyp
+             && index >= 0
+             && index < length
+             && (match destination_ctyp with
+                | CT_tup field_ctyps -> ctyp_equal (List.nth field_ctyps index) (cval_ctyp value)
+                | _ -> false)
+             && not (reads destination value) ->
+          collect ((index, value) :: rev_fields) rest
+      | rest -> (List.rev rev_fields, rest)
+    in
+    collect [] instrs
+  in
+  let complete_tuple length fields =
+    List.length fields = length
+    && List.sort_uniq Int.compare (List.map fst fields) = Util.list_init length (fun index -> index)
+  in
+  let collect_converted_tuple destination destination_ctyp field_ctyps instrs =
+    let length = List.length field_ctyps in
+    let rec collect rev_fields = function
+      | I_aux
+          ( I_copy
+              ( CL_tuple (CL_id (base, base_ctyp), index),
+                value
+              ),
+            _
+          )
+        :: rest
+        when Name.compare destination base = 0
+             && ctyp_equal destination_ctyp base_ctyp
+             && index >= 0
+             && index < length
+             && not (List.mem_assoc index rev_fields) -> (
+          match preserve_assignment_conversion (List.nth field_ctyps index) value with
+          | Some value -> collect ((index, value) :: rev_fields) rest
+          | None -> (List.rev rev_fields, rest)
+        )
+      | rest -> (List.rev rev_fields, rest)
+    in
+    collect [] instrs
+  in
+  let rewrite_lists instrs =
+    let rec rewrite = function
+      | I_aux
+          ( I_copy
+              ( CL_id (destination, (CT_tup target_ctyps as destination_ctyp)),
+                (V_tuple values as source)
+              ),
+            copy_aux
+          )
+        :: rest
+        when List.length target_ctyps = List.length values -> (
+          let converted =
+            List.map2 preserve_assignment_conversion target_ctyps values
+          in
+          if List.for_all Option.is_some converted
+             && not (ctyp_equal destination_ctyp (cval_ctyp source))
+          then
+            let converted = List.map Option.get converted in
+            I_aux
+              ( I_copy
+                  (CL_id (destination, destination_ctyp), V_tuple converted),
+                copy_aux
+              )
+            :: rewrite rest
+          else
+            I_aux
+              (I_copy (CL_id (destination, destination_ctyp), source), copy_aux)
+            :: rewrite rest
+        )
+      | (I_aux (I_decl (ctyp, destination), declaration_aux) as declaration) :: rest
+        when is_stack_ctyp ctx ctyp -> (
+          match expected_fields ctyp with
+          | Some expected ->
+              let fields, remaining = collect destination ctyp rest in
+              if fields <> [] && complete expected fields then
+                declaration
+                :: I_aux
+                     ( I_copy
+                         (CL_id (destination, ctyp), V_struct (fields, ctyp)),
+                       declaration_aux
+                     )
+                :: rewrite remaining
+              else declaration :: rewrite rest
+          | None -> (
+              match ctyp with
+              | CT_tup field_ctyps ->
+                  let fields, remaining = collect_tuple destination ctyp (List.length field_ctyps) rest in
+                  if fields <> [] && complete_tuple (List.length field_ctyps) fields then
+                    let values =
+                      List.sort (fun (left, _) (right, _) -> Int.compare left right) fields
+                      |> List.map snd
+                    in
+                    declaration
+                    :: I_aux
+                         (I_copy (CL_id (destination, ctyp), V_tuple values), declaration_aux)
+                    :: rewrite remaining
+                  else declaration :: rewrite rest
+              | _ -> declaration :: rewrite rest
+            )
+        )
+      | (I_aux
+           ( I_copy (CL_tuple (CL_id (destination, destination_ctyp), _), _),
+             copy_aux
+           )
+         as first)
+        :: rest -> (
+          match destination_ctyp with
+          | CT_tup field_ctyps ->
+              let fields, remaining =
+                collect_converted_tuple destination destination_ctyp field_ctyps (first :: rest)
+              in
+              if complete_tuple (List.length field_ctyps) fields then
+                let values =
+                  List.sort (fun (left, _) (right, _) -> Int.compare left right) fields
+                  |> List.map snd
+                in
+                I_aux (I_copy (CL_id (destination, destination_ctyp), V_tuple values), copy_aux)
+                :: rewrite remaining
+              else first :: rewrite rest
+          | _ -> first :: rewrite rest
+        )
+      | instr :: rest -> instr :: rewrite rest
+      | [] -> []
+    in
+    rewrite instrs
+  in
+  let rewrite_body body = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Turn a structured expression whose one arm exits into an early guard.
+   Sail often needs an arm to retain dependent-type facts, but C no longer
+   needs that lexical proof scope after JIB has fixed every ctyp:
+
+     if (valid) { normal } else { fatal_error(...); exit; }
+
+   becomes
+
+     if (!valid) { fatal_error(...); exit; }
+     normal
+
+   Returns use the same rewrite, eliminating [else] after a value or unit
+   return.  Only function-unique stack declarations leave their branch scope;
+   otherwise the continuing arm is retained as an explicit block. This is the
+   same lifetime/name proof used by [flatten_unique_stack_blocks]. *)
+let flatten_terminal_guards ctx (CDEF_aux (aux, def_annot)) =
+  let rewrite_body body =
+    let declaration_counts = ref NameMap.empty in
+    let count_declaration name =
+      let count = Option.value ~default:0 (NameMap.find_opt name !declaration_counts) in
+      declaration_counts := NameMap.add name (count + 1) !declaration_counts
+    in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               (match aux with
+               | I_decl (_, name)
+               | I_init (_, name, _)
+               | I_reinit (_, name, _)
+               | I_reset (_, name) ->
+                   count_declaration name
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    let movable branch =
+      let safe = ref true in
+      List.iter
+        (fun instr ->
+          ignore
+            (map_instr
+               (fun (I_aux (aux, _) as sub) ->
+                 (match aux with
+                 | I_decl (ctyp, name)
+                 | I_init (ctyp, name, _)
+                 | I_reinit (ctyp, name, _)
+                 | I_reset (ctyp, name) ->
+                     if
+                       (not (is_stack_ctyp ctx ctyp))
+                       || Option.value ~default:0 (NameMap.find_opt name !declaration_counts) <> 1
+                     then safe := false
+                 | I_clear (ctyp, _) when not (is_stack_ctyp ctx ctyp) -> safe := false
+                 | _ -> ()
+                 );
+                 sub
+               )
+               instr
+            )
+        )
+        branch;
+      !safe
+    in
+    let rec exits = function
+      | [] -> false
+      | branch -> (
+          match List.rev branch with
+          | I_aux (I_exit _, _) :: _ -> true
+          | I_aux (I_funcall (CR_one (CL_id (Return _, _)), _, _, _), _) :: _ -> true
+          | I_aux (I_return _, _) :: _ -> true
+          | I_aux (I_if (_, then_instrs, else_instrs), _) :: _ ->
+              exits then_instrs && exits else_instrs
+          | I_aux (I_block instrs, _) :: _ -> exits instrs
+          | _ -> false
+        )
+    in
+    let contains_label branch =
+      List.exists
+        (fun instr ->
+          let found = ref false in
+          ignore
+            (map_instr
+               (fun (I_aux (aux, _) as sub) ->
+                 (match aux with I_label _ -> found := true | _ -> ());
+                 sub
+               )
+               instr
+            );
+          !found
+        )
+        branch
+    in
+    let continue_with branch branch_aux continuation =
+      let branch =
+        if movable branch then branch else [I_aux (I_block branch, branch_aux)]
+      in
+      branch @ continuation
+    in
+    let rec rewrite = function
+      (* A flattened match can leave its successful, terminal continuation in
+         the only populated branch and the fatal/default arm as the following
+         statements.  Turn that fallthrough terminal path into an early guard,
+         lifting the successful branch (and any private join label it owns)
+         back into the surrounding sequence. *)
+      | I_aux (I_if (condition, then_instrs, []), if_aux) :: rest
+        when contains_label then_instrs && exits then_instrs && exits rest ->
+          let then_instrs = rewrite then_instrs in
+          let rest = rewrite rest in
+          I_aux (I_if (V_call (Bnot, [condition]), rest, []), if_aux)
+          :: continue_with then_instrs if_aux []
+      | I_aux (I_if (condition, [], else_instrs), if_aux) :: rest
+        when contains_label else_instrs && exits else_instrs && exits rest ->
+          let else_instrs = rewrite else_instrs in
+          let rest = rewrite rest in
+          I_aux (I_if (condition, rest, []), if_aux)
+          :: continue_with else_instrs if_aux []
+      | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rest ->
+          let then_instrs = rewrite then_instrs in
+          let else_instrs = rewrite else_instrs in
+          let then_exits = exits then_instrs in
+          let else_exits = exits else_instrs in
+          if then_exits && else_exits then
+            I_aux (I_if (condition, then_instrs, []), if_aux)
+            :: continue_with else_instrs if_aux (rewrite rest)
+          else if else_exits then
+            I_aux (I_if (V_call (Bnot, [condition]), else_instrs, []), if_aux)
+            :: continue_with then_instrs if_aux (rewrite rest)
+          else if then_exits then
+            I_aux (I_if (condition, then_instrs, []), if_aux)
+            :: continue_with else_instrs if_aux (rewrite rest)
+          else
+            I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rewrite rest
+      | I_aux (I_block block, block_aux) :: rest ->
+          I_aux (I_block (rewrite block), block_aux) :: rewrite rest
+      | I_aux (I_try_block block, block_aux) :: rest ->
+          I_aux (I_try_block (rewrite block), block_aux) :: rewrite rest
+      | instr :: rest -> instr :: rewrite rest
+      | [] -> []
+    in
+    rewrite body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Preserve assignment conversion semantics while eliminating adjacent copy
+   chains.  In both patterns the intermediate and consumer have the same JIB
+   type, so assigning the producer directly performs the same C conversion as
+   assigning it through the temporary first.  This intentionally does not
+   substitute a differently typed producer into arbitrary arithmetic. *)
+let fold_copy_conversions (CDEF_aux (aux, def_annot)) =
+  let rewrite_lists instrs =
+    let rec rewrite = function
+      | I_aux
+          ( I_funcall (CR_one (CL_id (temporary, temporary_ctyp)), extern, callee, args),
+            call_aux
+          )
+        :: I_aux (I_return (V_id (result, result_ctyp)), _)
+        :: rest
+        when Name.compare temporary result = 0 && ctyp_equal temporary_ctyp result_ctyp ->
+          I_aux
+            ( I_funcall (CR_one (CL_id (Return (-1), result_ctyp)), extern, callee, args),
+              call_aux
+            )
+          :: rewrite rest
+      | I_aux (I_init (temporary_ctyp, temporary, Init_cval cval), _)
+        :: I_aux (I_return (V_id (result, result_ctyp)), return_aux)
+        :: rest
+        when Name.compare temporary result = 0
+             && ctyp_equal temporary_ctyp result_ctyp
+             && ctyp_equal temporary_ctyp (cval_ctyp cval) ->
+          I_aux (I_return cval, return_aux) :: rewrite rest
+      | I_aux (I_copy (CL_id (temporary, temporary_ctyp), cval), _)
+        :: I_aux (I_return (V_id (result, result_ctyp)), return_aux)
+        :: rest
+        when Name.compare temporary result = 0
+             && ctyp_equal temporary_ctyp result_ctyp
+             && ctyp_equal temporary_ctyp (cval_ctyp cval) ->
+          I_aux (I_return cval, return_aux) :: rewrite rest
+      | I_aux (I_copy (CL_id (temporary, temporary_ctyp), cval), _)
+        :: I_aux (I_copy (destination, V_id (source, source_ctyp)), copy_aux)
+        :: rest
+        when Name.compare temporary source = 0
+             && ctyp_equal temporary_ctyp source_ctyp
+             && ctyp_equal temporary_ctyp (clexp_ctyp destination)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:temporary ~direct:false instr)
+                     rest) ->
+          I_aux (I_copy (destination, cval), copy_aux) :: rewrite rest
+      | I_aux
+          ( I_funcall (CR_one (CL_id (temporary, temporary_ctyp)), extern, callee, args),
+            call_aux
+          )
+        :: I_aux (I_copy (destination, V_id (source, source_ctyp)), _)
+        :: rest
+        when Name.compare temporary source = 0
+             && ctyp_equal temporary_ctyp source_ctyp
+             && ctyp_equal temporary_ctyp (clexp_ctyp destination)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:temporary ~direct:false instr)
+                     rest) ->
+          I_aux (I_funcall (CR_one destination, extern, callee, args), call_aux) :: rewrite rest
+      | instr :: rest -> instr :: rewrite rest
+      | [] -> []
+    in
+    rewrite instrs
+  in
+  let rewrite_body body =
+    let rec fixpoint n body =
+      let rewritten = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+      if n = 0 || rewritten = body then rewritten else fixpoint (n - 1) rewritten
+    in
+    fixpoint 2 body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* A stack result selected by structured control flow does not need a mutable
+   join temporary when every branch produces the result exactly once:
+
+     if (condition) result = f(); else result = zero;
+     return result;
+
+   Sink the return into both branches.  A terminal function call is marked by
+   restoring JIB's Return destination; code generation emits that form as a C
+   return expression.  Calls followed by exception handling are deliberately
+   not terminal, so the check remains between the call and the eventual
+   return. *)
+let sink_terminal_stack_returns (CDEF_aux (aux, def_annot)) =
+  let same_name left right = Name.compare left right = 0 in
+  let preserve_assignment_conversion target_ctyp value =
+    let source_ctyp = cval_ctyp value in
+    if ctyp_equal source_ctyp target_ctyp then Some value
+    else
+      match (target_ctyp, source_ctyp) with
+      | CT_fuint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) ->
+          Some (V_call (Unsigned width, [value]))
+      | CT_fint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) ->
+          Some (V_call (Signed width, [value]))
+      | _ -> None
+  in
+  let sink_tuple result result_ctyp return_aux instrs =
+    match result_ctyp with
+    | CT_tup field_ctyps ->
+        let length = List.length field_ctyps in
+        let rec collect fields = function
+          | I_aux
+              ( I_copy
+                  ( CL_tuple (CL_id (destination, destination_ctyp), index),
+                    value
+                  ),
+                _
+              )
+            :: reversed
+            when same_name destination result
+                 && ctyp_equal destination_ctyp result_ctyp
+                 && index >= 0
+                 && index < length
+                 && not (List.mem_assoc index fields) -> (
+              match preserve_assignment_conversion (List.nth field_ctyps index) value with
+              | Some value -> collect ((index, value) :: fields) reversed
+              | None -> None
+            )
+          | reversed when List.length fields = length ->
+              let values =
+                List.sort (fun (left, _) (right, _) -> Int.compare left right) fields
+                |> List.map snd
+              in
+              Some (List.rev (I_aux (I_return (V_tuple values), return_aux) :: reversed))
+          | _ -> None
+        in
+        collect [] (List.rev instrs)
+    | _ -> None
+  in
+  let rec sink result result_ctyp return_aux instrs =
+    match sink_tuple result result_ctyp return_aux instrs with
+    | Some instrs -> Some instrs
+    | None -> (match List.rev instrs with
+    | I_aux (I_copy (CL_id (destination, destination_ctyp), cval), _) :: rev_prefix
+      when same_name destination result
+           && ctyp_equal destination_ctyp result_ctyp
+           && ctyp_equal (cval_ctyp cval) result_ctyp ->
+        Some (List.rev (I_aux (I_return cval, return_aux) :: rev_prefix))
+    | I_aux
+        ( I_funcall (CR_one (CL_id (destination, destination_ctyp)), extern, callee, args),
+          call_aux
+        )
+      :: rev_prefix
+      when same_name destination result && ctyp_equal destination_ctyp result_ctyp ->
+        Some
+          (List.rev
+             (I_aux
+                ( I_funcall (CR_one (CL_id (Return (-1), result_ctyp)), extern, callee, args),
+                  call_aux
+                )
+             :: rev_prefix
+             )
+          )
+    | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rev_prefix -> (
+        match
+          ( sink result result_ctyp return_aux then_instrs,
+            sink result result_ctyp return_aux else_instrs
+          )
+        with
+        | Some then_instrs, Some else_instrs ->
+            Some
+              (List.rev
+                 (I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rev_prefix)
+              )
+        | _ -> None
+      )
+    | I_aux (I_block block, block_aux) :: rev_prefix -> (
+        match sink result result_ctyp return_aux block with
+        | Some block when rev_prefix = [] -> Some block
+        | Some block ->
+            Some (List.rev (I_aux (I_block block, block_aux) :: rev_prefix))
+        | None -> None
+      )
+    | _ -> None
+    )
+  in
+  let target_counts body =
+    let counts = Hashtbl.create 16 in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               (match aux with
+               | I_goto label | I_jump (_, label) ->
+                   Hashtbl.replace counts label (1 + Option.value ~default:0 (Hashtbl.find_opt counts label))
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    fun label -> Option.value ~default:0 (Hashtbl.find_opt counts label)
+  in
+  let label_counts body =
+    let counts = Hashtbl.create 16 in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               (match aux with
+               | I_label label ->
+                   Hashtbl.replace counts label (1 + Option.value ~default:0 (Hashtbl.find_opt counts label))
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    fun label -> Option.value ~default:0 (Hashtbl.find_opt counts label)
+  in
+  let split_at_label target instrs =
+    let rec split prefix = function
+      | I_aux (I_label label, _) :: rest when String.equal label target -> Some (List.rev prefix, rest)
+      | instr :: rest -> split (instr :: prefix) rest
+      | [] -> None
+    in
+    split [] instrs
+  in
+  let drop_terminal_goto instrs =
+    match List.rev instrs with
+    | I_aux (I_goto label, _) :: prefix -> Some (List.rev prefix, label)
+    | _ -> None
+  in
+  let split_at_jump instrs =
+    let rec split prefix = function
+      | I_aux (I_jump (condition, alternate), jump_aux) :: rest ->
+          Some (List.rev prefix, condition, alternate, jump_aux, rest)
+      | (I_aux ((I_label _ | I_goto _ | I_return _ | I_exit _), _) :: _) -> None
+      | instr :: rest -> split (instr :: prefix) rest
+      | [] -> None
+    in
+    split [] instrs
+  in
+  let rec terminal = function
+    | [] -> false
+    | instrs -> (
+        match List.rev instrs with
+        | I_aux (I_exit _, _) :: _
+        | I_aux (I_return _, _) :: _
+        | I_aux (I_copy (CL_id (Return _, _), _), _) :: _
+        | I_aux (I_funcall (CR_one (CL_id (Return _, _)), _, _, _), _) :: _ ->
+            true
+        | I_aux (I_if (_, then_instrs, else_instrs), _) :: _ ->
+            terminal then_instrs && terminal else_instrs
+        | I_aux (I_block instrs, _) :: _ -> terminal instrs
+        | _ -> false
+      )
+  in
+  let split_at_terminal_branch instrs =
+    let rec split prefix = function
+      | I_aux (I_jump (condition, alternate), jump_aux) :: rest ->
+          Some (List.rev prefix, condition, alternate, jump_aux, rest, true)
+      | I_aux
+          ( I_if
+              ( condition,
+                [],
+                [I_aux (I_goto alternate, _)]
+              ),
+            if_aux
+          )
+        :: rest ->
+          Some (List.rev prefix, condition, alternate, if_aux, rest, false)
+      | I_aux
+          ( I_if
+              ( condition,
+                [I_aux (I_goto alternate, _)],
+                []
+              ),
+            if_aux
+          )
+        :: rest ->
+          Some (List.rev prefix, condition, alternate, if_aux, rest, true)
+      | (I_aux ((I_label _ | I_goto _ | I_return _ | I_exit _), _) :: _) -> None
+      | instr :: rest -> split (instr :: prefix) rest
+      | [] -> None
+    in
+    split [] instrs
+  in
+  let fold_terminal_copy_return instrs =
+    match List.rev instrs with
+    | I_aux (I_return (V_id (returned, return_ctyp)), return_aux)
+      :: I_aux (I_copy (CL_id (assigned, assigned_ctyp), value), _)
+      :: reversed
+      when Name.compare returned assigned = 0
+           && ctyp_equal return_ctyp assigned_ctyp
+           && ctyp_equal (cval_ctyp value) assigned_ctyp ->
+        List.rev (I_aux (I_return value, return_aux) :: reversed)
+    | _ -> instrs
+  in
+  let fold_branch_condition prefix condition =
+    match (List.rev prefix, condition) with
+    | ( I_aux (I_copy (CL_id (assigned, assigned_ctyp), value), _)
+        :: I_aux (I_decl (decl_ctyp, declared), _)
+        :: reversed,
+        V_id (read, read_ctyp)
+      )
+      when Name.compare assigned declared = 0
+           && Name.compare assigned read = 0
+           && ctyp_equal assigned_ctyp decl_ctyp
+           && ctyp_equal assigned_ctyp read_ctyp ->
+        (List.rev reversed, value)
+    | _ -> (prefix, condition)
+  in
+  let rec structure_terminal_ladder targets labels ladder =
+    match split_at_terminal_branch ladder with
+    | Some
+        ( condition_prefix,
+          condition,
+          alternate_label,
+          branch_aux,
+          ladder_tail,
+          alternate_on_true
+        ) -> (
+        match split_at_label alternate_label ladder_tail with
+        | Some (primary, alternate)
+          when targets alternate_label = 1
+               && labels alternate_label = 1
+               && terminal primary -> (
+            match structure_terminal_ladder targets labels alternate with
+            | Some alternate ->
+                let condition_prefix, condition =
+                  fold_branch_condition condition_prefix condition
+                in
+                let then_instrs, else_instrs =
+                  if alternate_on_true then (alternate, primary) else (primary, alternate)
+                in
+                Some
+                  (condition_prefix @ [I_aux (I_if (condition, then_instrs, else_instrs), branch_aux)])
+            | None -> None
+          )
+        | _ -> None
+      )
+    | None when terminal ladder -> Some (fold_terminal_copy_return ladder)
+    | None -> None
+  in
+  let rec rewrite targets labels = function
+    | ( I_aux (I_if (_, [], [I_aux (I_goto _, _)]), _) as first_branch
+      )
+      :: tail
+    | ( I_aux (I_if (_, [I_aux (I_goto _, _)], []), _) as first_branch
+      )
+      :: tail -> (
+        match structure_terminal_ladder targets labels (first_branch :: tail) with
+        | Some structured -> structured
+        | None -> (
+            match first_branch with
+            | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) ->
+                I_aux
+                  ( I_if
+                      ( condition,
+                        rewrite targets labels then_instrs,
+                        rewrite targets labels else_instrs
+                      ),
+                    if_aux
+                  )
+                :: rewrite targets labels tail
+            | _ -> assert false
+          )
+      )
+    (* An exhaustive multi-arm match is flattened by JIB into a ladder of
+       conditional jumps.  Every selected arm jumps to one result label and
+       the final arm falls through to it:
+
+         jump c1 case2; arm1; goto finish;
+         case2: jump c2 case3; arm2; goto finish;
+         case3: arm3;
+         finish: return result;
+
+       Rebuild that ladder as nested structured conditionals, then sink the
+       terminal return into each value-producing arm.  The target/label counts
+       prove that all removed labels are private to this exact ladder.  An arm
+       which already exits (for example fatal_error(...); exit(())) is kept as
+       terminal even though it does not assign the result. *)
+    | (I_aux (I_jump (_, first_alternate), first_jump_aux) as first_jump) :: tail -> (
+        match structure_terminal_ladder targets labels (first_jump :: tail) with
+        | Some structured -> structured
+        | None -> (
+        match split_at_label first_alternate tail with
+        | Some (first_arm_with_goto, after_first_alternate)
+          when targets first_alternate = 1 && labels first_alternate = 1 -> (
+            match drop_terminal_goto first_arm_with_goto with
+            | Some (_, finish_label) when labels finish_label = 1 -> (
+                match split_at_label finish_label after_first_alternate with
+                | Some
+                    ( remaining_ladder,
+                      I_aux (I_return (V_id (result, result_ctyp)), return_aux) :: rest
+                    ) ->
+                    let ladder =
+                      first_jump
+                      :: first_arm_with_goto
+                      @ (I_aux (I_label first_alternate, first_jump_aux) :: remaining_ladder)
+                    in
+                    let rec structure ladder =
+                      match split_at_jump ladder with
+                      | Some (condition_prefix, condition, alternate_label, jump_aux, ladder_tail) -> (
+                          match split_at_label alternate_label ladder_tail with
+                          | Some (primary_with_goto, alternate)
+                            when targets alternate_label = 1 && labels alternate_label = 1 -> (
+                              match drop_terminal_goto primary_with_goto with
+                              | Some (primary, primary_finish)
+                                when String.equal primary_finish finish_label -> (
+                                  match (sink result result_ctyp return_aux primary, structure alternate) with
+                                  | Some primary, Some (alternate, gotos) ->
+                                      Some
+                                        ( condition_prefix
+                                          @ [I_aux (I_if (condition, alternate, primary), jump_aux)],
+                                          gotos + 1
+                                        )
+                                  | _ -> None
+                                )
+                              | _ -> None
+                            )
+                          | _ -> None
+                        )
+                      | None -> (
+                          match drop_terminal_goto ladder with
+                          | Some (final_arm, final_finish)
+                            when String.equal final_finish finish_label -> (
+                              match sink result result_ctyp return_aux final_arm with
+                              | Some final_arm -> Some (final_arm, 1)
+                              | None when terminal final_arm -> Some (final_arm, 1)
+                              | None -> None
+                            )
+                          | _ -> (
+                              match sink result result_ctyp return_aux ladder with
+                              | Some final_arm -> Some (final_arm, 0)
+                              | None when terminal ladder -> Some (ladder, 0)
+                              | None -> None
+                            )
+                        )
+                    in
+                    (match structure ladder with
+                    | Some (structured, gotos) when targets finish_label = gotos ->
+                        structured @ rewrite targets labels rest
+                    | _ -> first_jump :: rewrite targets labels tail
+                    )
+                | _ -> first_jump :: rewrite targets labels tail
+              )
+            | _ -> first_jump :: rewrite targets labels tail
+          )
+        | _ -> first_jump :: rewrite targets labels tail
+        )
+      )
+    | I_aux (I_if (condition, then_instrs, else_instrs), if_aux)
+      :: I_aux (I_return (V_id (result, result_ctyp)), return_aux)
+      :: rest -> (
+        let then_instrs = rewrite targets labels then_instrs in
+        let else_instrs = rewrite targets labels else_instrs in
+        match
+          ( sink result result_ctyp return_aux then_instrs,
+            sink result result_ctyp return_aux else_instrs
+          )
+        with
+        | Some then_instrs, Some else_instrs ->
+            I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rewrite targets labels rest
+        | _ ->
+            I_aux (I_if (condition, then_instrs, else_instrs), if_aux)
+            :: I_aux (I_return (V_id (result, result_ctyp)), return_aux)
+            :: rewrite targets labels rest
+      )
+    | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rest ->
+        I_aux
+          (I_if (condition, rewrite targets labels then_instrs, rewrite targets labels else_instrs), if_aux)
+        :: rewrite targets labels rest
+    | I_aux (I_block instrs, block_aux) :: rest ->
+        I_aux (I_block (rewrite targets labels instrs), block_aux) :: rewrite targets labels rest
+    | I_aux (I_try_block instrs, block_aux) :: rest ->
+        I_aux (I_try_block (rewrite targets labels instrs), block_aux) :: rewrite targets labels rest
+    | instr :: rest -> instr :: rewrite targets labels rest
+    | [] -> []
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      let targets = target_counts body in
+      let labels = label_counts body in
+      let rewritten =
+        match structure_terminal_ladder targets labels body with
+        | Some structured -> rewrite targets labels structured
+        | None -> rewrite targets labels body
+      in
+      CDEF_aux (CDEF_fundef (id, ret, args, rewritten), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Reconstruct the private forward-label regions used by JIB for ordinary
+   expression and statement matches:
+
+     jump invalid case2; arm1; goto finish;
+     case2: ...; arm2;
+     finish: continuation
+
+   becomes a structured conditional followed by the continuation.  Unlike
+   [sink_terminal_stack_returns], this also handles unit-valued matches whose
+   join is followed by more work.  Multiple adjacent jumps to the same case
+   label are the conjunction of a guarded match arm; their jump conditions are
+   combined as a disjunction.  Target and definition counts prove that every
+   removed label is private to the reconstructed region. *)
+let structure_forward_match_joins (CDEF_aux (aux, def_annot)) =
+  let target_counts body =
+    let counts = Hashtbl.create 16 in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               (match aux with
+               | I_goto label | I_jump (_, label) ->
+                   Hashtbl.replace counts label
+                     (1 + Option.value ~default:0 (Hashtbl.find_opt counts label))
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    fun label -> Option.value ~default:0 (Hashtbl.find_opt counts label)
+  in
+  let label_counts body =
+    let counts = Hashtbl.create 16 in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               (match aux with
+               | I_label label ->
+                   Hashtbl.replace counts label
+                     (1 + Option.value ~default:0 (Hashtbl.find_opt counts label))
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    fun label -> Option.value ~default:0 (Hashtbl.find_opt counts label)
+  in
+  let split_at_label target instrs =
+    let rec split reversed = function
+      | I_aux (I_label label, _) :: rest when String.equal label target ->
+          Some (List.rev reversed, rest)
+      | instr :: rest -> split (instr :: reversed) rest
+      | [] -> None
+    in
+    split [] instrs
+  in
+  let drop_goto target instrs =
+    match List.rev instrs with
+    | I_aux (I_goto label, _) :: reversed when String.equal label target ->
+        Some (List.rev reversed)
+    | _ -> None
+  in
+  let branch_at_head = function
+    | I_aux (I_jump (condition, alternate), branch_aux) :: rest ->
+        Some (condition, alternate, branch_aux, rest)
+    | I_aux
+        (I_if (condition, [I_aux (I_goto alternate, _)], []), branch_aux)
+      :: rest ->
+        Some (condition, alternate, branch_aux, rest)
+    | I_aux
+        (I_if (condition, [], [I_aux (I_goto alternate, _)]), branch_aux)
+      :: rest ->
+        Some (V_call (Bnot, [condition]), alternate, branch_aux, rest)
+    | _ -> None
+  in
+  let split_at_branch instrs =
+    let rec split reversed remaining =
+      match branch_at_head remaining with
+      | Some (condition, alternate, branch_aux, rest) ->
+          Some (List.rev reversed, condition, alternate, branch_aux, rest)
+      | None -> (
+          match remaining with
+          | (I_aux ((I_label _ | I_goto _ | I_return _ | I_exit _), _) :: _) -> None
+          | instr :: rest -> split (instr :: reversed) rest
+          | [] -> None
+        )
+    in
+    split [] instrs
+  in
+  let consume_same_alternate alternate first_condition instrs =
+    let rec consume conditions count remaining =
+      match branch_at_head remaining with
+      | Some (condition, next_alternate, _, rest)
+        when String.equal alternate next_alternate ->
+          consume (condition :: conditions) (count + 1) rest
+      | _ ->
+          let conditions = List.rev conditions in
+          let condition =
+            match conditions with
+            | [condition] -> condition
+            | conditions -> V_call (Bor, conditions)
+          in
+          (condition, count, remaining)
+    in
+    consume [first_condition] 1 instrs
+  in
+  let rec rewrite targets labels instrs =
+    let structure_to_join finish_label ladder =
+      let rec structure ladder =
+        match split_at_branch ladder with
+        | Some
+            ( condition_prefix,
+              first_condition,
+              alternate_label,
+              branch_aux,
+              after_first_branch
+            ) ->
+            let condition, alternate_targets, ladder_tail =
+              consume_same_alternate alternate_label first_condition after_first_branch
+            in
+            (match split_at_label alternate_label ladder_tail with
+            | Some (primary_with_goto, alternate)
+              when labels alternate_label = 1
+                   && targets alternate_label = alternate_targets -> (
+                match (drop_goto finish_label primary_with_goto, structure alternate) with
+                | Some primary, Some (alternate, gotos) ->
+                    Some
+                      ( condition_prefix
+                        @ [I_aux (I_if (condition, alternate, primary), branch_aux)],
+                        gotos + 1
+                      )
+                | _ -> None
+              )
+            | _ -> None
+            )
+        | None -> (
+            match drop_goto finish_label ladder with
+            | Some final_arm -> Some (final_arm, 1)
+            | None -> Some (ladder, 0)
+          )
+      in
+      structure ladder
+    in
+    match split_at_branch instrs with
+    | Some
+        ( prefix,
+          first_condition,
+          first_alternate,
+          first_branch_aux,
+          after_first_branch
+        ) ->
+        let _condition, alternate_targets, ladder_tail =
+          consume_same_alternate first_alternate first_condition after_first_branch
+        in
+        (match split_at_label first_alternate ladder_tail with
+        | Some (first_arm_with_goto, after_first_alternate)
+          when labels first_alternate = 1
+               && targets first_alternate = alternate_targets -> (
+            match List.rev first_arm_with_goto with
+            | I_aux (I_goto finish_label, _) :: _ when labels finish_label = 1 -> (
+                match split_at_label finish_label after_first_branch with
+                | Some (ladder_before_finish, continuation) ->
+                    (* Preserve the original adjacent guarded-arm jumps here.
+                       Their target count is part of the privacy proof and
+                       [structure_to_join] combines them itself.  Pass only
+                       the match ladder, not the continuation following its
+                       join label: the latter is appended exactly once below. *)
+                    let complete_ladder =
+                      I_aux (I_jump (first_condition, first_alternate), first_branch_aux)
+                      :: ladder_before_finish
+                    in
+                    (match structure_to_join finish_label complete_ladder with
+                    | Some (structured, gotos) when targets finish_label = gotos ->
+                        rewrite targets labels prefix
+                        @ structured
+                        @ rewrite targets labels continuation
+                    | _ ->
+                        (match instrs with
+                        | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rest ->
+                            I_aux
+                              ( I_if
+                                  ( condition,
+                                    rewrite targets labels then_instrs,
+                                    rewrite targets labels else_instrs
+                                  ),
+                                if_aux
+                              )
+                            :: rewrite targets labels rest
+                        | instr :: rest -> instr :: rewrite targets labels rest
+                        | [] -> []
+                        )
+                    )
+                | None -> (
+                    match instrs with
+                    | instr :: rest -> instr :: rewrite targets labels rest
+                    | [] -> []
+                  )
+              )
+            | _ -> (
+                match instrs with
+                | instr :: rest -> instr :: rewrite targets labels rest
+                | [] -> []
+              )
+          )
+        | _ -> (
+            match instrs with
+            | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rest ->
+                I_aux
+                  ( I_if
+                      ( condition,
+                        rewrite targets labels then_instrs,
+                        rewrite targets labels else_instrs
+                      ),
+                    if_aux
+                  )
+                :: rewrite targets labels rest
+            | instr :: rest -> instr :: rewrite targets labels rest
+            | [] -> []
+          )
+        )
+    | None -> (
+        match instrs with
+        | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rest ->
+            I_aux
+              ( I_if
+                  ( condition,
+                    rewrite targets labels then_instrs,
+                    rewrite targets labels else_instrs
+                  ),
+                if_aux
+              )
+            :: rewrite targets labels rest
+        | I_aux (I_block block, block_aux) :: rest ->
+            I_aux (I_block (rewrite targets labels block), block_aux)
+            :: rewrite targets labels rest
+        | I_aux (I_try_block block, block_aux) :: rest ->
+            I_aux (I_try_block (rewrite targets labels block), block_aux)
+            :: rewrite targets labels rest
+        | instr :: rest -> instr :: rewrite targets labels rest
+        | [] -> []
+      )
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      let targets = target_counts body in
+      let labels = label_counts body in
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite targets labels body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* C can elide the copy of a named aggregate local only when every return of
+   that value reaches one named return statement.  Late return sinking makes
+   the common Sail shape
+
+     if (condition) return transform(result);
+     return result;
+
+   readable, but Clang correctly reports that the two returns disable NRVO.
+   Restore the equally direct single-return form by assigning the transformed
+   value back to the already-initialized stack aggregate.  The inverse shape
+   is handled only when the selected arm is exactly [return result], so moving
+   the fallthrough computation under the inverted guard cannot discard work.
+   Scalar returns are deliberately left alone. *)
+let consolidate_named_aggregate_returns ctx (CDEF_aux (aux, def_annot)) =
+  let locals = ref NameSet.empty in
+  let is_aggregate = function
+    | CT_struct _ | CT_variant _ | CT_tup _ | CT_fvector _ -> true
+    | ctyp ->
+        is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_u320 ctyp
+        || is_c_repr_fixed_bytes ctyp
+  in
+  let assign_return_to result result_ctyp = function
+    | I_aux (I_return value, instr_aux)
+      when ctyp_equal (cval_ctyp value) result_ctyp ->
+        Some (I_aux (I_copy (CL_id (result, result_ctyp), value), instr_aux), instr_aux)
+    | I_aux
+        ( I_funcall
+            (CR_one (CL_id (Return _, return_ctyp)), extern, callee, args),
+          instr_aux
+        )
+      when ctyp_equal return_ctyp result_ctyp ->
+        Some
+          ( I_aux
+              (I_funcall (CR_one (CL_id (result, result_ctyp)), extern, callee, args), instr_aux),
+            instr_aux
+          )
+    | _ -> None
+  in
+  let assign_terminal_return result result_ctyp branch =
+    match List.rev branch with
+    | terminal :: reversed -> (
+        match assign_return_to result result_ctyp terminal with
+        | Some (assignment, _) -> Some (List.rev (assignment :: reversed))
+        | None -> None
+      )
+    | [] -> None
+  in
+  let exact_named_return = function
+    | [I_aux (I_return (V_id (result, result_ctyp)), return_aux)] ->
+        Some (result, result_ctyp, return_aux)
+    | _ -> None
+  in
+  let rec rewrite = function
+    | I_aux (I_if (condition, then_instrs, []), if_aux)
+      :: I_aux (I_return (V_id (result, result_ctyp)), return_aux)
+      :: rest
+      when NameSet.mem result !locals
+           && is_aggregate result_ctyp
+           && is_stack_ctyp ctx result_ctyp ->
+        let then_instrs = rewrite then_instrs in
+        (match assign_terminal_return result result_ctyp then_instrs with
+        | Some then_instrs ->
+            I_aux (I_if (condition, then_instrs, []), if_aux)
+            :: I_aux (I_return (V_id (result, result_ctyp)), return_aux)
+            :: rewrite rest
+        | None ->
+            I_aux (I_if (condition, then_instrs, []), if_aux)
+            :: I_aux (I_return (V_id (result, result_ctyp)), return_aux)
+            :: rewrite rest
+        )
+    | I_aux (I_if (condition, then_instrs, []), if_aux) :: terminal :: rest ->
+        let then_instrs = rewrite then_instrs in
+        (match exact_named_return then_instrs with
+        | Some (result, result_ctyp, return_aux)
+          when NameSet.mem result !locals
+               && is_aggregate result_ctyp
+               && is_stack_ctyp ctx result_ctyp -> (
+            match assign_return_to result result_ctyp terminal with
+            | Some (assignment, _) ->
+                I_aux (I_if (V_call (Bnot, [condition]), [assignment], []), if_aux)
+                :: I_aux (I_return (V_id (result, result_ctyp)), return_aux)
+                :: rewrite rest
+            | None ->
+                I_aux (I_if (condition, then_instrs, []), if_aux)
+                :: terminal
+                :: rewrite rest
+          )
+        | _ ->
+            I_aux (I_if (condition, then_instrs, []), if_aux)
+            :: terminal
+            :: rewrite rest
+        )
+    | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rest ->
+        I_aux
+          (I_if (condition, rewrite then_instrs, rewrite else_instrs), if_aux)
+        :: rewrite rest
+    | I_aux (I_block instrs, block_aux) :: rest ->
+        I_aux (I_block (rewrite instrs), block_aux) :: rewrite rest
+    | I_aux (I_try_block instrs, block_aux) :: rest ->
+        I_aux (I_try_block (rewrite instrs), block_aux) :: rewrite rest
+    | instr :: rest -> instr :: rewrite rest
+    | [] -> []
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      List.iter
+        (fun instr ->
+          ignore
+            (map_instr
+               (fun (I_aux (aux, _) as sub) ->
+                 (match aux with
+                 | I_decl (_, local) | I_init (_, local, _) ->
+                     locals := NameSet.add local !locals
+                 | _ -> ()
+                 );
+                 sub
+               )
+               instr
+            )
+        )
+        body;
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* [fatal_error] is the optimized model's explicit noreturn boundary.  Sail
+   keeps a following [exit(())] or synthesized value return solely to type the
+   source expression, and match lowering may leave additional join scaffolding
+   after that call.  Nothing in the same lexical instruction sequence is
+   reachable once the call executes, so truncate it in typed JIB instead of
+   relying on the C emitter to recognize one particular adjacent [I_exit]
+   shape.  Nested branches are rewritten independently; a fatal call in only
+   one arm therefore cannot discard the other arm's continuation. *)
+let prune_after_fatal_error (CDEF_aux (aux, def_annot)) =
+  let is_fatal_call = function
+    | I_aux (I_funcall (_, _, callee, _), _) ->
+        String.equal (string_of_id (fst callee)) "fatal_error"
+    | _ -> false
+  in
+  let rec rewrite = function
+    | [] -> []
+    | instr :: _ when is_fatal_call instr -> [instr]
+    | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rest ->
+        I_aux
+          (I_if (condition, rewrite then_instrs, rewrite else_instrs), if_aux)
+        :: rewrite rest
+    | I_aux (I_block instrs, block_aux) :: rest ->
+        I_aux (I_block (rewrite instrs), block_aux) :: rewrite rest
+    | I_aux (I_try_block instrs, block_aux) :: rest ->
+        I_aux (I_try_block (rewrite instrs), block_aux) :: rewrite rest
+    | instr :: rest -> instr :: rewrite rest
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
+  let rec trivial = function
+    | V_id _ | V_member _ | V_lit _ -> true
+    | V_tuple values -> List.for_all trivial values
+    | _ -> false
+  in
+  let preserve_assignment_conversion target_ctyp value =
+    let source_ctyp = cval_ctyp value in
+    if ctyp_equal source_ctyp target_ctyp then Some value
+    else
+      match (target_ctyp, source_ctyp) with
+      | CT_fuint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) ->
+          Some (V_call (Unsigned width, [value]))
+      | CT_fint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) ->
+          Some (V_call (Signed width, [value]))
+      | _ -> None
+  in
+  let contains_label instr =
+    let found = ref false in
+    ignore
+      (map_instr
+         (fun (I_aux (aux, _) as sub) ->
+           (match aux with I_label _ -> found := true | _ -> ());
+           sub
+         )
+         instr
+      );
+    !found
+  in
+  let rewrite_lists locals instrs =
+    (* A declaration may precede the assignment that gives a temporary its
+       first value because JIB preserves the Sail expression's outer scope.
+       The intervening instructions are retained in place: finding the copy
+       only lets the ordinary copy-propagation proof see the same web it would
+       see if declaration and assignment had been adjacent.  Do not cross a
+       label or any reference to the declared name. *)
+    let rec first_copy name decl_ctyp rev_gap = function
+      | (I_aux (I_copy (CL_id (copy_name, copy_ctyp), cval), _) as copy) :: rest
+        when Name.compare name copy_name = 0 && ctyp_equal decl_ctyp copy_ctyp ->
+          Some (List.rev rev_gap, copy, cval, rest)
+      | instr :: rest
+        when (not (contains_label instr))
+             && not (NameSet.mem name (instr_ids ~direct:false instr)) ->
+          first_copy name decl_ctyp (instr :: rev_gap) rest
+      | _ -> None
+    in
+    let rec scan acc = function
+      | (I_aux (I_decl (decl_ctyp, ((Name _ | Gen _) as x)), _) as decl)
+        :: tail -> (
+          match first_copy x decl_ctyp [] tail with
+          | None -> scan (decl :: acc) tail
+          | Some (gap, copy, cval, rest) -> (
+          match preserve_assignment_conversion decl_ctyp cval with
+          | None -> scan (decl :: acc) tail
+          | Some propagated_cval ->
+              let roots = instr_reads ~direct:true copy in
+              let reads_of instr = if instr_references ~read:x ~direct:false instr then 1 else 0 in
+              let read_count = List.fold_left (fun n instr -> n + reads_of instr) 0 rest in
+              let written_later name =
+                List.exists (fun instr -> instr_references ~write:name ~direct:false instr) rest
+              in
+              let label_before_last_read =
+                let rec check remaining_reads = function
+                  | [] -> false
+                  | _ when remaining_reads <= 0 -> false
+                  | instr :: rest -> contains_label instr || check (remaining_reads - reads_of instr) rest
+                in
+                check read_count rest
+              in
+              let safe =
+                NameSet.subset roots locals
+                && (not (NameSet.exists written_later roots))
+                && (not (written_later x))
+                && (not label_before_last_read)
+                && (read_count = 1 || trivial propagated_cval)
+              in
+              if not safe then scan (decl :: acc) tail
+              else if read_count = 0 then scan (List.rev_append gap acc) rest
+              else (
+                let substitute = function
+                  | V_id (name, _) when Name.compare name x = 0 -> propagated_cval
+                  | other -> other
+                in
+                let simplify_tuple_projection = function
+                  | V_tuple_member (V_tuple values, length, index)
+                    when List.length values = length && index >= 0 && index < length ->
+                      List.nth values index
+                  | value -> value
+                in
+                scan (List.rev_append gap acc)
+                  (List.map
+                     (fun instr ->
+                       map_instr_cval substitute instr
+                       |> map_instr_cval simplify_tuple_projection
+                     )
+                     rest
+                  )
+              )
+          )
+        )
+      | instr :: rest -> scan (instr :: acc) rest
+      | [] -> List.rev acc
+    in
+    scan [] instrs
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      (* A write does not make its destination a local: Sail registers are
+         ordinary JIB names too, and a function may assign one before taking a
+         snapshot of it.  Treating every written name as local allowed the
+         snapshot to be substituted across a later call which mutated the
+         register.  Only arguments and names with an actual body declaration
+         have value lifetimes that this local data-flow proof can track. *)
+      let locals = ref (NameSet.of_list args) in
+      List.iter
+        (fun instr ->
+          ignore
+            (map_instr
+               (fun (I_aux (aux, _) as sub) ->
+                 (match aux with
+                 | I_decl (_, name) | I_init (_, name, _) ->
+                     locals := NameSet.add name !locals
+                 | _ -> ()
+                 );
+                 sub
+               )
+               instr
+            )
+        )
+        body;
+      let rec fixpoint n body =
+        let rewritten = List.map (map_instrs (rewrite_lists !locals)) body in
+        let rewritten = rewrite_lists !locals rewritten in
+        if n = 0 then rewritten else fixpoint (n - 1) rewritten
+      in
+      let body = fixpoint 2 body in
+      CDEF_aux (CDEF_fundef (id, ret, args, body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Declaration fusion is intentionally the final producer of local
+   declarations.  Doing it before copy propagation and terminal-return
+   sinking obscures the declaration/copy patterns those semantic simplifiers
+   consume.  A final [fold_copy_conversions] below consumes any
+   initialization/return pair created here. *)
+let initialize_stack_locals (CDEF_aux (aux, def_annot)) =
+  let initialization_value target_ctyp value =
+    let source_ctyp = cval_ctyp value in
+    if ctyp_equal source_ctyp target_ctyp then Some value
+    else
+      match (target_ctyp, source_ctyp) with
+      | CT_fuint width, (CT_fuint _ | CT_fint _ | CT_constant _) ->
+          Some (V_call (Unsigned width, [value]))
+      | CT_fint width, (CT_fuint _ | CT_fint _ | CT_constant _) ->
+          Some (V_call (Signed width, [value]))
+      | _ -> None
+  in
+  let rewrite_lists instrs =
+    let rec rewrite = function
+      | I_aux (I_decl (decl_ctyp, destination), decl_aux)
+        :: I_aux (I_copy (CL_id (assigned, copy_ctyp), value), copy_aux)
+        :: rest
+        when Name.compare destination assigned = 0 && ctyp_equal decl_ctyp copy_ctyp -> (
+          match initialization_value decl_ctyp value with
+          | Some value -> I_aux (I_init (decl_ctyp, destination, Init_cval value), decl_aux) :: rewrite rest
+          | None ->
+              I_aux (I_decl (decl_ctyp, destination), decl_aux)
+              :: I_aux (I_copy (CL_id (assigned, copy_ctyp), value), copy_aux)
+              :: rewrite rest
+        )
+      | instr :: rest -> instr :: rewrite rest
+      | [] -> []
+    in
+    rewrite instrs
+  in
+  let rewrite_body body = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Normalize the boolean cvals exposed by copy propagation before rendering
+   structured control flow.  This is intentionally a small, proof-obvious
+   algebra over C's bool-valued JIB operations: it neither duplicates nor
+   reorders an operand.
+
+     !(!condition)  -> condition
+     condition == true / true == condition -> condition
+     condition == false / false == condition -> !condition
+     condition != false / false != condition -> condition
+     condition != true / true != condition -> !condition
+     false || condition / condition || false -> condition
+     true && condition / condition && true -> condition
+
+   A leading negation on an if is removed by exchanging its arms.  Besides
+   producing the positive form a Sail reader expects, this also lets the
+   empty-arm renderer avoid introducing a second negation. *)
+let simplify_boolean_control_flow (CDEF_aux (aux, def_annot)) =
+  let bool_literal expected = function
+    | V_lit (VL_bool actual, CT_bool) when Bool.equal expected actual -> true
+    | _ -> false
+  in
+  let negate value =
+    match value with V_call (Bnot, [inner]) -> inner | _ -> V_call (Bnot, [value])
+  in
+  let literal value = V_lit (VL_bool value, CT_bool) in
+  let simplify_boolean_operator operator ~identity ~annihilator values =
+    if List.exists (bool_literal annihilator) values then literal annihilator
+    else
+      match List.filter (fun value -> not (bool_literal identity value)) values with
+      | [] -> literal identity
+      | [value] -> value
+      | values -> V_call (operator, values)
+  in
+  let simplify_comparison equal left right =
+    let with_literal value literal =
+      if not (ctyp_equal (cval_ctyp value) CT_bool) then None
+      else if bool_literal true literal then Some (if equal then value else negate value)
+      else if bool_literal false literal then Some (if equal then negate value else value)
+      else None
+    in
+    match with_literal left right with Some value -> Some value | None -> with_literal right left
+  in
+  let simplify = function
+    | V_call (Bnot, [V_lit (VL_bool value, CT_bool)]) -> literal (not value)
+    | V_call (Bnot, [V_call (Bnot, [value])]) -> value
+    | V_call (Bor, values) ->
+        simplify_boolean_operator Bor ~identity:false ~annihilator:true values
+    | V_call (Band, values) ->
+        simplify_boolean_operator Band ~identity:true ~annihilator:false values
+    | V_call (Eq, [left; right]) as comparison -> (
+        match simplify_comparison true left right with Some value -> value | None -> comparison
+      )
+    | V_call (Neq, [left; right]) as comparison -> (
+        match simplify_comparison false left right with Some value -> value | None -> comparison
+      )
+    | value -> value
+  in
+  let rewrite_if = function
+    | I_aux (I_if (V_call (Bnot, [condition]), then_instrs, else_instrs), annot) ->
+        I_aux (I_if (condition, else_instrs, then_instrs), annot)
+    | instr -> instr
+  in
+  let rewrite_body body =
+    let rec fixpoint n body =
+      let rewritten = List.map (map_instr_cval simplify) body |> List.map (map_instr rewrite_if) in
+      if n = 0 || rewritten = body then rewritten else fixpoint (n - 1) rewritten
+    in
+    fixpoint 2 body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* JIB's native integer types retain useful range information after dependent
+   Sail types have been specialized. Use only ranges that follow directly
+   from those representations, literals, and a positive constant remainder;
+   this is enough to remove checked-conversion guards that have become
+   impossible without rerunning the source-level prover in the C backend. *)
+let integer_ctyp_bounds = function
+  | CT_fuint width -> Some (Big_int.zero, max_uint width)
+  | CT_fint width -> Some (min_int width, max_int width)
+  | CT_fbits width -> Some (Big_int.zero, max_uint width)
+  | ctyp when is_c_repr_u128 ctyp -> Some (Big_int.zero, max_uint 128)
+  | ctyp when is_c_repr_u256 ctyp -> Some (Big_int.zero, max_uint 256)
+  | ctyp when is_c_repr_u320 ctyp -> Some (Big_int.zero, max_uint 320)
+  | CT_constant value -> Some (value, value)
+  | _ -> None
+
+let bit_literal_integer bits =
+  List.fold_left
+    (fun value bit ->
+      Option.bind value (fun value ->
+          match bit with
+          | Sail2_values.B0 -> Some (Big_int.mul value (Big_int.of_int 2))
+          | Sail2_values.B1 -> Some (Big_int.succ (Big_int.mul value (Big_int.of_int 2)))
+          | Sail2_values.BU -> None
+        )
+    )
+    (Some Big_int.zero) bits
+
+let rec integer_literal_value = function
+  | V_lit (VL_int value, _) -> Some value
+  | V_lit (VL_bits bits, _) -> bit_literal_integer bits
+  | V_call ((Unsigned _ | Zero_extend _), [value]) -> integer_literal_value value
+  | _ -> None
+
+let rec integer_cval_bounds = function
+  | V_lit (VL_int value, _) -> Some (value, value)
+  | V_lit (VL_bits bits, _) -> Option.map (fun value -> (value, value)) (bit_literal_integer bits)
+  | V_call ((Unsigned width | Zero_extend width), [value]) -> (
+      match integer_cval_bounds value with
+      | Some (lower, upper) when Big_int.greater_equal lower Big_int.zero ->
+          Some (lower, Big_int.min upper (max_uint width))
+      | _ -> Some (Big_int.zero, max_uint width)
+    )
+  | V_call ((Signed width), [_]) -> Some (min_int width, max_int width)
+  | V_call (Bvand, [left; right]) -> (
+      match (integer_literal_value left, integer_literal_value right) with
+      | _, Some mask when Big_int.greater_equal mask Big_int.zero -> integer_mask_bounds left mask
+      | Some mask, _ when Big_int.greater_equal mask Big_int.zero -> integer_mask_bounds right mask
+      | _ -> integer_ctyp_bounds (cval_ctyp left)
+    )
+  | V_call ((Imod | Proven_imod), [left; right]) -> integer_remainder_bounds left right
+  | V_call (Mixed_proven_imod (_, _), [left; right]) -> integer_remainder_bounds left right
+  | value -> integer_ctyp_bounds (cval_ctyp value)
+
+and integer_mask_bounds value mask =
+  match integer_cval_bounds value with
+  | Some (lower, upper) when Big_int.greater_equal lower Big_int.zero ->
+      Some (Big_int.zero, Big_int.min upper mask)
+  | _ -> Some (Big_int.zero, mask)
+
+and integer_remainder_bounds left right =
+  match (integer_cval_bounds left, integer_cval_bounds right) with
+  | Some (left_lower, left_upper), Some (modulus_lower, modulus_upper)
+    when Big_int.equal modulus_lower modulus_upper && Big_int.greater modulus_lower Big_int.zero ->
+      let magnitude = Big_int.pred modulus_lower in
+      if Big_int.less_equal Big_int.zero left_lower then
+        Some (Big_int.zero, Big_int.min left_upper magnitude)
+      else if Big_int.less_equal left_upper Big_int.zero then
+        Some (Big_int.max left_lower (Big_int.negate magnitude), Big_int.zero)
+      else Some (Big_int.negate magnitude, magnitude)
+  | _ -> None
+
+let integer_cval_fits lower upper value =
+  match integer_cval_bounds value with
+  | Some (value_lower, value_upper) ->
+      Big_int.less_equal lower value_lower && Big_int.less_equal value_upper upper
+  | None -> false
+
+let simplify_bounded_integer_predicates (CDEF_aux (aux, def_annot)) =
+  let bounds = integer_cval_bounds in
+  let comparison_result op (left_lower, left_upper) (right_lower, right_upper) =
+    match op with
+    | Ilt when Big_int.less left_upper right_lower -> Some true
+    | Ilt when Big_int.greater_equal left_lower right_upper -> Some false
+    | Igt when Big_int.greater left_lower right_upper -> Some true
+    | Igt when Big_int.less_equal left_upper right_lower -> Some false
+    | Ilteq when Big_int.less_equal left_upper right_lower -> Some true
+    | Ilteq when Big_int.greater left_lower right_upper -> Some false
+    | Igteq when Big_int.greater_equal left_lower right_upper -> Some true
+    | Igteq when Big_int.less left_upper right_lower -> Some false
+    | Eq when Big_int.less left_upper right_lower || Big_int.greater left_lower right_upper -> Some false
+    | Eq
+      when Big_int.equal left_lower left_upper
+           && Big_int.equal right_lower right_upper
+           && Big_int.equal left_lower right_lower ->
+        Some true
+    | Neq when Big_int.less left_upper right_lower || Big_int.greater left_lower right_upper -> Some true
+    | Neq
+      when Big_int.equal left_lower left_upper
+           && Big_int.equal right_lower right_upper
+           && Big_int.equal left_lower right_lower ->
+        Some false
+    | _ -> None
+  in
+  let simplify = function
+    | V_call (((Ilt | Igt | Ilteq | Igteq | Eq | Neq) as op), [left; right]) as comparison -> (
+        match (bounds left, bounds right) with
+        | Some left_bounds, Some right_bounds -> (
+            match comparison_result op left_bounds right_bounds with
+            | Some result -> V_lit (VL_bool result, CT_bool)
+            | None -> comparison
+          )
+        | _ -> comparison
+      )
+    | value -> value
+  in
+  let rewrite_body body =
+    let rec fixpoint n body =
+      let rewritten = List.map (map_instr_cval simplify) body in
+      if n = 0 || rewritten = body then rewritten else fixpoint (n - 1) rewritten
+    in
+    fixpoint 2 body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Top-level letbinds whose bound globals are never read do not deserve a
+   create_letbind initializer or storage. Sail top-level lets are pure, so
+   dropping an unread one cannot change observable behavior. Liveness is
+   transitive: a letbind read only by another letbind's initializer stays
+   only if that letbind is itself live. Returns the filtered definitions and
+   the surviving letbind numbers. *)
+let optimize_dead_letbinds = ref false
+
+let remove_dead_letbinds cdefs =
+  let letbind_names =
+    List.filter_map
+      (function
+        | CDEF_aux (CDEF_let (number, bindings, _), _) ->
+            Some (number, NameSet.of_list (List.map (fun (id, _) -> name id) bindings))
+        | _ -> None
+        )
+      cdefs
+  in
+  let letbind_reads =
+    List.filter_map
+      (function
+        | CDEF_aux (CDEF_let (number, _, instrs), _) ->
+            Some
+              ( number,
+                List.fold_left (fun acc instr -> NameSet.union acc (instr_reads ~direct:false instr)) NameSet.empty
+                  instrs
+              )
+        | _ -> None
+        )
+      cdefs
+  in
+  let base_reads =
+    List.fold_left
+      (fun acc cdef ->
+        match cdef with
+        | CDEF_aux (CDEF_let _, _) -> acc
+        | CDEF_aux ((CDEF_fundef (_, _, _, instrs) | CDEF_startup (_, instrs) | CDEF_finish (_, instrs)), _) ->
+            List.fold_left (fun acc instr -> NameSet.union acc (instr_reads ~direct:false instr)) acc instrs
+        | CDEF_aux (CDEF_register (_, _, instrs), _) ->
+            List.fold_left (fun acc instr -> NameSet.union acc (instr_reads ~direct:false instr)) acc instrs
+        | _ -> acc
+      )
+      NameSet.empty cdefs
+  in
+  let live_of reads =
+    List.filter_map (fun (number, names) -> if NameSet.disjoint names reads then None else Some number) letbind_names
+  in
+  let rec fixpoint live =
+    let reads =
+      List.fold_left
+        (fun acc (number, reads) -> if List.mem number live then NameSet.union acc reads else acc)
+        base_reads letbind_reads
+    in
+    let live' = live_of reads in
+    if List.length live' = List.length live then live' else fixpoint live'
+  in
+  let live = fixpoint (live_of base_reads) in
+  let cdefs =
+    List.filter
+      (function CDEF_aux (CDEF_let (number, _, _), _) -> List.mem number live | _ -> true)
+      cdefs
+  in
+  (cdefs, live)
+
+let optimize ~have_rts ~specialize_c ~optimized_model ctx recursive_functions cdefs =
   let nothing cdefs = cdefs in
   cdefs
+  |> (if !optimize_unit_results then List.map (discard_unread_stack_results ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map (flatten_unique_stack_blocks ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
+  |> (if !optimize_pure_copies then List.map merge_repeated_conditional_branches else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_bounded_integer_predicates else nothing)
+  |> (if !optimize_pure_copies then List.map prune_constant_branches else nothing)
+  |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_alias then List.concat_map remove_alias else nothing)
   |> (if !optimize_alias then combine_variables ctx else nothing)
+  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
+  |> (if !optimize_pure_copies then List.map (flatten_unique_stack_blocks ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
+  |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   (* We need the runtime to initialize hoisted allocations *)
   |> ( if !optimize_hoist_allocations && have_rts then List.concat_map (hoist_allocations recursive_functions)
        else nothing
      )
   |> (if specialize_c then drop_redundant_to_bytes_mask else nothing)
   |> remove_stack_clears ctx
+  |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
+  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_unit_results then List.map (discard_unread_stack_results ctx) else nothing)
+  |> (if !optimize_unit_results then List.map (erase_unit_scaffolding ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
+  |> (if !optimize_pure_copies then List.map merge_repeated_conditional_branches else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_bounded_integer_predicates else nothing)
+  |> (if !optimize_pure_copies then List.map prune_constant_branches else nothing)
+  |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
+  |> (if !optimize_unit_results then List.map remove_fallthrough_gotos else nothing)
+  |> (if !optimize_unit_results then List.map (return_from_terminal_unit_label ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map return_from_terminal_stack_label else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
+  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  (* The preceding propagation can expose a narrow tuple literal only after
+     the earlier aggregate passes have run. Normalize its field widening in
+     typed JIB, then sink the exact result before local initialization makes
+     the remaining match labels lifetime-sensitive in emitted C. *)
+  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
+  |> (if !optimize_pure_copies then List.map merge_repeated_conditional_branches else nothing)
+  |> (if !optimize_pure_copies then List.map initialize_stack_locals else nothing)
+  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map structure_forward_match_joins else nothing)
+  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  (* Late return sinking creates new terminal branches after the earlier guard
+     cleanup.  Flatten those only after declarations and conversions have
+     reached their final form, so generated C never retains an [else] merely
+     because its sibling became a direct return late in this pipeline. *)
+  |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
+  (* Flattening a terminal guard can expose one last match ladder whose join
+     was previously nested in the surviving branch.  Re-run return sinking so
+     that match arms return their values directly before C emission. *)
+  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
+  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then List.map structure_forward_match_joins else nothing)
+  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map (consolidate_named_aggregate_returns ctx) else nothing)
+  |> (if optimized_model then List.map prune_after_fatal_error else nothing)
+  |> (if !optimize_unit_results then List.map (discard_unread_stack_results ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
 
 (**************************************************************************)
 (* 6. Code generation                                                     *)
@@ -2907,6 +5525,8 @@ module type CODEGEN_CONFIG = sig
   val c_repr_fixed_bytes : int Bindings.t
   val c_repr_fixed_bytes_u64_lanes : int Bindings.t
   val c_repr_fixed_bytes_u64_lane_alias_lengths : int list
+  val c_repr_fixed_bytes_names : (int * string) list
+  val c_static_evaluators : string Bindings.t
   val specialize_c : bool
   val require_bounded_int : bool
   val specialization_plan_json : string option
@@ -2918,6 +5538,8 @@ module type CODEGEN_CONFIG = sig
   val byte_pointer_fields : (id * id * string) list
   val byte_pointer_types : string Bindings.t
   val byte_pointer_signatures : (string option list * string option) Bindings.t
+  val fixed_bytes_signatures : (int option list * int option) Bindings.t
+  val fixed_bytes_u64_lanes_signatures : (int option list * int option) Bindings.t
   val package_name : string
   val cpp : bool
   val cpp_class_name : string
@@ -2944,10 +5566,13 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let requested_modules : (string * c_module list) option ref = ref None
   let generated_modules : c_module_output list option ref = ref None
+  let generated_base_header : string option ref = ref None
+  let generated_support_header : string option ref = ref None
   let emitted_external_functions = ref Util.StringSet.empty
   let current_static_helper_demands = ref Util.StringSet.empty
   let static_equality_declarations : (string * document) list ref = ref []
   let static_equality_declaration_names = ref Util.StringSet.empty
+  let function_parameter_names : string list Bindings.t ref = ref Bindings.empty
 
   let has_prefix prefix s =
     if String.length s < String.length prefix then false else String.sub s 0 (String.length prefix) = prefix
@@ -3009,7 +5634,32 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
         let pretty () s = if Config.no_mangle then s else Util.zencode_string s
 
-        let mangle () s = Util.zencode_string s
+        (* In no-mangle mode a forbidden name (a gensym containing '#' or
+           '.', a C keyword collision) is sanitized into a readable C
+           identifier instead of z-encoded; the generator's variant counter
+           resolves any collisions. *)
+        let readable_sanitize s =
+          let buf = Buffer.create (String.length s + 1) in
+          String.iter
+            (fun c ->
+              match c with
+              | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> Buffer.add_char buf c
+              | _ -> Buffer.add_char buf '_'
+            )
+            s;
+          let s = Buffer.contents buf in
+          let s = if s = "" then "tmp" else s in
+          match s.[0] with '0' .. '9' -> "tmp_" ^ s | _ -> s
+
+        let mangle () s =
+          if Config.no_mangle && String.equal s "main" then "zmain"
+          else if Config.no_mangle then (
+            let sanitized = readable_sanitize s in
+            (* A name can be forbidden without containing invalid characters
+               (C keywords, reserved prefixes); mangling must always rename. *)
+            if String.equal sanitized s then sanitized ^ "_" else sanitized
+          )
+          else Util.zencode_string s
 
         let variant s = function 0 -> s | n -> s ^ string_of_int n
 
@@ -3027,6 +5677,9 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let sgen_name =
     let ssa_num n = if n = -1 then "" else "/" ^ string_of_int n in
     function
+    | Gen (v1, v2, n, source_name, _) when Config.no_mangle ->
+        let source_name = Option.value ~default:"tmp" source_name in
+        NameGen.translate () (sprintf "%s#%d.%d" source_name v1 v2) ^ ssa_num n
     | Gen (v1, v2, n, _, _) -> NameGen.to_string () (mk_id (sprintf "%d.%d" v1 v2)) ^ ssa_num n
     | Name (id, n) -> NameGen.to_string () id ^ ssa_num n
     | Abstract id -> NameGen.to_string ~prefix:"abstract_" () id
@@ -3042,12 +5695,19 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let codegen_id id = string (sgen_id id)
 
+  let disambiguate_optimized_function_name str =
+    if Config.optimized_model && Config.no_mangle
+       && List.mem str ["u128"; "u256"; "u320"]
+    then "as_" ^ str
+    else str
+
   let sgen_function_id id =
-    let str = NameGen.to_string () id in
-    if Config.no_mangle then str else !opt_prefix ^ String.sub str 1 (String.length str - 1)
+    let str = NameGen.to_string () id |> disambiguate_optimized_function_name in
+    if Config.no_mangle then str
+    else !opt_prefix ^ String.sub str 1 (String.length str - 1)
 
   let sgen_function_uid uid =
-    let str = sgen_uid uid in
+    let str = sgen_uid uid |> disambiguate_optimized_function_name in
     if Config.no_mangle then str else !opt_prefix ^ String.sub str 1 (String.length str - 1)
 
   let codegen_function_id id = string (sgen_function_id id)
@@ -3055,15 +5715,19 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let readable_ctyp_names = ref CTMap.empty
   let readable_ctyp_names_used = ref Util.StringSet.empty
 
+  let fixed_bytes_type_name ctyp =
+    let length = Option.get (c_repr_fixed_bytes_length ctyp) in
+    match List.assoc_opt length Config.c_repr_fixed_bytes_names with
+    | Some name -> name
+    | None when is_c_repr_fixed_bytes_u64_lanes ctyp -> "fixed_bytes_u64_lanes_" ^ string_of_int length
+    | None -> "fixed_bytes_" ^ string_of_int length
+
   let rec readable_ctyp_stem = function
     | ctyp when is_c_repr_byte_pointer ctyp ->
         "byte_pointer_" ^ Option.get (c_repr_byte_pointer_adapter ctyp)
     | ctyp when is_c_repr_u320 ctyp -> "u320"
     | ctyp when is_c_repr_u256 ctyp -> "u256"
-    | ctyp when is_c_repr_fixed_bytes_u64_lanes ctyp ->
-        "fixed_bytes_u64_lanes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_u64_lanes_length ctyp))
-    | ctyp when is_c_repr_fixed_bytes ctyp ->
-        "fixed_bytes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_length ctyp))
+    | ctyp when is_c_repr_fixed_bytes ctyp -> fixed_bytes_type_name ctyp
     | CT_unit -> "unit"
     | CT_bool -> "bool"
     | CT_fbits n -> "bits_" ^ string_of_int n
@@ -3112,15 +5776,13 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let is_native_unsigned_integer = function CT_fuint width -> width <= 64 | _ -> false
   let is_native_signed_integer = function CT_fint width -> width <= 64 | _ -> false
+
   let rec sgen_ctyp = function
     | ctyp when is_c_repr_byte_pointer ctyp -> "uint8_t *"
-    | ctyp when is_c_repr_u128 ctyp -> "sail_u128"
-    | ctyp when is_c_repr_u256 ctyp -> "sail_u256"
-    | ctyp when is_c_repr_u320 ctyp -> "sail_u320"
-    | ctyp when is_c_repr_fixed_bytes_u64_lanes ctyp ->
-        "sail_fixed_bytes_u64_lanes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_u64_lanes_length ctyp))
-    | ctyp when is_c_repr_fixed_bytes ctyp ->
-        "sail_fixed_bytes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_length ctyp))
+    | ctyp when is_c_repr_u128 ctyp -> "u128"
+    | ctyp when is_c_repr_u256 ctyp -> "u256"
+    | ctyp when is_c_repr_u320 ctyp -> "u320"
+    | ctyp when is_c_repr_fixed_bytes ctyp -> fixed_bytes_type_name ctyp
     | CT_unit -> "unit"
     | CT_bool -> "bool"
     | CT_fbits _ -> "uint64_t"
@@ -3130,7 +5792,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CT_constant _ -> "int64_t"
     | CT_lint -> "sail_int"
     | CT_lbits -> "lbits"
-    | CT_tup _ as tup -> "struct " ^ Util.zencode_string ("tuple_" ^ string_of_ctyp tup)
+    | CT_tup _ as tup -> "struct " ^ composite_ctyp_name ("tuple_" ^ string_of_ctyp tup) tup
     | CT_struct (id, _) -> "struct " ^ sgen_id id
     | CT_enum id -> "enum " ^ sgen_id id
     | CT_variant (id, _) -> "struct " ^ sgen_id id
@@ -3153,10 +5815,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | ctyp when is_c_repr_u128 ctyp -> "u128"
     | ctyp when is_c_repr_u256 ctyp -> "u256"
     | ctyp when is_c_repr_u320 ctyp -> "u320"
-    | ctyp when is_c_repr_fixed_bytes_u64_lanes ctyp ->
-        "fixed_bytes_u64_lanes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_u64_lanes_length ctyp))
-    | ctyp when is_c_repr_fixed_bytes ctyp ->
-        "fixed_bytes_" ^ string_of_int (Option.get (c_repr_fixed_bytes_length ctyp))
+    | ctyp when is_c_repr_fixed_bytes ctyp -> fixed_bytes_type_name ctyp
     | CT_unit -> "unit"
     | CT_bool -> "bool"
     | CT_fbits _ -> "fbits"
@@ -3166,7 +5825,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CT_constant _ -> "mach_int"
     | CT_lint -> "sail_int"
     | CT_lbits -> "lbits"
-    | CT_tup _ as tup -> Util.zencode_string ("tuple_" ^ string_of_ctyp tup)
+    | CT_tup _ as tup -> composite_ctyp_name ("tuple_" ^ string_of_ctyp tup) tup
     | CT_struct (id, _) -> sgen_id id
     | CT_enum id -> sgen_id id
     | CT_variant (id, _) -> sgen_id id
@@ -3185,6 +5844,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let sgen_const_ctyp = function CT_string -> "const_sail_string" | ty -> sgen_ctyp ty
 
+  (* Distinct bounded Sail integer types frequently share one concrete C
+     carrier.  Once any semantic range check has been emitted, spelling a cast
+     between identical carriers adds no conversion and obscures the generated
+     expression. *)
+  let same_c_storage_type left right = String.equal (sgen_ctyp left) (sgen_ctyp right)
+
   let sgen_mask n =
     if n = 0 then "UINT64_C(0)"
     else if n <= 64 then (
@@ -3193,6 +5858,10 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       "UINT64_C(0x" ^ first ^ chars_F ^ ")"
     )
     else failwith "Tried to create a mask literal for a vector greater than 64 bits."
+
+  let sgen_bitlist bs =
+    let padding = (4 - (List.length bs mod 4)) mod 4 in
+    Sail2_values.show_bitlist (Util.list_init padding (fun _ -> Sail2_values.B0) @ bs)
 
   let sgen_u256_bits bs =
     let length = List.length bs in
@@ -3210,20 +5879,20 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           chunk :: chunks size rest
     in
     let limbs =
-      chunks 64 padded |> List.rev |> List.map (fun limb -> "UINT64_C(" ^ Sail2_values.show_bitlist limb ^ ")")
+      chunks 64 padded |> List.rev |> List.map (fun limb -> "UINT64_C(" ^ sgen_bitlist limb ^ ")")
     in
-    "((sail_u256){{" ^ String.concat ", " limbs ^ "}})"
+    "(u256){{" ^ String.concat ", " limbs ^ "}}"
 
   let sgen_u128_int value =
     let mask = max_uint 64 in
     let lo = Big_int.bitwise_and value mask in
     let hi = Big_int.shift_right value 64 in
-    "((sail_u128){{UINT64_C(" ^ Big_int.to_string lo ^ "), UINT64_C(" ^ Big_int.to_string hi ^ ")}})"
+    "(u128){{UINT64_C(" ^ Big_int.to_string lo ^ "), UINT64_C(" ^ Big_int.to_string hi ^ ")}}"
 
   let sgen_u256_int value =
     let mask = max_uint 64 in
     let limb shift = Big_int.shift_right value shift |> fun value -> Big_int.bitwise_and value mask in
-    "((sail_u256){{UINT64_C("
+    "(u256){{UINT64_C("
     ^ Big_int.to_string (limb 0)
     ^ "), UINT64_C("
     ^ Big_int.to_string (limb 64)
@@ -3231,12 +5900,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     ^ Big_int.to_string (limb 128)
     ^ "), UINT64_C("
     ^ Big_int.to_string (limb 192)
-    ^ ")}})"
+    ^ ")}}"
 
   let sgen_u320_int value =
     let mask = max_uint 64 in
     let limb shift = Big_int.shift_right value shift |> fun value -> Big_int.bitwise_and value mask in
-    "((sail_u320){{UINT64_C("
+    "(u320){{UINT64_C("
     ^ Big_int.to_string (limb 0)
     ^ "), UINT64_C("
     ^ Big_int.to_string (limb 64)
@@ -3246,7 +5915,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     ^ Big_int.to_string (limb 192)
     ^ "), UINT64_C("
     ^ Big_int.to_string (limb 256)
-    ^ ")}})"
+    ^ ")}}"
 
   let sgen_i128_int value =
     let unsigned_i128 value =
@@ -3264,16 +5933,17 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let sgen_value ctyp = function
     | VL_bits bs when is_c_repr_u256 ctyp -> sgen_u256_bits bs
     | VL_bits [] -> "UINT64_C(0)"
-    | VL_bits bs -> "UINT64_C(" ^ Sail2_values.show_bitlist bs ^ ")"
+    | VL_bits bs -> "UINT64_C(" ^ sgen_bitlist bs ^ ")"
     | VL_int i -> (
         match ctyp with
         | ctyp when is_c_repr_u320 ctyp -> sgen_u320_int i
         | ctyp when is_c_repr_u256 ctyp -> sgen_u256_int i
         | ctyp when is_c_repr_u128 ctyp -> sgen_u128_int i
-        | CT_fuint width when width < 64 -> "((" ^ sgen_ctyp ctyp ^ ")UINT64_C(" ^ Big_int.to_string i ^ "))"
-        | CT_fuint _ -> "UINT64_C(" ^ Big_int.to_string i ^ ")"
+        | CT_fuint width when width <= 64 ->
+            "UINT" ^ string_of_int width ^ "_C(" ^ Big_int.to_string i ^ ")"
         | CT_fint width when width > 64 -> sgen_i128_int i
-        | CT_fint width when width < 64 -> "((" ^ sgen_ctyp ctyp ^ ")INT64_C(" ^ Big_int.to_string i ^ "))"
+        | CT_fint width when width < 64 ->
+            "INT" ^ string_of_int width ^ "_C(" ^ Big_int.to_string i ^ ")"
         | _ -> if Big_int.equal i (min_int 64) then "INT64_MIN" else "INT64_C(" ^ Big_int.to_string i ^ ")"
       )
     | VL_bool true -> "true"
@@ -3295,20 +5965,91 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | V_field (f, field, _) -> sprintf "%s.%s" (sgen_cval f) (sgen_id field)
     | V_tuple_member (f, _, n) -> sprintf "%s.%s" (sgen_cval f) (sgen_tuple_id n)
     | V_ctor_kind (f, ctor) -> sgen_cval f ^ ".kind" ^ " != Kind_" ^ sgen_uid ctor
-    | V_struct (fields, _) ->
-        sprintf "{%s}" (Util.string_of_list ", " (fun (field, cval) -> sgen_id field ^ " = " ^ sgen_cval cval) fields)
+    | V_struct (fields, ctyp) ->
+        sprintf "((%s){%s})" (sgen_ctyp ctyp)
+          (Util.string_of_list ", "
+             (fun (field, cval) -> "." ^ sgen_id field ^ " = " ^ sgen_cval_in_value_context cval)
+             fields
+          )
     | V_ctor_unwrap (f, ctor, _) -> sprintf "%s.variants.%s" (sgen_cval f) (sgen_uid ctor)
-    | V_tuple _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Cannot generate C value for a tuple literal"
+    | (V_tuple values as tuple) ->
+        sprintf "((%s){%s})" (sgen_ctyp (cval_ctyp tuple))
+          (Util.string_of_list ", "
+             (fun (index, value) ->
+               "." ^ sgen_tuple_id index ^ " = " ^ sgen_cval_in_value_context value
+             )
+             (List.mapi (fun index value -> (index, value)) values)
+          )
+
+  (* C's logical, comparison, and negation operators have type [int], even
+     when both operands are [_Bool].  JIB correctly records their semantic
+     result as [CT_bool], so make that representation boundary explicit only
+     when the rendered expression is one of those native C operators.  Calls
+     to generated equality/order helpers already return [bool] and must remain
+     uncast: besides being clearer, this avoids redundant-cast diagnostics.
+
+     Native operator expressions are parenthesized by [sgen_call], except for
+     the deliberately compact [!flag] form.  Constructor-kind tests are the
+     one comparison form emitted without outer parentheses. *)
+  and sgen_cval_in_value_context cval =
+    let rendered = sgen_cval cval in
+    if ctyp_equal (cval_ctyp cval) CT_bool then
+      match cval with
+      | V_ctor_kind _ -> sprintf "(bool)(%s)" rendered
+      | V_call _ when String.length rendered > 0 && (rendered.[0] = '(' || rendered.[0] = '!') ->
+          let rendered =
+            let length = String.length rendered in
+            if length >= 2 && rendered.[0] = '(' && rendered.[length - 1] = ')' then
+              String.sub rendered 1 (length - 2)
+            else rendered
+          in
+          sprintf "(bool)(%s)" rendered
+      | _ -> rendered
+    else rendered
+
+  and sgen_cval_as target_ctyp cval =
+    let storage_width = function
+      | CT_fuint width | CT_fint width -> Some (if width > 64 then 128 else native_c_integer_width width)
+      | _ -> None
+    in
+    let widened_proven_binop operator left right =
+      match (storage_width target_ctyp, storage_width (cval_ctyp cval)) with
+      | Some target_width, Some source_width when target_width > source_width ->
+          Some
+            (sprintf "(%s %s %s)" (sgen_cval_as target_ctyp left) operator
+               (sgen_cval_as target_ctyp right)
+            )
+      | _ -> None
+    in
+    if same_c_storage_type target_ctyp (cval_ctyp cval) then sgen_cval cval
+    else
+      match cval with
+      | V_call (Proven_iadd, [left; right]) -> (
+          match widened_proven_binop "+" left right with
+          | Some expression -> expression
+          | None -> sprintf "(%s)%s" (sgen_ctyp target_ctyp) (sgen_cval cval)
+        )
+      | V_call (Proven_isub, [left; right]) -> (
+          match widened_proven_binop "-" left right with
+          | Some expression -> expression
+          | None -> sprintf "(%s)%s" (sgen_ctyp target_ctyp) (sgen_cval cval)
+        )
+      | V_call (Proven_imul, [left; right]) -> (
+          match widened_proven_binop "*" left right with
+          | Some expression -> expression
+          | None -> sprintf "(%s)%s" (sgen_ctyp target_ctyp) (sgen_cval cval)
+        )
+      | _ -> sprintf "(%s)%s" (sgen_ctyp target_ctyp) (sgen_cval cval)
 
   and sgen_proven_native_binop operator v1 v2 =
     let raw () = sprintf "(%s %s %s)" (sgen_cval v1) operator (sgen_cval v2) in
     match cval_ctyp v1 with
     | CT_fuint width when width < 32 ->
-        sprintf "((%s)(((uint32_t)%s) %s ((uint32_t)%s)))" (sgen_ctyp (CT_fuint width)) (sgen_cval v1) operator
-          (sgen_cval v2)
+        sprintf "((%s)(%s %s %s))" (sgen_ctyp (CT_fuint width)) (sgen_cval_as (CT_fuint 32) v1) operator
+          (sgen_cval_as (CT_fuint 32) v2)
     | CT_fint width when width < 32 ->
-        sprintf "((%s)(((int32_t)%s) %s ((int32_t)%s)))" (sgen_ctyp (CT_fint width)) (sgen_cval v1) operator
-          (sgen_cval v2)
+        sprintf "((%s)(%s %s %s))" (sgen_ctyp (CT_fint width)) (sgen_cval_as (CT_fint 32) v1) operator
+          (sgen_cval_as (CT_fint 32) v2)
     | CT_fint _ | CT_fuint _ -> raw ()
     | ctyp when is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_u320 ctyp ->
         (* A semantic proof can be attached while an integer still has a
@@ -3332,23 +6073,113 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
              (string_of_ctyp (cval_ctyp v1)) (string_of_ctyp (cval_ctyp v2)))
 
   and sgen_call op cvals =
+    let macro_argument value =
+      let rendered = sgen_cval value in
+      match value with
+      | V_lit (_, ctyp)
+        when is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_u320 ctyp ->
+          "(" ^ rendered ^ ")"
+      | _ -> rendered
+    in
     let u320_of value =
       match cval_ctyp value with
       | ctyp when is_c_repr_u320 ctyp -> sgen_cval value
       | ctyp when is_c_repr_u256 ctyp -> sprintf "u320_of_u256(%s)" (sgen_cval value)
       | ctyp when is_c_repr_u128 ctyp -> sprintf "u320_of_u128(%s)" (sgen_cval value)
       | CT_fuint _ -> sprintf "u320_of_u64(%s)" (sgen_cval value)
-      | ctyp -> failwith ("Cannot widen " ^ string_of_ctyp ctyp ^ " to sail_u320")
+      | ctyp -> failwith ("Cannot widen " ^ string_of_ctyp ctyp ^ " to u320")
+    in
+    let native_ordering_operand value =
+      match cval_ctyp value with
+      | CT_fuint width | CT_fint width -> width <= 64
+      | _ -> false
+    in
+    let native_ordering_pair left right =
+      native_ordering_operand left && native_ordering_operand right
+    in
+    let mixed_native_comparison op left right =
+      let compare_signed_unsigned signed_width unsigned_width signed unsigned =
+        if signed_width > unsigned_width then None
+        else
+          let signed = sgen_cval signed in
+          let unsigned = sgen_cval unsigned in
+          let zero = sgen_value (CT_fint signed_width) (VL_int Big_int.zero) in
+          let converted = sprintf "((%s)%s)" (sgen_ctyp (CT_fuint unsigned_width)) signed in
+          match op with
+          | Eq -> Some (sprintf "(%s >= %s && %s == %s)" signed zero converted unsigned)
+          | Neq -> Some (sprintf "(%s < %s || %s != %s)" signed zero converted unsigned)
+          | Ilt -> Some (sprintf "(%s < %s || %s < %s)" signed zero converted unsigned)
+          | Igt -> Some (sprintf "(%s > %s && %s > %s)" signed zero converted unsigned)
+          | Ilteq -> Some (sprintf "(%s <= %s || %s <= %s)" signed zero converted unsigned)
+          | Igteq -> Some (sprintf "(%s >= %s && %s >= %s)" signed zero converted unsigned)
+          | _ -> None
+      in
+      let compare_unsigned_signed unsigned_width signed_width unsigned signed =
+        if signed_width > unsigned_width then None
+        else
+          let unsigned = sgen_cval unsigned in
+          let signed = sgen_cval signed in
+          let zero = sgen_value (CT_fint signed_width) (VL_int Big_int.zero) in
+          let converted = sprintf "((%s)%s)" (sgen_ctyp (CT_fuint unsigned_width)) signed in
+          match op with
+          | Eq -> Some (sprintf "(%s >= %s && %s == %s)" signed zero unsigned converted)
+          | Neq -> Some (sprintf "(%s < %s || %s != %s)" signed zero unsigned converted)
+          | Ilt -> Some (sprintf "(%s > %s && %s < %s)" signed zero unsigned converted)
+          | Igt -> Some (sprintf "(%s < %s || %s > %s)" signed zero unsigned converted)
+          | Ilteq -> Some (sprintf "(%s >= %s && %s <= %s)" signed zero unsigned converted)
+          | Igteq -> Some (sprintf "(%s <= %s || %s >= %s)" signed zero unsigned converted)
+          | _ -> None
+      in
+      match (cval_ctyp left, cval_ctyp right) with
+      | CT_fint signed_width, CT_fuint unsigned_width ->
+          compare_signed_unsigned signed_width unsigned_width left right
+      | CT_fuint unsigned_width, CT_fint signed_width ->
+          compare_unsigned_signed unsigned_width signed_width left right
+      | _ -> None
     in
     match (op, cvals) with
+    | Bnot, [V_lit (VL_bool value, _)] -> if value then "false" else "true"
+    | Bnot, [V_call (Bnot, [value])] -> sgen_cval value
+    | Bnot, [V_call (Band, values)] ->
+        sgen_call Bor (List.map (fun value -> V_call (Bnot, [value])) values)
+    | Bnot, [V_call (Bor, values)] ->
+        sgen_call Band (List.map (fun value -> V_call (Bnot, [value])) values)
+    | Bnot, [V_call (Eq, [left; right])] -> sgen_call Neq [left; right]
+    | Bnot, [V_call (Neq, [left; right])] -> sgen_call Eq [left; right]
+    | Bnot, [V_call (Ilt, [left; right])] -> sgen_call Igteq [left; right]
+    | Bnot, [V_call (Igt, [left; right])] -> sgen_call Ilteq [left; right]
+    | Bnot, [V_call (Ilteq, [left; right])] -> sgen_call Igt [left; right]
+    | Bnot, [V_call (Igteq, [left; right])] -> sgen_call Ilt [left; right]
+    | Bnot, [((V_id _ | V_member _ | V_field _ | V_tuple_member _ | V_ctor_unwrap _) as v)] ->
+        "!" ^ sgen_cval v
     | Bnot, [v] -> "!(" ^ sgen_cval v ^ ")"
-    | Band, vs -> "(" ^ Util.string_of_list " && " sgen_cval vs ^ ")"
-    | Bor, vs -> "(" ^ Util.string_of_list " || " sgen_cval vs ^ ")"
+    | Band, vs ->
+        if List.exists (function V_lit (VL_bool false, _) -> true | _ -> false) vs then "false"
+        else (
+          let vs = List.filter (function V_lit (VL_bool true, _) -> false | _ -> true) vs in
+          match vs with
+          | [] -> "true"
+          | [value] -> sgen_cval value
+          | values -> "(" ^ Util.string_of_list " && " sgen_cval values ^ ")"
+        )
+    | Bor, vs ->
+        if List.exists (function V_lit (VL_bool true, _) -> true | _ -> false) vs then "true"
+        else (
+          let vs = List.filter (function V_lit (VL_bool false, _) -> false | _ -> true) vs in
+          match vs with
+          | [] -> "false"
+          | [value] -> sgen_cval value
+          | values -> "(" ^ Util.string_of_list " || " sgen_cval values ^ ")"
+        )
     | List_hd, [v] -> sprintf "(%s).hd" ("*" ^ sgen_cval v)
     | List_tl, [v] -> sprintf "(%s).tl" ("*" ^ sgen_cval v)
     | List_is_empty, [v] -> sprintf "(%s == NULL)" (sgen_cval v)
     | Eq, [v1; v2] -> (
+        match mixed_native_comparison Eq v1 v2 with
+        | Some comparison -> comparison
+        | None -> (
         match (cval_ctyp v1, cval_ctyp v2) with
+        | CT_unit, CT_unit when Config.optimized_model && !optimize_unit_results -> "true"
         | left, right when is_c_repr_byte_pointer left && ctyp_equal left right ->
             sprintf "(%s == %s)" (sgen_cval v1) (sgen_cval v2)
         | CT_sbits _, _ -> sprintf "eq_sbits(%s, %s)" (sgen_cval v1) (sgen_cval v2)
@@ -3365,9 +6196,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | ctyp, _ when is_c_repr_value ctyp ->
             sprintf "eq_%s(%s, %s)" (sgen_ctyp_name ctyp) (sgen_cval v1) (sgen_cval v2)
         | _ -> sprintf "(%s == %s)" (sgen_cval v1) (sgen_cval v2)
+        )
       )
     | Neq, [v1; v2] -> (
+        match mixed_native_comparison Neq v1 v2 with
+        | Some comparison -> comparison
+        | None -> (
         match (cval_ctyp v1, cval_ctyp v2) with
+        | CT_unit, CT_unit when Config.optimized_model && !optimize_unit_results -> "false"
         | left, right when is_c_repr_byte_pointer left && ctyp_equal left right ->
             sprintf "(%s != %s)" (sgen_cval v1) (sgen_cval v2)
         | CT_sbits _, _ -> sprintf "neq_sbits(%s, %s)" (sgen_cval v1) (sgen_cval v2)
@@ -3384,7 +6220,10 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | ctyp, _ when is_c_repr_value ctyp ->
             sprintf "(!eq_%s(%s, %s))" (sgen_ctyp_name ctyp) (sgen_cval v1) (sgen_cval v2)
         | _ -> sprintf "(%s != %s)" (sgen_cval v1) (sgen_cval v2)
+        )
       )
+    | Ilt, [v1; v2] when Option.is_some (mixed_native_comparison Ilt v1 v2) ->
+        Option.get (mixed_native_comparison Ilt v1 v2)
     | Ilt, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) || is_c_repr_u320 (cval_ctyp v2) ->
         sprintf "u320_lt(%s, %s)" (u320_of v1) (u320_of v2)
     | Ilt, [v1; v2] when is_c_repr_u256 (cval_ctyp v1) && is_c_repr_u128 (cval_ctyp v2) ->
@@ -3402,8 +6241,20 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         sprintf "u64_lt_u256(%s, %s)" (sgen_cval v1) (sgen_cval v2)
     | Ilt, [v1; v2] when is_c_repr_u256 (cval_ctyp v1) -> sprintf "u256_lt(%s, %s)" (sgen_cval v1) (sgen_cval v2)
     | Ilt, [v1; v2] -> sprintf "(%s < %s)" (sgen_cval v1) (sgen_cval v2)
+    | Igt, [v1; v2] when Option.is_some (mixed_native_comparison Igt v1 v2) ->
+        Option.get (mixed_native_comparison Igt v1 v2)
+    | Igt, [v1; v2] when native_ordering_pair v1 v2 ->
+        sprintf "(%s > %s)" (sgen_cval v1) (sgen_cval v2)
     | Igt, [v1; v2] -> sgen_call Ilt [v2; v1]
+    | Ilteq, [v1; v2] when Option.is_some (mixed_native_comparison Ilteq v1 v2) ->
+        Option.get (mixed_native_comparison Ilteq v1 v2)
+    | Ilteq, [v1; v2] when native_ordering_pair v1 v2 ->
+        sprintf "(%s <= %s)" (sgen_cval v1) (sgen_cval v2)
     | Ilteq, [v1; v2] -> sprintf "(!%s)" (sgen_call Ilt [v2; v1])
+    | Igteq, [v1; v2] when Option.is_some (mixed_native_comparison Igteq v1 v2) ->
+        Option.get (mixed_native_comparison Igteq v1 v2)
+    | Igteq, [v1; v2] when native_ordering_pair v1 v2 ->
+        sprintf "(%s >= %s)" (sgen_cval v1) (sgen_cval v2)
     | Igteq, [v1; v2] -> sprintf "(!%s)" (sgen_call Ilt [v1; v2])
     | Widening_iadd (128, _), [v1; v2] -> sprintf "u128_add_u64_u64(%s, %s)" (sgen_cval v1) (sgen_cval v2)
     | Widening_imul (128, _), [v1; v2] -> sprintf "u128_mul_u64_u64(%s, %s)" (sgen_cval v1) (sgen_cval v2)
@@ -3433,8 +6284,10 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                  (string_of_ctyp right)
               )
       )
-    | Widening_iadd (320, _), [v1; v2] -> sprintf "u320_add_widen(%s, %s)" (sgen_cval v1) (sgen_cval v2)
-    | Widening_imul (320, _), [v1; v2] -> sprintf "u320_mul_widen(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+    | Widening_iadd (320, _), [v1; v2] ->
+        sprintf "u320_add_widen(%s, %s)" (macro_argument v1) (macro_argument v2)
+    | Widening_imul (320, _), [v1; v2] ->
+        sprintf "u320_mul_widen(%s, %s)" (macro_argument v1) (macro_argument v2)
     | (Widening_iadd (width, _) | Widening_imul (width, _)), _ ->
         failwith (sprintf "Unsupported exact widening integer operation at width %d" width)
     | Wrapping_iadd width, [v1; v2] -> (
@@ -3621,14 +6474,18 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                  (string_of_ctyp left_ctyp) (string_of_ctyp right_ctyp)
               ));
         let operator = match op with Mixed_proven_idiv _ -> "/" | _ -> "%" in
-        sprintf "((%s)(((%s)%s) %s ((%s)%s)))" (sgen_ctyp result_ctyp) (sgen_ctyp operation_ctyp)
-          (sgen_cval left) operator (sgen_ctyp operation_ctyp) (sgen_cval right)
+        let operation =
+          sprintf "(%s %s %s)" (sgen_cval_as operation_ctyp left) operator (sgen_cval_as operation_ctyp right)
+        in
+        if same_c_storage_type result_ctyp operation_ctyp then operation
+        else sprintf "((%s)%s)" (sgen_ctyp result_ctyp) operation
       )
-    | Unsigned width, [vec] -> sprintf "((%s) %s)" (sgen_ctyp (CT_fuint width)) (sgen_cval vec)
+    | Unsigned width, [V_lit (VL_int value, _)] -> sgen_value (CT_fuint width) (VL_int value)
+    | Unsigned width, [vec] -> sgen_cval_as (CT_fuint width) vec
     | Signed width, [value] -> (
         match cval_ctyp value with
         | CT_fbits n when width = 64 -> sprintf "fast_signed(%s, %d)" (sgen_cval value) n
-        | CT_fint _ | CT_fuint _ | CT_constant _ -> sprintf "((%s) %s)" (sgen_ctyp (CT_fint width)) (sgen_cval value)
+        | CT_fint _ | CT_fuint _ | CT_constant _ -> sgen_cval_as (CT_fint width) value
         | ctyp -> c_error (sprintf "Cannot lower proved signed conversion from %s" (string_of_ctyp ctyp))
       )
     | Bvand, [v1; v2] -> (
@@ -3748,7 +6605,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | Proven_vector_access length, [vector; index] -> (
         match cval_ctyp vector with
         | CT_fvector (actual_length, _) when length = actual_length ->
-            sprintf "((%s).data[(size_t)(%s)])" (sgen_cval vector) (sgen_cval index)
+            sprintf "%s.data[(size_t)%s]" (sgen_cval vector) (sgen_cval index)
         | _ -> assert false
       )
     | Slice len, [vec; start] -> (
@@ -3862,6 +6719,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let codegen_equal ctyp arg1 arg2 =
     match ctyp with
+    | CT_unit when Config.optimized_model && !optimize_unit_results -> string "true"
     | ctyp when is_c_repr_byte_pointer ctyp -> ksprintf string "(%s == %s)" arg1 arg2
     | CT_ref _ -> ksprintf string "(%s == %s)" arg1 arg2
     | CT_fint _ | CT_fuint _ -> ksprintf string "(%s == %s)" arg1 arg2
@@ -3875,7 +6733,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                 Util.StringSet.add helper !static_equality_declaration_names;
               static_equality_declarations :=
                 ( helper,
-                  ksprintf string "static bool %s(const %s op1, const %s op2);" helper
+                  ksprintf string "static bool %s(%s op1, %s op2);" helper
                     (sgen_ctyp ctyp) (sgen_ctyp ctyp)
                 )
                 :: !static_equality_declarations
@@ -3883,6 +6741,17 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | _ -> ()
         );
         sail_equal (sgen_ctyp_name ctyp) "%s, %s" arg1 arg2
+
+  (* Native C equality operators produce [int].  When an equality expression
+     is itself the value returned by a generated [_Bool] helper, make that
+     representation conversion explicit.  Equality helper calls already
+     return [bool], so retaining them verbatim avoids redundant casts. *)
+  let codegen_equal_in_bool_value ctyp arg1 arg2 =
+    let equality = codegen_equal ctyp arg1 arg2 in
+    match ctyp with
+    | ctyp when is_c_repr_byte_pointer ctyp -> string "(bool)" ^^ equality
+    | CT_ref _ | CT_fint _ | CT_fuint _ -> string "(bool)" ^^ equality
+    | _ -> equality
 
   let monomorphic_id_base id =
     let name = string_of_id id in
@@ -3921,7 +6790,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let codegen_fixed_integer_conversion l clexp ctyp_to cval ctyp_from =
     let storage_width width = if width > 64 then 128 else native_c_integer_width width in
     let assignment =
-      ksprintf string "  %s = (%s)(%s);" (sgen_clexp_pure l clexp) (sgen_ctyp ctyp_to) (sgen_cval cval)
+      let value = sgen_cval_as ctyp_to cval in
+      ksprintf string "  %s = %s;" (sgen_clexp_pure l clexp) value
     in
     let failure message = ksprintf string "    sail_native_conversion_failure(\"%s\");" message in
     let checked condition message =
@@ -3932,18 +6802,20 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     let upper_unsigned_bound ctyp width = sgen_value ctyp (VL_int (max_uint width)) in
     let outside_target_domain () = sprintf "integer value is outside the %s domain" (sgen_ctyp ctyp_to) in
     let negative_target () = sprintf "negative integer cannot be represented as %s" (sgen_ctyp ctyp_to) in
+    let fits_unsigned width = integer_cval_fits Big_int.zero (max_uint width) cval in
+    let fits_signed width = integer_cval_fits (min_int width) (max_int width) cval in
     match (ctyp_to, ctyp_from) with
     | CT_fuint to_width, CT_fuint from_width ->
         let to_width = storage_width to_width in
         let from_width = storage_width from_width in
-        if from_width <= to_width then assignment
+        if from_width <= to_width || fits_unsigned to_width then assignment
         else
           checked (sprintf "%s > %s" (sgen_cval cval) (upper_unsigned_bound ctyp_to to_width)) (outside_target_domain ())
           ^^ assignment
     | CT_fint to_width, CT_fint from_width ->
         let to_width = storage_width to_width in
         let from_width = storage_width from_width in
-        if from_width <= to_width then assignment
+        if from_width <= to_width || fits_signed to_width then assignment
         else
           checked
             (sprintf "%s < %s || %s > %s" (sgen_cval cval) (lower_bound ctyp_to to_width) (sgen_cval cval)
@@ -3955,7 +6827,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         let to_width = storage_width to_width in
         let from_width = storage_width from_width in
         let negative = checked (sprintf "%s < 0" (sgen_cval cval)) (negative_target ()) in
-        if from_width <= to_width then negative ^^ assignment
+        if fits_unsigned to_width then assignment
+        else if from_width <= to_width then negative ^^ assignment
         else
           negative
           ^^ checked
@@ -3965,11 +6838,102 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CT_fint to_width, CT_fuint from_width ->
         let to_width = storage_width to_width in
         let from_width = storage_width from_width in
-        if from_width < to_width then assignment
+        if from_width < to_width || fits_signed to_width then assignment
         else
           checked (sprintf "%s > %s" (sgen_cval cval) (upper_signed_bound ctyp_to to_width)) (outside_target_domain ())
           ^^ assignment
     | _ -> assert false
+
+  (* Return the expression for conversions that can be written directly in a
+     stack-local initializer.  Checked native-integer conversions deliberately
+     return [None]: their guard must execute before the assignment, so keeping
+     a separate declaration is the honest C representation. *)
+  let stack_conversion_initializer ctyp_to cval =
+    let ctyp_from = cval_ctyp cval in
+    let value =
+      if ctyp_equal ctyp_to ctyp_from then sgen_cval_in_value_context cval else sgen_cval cval
+    in
+    let call helper = Some (sprintf "%s(%s)" helper value) in
+    let cast_call helper =
+      let call = sprintf "%s(%s)" helper value in
+      if String.equal (sgen_ctyp ctyp_to) "uint64_t" then Some call
+      else Some (sprintf "(%s)%s" (sgen_ctyp ctyp_to) call)
+    in
+    let cast () =
+      Some (sgen_cval_as ctyp_to cval)
+    in
+    let storage_width width = if width > 64 then 128 else native_c_integer_width width in
+    if ctyp_equal ctyp_to ctyp_from then Some value
+    else
+      match (ctyp_to, ctyp_from) with
+      | to_typ, (CT_fint _ | CT_fuint _ | CT_constant _) when is_c_repr_byte_pointer to_typ -> (
+          let adapter = Option.get (c_repr_byte_pointer_adapter to_typ) in
+          if adapter = direct_byte_pointer_adapter then
+            match cval with
+            | V_lit (VL_int literal, _) when Big_int.equal literal Big_int.zero -> Some "NULL"
+            | _ -> None
+          else Some (sprintf "%s((uint64_t)%s)" adapter value)
+        )
+      | CT_fuint to_width, CT_fuint from_width
+        when storage_width from_width <= storage_width to_width ->
+          cast ()
+      | CT_fuint to_width, (CT_fuint _ | CT_fint _ | CT_constant _)
+        when integer_cval_fits Big_int.zero (max_uint (storage_width to_width)) cval ->
+          cast ()
+      | CT_fint to_width, CT_fint from_width
+        when storage_width from_width <= storage_width to_width ->
+          cast ()
+      | CT_fint to_width, (CT_fuint _ | CT_fint _ | CT_constant _)
+        when integer_cval_fits (min_int (storage_width to_width)) (max_int (storage_width to_width)) cval ->
+          cast ()
+      | CT_fint to_width, CT_fuint from_width
+        when storage_width from_width < storage_width to_width ->
+          cast ()
+      | to_typ, CT_fuint _ when is_c_repr_u320 to_typ -> call "u320_of_u64"
+      | to_typ, from_typ when is_c_repr_u320 to_typ && is_c_repr_u128 from_typ -> call "u320_of_u128"
+      | to_typ, from_typ when is_c_repr_u320 to_typ && is_c_repr_u256 from_typ -> call "u320_of_u256"
+      | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u320 from_typ -> cast_call "u320_to_u64"
+      | to_typ, from_typ when is_c_repr_u256 to_typ && is_c_repr_u320 from_typ -> call "u256_of_u320"
+      | to_typ, from_typ when is_c_repr_u128 to_typ && is_c_repr_u320 from_typ -> call "u128_of_u320"
+      | to_typ, CT_fbits _ when is_c_repr_u256 to_typ -> call "u256_of_fbits"
+      | to_typ, CT_fuint _ when is_c_repr_u256 to_typ -> call "u256_of_fbits"
+      | to_typ, from_typ when is_c_repr_u256 to_typ && is_c_repr_u128 from_typ -> call "u256_of_u128"
+      | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u256 from_typ -> cast_call "u256_to_u64"
+      | to_typ, CT_fuint _ when is_c_repr_u128 to_typ -> call "u128_of_u64"
+      | to_typ, CT_fint width when is_c_repr_u128 to_typ && width > 64 ->
+          Some
+            (sprintf "(u128){{(uint64_t)%s, (uint64_t)(((unsigned __int128)%s) >> 64)}}" value value)
+      | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u128 from_typ -> cast_call "u128_to_u64"
+      | to_typ, from_typ when is_c_repr_u128 to_typ && is_c_repr_u256 from_typ -> call "u128_of_u256"
+      | _ -> None
+
+  (* A semantic byte vector becomes a fixed C byte aggregate through a small
+     fill loop.  Keep initialization configurable so an adjacent declaration
+     can initialize the aggregate on that same line and then emit only the
+     loop.  Besides producing idiomatic C, the explicit zero value makes the
+     conversion visibly total to Clang's dataflow analysis. *)
+  let codegen_fixed_bytes_vector_conversion l clexp cval to_typ ~initialize =
+    let length = Option.get (c_repr_fixed_bytes_length to_typ) in
+    let i = ngensym () in
+    let initialization =
+      if initialize then
+        ksprintf string "  %s = %s_zero();" (sgen_clexp_pure l clexp) (sgen_ctyp_name to_typ)
+        ^^ hardline
+      else empty
+    in
+    let update =
+      if is_c_repr_fixed_bytes_u64_lanes to_typ then
+        ksprintf string "    %s = fast_unsigned_vector_update_%s(%s, %s, %s.data[%s]);"
+          (sgen_clexp_pure l clexp) (sgen_ctyp_name to_typ) (sgen_clexp_pure l clexp) (sgen_name i)
+          (sgen_cval cval) (sgen_name i)
+      else
+        ksprintf string "    %s.bytes[%s] = (uint8_t)(%s.data[%s] & UINT64_C(0xff));"
+          (sgen_clexp_pure l clexp) (sgen_name i) (sgen_cval cval) (sgen_name i)
+    in
+    initialization
+    ^^ ksprintf string "  for (size_t %s = 0; %s < %d; ++%s) {" (sgen_name i) (sgen_name i) length
+         (sgen_name i)
+    ^^ hardline ^^ update ^^ hardline ^^ string "  }"
 
   (** Generate instructions to copy from a cval to a clexp. This will insert any needed type conversions from big
       integers to small integers (or vice versa), or from arbitrary-length bitvectors to and from uint64 bitvectors as
@@ -3977,11 +6941,21 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let rec codegen_conversion l ctx clexp cval =
     let ctyp_to = clexp_ctyp clexp in
     let ctyp_from = cval_ctyp cval in
+    let assign_u64_call helper =
+      let call = sprintf "%s(%s)" helper (sgen_cval cval) in
+      let value =
+        if String.equal (sgen_ctyp ctyp_to) "uint64_t" then call else sprintf "(%s)%s" (sgen_ctyp ctyp_to) call
+      in
+      ksprintf string "  %s = %s;" (sgen_clexp_pure l clexp) value
+    in
     match (ctyp_to, ctyp_from) with
     (* When both types are equal, we don't need any conversion. *)
     | _, _ when ctyp_equal ctyp_to ctyp_from ->
-        if is_stack_ctyp ctx ctyp_to then ksprintf string "  %s = %s;" (sgen_clexp_pure l clexp) (sgen_cval cval)
-        else sail_copy ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp_to) "%s, %s" (sgen_clexp l clexp) (sgen_cval cval)
+        if is_stack_ctyp ctx ctyp_to then
+          ksprintf string "  %s = %s;" (sgen_clexp_pure l clexp) (sgen_cval_in_value_context cval)
+        else
+          sail_copy ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp_to) "%s, %s" (sgen_clexp l clexp)
+            (sgen_cval_in_value_context cval)
     | to_typ, (CT_fint _ | CT_fuint _ | CT_constant _) when is_c_repr_byte_pointer to_typ ->
         let adapter = Option.get (c_repr_byte_pointer_adapter to_typ) in
         if adapter = direct_byte_pointer_adapter then
@@ -3993,7 +6967,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                 (Reporting.err_general l
                    "C backend: an adapter-free $[c_repr byte_pointer] value cannot be constructed from a semantic integer other than literal zero"
                 )
-        else ksprintf string "  %s = %s((uint64_t)(%s));" (sgen_clexp_pure l clexp) adapter (sgen_cval cval)
+        else ksprintf string "  %s = %s((uint64_t)%s);" (sgen_clexp_pure l clexp) adapter (sgen_cval cval)
     | (CT_fint _ | CT_fuint _), (CT_fint _ | CT_fuint _) ->
         (* Most width changes are proved refinements selected from semantic
            ranges.  Explicit [$[c_repr]] newtypes are also represented by this
@@ -4013,7 +6987,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | to_typ, from_typ when is_c_repr_u320 to_typ && is_c_repr_u256 from_typ ->
         ksprintf string "  %s = u320_of_u256(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u320 from_typ ->
-        ksprintf string "  %s = u320_to_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+        assign_u64_call "u320_to_u64"
     | to_typ, from_typ when is_c_repr_u256 to_typ && is_c_repr_u320 from_typ ->
         ksprintf string "  %s = u256_of_u320(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, from_typ when is_c_repr_u128 to_typ && is_c_repr_u320 from_typ ->
@@ -4045,39 +7019,24 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | to_typ, from_typ when is_c_repr_u256 to_typ && is_c_repr_u128 from_typ ->
         ksprintf string "  %s = u256_of_u128(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u256 from_typ ->
-        ksprintf string "  %s = u256_to_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+        assign_u64_call "u256_to_u64"
     | to_typ, CT_fuint _ when is_c_repr_u128 to_typ ->
         ksprintf string "  %s = u128_of_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | to_typ, CT_fint width when is_c_repr_u128 to_typ && width > 64 ->
-        ksprintf string "  %s = ((sail_u128){{(uint64_t)(%s), (uint64_t)(((unsigned __int128)(%s)) >> 64)}});"
+        ksprintf string "  %s = (u128){{(uint64_t)%s, (uint64_t)(((unsigned __int128)%s) >> 64)}};"
           (sgen_clexp_pure l clexp) (sgen_cval cval) (sgen_cval cval)
     | to_typ, CT_lint when is_c_repr_u128 to_typ ->
         ksprintf string "  %s = u128_of_sail_int(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | (CT_fint _ | CT_fuint _), from_typ when is_c_repr_u128 from_typ ->
-        ksprintf string "  %s = u128_to_u64(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
+        assign_u64_call "u128_to_u64"
     | to_typ, from_typ when is_c_repr_u128 to_typ && is_c_repr_u256 from_typ ->
         ksprintf string "  %s = u128_of_u256(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
-    | to_typ, (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)) when is_c_repr_fixed_bytes to_typ ->
-        let length = Option.get (c_repr_fixed_bytes_length to_typ) in
-        let i = ngensym () in
-        if is_c_repr_fixed_bytes_u64_lanes to_typ then
-          ksprintf string "  %s = %s_zero();" (sgen_clexp_pure l clexp) (sgen_ctyp_name to_typ)
-          ^^ hardline
-          ^^ ksprintf string "  for (size_t %s = 0; %s < %d; ++%s) {" (sgen_name i) (sgen_name i) length
-               (sgen_name i)
-          ^^ hardline
-          ^^ ksprintf string "    %s = fast_unsigned_vector_update_%s(%s, %s, %s.data[%s]);"
-               (sgen_clexp_pure l clexp) (sgen_ctyp_name to_typ) (sgen_clexp_pure l clexp) (sgen_name i)
-               (sgen_cval cval) (sgen_name i)
-          ^^ hardline ^^ string "  }"
-        else
-          ksprintf string "  for (size_t %s = 0; %s < %d; ++%s) {" (sgen_name i) (sgen_name i) length
-               (sgen_name i)
-          ^^ hardline
-          ^^ ksprintf string "    %s.bytes[%s] = (uint8_t)(%s.data[%s] & UINT64_C(0xff));"
-               (sgen_clexp_pure l clexp) (sgen_name i) (sgen_cval cval) (sgen_name i)
-          ^^ hardline ^^ string "  }"
-    | (CT_vector (CT_fbits 8) | CT_fvector (_, CT_fbits 8)), from_typ when is_c_repr_fixed_bytes from_typ ->
+    | ( to_typ,
+        (CT_vector (CT_fbits 8 | CT_fuint 8) | CT_fvector (_, (CT_fbits 8 | CT_fuint 8))) )
+      when is_c_repr_fixed_bytes to_typ ->
+        codegen_fixed_bytes_vector_conversion l clexp cval to_typ ~initialize:true
+    | (CT_vector (CT_fbits 8 | CT_fuint 8) | CT_fvector (_, (CT_fbits 8 | CT_fuint 8))), from_typ
+      when is_c_repr_fixed_bytes from_typ ->
         let length = Option.get (c_repr_fixed_bytes_length from_typ) in
         let i = ngensym () in
         sail_kill ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp_to) "%s" (sgen_clexp l clexp)
@@ -4203,6 +7162,72 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let squash_empty docs = List.filter (fun doc -> requirement doc > 0) docs
   let sq_separate_map sep f xs = separate sep (squash_empty (List.map f xs))
 
+  let erase_unit_values = Config.optimized_model && !optimize_unit_results
+
+  let retain_c_parameter ctyp = not (erase_unit_values && ctyp_equal ctyp CT_unit)
+
+  let c_parameter_items parameters =
+    let parameters = List.filter (fun (ctyp, _) -> retain_c_parameter ctyp) parameters in
+    List.map
+      (fun (ctyp, name) -> sgen_const_ctyp ctyp ^ if String.equal name "" then "" else " " ^ name)
+      parameters
+
+  let c_parameter_list parameters =
+    let parameters = c_parameter_items parameters in
+    match (erase_unit_values, !opt_extra_params, parameters) with
+    | true, None, [] -> "void"
+    | _ -> extra_params () ^ String.concat ", " parameters
+
+  (* An adjacent stack-local declaration and returning call can be emitted as
+     one ordinary C initializer.  Keep this code-generation-only: JIB still
+     models calls explicitly, which is important to the effect and exception
+     passes, while the final optimized C need not expose that administrative
+     split. *)
+  let stack_call_initializer = ref None
+
+  let stack_call_initializer_compatible declared destination =
+    ctyp_equal declared destination
+    ||
+    let native_integer = function
+      | CT_fuint width | CT_fint width -> width <= 64
+      | CT_fbits width -> width <= 64
+      | _ -> false
+    in
+    native_integer declared && native_integer destination
+
+  let sgen_stack_call_destination l ctyp clexp =
+    match (!stack_call_initializer, clexp) with
+    | Some (declared, declared_ctyp), CL_id (destination, destination_ctyp)
+      when Name.compare declared destination = 0
+           && stack_call_initializer_compatible declared_ctyp ctyp
+           && stack_call_initializer_compatible declared_ctyp destination_ctyp ->
+        sprintf "%s %s" (sgen_ctyp declared_ctyp) (sgen_name declared)
+    | _ -> sgen_clexp_pure l clexp
+
+  (* [sgen_cval] parenthesizes C operators so that values remain safe when
+     embedded in larger expressions.  A control-flow condition supplies its
+     own mandatory parentheses, however, and emitting both layers produces
+     the conspicuous [if ((a < b))] form.  Remove exactly one pair only when
+     it encloses the complete rendered expression; nested casts and grouping
+     inside the expression are left intact. *)
+  let sgen_condition cval =
+    let rendered = sgen_cval cval in
+    let length = String.length rendered in
+    let outer_parentheses_enclose_all () =
+      if length < 2 || rendered.[0] <> '(' || rendered.[length - 1] <> ')' then false
+      else
+        let rec scan index depth =
+          if index = length then depth = 0
+          else
+            let depth =
+              match rendered.[index] with '(' -> depth + 1 | ')' -> depth - 1 | _ -> depth
+            in
+            depth >= 0 && (index = length - 1 || depth > 0) && scan (index + 1) depth
+        in
+        scan 0 0
+    in
+    if outer_parentheses_enclose_all () then String.sub rendered 1 (length - 2) else rendered
+
   let rec codegen_instr fid ctx (I_aux (instr, (_, l))) =
     match instr with
     | I_decl (ctyp, id) when is_stack_ctyp ctx ctyp -> ksprintf string "  %s %s;" (sgen_ctyp ctyp) (sgen_name id)
@@ -4211,46 +7236,47 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         ^^ hardline
         ^^ sail_create ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp) "&%s" (sgen_name id)
     | I_copy (clexp, cval) -> codegen_conversion l ctx clexp cval
-    | I_jump (cval, label) -> ksprintf string "  if (%s) goto %s;" (sgen_cval cval) label
+    | I_jump (cval, label) ->
+        ksprintf string "  if (%s) {\n    goto %s;\n  }" (sgen_condition cval) label
+    | I_if (V_lit (VL_bool condition, CT_bool), then_instrs, else_instrs) ->
+        codegen_instrs fid ctx (if condition then then_instrs else else_instrs)
     | I_if (cval, [], else_instrs) -> codegen_instr fid ctx (iif l (V_call (Bnot, [cval])) else_instrs [])
     | I_if (cval, [then_instr], []) ->
-        ksprintf string "  if (%s)" (sgen_cval cval)
-        ^^ space
-        ^^ surround 2 0 lbrace (codegen_instr fid ctx then_instr) (twice space ^^ rbrace)
+        ksprintf string "  if (%s)" (sgen_condition cval)
+        ^^ space ^^ lbrace
+        ^^ nest 2 (hardline ^^ codegen_instr fid ctx then_instr)
+        ^^ hardline ^^ twice space ^^ rbrace
     | I_if (cval, then_instrs, []) ->
         string "  if" ^^ space
-        ^^ parens (string (sgen_cval cval))
-        ^^ space
-        ^^ surround 2 0 lbrace (separate_map hardline (codegen_instr fid ctx) then_instrs) (twice space ^^ rbrace)
+        ^^ parens (string (sgen_condition cval))
+        ^^ space ^^ lbrace
+        ^^ nest 2 (hardline ^^ codegen_instrs fid ctx then_instrs)
+        ^^ hardline ^^ twice space ^^ rbrace
     | I_if (cval, then_instrs, else_instrs) ->
+        let codegen_branch instrs =
+          lbrace
+          ^^ nest 2 (hardline ^^ codegen_instrs fid ctx instrs)
+          ^^ hardline ^^ twice space ^^ rbrace
+        in
         let rec codegen_if cval then_instrs else_instrs =
           match else_instrs with
           | [I_aux (I_if (else_i, else_t, else_e), _)] ->
               string "if" ^^ space
-              ^^ parens (string (sgen_cval cval))
-              ^^ space
-              ^^ surround 2 0 lbrace
-                   (sq_separate_map hardline (codegen_instr fid ctx) then_instrs)
-                   (twice space ^^ rbrace)
+              ^^ parens (string (sgen_condition cval))
+              ^^ space ^^ codegen_branch then_instrs
               ^^ space ^^ string "else" ^^ space ^^ codegen_if else_i else_t else_e
           | _ ->
               string "if" ^^ space
-              ^^ parens (string (sgen_cval cval))
-              ^^ space
-              ^^ surround 2 0 lbrace
-                   (sq_separate_map hardline (codegen_instr fid ctx) then_instrs)
-                   (twice space ^^ rbrace)
-              ^^ space ^^ string "else" ^^ space
-              ^^ surround 2 0 lbrace
-                   (sq_separate_map hardline (codegen_instr fid ctx) else_instrs)
-                   (twice space ^^ rbrace)
+              ^^ parens (string (sgen_condition cval))
+              ^^ space ^^ codegen_branch then_instrs
+              ^^ space ^^ string "else" ^^ space ^^ codegen_branch else_instrs
         in
         twice space ^^ codegen_if cval then_instrs else_instrs
     | I_block instrs ->
-        string "  {" ^^ jump 2 2 (sq_separate_map hardline (codegen_instr fid ctx) instrs) ^^ hardline ^^ string "  }"
+        string "  {" ^^ jump 2 2 (codegen_instrs fid ctx instrs) ^^ hardline ^^ string "  }"
     | I_try_block instrs ->
         string "  { /* try */"
-        ^^ jump 2 2 (sq_separate_map hardline (codegen_instr fid ctx) instrs)
+        ^^ jump 2 2 (codegen_instrs fid ctx instrs)
         ^^ hardline ^^ string "  }"
     | I_funcall (x, extern_info, f, args) ->
         let special_extern = match extern_info with Extern _ -> true | Call _ -> false in
@@ -4259,7 +7285,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           | CR_one x -> x
           | CR_multi _ -> Reporting.unreachable l __POS__ "Multiple returns should not exist in C backend"
         in
-        let default_c_args = Util.string_of_list ", " sgen_cval args in
+        let args =
+          if erase_unit_values && not (is_variant_constructor ctx (fst f)) then
+            List.filter (fun arg -> not (ctyp_equal (cval_ctyp arg) CT_unit)) args
+          else args
+        in
+        let default_c_args = Util.string_of_list ", " sgen_cval_in_value_context args in
         let ctyp = clexp_ctyp x in
         let is_extern = ctx_is_extern (fst f) ctx || special_extern in
         let fname =
@@ -4453,27 +7484,73 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           | [left; right]
             when is_c_repr_byte_pointer (cval_ctyp left)
                  && ctyp_equal (cval_ctyp left) (cval_ctyp right) ->
-              ksprintf string "  %s = (%s)(%s - %s);" (sgen_clexp_pure l x) (sgen_ctyp ctyp)
-                (sgen_cval left) (sgen_cval right)
+              if (match x with CL_id (Return _, _) -> true | _ -> false) then
+                ksprintf string "  return (%s)(%s - %s);" (sgen_ctyp ctyp) (sgen_cval left) (sgen_cval right)
+              else
+                ksprintf string "  %s = (%s)(%s - %s);" (sgen_stack_call_destination l ctyp x) (sgen_ctyp ctyp)
+                  (sgen_cval left) (sgen_cval right)
           | _ -> c_error ~loc:l "byte-pointer difference marker with incompatible operands"
         )
         else if raw_fname = "__sail_fixed_assert" then (
-          match args with
-          | [condition] ->
-              ksprintf string "  if (!(%s)) __builtin_trap();\n  %s = UNIT;" (sgen_cval condition)
-                (sgen_clexp_pure l x)
+          let failed condition =
+            match condition with
+            | V_lit (VL_bool _, _) -> "(!(" ^ sgen_cval condition ^ "))"
+            | _ ->
+                let expression = sgen_call Bnot [condition] in
+                let length = String.length expression in
+                if length >= 2 && expression.[0] = '(' && expression.[length - 1] = ')' then expression
+                else "(" ^ expression ^ ")"
+          in
+          match (args, x) with
+          | [condition], CL_void _ ->
+              ksprintf string "  if %s {\n    __builtin_trap();\n  }" (failed condition)
+          | [condition], CL_id (Return _, _) when erase_unit_values && ctyp_equal ctyp CT_unit ->
+              ksprintf string "  if %s {\n    __builtin_trap();\n  }\n  return;" (failed condition)
+          | [condition], CL_id (Return _, _) ->
+              ksprintf string "  if %s {\n    __builtin_trap();\n  }\n  return UNIT;" (failed condition)
+          | [condition], _ when erase_unit_values && ctyp_equal ctyp CT_unit ->
+              ksprintf string "  if %s {\n    __builtin_trap();\n  }" (failed condition)
+          | [condition], _ ->
+              ksprintf string "  if %s {\n    __builtin_trap();\n  }\n  %s = UNIT;" (failed condition)
+                (sgen_stack_call_destination l ctyp x)
           | _ -> c_error ~loc:l "fixed assertion marker with bad arity"
         )
+        else if raw_fname = "fatal_error" then (
+          match args with
+          | [_] -> string (Printf.sprintf "  fatal_error(%s);" c_args)
+          | _ -> c_error ~loc:l "fatal_error with bad arity"
+        )
         else if fname = "reg_deref" then
-          if is_stack_ctyp ctx ctyp then ksprintf string "  %s = *(%s);" (sgen_clexp_pure l x) c_args
+          if (match x with CL_id (Return _, _) -> true | _ -> false) then
+            ksprintf string "  return *(%s);" c_args
+          else if is_stack_ctyp ctx ctyp then
+            ksprintf string "  %s = *(%s);" (sgen_stack_call_destination l ctyp x) c_args
           else sail_copy ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp) "&%s, *(%s)" (sgen_clexp_pure l x) c_args
+        else if (match x with CL_void _ -> true | _ -> false) then
+          string (Printf.sprintf "  %s(%s%s);" fname (extra_arguments is_extern) c_args)
+        else if erase_unit_values && ctyp_equal ctyp CT_unit then
+          if (match x with CL_id (Return _, _) -> true | _ -> false) then
+            string (Printf.sprintf "  %s(%s%s);\n  return;" fname (extra_arguments is_extern) c_args)
+          else string (Printf.sprintf "  %s(%s%s);" fname (extra_arguments is_extern) c_args)
+        else if (match x with CL_id (Return _, _) -> true | _ -> false) then
+          string (Printf.sprintf "  return %s(%s%s);" fname (extra_arguments is_extern) c_args)
         else if is_stack_ctyp ctx ctyp then
-          string (Printf.sprintf "  %s = %s(%s%s);" (sgen_clexp_pure l x) fname (extra_arguments is_extern) c_args)
+          string
+            (Printf.sprintf "  %s = %s(%s%s);" (sgen_stack_call_destination l ctyp x) fname
+               (extra_arguments is_extern) c_args
+            )
         else string (Printf.sprintf "  %s(%s%s, %s);" fname (extra_arguments is_extern) (sgen_clexp l x) c_args)
     | I_clear (ctyp, _) when is_stack_ctyp ctx ctyp -> empty
     | I_clear (ctyp, id) -> sail_kill ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp) "&%s" (sgen_name id)
     | I_init (ctyp, id, init) -> (
         match init with
+        | Init_cval cval
+          when Config.optimized_model
+               && not Config.cpp
+               && is_stack_ctyp ctx ctyp
+               && Option.is_some (stack_conversion_initializer ctyp cval) ->
+            ksprintf string "  %s %s = %s;" (sgen_ctyp ctyp) (sgen_name id)
+              (Option.get (stack_conversion_initializer ctyp cval))
         | Init_cval cval ->
             codegen_instr fid ctx (idecl l ctyp id) ^^ hardline ^^ codegen_conversion l ctx (CL_id (id, ctyp)) cval
         | Init_static VL_undefined -> ksprintf string "  static %s %s;" (sgen_ctyp ctyp) (sgen_name id)
@@ -4489,12 +7566,20 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                  (fun i acc part -> acc ^^ hardline ^^ ksprintf string "  %s[%d] = \"%s\";" name i part)
                  empty parts
       )
+    | I_reinit (ctyp, id, cval)
+      when Config.optimized_model
+           && not Config.cpp
+           && is_stack_ctyp ctx ctyp
+           && Option.is_some (stack_conversion_initializer ctyp cval) ->
+        ksprintf string "  %s %s = %s;" (sgen_ctyp ctyp) (sgen_name id)
+          (Option.get (stack_conversion_initializer ctyp cval))
     | I_reinit (ctyp, id, cval) ->
         codegen_instr fid ctx (ireset l ctyp id) ^^ hardline ^^ codegen_conversion l ctx (CL_id (id, ctyp)) cval
     | I_reset (ctyp, id) when is_stack_ctyp ctx ctyp ->
         string (Printf.sprintf "  %s %s;" (sgen_ctyp ctyp) (sgen_name id))
     | I_reset (ctyp, id) -> sail_recreate ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp) "&%s" (sgen_name id)
-    | I_return cval -> twice space ^^ c_return (string (sgen_cval cval))
+    | I_return cval when erase_unit_values && ctyp_equal (cval_ctyp cval) CT_unit -> string "  return;"
+    | I_return cval -> twice space ^^ c_return (string (sgen_cval_in_value_context cval))
     | I_throw _ -> c_error ~loc:l "I_throw reached code generator"
     | I_undefined ctyp ->
         let rec codegen_exn_return ctyp =
@@ -4503,6 +7588,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           | ctyp when is_c_repr_u320 ctyp -> ("u320_zero()", [])
           | ctyp when is_c_repr_u256 ctyp -> ("u256_zero()", [])
           | ctyp when is_c_repr_fixed_bytes ctyp -> (sprintf "%s_zero()" (sgen_ctyp_name ctyp), [])
+          | CT_unit when erase_unit_values -> ("", [])
           | CT_unit -> ("UNIT", [])
           | CT_fint width when width > 64 -> ("((__int128)INT64_C(0xdeadc0de))", [])
           | (CT_fint _ | CT_fuint _) as ctyp -> (sprintf "((%s)UINT64_C(0xdeadc0de))" (sgen_ctyp ctyp), [])
@@ -4561,7 +7647,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         let ret, prev = codegen_exn_return ctyp in
         separate_map hardline (fun str -> string ("  " ^ str)) (List.rev prev)
         ^^ hardline
-        ^^ string (Printf.sprintf "  return %s;" ret)
+        ^^ string (if erase_unit_values && ctyp_equal ctyp CT_unit then "  return;" else Printf.sprintf "  return %s;" ret)
     | I_comment str -> string ("  /* " ^ str ^ " */")
     | I_label str -> string (str ^ ": ;")
     | I_goto str -> string (Printf.sprintf "  goto %s;" str)
@@ -4570,9 +7656,310 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | I_end _ -> assert false
     | I_exit _ -> string ("  sail_match_failure(\"" ^ String.escaped (string_of_id fid) ^ "\");")
 
+  and codegen_instrs fid ctx instrs =
+    let split_simple_loop loop_label end_label instrs =
+      let rec split reversed = function
+        | I_aux (I_goto back_edge, _)
+          :: I_aux (I_label end_target, _)
+          :: rest
+          when String.equal back_edge loop_label
+               && String.equal end_target end_label ->
+            Some (List.rev reversed, rest)
+        | instr :: rest -> split (instr :: reversed) rest
+        | [] -> None
+      in
+      split [] instrs
+    in
+    let references_label target instrs =
+      List.exists
+        (fun instr ->
+          let found = ref false in
+          ignore
+            (map_instr
+               (fun (I_aux (aux, _) as sub) ->
+                 (match aux with
+                 | I_goto label | I_jump (_, label) when String.equal label target ->
+                     found := true
+                 | _ -> ()
+                 );
+                 sub
+               )
+               instr
+            );
+          !found
+        )
+        instrs
+    in
+    let split_loop_header instrs =
+      let rec split reversed = function
+        | I_aux (I_jump (condition, end_label), _) :: rest ->
+            Some (List.rev reversed, condition, end_label, rest)
+        | instr :: rest -> split (instr :: reversed) rest
+        | [] -> None
+      in
+      split [] instrs
+    in
+    let rec docs = function
+      (* A Sail [foreach] reaches JIB as a label followed by an exit jump,
+         a body, and a private back edge.  Recover that region as a C loop.
+         The loop setup and induction update remain ordinary typed JIB
+         statements, while the structured loop prevents its exit edge from
+         jumping across body-local initializers. *)
+      | (I_aux (I_label loop_label, _) as loop_instruction)
+        :: (I_aux (I_jump (exit_condition, end_label), _) as exit_jump)
+        :: tail -> (
+          match split_simple_loop loop_label end_label tail with
+          | Some (body, rest)
+            when not (references_label loop_label body)
+                 && not (references_label end_label body)
+                 && not (references_label loop_label rest)
+                 && not (references_label end_label rest) ->
+              (string "  while" ^^ space
+              ^^ parens
+                   (string
+                      (sgen_condition
+                         (V_call (Bnot, [exit_condition]))
+                      )
+                   )
+              ^^ space ^^ lbrace
+              ^^ nest 2 (hardline ^^ codegen_instrs fid ctx body)
+              ^^ hardline ^^ twice space ^^ rbrace
+              )
+              :: docs rest
+          | _ -> codegen_instr fid ctx loop_instruction :: docs (exit_jump :: tail)
+        )
+      (* JIB represents a Sail [while] as a private label, a condition
+         temporary, an exit jump, and a back edge.  When neither label is
+         referenced from the body, recover the source loop at emission time.
+         This keeps declarations inside the C loop body, so the exit edge does
+         not jump across their initializers, and removes the administrative
+         boolean temporary entirely. *)
+      | (I_aux (I_decl (CT_bool, declared), _) as declaration)
+        :: (I_aux (I_label loop_label, _) as loop_instruction)
+        :: ( I_aux
+               ( I_copy
+                   ( CL_id (assigned, assigned_ctyp),
+                     condition
+                   ),
+                 _
+               ) as condition_copy
+           )
+        :: ( I_aux
+               ( I_jump
+                   ( V_call (Bnot, [V_id (tested, tested_ctyp)]),
+                     end_label
+                   ),
+                 _
+               ) as exit_jump
+           )
+        :: tail
+        when Name.compare declared assigned = 0
+             && Name.compare declared tested = 0
+             && ctyp_equal assigned_ctyp CT_bool
+             && ctyp_equal tested_ctyp CT_bool
+             && ctyp_equal (cval_ctyp condition) CT_bool -> (
+          match split_simple_loop loop_label end_label tail with
+          | Some (body, rest)
+            when not (references_label loop_label body)
+                 && not (references_label end_label body)
+                 && not (references_label loop_label rest)
+                 && not (references_label end_label rest)
+                 && not
+                      (List.exists
+                         (fun instr -> instr_references ~read:declared ~direct:false instr)
+                         (body @ rest)) ->
+              (string "  while" ^^ space
+              ^^ parens (string (sgen_condition condition))
+              ^^ space ^^ lbrace
+              ^^ nest 2 (hardline ^^ codegen_instrs fid ctx body)
+              ^^ hardline ^^ twice space ^^ rbrace
+              )
+              :: docs rest
+          | _ ->
+              codegen_instr fid ctx declaration
+              :: docs (loop_instruction :: condition_copy :: exit_jump :: tail)
+        )
+      (* A non-trivial [while] condition can contain pure calls and short-
+         circuit control flow before its exit jump.  Keep those typed JIB
+         statements in the loop header and replace the private back edge with
+         a structured infinite loop plus [break].  The administrative result
+         declaration moves into the loop because it is not loop-carried. *)
+      | (I_aux (I_decl (CT_bool, declared), _) as declaration)
+        :: (I_aux (I_label loop_label, _) as loop_instruction)
+        :: tail -> (
+          match split_loop_header tail with
+          | Some (header, exit_condition, end_label, after_jump) -> (
+              match split_simple_loop loop_label end_label after_jump with
+              | Some (body, rest)
+                when not (references_label loop_label header)
+                     && not (references_label end_label header)
+                     && not (references_label loop_label body)
+                     && not (references_label end_label body)
+                     && not (references_label loop_label rest)
+                     && not (references_label end_label rest)
+                     && not
+                          (List.exists
+                             (fun instr ->
+                               instr_references ~read:declared ~direct:false instr
+                             )
+                             (body @ rest)
+                          ) ->
+                  (string "  while (true)" ^^ space ^^ lbrace
+                  ^^ nest 2
+                       (hardline
+                       ^^ codegen_instrs fid ctx (declaration :: header)
+                       ^^ hardline
+                       ^^ ksprintf string "  if (%s) {"
+                            (sgen_condition exit_condition)
+                       ^^ hardline ^^ string "    break;"
+                       ^^ hardline ^^ string "  }"
+                       ^^ hardline ^^ codegen_instrs fid ctx body
+                       )
+                  ^^ hardline ^^ twice space ^^ rbrace
+                  )
+                  :: docs rest
+              | _ ->
+                  codegen_instr fid ctx declaration
+                  :: docs (loop_instruction :: tail)
+            )
+          | None ->
+              codegen_instr fid ctx declaration
+              :: docs (loop_instruction :: tail)
+        )
+      (* Stack clears have no generated C representation.  Drop them before
+         matching adjacent source operations so an invisible lifetime marker
+         cannot prevent declaration/return folding.  The JIB optimizer already
+         removes these in ordinary bodies, but later specialization cleanup can
+         expose another one immediately before emission. *)
+      | instr :: I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp ->
+          docs (instr :: rest)
+      | I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp -> docs rest
+      (* [fatal_error] is the optimized model's concrete noreturn boundary.
+         Sail's following [exit(())] exists only to give the source expression
+         the required result type; JIB lowers that bridge to [I_exit].  Once
+         the fatal call is adjacent, emitting a second abort is unreachable
+         noise and obscures the intended C control flow. *)
+      | ( I_aux (I_funcall (_, _, callee, _), _) as fatal_call )
+        :: I_aux (I_exit _, _)
+        :: rest
+        when Config.optimized_model
+             && String.equal (string_of_id (fst callee)) "fatal_error" ->
+          codegen_instr fid ctx fatal_call :: docs rest
+      | I_aux (I_init (initialized_ctyp, initialized, Init_cval value), _)
+        :: I_aux (I_return (V_id (result, result_ctyp)), _)
+        :: rest
+        when Config.optimized_model
+             && not Config.cpp
+             && is_stack_ctyp ctx initialized_ctyp
+             && Name.compare initialized result = 0
+             && ctyp_equal initialized_ctyp result_ctyp
+             && Option.is_some (stack_conversion_initializer initialized_ctyp value) ->
+          ksprintf string "  return %s;"
+            (Option.get (stack_conversion_initializer initialized_ctyp value))
+          :: docs rest
+      | I_aux (I_reinit (initialized_ctyp, initialized, value), _)
+        :: I_aux (I_return (V_id (result, result_ctyp)), _)
+        :: rest
+        when Config.optimized_model
+             && not Config.cpp
+             && is_stack_ctyp ctx initialized_ctyp
+             && Name.compare initialized result = 0
+             && ctyp_equal initialized_ctyp result_ctyp
+             && Option.is_some (stack_conversion_initializer initialized_ctyp value) ->
+          ksprintf string "  return %s;"
+            (Option.get (stack_conversion_initializer initialized_ctyp value))
+          :: docs rest
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux
+             ( I_copy
+                 ( CL_id (destination, destination_ctyp),
+                   value
+                 ),
+               (_, conversion_location)
+             )
+        :: rest
+        when Config.optimized_model
+             && not Config.cpp
+             && is_c_repr_fixed_bytes declared_ctyp
+             && Name.compare declared destination = 0
+             && ctyp_equal declared_ctyp destination_ctyp
+             && (match cval_ctyp value with
+                | CT_vector (CT_fbits 8 | CT_fuint 8)
+                | CT_fvector (_, (CT_fbits 8 | CT_fuint 8)) -> true
+                | _ -> false) ->
+          (ksprintf string "  %s %s = {0};" (sgen_ctyp declared_ctyp) (sgen_name declared)
+          ^^ hardline
+          ^^ codegen_fixed_bytes_vector_conversion conversion_location
+               (CL_id (destination, destination_ctyp)) value declared_ctyp ~initialize:false
+          )
+          :: docs rest
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux (I_copy (CL_id (destination, destination_ctyp), value), _)
+        :: I_aux (I_return (V_id (result, result_ctyp)), _)
+        :: rest
+        when Config.optimized_model
+             && not Config.cpp
+             && is_stack_ctyp ctx declared_ctyp
+             && Name.compare declared destination = 0
+             && Name.compare declared result = 0
+             && ctyp_equal declared_ctyp result_ctyp
+             && stack_call_initializer_compatible declared_ctyp destination_ctyp
+             && Option.is_some (stack_conversion_initializer destination_ctyp value) ->
+          ksprintf string "  return %s;"
+            (Option.get (stack_conversion_initializer destination_ctyp value))
+          :: docs rest
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux (I_copy (CL_id (destination, destination_ctyp), value), _)
+        :: rest
+        when Config.optimized_model
+             && not Config.cpp
+             && is_stack_ctyp ctx declared_ctyp
+             && Name.compare declared destination = 0
+             && stack_call_initializer_compatible declared_ctyp destination_ctyp
+             && Option.is_some (stack_conversion_initializer destination_ctyp value) ->
+          ksprintf string "  %s %s = %s;" (sgen_ctyp declared_ctyp) (sgen_name declared)
+            (Option.get (stack_conversion_initializer destination_ctyp value))
+          :: docs rest
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: ( I_aux
+               ( I_funcall (CR_one (CL_id (destination, destination_ctyp)), _, _, _),
+                 _
+               ) as call
+           )
+        :: rest
+        when Config.optimized_model
+             && not Config.cpp
+             && is_stack_ctyp ctx declared_ctyp
+             && Name.compare declared destination = 0
+             && stack_call_initializer_compatible declared_ctyp destination_ctyp ->
+          let previous = !stack_call_initializer in
+          stack_call_initializer := Some (declared, declared_ctyp);
+          let call_doc = codegen_instr fid ctx call in
+          stack_call_initializer := previous;
+          call_doc :: docs rest
+      | instr :: rest -> codegen_instr fid ctx instr :: docs rest
+      | [] -> []
+    in
+    separate hardline (squash_empty (docs instrs))
+
+  let emit_optimized_exception_state = ref true
+
+  let static_type_helper_return return =
+    if Config.optimized_model then "static inline " ^ return else "static " ^ return
+
   let codegen_type_def ctx =
     let open Printf in
     function
+    | CTD_variant (id, _, _)
+      when Config.optimized_model
+           && not !emit_optimized_exception_state
+           && String.equal (string_of_id id) "exception" ->
+        (* Sail keeps a dummy exception union even when the model has no
+           language-level throws.  The optimized EVM model uses the explicit
+           noreturn [fatal_error] boundary and represents recoverable EVM
+           halts as ordinary data, so this otherwise contributes only dead
+           current_exception/have_exception ABI state. *)
+        []
     | CTD_abstract (id, ctyp, inst) ->
         let setter_prototype, setter =
           match inst with
@@ -4595,7 +7982,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
               ( ksprintf string "void sail_set_abstract_%s(void);" (string_of_id id),
                 c_function ~return:"void"
                   (ksprintf string "%ssail_set_abstract_%s(void)" (class_impl_prefix ()) (string_of_id id))
-                  [separate_map hardline (codegen_instr (mk_id "set_abstract") ctx) init]
+                  [codegen_instrs (mk_id "set_abstract") ctx init]
               )
         in
         [
@@ -4610,13 +7997,17 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CTD_enum (id, (first_id :: _ as ids)) ->
         let enum_name = sgen_id id in
         let enum_eq =
-          c_function ~return:"static bool"
+          c_function ~return:(static_type_helper_return "bool")
             (sail_equal enum_name "enum %s op1, enum %s op2" enum_name enum_name)
-            [c_stmt "return op1 == op2"]
+            [c_stmt "return (bool)(op1 == op2)"]
         in
         let enum_undefined =
           let name = sgen_id id in
-          string (Printf.sprintf "static enum %s UNDEFINED(%s)(unit u) { return %s; }" name name (sgen_id first_id))
+          let parameter = if Config.optimized_model then "void" else "unit u" in
+          string
+            (Printf.sprintf "%s UNDEFINED(%s)(%s) { return %s; }"
+               (static_type_helper_return ("enum " ^ name)) name parameter (sgen_id first_id)
+            )
         in
         (* Conservatively use the smallest size of int to guard specifying storage size.  This assumes C++11,
            but could also be done for C23. *)
@@ -4640,18 +8031,18 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           StaticFunctionDefinition enum_undefined;
         ]
     | CTD_enum (id, []) -> c_error ("Cannot compile empty enum " ^ string_of_id id)
-    | CTD_abbrev (_, ctyp) when Config.optimized_model && not (is_stack_ctyp ctx ctyp) ->
-        (* Transparent source aliases do not allocate storage themselves.  Do
-           not leak an otherwise-unused generic alias such as [sail_int] into
-           the fixed optimized ABI; any concrete use of it is diagnosed by
-           the representation validator before code generation. *)
+    | CTD_abbrev (_, _) when Config.optimized_model ->
+        (* Transparent source aliases do not own optimized-C type identity.
+           [$[c_repr]] selects the concrete ABI carrier; semantic aliases such
+           as [word], [hash], or [address] are erased after type checking. *)
         []
     | CTD_abbrev (id, ctyp) ->
+        let underlying = sgen_ctyp ctyp in
         [
           TypeDeclaration
             (ksprintf string "// type abbreviation %s" (string_of_id id)
             ^^ hardline
-            ^^ separate space [string "typedef"; string (sgen_ctyp ctyp); codegen_id id]
+            ^^ separate space [string "typedef"; string underlying; codegen_id id]
             ^^ semi
             );
         ]
@@ -4664,7 +8055,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           else sail_copy ~suffix:";" (sgen_ctyp_name ctyp) "&rop->%s, op.%s" (sgen_id id) (sgen_id id)
         in
         let struct_copy =
-          c_function ~return:"static void"
+          c_function ~return:(static_type_helper_return "void")
             (sail_copy struct_name "struct %s *rop, const struct %s op" struct_name struct_name)
             (List.map set_field ctors)
         in
@@ -4673,7 +8064,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           let per_field (field_id, ctyp) =
             if not (is_stack_ctyp ctx ctyp) then [f (sgen_ctyp_name ctyp) "&op->%s" (sgen_id field_id) ^^ semi] else []
           in
-          c_function ~return:"static void"
+          c_function ~return:(static_type_helper_return "void")
             (f struct_name "struct %s *op" struct_name)
             (List.concat (List.map per_field ctors))
         in
@@ -4682,9 +8073,16 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             let field = sgen_id field_id in
             codegen_equal ctyp (sprintf "op1.%s" field) (sprintf "op2.%s" field)
           in
-          c_function ~return:"static bool"
+          let equality =
+            match ctors with
+            | [(field_id, ctyp)] ->
+                let field = sgen_id field_id in
+                codegen_equal_in_bool_value ctyp (sprintf "op1.%s" field) (sprintf "op2.%s" field)
+            | _ -> string "(bool)(" ^^ separate_map (string " && ") field_eq ctors ^^ string ")"
+          in
+          c_function ~return:(static_type_helper_return "bool")
             (sail_equal (sgen_id id) "struct %s op1, struct %s op2" (sgen_id id) (sgen_id id))
-            [string "return" ^^ space ^^ separate_map (string " && ") field_eq ctors ^^ semi]
+            [string "return" ^^ space ^^ equality ^^ semi]
         in
         (* Generate the struct and add the generated functions *)
         let struct_field (id, ctyp) = string (sgen_ctyp ctyp) ^^ space ^^ codegen_id id in
@@ -4734,7 +8132,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         let codegen_init =
           let n = sgen_id id in
           let ctor_id, ctyp = List.hd tus in
-          c_function ~return:"static void" (sail_create n "struct %s *op" n)
+          c_function ~return:(static_type_helper_return "void") (sail_create n "struct %s *op" n)
             ([string (Printf.sprintf "op->kind = Kind_%s;" (sgen_id ctor_id))]
             @
             if not (is_stack_ctyp ctx ctyp) then
@@ -4744,7 +8142,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         in
         let codegen_reinit =
           let n = sgen_id id in
-          c_function ~return:"static void" (sail_recreate n "struct %s *op" n) []
+          c_function ~return:(static_type_helper_return "void") (sail_recreate n "struct %s *op" n) []
         in
         let clear_field v ctor_id ctyp =
           if is_stack_ctyp ctx ctyp then None
@@ -4752,13 +8150,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         in
         let codegen_clear =
           let n = sgen_id id in
-          c_function ~return:"static void" (sail_kill n "struct %s *op" n) [each_ctor "op->" (clear_field "op") tus]
+          c_function ~return:(static_type_helper_return "void") (sail_kill n "struct %s *op" n)
+            [each_ctor "op->" (clear_field "op") tus]
         in
         let codegen_ctor (ctor_id, ctyp) =
           let ctor_args = Printf.sprintf "%s op" (sgen_const_ctyp ctyp) in
           if Config.optimized_model && stack_variant then
             let n = sgen_id id in
-            c_function ~return:("static struct " ^ n)
+            c_function ~return:(static_type_helper_return ("struct " ^ n))
               (ksprintf string "%s(%s%s)" (sgen_function_id ctor_id) (extra_params ()) ctor_args)
               [
                 ksprintf string "struct %s result;" n;
@@ -4767,7 +8166,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                 c_return (string "result");
               ]
           else
-            c_function ~return:"static void"
+            c_function ~return:(static_type_helper_return "void")
               (ksprintf string "%s(%sstruct %s *rop, %s)" (sgen_function_id ctor_id) (extra_params ()) (sgen_id id)
                  ctor_args
               )
@@ -4793,7 +8192,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                        (sgen_id ctor_id) (sgen_id ctor_id)
               )
           in
-          c_function ~return:"static void"
+          c_function ~return:(static_type_helper_return "void")
             (sail_copy n "struct %s *rop, struct %s op" n n)
             [
               each_ctor "rop->" (clear_field "rop") tus ^^ semi;
@@ -4804,27 +8203,50 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         let codegen_eq =
           let codegen_eq_test ctor_id ctyp =
             c_return
-              (codegen_equal ctyp
+              (codegen_equal_in_bool_value ctyp
                  (sprintf "op1.variants.%s" (sgen_id ctor_id))
                  (sprintf "op2.variants.%s" (sgen_id ctor_id))
               )
           in
           let codegen_eq_tests ctors =
+            let unit_ctors, payload_ctors =
+              List.partition
+                (fun (_, ctyp) ->
+                  Config.optimized_model
+                  && !optimize_unit_results
+                  && ctyp_equal ctyp CT_unit
+                )
+                ctors
+            in
+            let payload_cases =
+              List.map
+                (fun (ctor_id, ctyp) ->
+                  (ksprintf string "Kind_%s" (sgen_id ctor_id), [codegen_eq_test ctor_id ctyp])
+                )
+                payload_ctors
+            in
+            let unit_cases =
+              match List.rev unit_ctors with
+              | [] -> []
+              | (last_ctor_id, _) :: preceding ->
+                  List.rev_map
+                    (fun (ctor_id, _) -> (ksprintf string "Kind_%s" (sgen_id ctor_id), []))
+                    preceding
+                  @ [(ksprintf string "Kind_%s" (sgen_id last_ctor_id), [c_return (string "true")])]
+            in
             c_if (ksprintf string "(op1.kind != op2.kind)") [c_return (string "false")]
+            ^^ ( match payload_cases @ unit_cases with
+               | [] -> empty
+               | cases ->
+                   hardline
+                   ^^ c_switch ~case_break:false (string "(op1.kind)") cases
+               )
             ^^ hardline
-            ^^ c_switch (string "(op1.kind)")
-                 (List.map
-                    (fun (ctor_id, ctyp) ->
-                      (ksprintf string "Kind_%s" (sgen_id ctor_id), [codegen_eq_test ctor_id ctyp])
-                    )
-                    ctors
-                 )
-            ^^ hardline
-            (* This should be unreachable. *)
             ^^ c_return (string "false")
           in
           let n = sgen_id id in
-          c_function ~return:"static bool" (sail_equal n "struct %s op1, struct %s op2" n n) [codegen_eq_tests tus]
+          c_function ~return:(static_type_helper_return "bool")
+            (sail_equal n "struct %s op1, struct %s op2" n n) [codegen_eq_tests tus]
         in
         [
           TypeDeclaration
@@ -4910,8 +8332,9 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         StaticFunctionDefinition
           (string
              {|
-static inline void sail_native_conversion_failure(const char *operation) {
-  fprintf(stderr, "Sail C backend: %s\n", operation);
+_Noreturn static inline void sail_native_conversion_failure(const char *operation) {
+  const int write_status = fprintf(stderr, "Sail C backend: %s\n", operation);
+  (void)write_status;
   exit(EXIT_FAILURE);
 }
 |}
@@ -4928,7 +8351,7 @@ static inline void sail_native_conversion_failure(const char *operation) {
           {|
 #ifndef SAIL_U128_DEFINED
 #define SAIL_U128_DEFINED
-typedef struct { uint64_t limbs[2]; } sail_u128;
+typedef struct { uint64_t limbs[2]; } u128;
 #endif
 |}
       in
@@ -4936,157 +8359,161 @@ typedef struct { uint64_t limbs[2]; } sail_u128;
         string
           {|
 
-static inline sail_u128 u128_zero(void) {
-  sail_u128 result = {{0}};
+static inline u128 u128_zero(void) {
+  u128 result = {{0}};
   return result;
 }
 
-static inline sail_u128 u128_of_u64(const uint64_t value) {
-  sail_u128 result = {{value, UINT64_C(0)}};
+static inline u128 u128_of_u64(const uint64_t value) {
+  u128 result = {{value, UINT64_C(0)}};
   return result;
 }
 
-static inline uint64_t u128_to_u64(const sail_u128 value) {
+static inline uint64_t u128_to_u64(const u128 value) {
   if (value.limbs[1] != UINT64_C(0)) {
     sail_native_conversion_failure("integer value is outside the uint64_t domain");
   }
   return value.limbs[0];
 }
 
-static inline uint64_t u128_extract_u64(const sail_u128 value, const uint64_t start) {
-  if (start >= UINT64_C(128)) return UINT64_C(0);
+static inline uint64_t u128_extract_u64(const u128 value, const uint64_t start) {
+  if (start >= UINT64_C(128)) {
+    return UINT64_C(0);
+  }
   const size_t limb = (size_t)(start >> 6);
   const unsigned offset = (unsigned)(start & UINT64_C(63));
   uint64_t result = value.limbs[limb] >> offset;
-  if (offset != 0 && limb + 1 < 2) result |= value.limbs[limb + 1] << (64 - offset);
+  if (offset != 0 && limb + 1 < 2) {
+    result |= value.limbs[limb + 1] << (64 - offset);
+  }
   return result;
 }
 
-static inline bool eq_u128(const sail_u128 lhs, const sail_u128 rhs) {
-  return lhs.limbs[0] == rhs.limbs[0] && lhs.limbs[1] == rhs.limbs[1];
+static inline bool eq_u128(const u128 op1, const u128 op2) {
+  return (bool)(op1.limbs[0] == op2.limbs[0] && op1.limbs[1] == op2.limbs[1]);
 }
 
-static inline bool u128_eq_u64(const sail_u128 lhs, const uint64_t rhs) {
-  return lhs.limbs[0] == rhs && lhs.limbs[1] == UINT64_C(0);
+static inline bool u128_eq_u64(const u128 lhs, const uint64_t rhs) {
+  return (bool)(lhs.limbs[0] == rhs && lhs.limbs[1] == UINT64_C(0));
 }
 
-static inline sail_u128 u128_not(const sail_u128 value) {
-  sail_u128 result = {{~value.limbs[0], ~value.limbs[1]}};
+static inline u128 u128_not(const u128 value) {
+  u128 result = {{~value.limbs[0], ~value.limbs[1]}};
   return result;
 }
 
-static inline sail_u128 u128_and(const sail_u128 lhs, const sail_u128 rhs) {
-  sail_u128 result = {{lhs.limbs[0] & rhs.limbs[0], lhs.limbs[1] & rhs.limbs[1]}};
+static inline u128 u128_and(const u128 lhs, const u128 rhs) {
+  u128 result = {{lhs.limbs[0] & rhs.limbs[0], lhs.limbs[1] & rhs.limbs[1]}};
   return result;
 }
 
-static inline sail_u128 u128_or(const sail_u128 lhs, const sail_u128 rhs) {
-  sail_u128 result = {{lhs.limbs[0] | rhs.limbs[0], lhs.limbs[1] | rhs.limbs[1]}};
+static inline u128 u128_or(const u128 lhs, const u128 rhs) {
+  u128 result = {{lhs.limbs[0] | rhs.limbs[0], lhs.limbs[1] | rhs.limbs[1]}};
   return result;
 }
 
-static inline sail_u128 u128_xor(const sail_u128 lhs, const sail_u128 rhs) {
-  sail_u128 result = {{lhs.limbs[0] ^ rhs.limbs[0], lhs.limbs[1] ^ rhs.limbs[1]}};
+static inline u128 u128_xor(const u128 lhs, const u128 rhs) {
+  u128 result = {{lhs.limbs[0] ^ rhs.limbs[0], lhs.limbs[1] ^ rhs.limbs[1]}};
   return result;
 }
 
-static inline bool u128_lt(const sail_u128 lhs, const sail_u128 rhs) {
-  return lhs.limbs[1] != rhs.limbs[1]
+static inline bool u128_lt(const u128 lhs, const u128 rhs) {
+  return (bool)(lhs.limbs[1] != rhs.limbs[1]
       ? lhs.limbs[1] < rhs.limbs[1]
-      : lhs.limbs[0] < rhs.limbs[0];
+      : lhs.limbs[0] < rhs.limbs[0]);
 }
 
-static inline bool u128_lt_u64(const sail_u128 lhs, const uint64_t rhs) {
-  return lhs.limbs[1] == UINT64_C(0) && lhs.limbs[0] < rhs;
+static inline bool u128_lt_u64(const u128 lhs, const uint64_t rhs) {
+  return (bool)(lhs.limbs[1] == UINT64_C(0) && lhs.limbs[0] < rhs);
 }
 
-static inline bool u64_lt_u128(const uint64_t lhs, const sail_u128 rhs) {
-  return rhs.limbs[1] != UINT64_C(0) || lhs < rhs.limbs[0];
+static inline bool u64_lt_u128(const uint64_t lhs, const u128 rhs) {
+  return (bool)(rhs.limbs[1] != UINT64_C(0) || lhs < rhs.limbs[0]);
 }
 
-static inline sail_u128 u128_add(const sail_u128 lhs, const sail_u128 rhs) {
-  sail_u128 result;
+static inline u128 u128_add(const u128 lhs, const u128 rhs) {
+  u128 result;
   result.limbs[0] = lhs.limbs[0] + rhs.limbs[0];
   result.limbs[1] = lhs.limbs[1] + rhs.limbs[1]
                   + (result.limbs[0] < lhs.limbs[0]);
   return result;
 }
 
-static inline sail_u128 u128_add_u64(const sail_u128 lhs, const uint64_t rhs) {
-  sail_u128 result = lhs;
+static inline u128 u128_add_u64(const u128 lhs, const uint64_t rhs) {
+  u128 result = lhs;
   result.limbs[0] += rhs;
   result.limbs[1] += result.limbs[0] < lhs.limbs[0];
   return result;
 }
 
-static inline sail_u128 u128_add_u64_u64(const uint64_t lhs,
+static inline u128 u128_add_u64_u64(const uint64_t lhs,
                                          const uint64_t rhs) {
-  sail_u128 result = {{lhs + rhs, lhs + rhs < lhs}};
+  u128 result = {{lhs + rhs, lhs + rhs < lhs}};
   return result;
 }
 
-static inline sail_u128 u128_sub(const sail_u128 lhs, const sail_u128 rhs) {
-  sail_u128 result;
+static inline u128 u128_sub(const u128 lhs, const u128 rhs) {
+  u128 result;
   result.limbs[0] = lhs.limbs[0] - rhs.limbs[0];
   result.limbs[1] = lhs.limbs[1] - rhs.limbs[1]
                   - (lhs.limbs[0] < rhs.limbs[0]);
   return result;
 }
 
-static inline sail_u128 u128_sub_u64(const sail_u128 lhs, const uint64_t rhs) {
-  sail_u128 result = lhs;
+static inline u128 u128_sub_u64(const u128 lhs, const uint64_t rhs) {
+  u128 result = lhs;
   result.limbs[0] -= rhs;
   result.limbs[1] -= lhs.limbs[0] < rhs;
   return result;
 }
 
-static inline uint64_t u64_sub_u128(const uint64_t lhs, const sail_u128 rhs) {
+static inline uint64_t u64_sub_u128(const uint64_t lhs, const u128 rhs) {
   return lhs - rhs.limbs[0];
 }
 
-static inline sail_u128 u128_sub_u64_u64(const uint64_t lhs,
+static inline u128 u128_sub_u64_u64(const uint64_t lhs,
                                          const uint64_t rhs) {
-  sail_u128 result = {{lhs - rhs, UINT64_C(0)}};
+  u128 result = {{lhs - rhs, UINT64_C(0)}};
   return result;
 }
 
-static inline sail_u128 u128_mul(const sail_u128 lhs, const sail_u128 rhs) {
+static inline u128 u128_mul(const u128 lhs, const u128 rhs) {
   const unsigned __int128 low = (unsigned __int128)lhs.limbs[0] * rhs.limbs[0];
-  sail_u128 result;
+  u128 result;
   result.limbs[0] = (uint64_t)low;
   result.limbs[1] = (uint64_t)(low >> 64)
-                  + lhs.limbs[0] * rhs.limbs[1]
-                  + lhs.limbs[1] * rhs.limbs[0];
+                  + (lhs.limbs[0] * rhs.limbs[1])
+                  + (lhs.limbs[1] * rhs.limbs[0]);
   return result;
 }
 
-static inline sail_u128 u128_mul_u64(const sail_u128 lhs, const uint64_t rhs) {
+static inline u128 u128_mul_u64(const u128 lhs, const uint64_t rhs) {
   const unsigned __int128 low = (unsigned __int128)lhs.limbs[0] * rhs;
-  sail_u128 result;
+  u128 result;
   result.limbs[0] = (uint64_t)low;
-  result.limbs[1] = (uint64_t)(low >> 64) + lhs.limbs[1] * rhs;
+  result.limbs[1] = (uint64_t)(low >> 64) + (lhs.limbs[1] * rhs);
   return result;
 }
 
-static inline sail_u128 u128_mul_u64_u64(const uint64_t lhs,
+static inline u128 u128_mul_u64_u64(const uint64_t lhs,
                                          const uint64_t rhs) {
   const unsigned __int128 product = (unsigned __int128)lhs * rhs;
-  sail_u128 result = {{(uint64_t)product, (uint64_t)(product >> 64)}};
+  u128 result = {{(uint64_t)product, (uint64_t)(product >> 64)}};
   return result;
 }
 
-static inline bool u128_is_zero(const sail_u128 value) {
+static inline bool u128_is_zero(const u128 value) {
   return (value.limbs[0] | value.limbs[1]) == UINT64_C(0);
 }
 
 /* Integer division helpers are emitted only for JIB operations carrying the
  * nonzero-divisor proof marker.  Do not re-check that source invariant here:
  * an unproved division remains in Sail's mathematical integer runtime. */
-static inline void u128_divrem_u64(const sail_u128 dividend,
+static inline void u128_divrem_u64(const u128 dividend,
                                    const uint64_t divisor,
-  sail_u128 *quotient,
+  u128 *quotient,
                                    uint64_t *remainder) {
-  sail_u128 q = {{0}};
+  u128 q = {{0}};
   uint64_t r = UINT64_C(0);
   q.limbs[1] = dividend.limbs[1] / divisor;
   r = dividend.limbs[1] % divisor;
@@ -5094,29 +8521,47 @@ static inline void u128_divrem_u64(const sail_u128 dividend,
       ((unsigned __int128)r << 64) | dividend.limbs[0];
   q.limbs[0] = (uint64_t)(partial / divisor);
   r = (uint64_t)(partial % divisor);
-  if (quotient != NULL) *quotient = q;
-  if (remainder != NULL) *remainder = r;
+  if (quotient != NULL) {
+    *quotient = q;
+  }
+  if (remainder != NULL) {
+    *remainder = r;
+  }
+}
+
+static inline void u128_store_divrem(const u128 quotient_value,
+                                     const u128 remainder_value,
+                                     u128 *quotient,
+                                     u128 *remainder) {
+  if (quotient != NULL) {
+    *quotient = quotient_value;
+  }
+  if (remainder != NULL) {
+    *remainder = remainder_value;
+  }
 }
 
 /* Two-limb specialization of normalized Knuth division.  Like ruint, it
  * dispatches the one-limb divisor case separately and computes at most one
  * quotient limb for a normalized two-limb divisor. */
-static inline void u128_divrem(const sail_u128 dividend,
-                               const sail_u128 divisor,
-                               sail_u128 *quotient,
-  sail_u128 *remainder) {
-  sail_u128 q = {{0}};
-  sail_u128 r = {{0}};
+static inline void u128_divrem(const u128 dividend,
+                               const u128 divisor,
+                               u128 *quotient,
+  u128 *remainder) {
+  u128 q = {{0}};
+  u128 r = {{0}};
   if (divisor.limbs[1] == UINT64_C(0)) {
     uint64_t rem = UINT64_C(0);
     u128_divrem_u64(dividend, divisor.limbs[0], &q, &rem);
     r.limbs[0] = rem;
-    goto done;
+    u128_store_divrem(q, r, quotient, remainder);
+    return;
   }
 
   if (u128_lt(dividend, divisor)) {
     r = dividend;
-    goto done;
+    u128_store_divrem(q, r, quotient, remainder);
+    return;
   }
 
   const unsigned shift = (unsigned)__builtin_clzll(divisor.limbs[1]);
@@ -5168,7 +8613,7 @@ static inline void u128_divrem(const sail_u128 dividend,
   const uint64_t borrow0 = u0 < p0_low;
   u0 -= p0_low;
 
-  const unsigned __int128 p1 = (unsigned __int128)qhat * v1
+  const unsigned __int128 p1 = ((unsigned __int128)qhat * v1)
                               + p0_high + borrow0;
   const uint64_t p1_low = (uint64_t)p1;
   const uint64_t p1_high = (uint64_t)(p1 >> 64);
@@ -5176,8 +8621,7 @@ static inline void u128_divrem(const sail_u128 dividend,
   u1 -= p1_low;
   const uint64_t top_subtrahend = p1_high + borrow1;
   const bool top_overflow = top_subtrahend < p1_high;
-  const bool negative = top_overflow || u2 < top_subtrahend;
-  u2 -= top_subtrahend;
+  const bool negative = (bool)(top_overflow || u2 < top_subtrahend);
 
   if (negative) {
     qhat--;
@@ -5195,30 +8639,28 @@ static inline void u128_divrem(const sail_u128 dividend,
     r.limbs[1] = u1 >> shift;
   }
 
-done:
-  if (quotient != NULL) *quotient = q;
-  if (remainder != NULL) *remainder = r;
+  u128_store_divrem(q, r, quotient, remainder);
 }
 
-static inline sail_u128 u128_div(const sail_u128 lhs, const sail_u128 rhs) {
-  sail_u128 result;
+static inline u128 u128_div(const u128 lhs, const u128 rhs) {
+  u128 result;
   u128_divrem(lhs, rhs, &result, NULL);
   return result;
 }
 
-static inline sail_u128 u128_mod(const sail_u128 lhs, const sail_u128 rhs) {
-  sail_u128 result;
+static inline u128 u128_mod(const u128 lhs, const u128 rhs) {
+  u128 result;
   u128_divrem(lhs, rhs, NULL, &result);
   return result;
 }
 
-static inline sail_u128 u128_div_u64(const sail_u128 lhs, const uint64_t rhs) {
-  sail_u128 result;
+static inline u128 u128_div_u64(const u128 lhs, const uint64_t rhs) {
+  u128 result;
   u128_divrem_u64(lhs, rhs, &result, NULL);
   return result;
 }
 
-static inline sail_u128 u128_mod_u64(const sail_u128 lhs, const uint64_t rhs) {
+static inline u128 u128_mod_u64(const u128 lhs, const uint64_t rhs) {
   uint64_t remainder;
   u128_divrem_u64(lhs, rhs, NULL, &remainder);
   return u128_of_u64(remainder);
@@ -5228,8 +8670,8 @@ static inline sail_u128 u128_mod_u64(const sail_u128 lhs, const uint64_t rhs) {
       let generic_sail_int_helpers =
         string
           {|
-static inline sail_u128 u128_of_sail_int(const sail_int value) {
-  sail_u128 result = {{0}};
+static inline u128 u128_of_sail_int(const sail_int value) {
+  u128 result = {{0}};
   sail_int_to_u64_array(result.limbs, 2, value);
   return result;
 }
@@ -5248,37 +8690,37 @@ static inline sail_u128 u128_of_sail_int(const sail_int value) {
           {|
 #ifndef SAIL_U128_DEFINED
 #define SAIL_U128_DEFINED
-typedef struct { uint64_t limbs[2]; } sail_u128;
+typedef struct { uint64_t limbs[2]; } u128;
 #endif
 
 #ifndef SAIL_U256_DEFINED
 #define SAIL_U256_DEFINED
-typedef struct { uint64_t limbs[4]; } sail_u256;
+typedef struct { uint64_t limbs[4]; } u256;
 #endif
 |}
       in
       let base_helpers =
         string
           {|
-static inline sail_u256 u256_zero(void) {
-  sail_u256 result = {{0}};
+static inline u256 u256_zero(void) {
+  u256 result = {{0}};
   return result;
 }
 
-static inline sail_u256 u256_of_u128(const sail_u128 value) {
-  sail_u256 result = {{value.limbs[0], value.limbs[1], UINT64_C(0), UINT64_C(0)}};
+static inline u256 u256_of_u128(const u128 value) {
+  u256 result = {{value.limbs[0], value.limbs[1], UINT64_C(0), UINT64_C(0)}};
   return result;
 }
 
-static inline sail_u128 u128_of_u256(const sail_u256 value) {
+static inline u128 u128_of_u256(const u256 value) {
   if (value.limbs[2] != UINT64_C(0) || value.limbs[3] != UINT64_C(0)) {
     sail_native_conversion_failure("integer value is outside the uint128_t domain");
   }
-  sail_u128 result = {{value.limbs[0], value.limbs[1]}};
+  u128 result = {{value.limbs[0], value.limbs[1]}};
   return result;
 }
 
-static inline uint64_t u256_to_u64(const sail_u256 value) {
+static inline uint64_t u256_to_u64(const u256 value) {
   if (value.limbs[1] != UINT64_C(0)
       || value.limbs[2] != UINT64_C(0)
       || value.limbs[3] != UINT64_C(0)) {
@@ -5287,73 +8729,94 @@ static inline uint64_t u256_to_u64(const sail_u256 value) {
   return value.limbs[0];
 }
 
-static inline bool eq_u256(const sail_u256 lhs, const sail_u256 rhs) {
-  return lhs.limbs[0] == rhs.limbs[0]
-      && lhs.limbs[1] == rhs.limbs[1]
-      && lhs.limbs[2] == rhs.limbs[2]
-      && lhs.limbs[3] == rhs.limbs[3];
+static inline bool eq_u256(const u256 op1, const u256 op2) {
+  return (bool)(op1.limbs[0] == op2.limbs[0]
+      && op1.limbs[1] == op2.limbs[1]
+      && op1.limbs[2] == op2.limbs[2]
+      && op1.limbs[3] == op2.limbs[3]);
 }
 
-static inline uint64_t u256_bit(const sail_u256 value, const int64_t index) {
-  if (index < 0 || index >= 256) return UINT64_C(0);
+static inline uint64_t u256_bit(const u256 value, const int64_t index) {
+  if (index < 0 || index >= 256) {
+    return UINT64_C(0);
+  }
   return (value.limbs[(uint64_t)index >> 6] >> ((uint64_t)index & UINT64_C(63))) & UINT64_C(1);
 }
 
-static inline uint64_t u256_extract_u64(const sail_u256 value, const uint64_t start) {
-  if (start >= UINT64_C(256)) return UINT64_C(0);
+static inline uint64_t u256_extract_u64(const u256 value, const uint64_t start) {
+  if (start >= UINT64_C(256)) {
+    return UINT64_C(0);
+  }
   const size_t limb = (size_t)(start >> 6);
   const unsigned offset = (unsigned)(start & UINT64_C(63));
   uint64_t result = value.limbs[limb] >> offset;
-  if (offset != 0 && limb + 1 < 4) result |= value.limbs[limb + 1] << (64 - offset);
+  if (offset != 0 && limb + 1 < 4) {
+    result |= value.limbs[limb + 1] << (64 - offset);
+  }
   return result;
 }
 
-static inline sail_u256 u256_update_u64(sail_u256 value, const uint64_t index,
+static inline u256 u256_update_u64(u256 value, const uint64_t index,
                                         const uint64_t bit) {
-  if (index >= UINT64_C(256)) return value;
+  if (index >= UINT64_C(256)) {
+    return value;
+  }
   const size_t limb = (size_t)(index >> 6);
   const uint64_t mask = UINT64_C(1) << (index & UINT64_C(63));
-  if ((bit & UINT64_C(1)) != 0) value.limbs[limb] |= mask;
-  else value.limbs[limb] &= ~mask;
+  if ((bit & UINT64_C(1)) != 0) {
+    value.limbs[limb] |= mask;
+  } else {
+    value.limbs[limb] &= ~mask;
+  }
   return value;
 }
 
-static inline sail_u256 u256_update_i64(sail_u256 value, const int64_t index,
+static inline u256 u256_update_i64(u256 value, const int64_t index,
                                         const uint64_t bit) {
-  if (index < INT64_C(0)) return value;
+  if (index < INT64_C(0)) {
+    return value;
+  }
   return u256_update_u64(value, (uint64_t)index, bit);
 }
 
-static inline uint64_t fast_vector_access_u256(const sail_u256 value, const int64_t index) {
+static inline uint64_t fast_vector_access_u256(const u256 value, const int64_t index) {
   return u256_bit(value, index);
 }
 
-static inline sail_u256 u256_not(const sail_u256 value) {
-  sail_u256 result;
-  for (size_t i = 0; i < 4; ++i) result.limbs[i] = ~value.limbs[i];
+static inline u256 u256_not(const u256 value) {
+  u256 result = {0};
+  for (size_t i = 0; i < 4; ++i) {
+    result.limbs[i] = ~value.limbs[i];
+  }
   return result;
 }
 
-static inline sail_u256 u256_and(const sail_u256 lhs, const sail_u256 rhs) {
-  sail_u256 result;
-  for (size_t i = 0; i < 4; ++i) result.limbs[i] = lhs.limbs[i] & rhs.limbs[i];
+static inline u256 u256_and(const u256 lhs, const u256 rhs) {
+  u256 result = {0};
+  for (size_t i = 0; i < 4; ++i) {
+    result.limbs[i] = lhs.limbs[i] & rhs.limbs[i];
+  }
   return result;
 }
 
-static inline sail_u256 u256_or(const sail_u256 lhs, const sail_u256 rhs) {
-  sail_u256 result;
-  for (size_t i = 0; i < 4; ++i) result.limbs[i] = lhs.limbs[i] | rhs.limbs[i];
+static inline u256 u256_or(const u256 lhs, const u256 rhs) {
+  u256 result = {0};
+  for (size_t i = 0; i < 4; ++i) {
+    result.limbs[i] = lhs.limbs[i] | rhs.limbs[i];
+  }
   return result;
 }
 
-static inline sail_u256 u256_xor(const sail_u256 lhs, const sail_u256 rhs) {
-  sail_u256 result;
-  for (size_t i = 0; i < 4; ++i) result.limbs[i] = lhs.limbs[i] ^ rhs.limbs[i];
+static inline u256 u256_xor(const u256 lhs, const u256 rhs) {
+  u256 result = {0};
+  for (size_t i = 0; i < 4; ++i) {
+    result.limbs[i] = lhs.limbs[i] ^ rhs.limbs[i];
+  }
   return result;
 }
 
-static inline sail_u256 u256_add(const sail_u256 lhs, const sail_u256 rhs) {
-  sail_u256 result;
+static inline u256 u256_add(const u256 lhs, const u256 rhs) {
+  u256 result = {0};
   uint64_t carry = UINT64_C(0);
   for (size_t i = 0; i < 4; ++i) {
     const uint64_t partial = lhs.limbs[i] + rhs.limbs[i];
@@ -5365,9 +8828,9 @@ static inline sail_u256 u256_add(const sail_u256 lhs, const sail_u256 rhs) {
   return result;
 }
 
-static inline sail_u256 u256_add_u128_u128(const sail_u128 lhs,
-                                           const sail_u128 rhs) {
-  sail_u256 result = {{0}};
+static inline u256 u256_add_u128_u128(const u128 lhs,
+                                           const u128 rhs) {
+  u256 result = {{0}};
   const unsigned __int128 low =
       (unsigned __int128)lhs.limbs[0] + rhs.limbs[0];
   result.limbs[0] = (uint64_t)low;
@@ -5378,9 +8841,9 @@ static inline sail_u256 u256_add_u128_u128(const sail_u128 lhs,
   return result;
 }
 
-static inline sail_u256 u256_add_u128_u64(const sail_u128 lhs,
+static inline u256 u256_add_u128_u64(const u128 lhs,
                                           const uint64_t rhs) {
-  sail_u256 result = {{0}};
+  u256 result = {{0}};
   const unsigned __int128 low = (unsigned __int128)lhs.limbs[0] + rhs;
   result.limbs[0] = (uint64_t)low;
   const unsigned __int128 high = (unsigned __int128)lhs.limbs[1] + (low >> 64);
@@ -5389,13 +8852,13 @@ static inline sail_u256 u256_add_u128_u64(const sail_u128 lhs,
   return result;
 }
 
-static inline sail_u256 u256_add_u64_u128(const uint64_t lhs,
-                                          const sail_u128 rhs) {
+static inline u256 u256_add_u64_u128(const uint64_t lhs,
+                                          const u128 rhs) {
   return u256_add_u128_u64(rhs, lhs);
 }
 
-static inline sail_u256 u256_sub(const sail_u256 lhs, const sail_u256 rhs) {
-  sail_u256 result;
+static inline u256 u256_sub(const u256 lhs, const u256 rhs) {
+  u256 result = {0};
   uint64_t borrow = UINT64_C(0);
   for (size_t i = 0; i < 4; ++i) {
     const uint64_t partial = lhs.limbs[i] - rhs.limbs[i];
@@ -5407,8 +8870,8 @@ static inline sail_u256 u256_sub(const sail_u256 lhs, const sail_u256 rhs) {
   return result;
 }
 
-static inline sail_u256 u256_mul(const sail_u256 lhs, const sail_u256 rhs) {
-  sail_u256 result = {{0}};
+static inline u256 u256_mul(const u256 lhs, const u256 rhs) {
+  u256 result = {{0}};
   for (size_t i = 0; i < 4; ++i) {
     unsigned __int128 carry = 0;
     for (size_t j = 0; i + j < 4; ++j) {
@@ -5422,15 +8885,15 @@ static inline sail_u256 u256_mul(const sail_u256 lhs, const sail_u256 rhs) {
   return result;
 }
 
-static inline sail_u256 u256_mul_u128_u128(const sail_u128 lhs,
-                                           const sail_u128 rhs) {
-  sail_u256 result = {{0}};
+static inline u256 u256_mul_u128_u128(const u128 lhs,
+                                           const u128 rhs) {
+  u256 result = {{0}};
   for (size_t i = 0; i < 2; ++i) {
     unsigned __int128 carry = 0;
     for (size_t j = 0; j < 2; ++j) {
       const size_t k = i + j;
       const unsigned __int128 sum =
-          (unsigned __int128)lhs.limbs[i] * rhs.limbs[j]
+          ((unsigned __int128)lhs.limbs[i] * rhs.limbs[j])
           + result.limbs[k] + carry;
       result.limbs[k] = (uint64_t)sum;
       carry = sum >> 64;
@@ -5440,13 +8903,13 @@ static inline sail_u256 u256_mul_u128_u128(const sail_u128 lhs,
   return result;
 }
 
-static inline sail_u256 u256_mul_u128_u64(const sail_u128 lhs,
+static inline u256 u256_mul_u128_u64(const u128 lhs,
                                           const uint64_t rhs) {
-  sail_u256 result = {{0}};
+  u256 result = {{0}};
   unsigned __int128 carry = 0;
   for (size_t i = 0; i < 2; ++i) {
     const unsigned __int128 product =
-        (unsigned __int128)lhs.limbs[i] * rhs + carry;
+        ((unsigned __int128)lhs.limbs[i] * rhs) + carry;
     result.limbs[i] = (uint64_t)product;
     carry = product >> 64;
   }
@@ -5454,66 +8917,76 @@ static inline sail_u256 u256_mul_u128_u64(const sail_u128 lhs,
   return result;
 }
 
-static inline sail_u256 u256_mul_u64_u128(const uint64_t lhs,
-                                          const sail_u128 rhs) {
+static inline u256 u256_mul_u64_u128(const uint64_t lhs,
+                                          const u128 rhs) {
   return u256_mul_u128_u64(rhs, lhs);
 }
 
-static inline bool u256_is_zero(const sail_u256 value) {
+static inline bool u256_is_zero(const u256 value) {
   return (value.limbs[0] | value.limbs[1] | value.limbs[2] | value.limbs[3])
       == UINT64_C(0);
 }
 
-static inline bool u256_lt(const sail_u256 lhs, const sail_u256 rhs) {
+static inline bool u256_lt(const u256 lhs, const u256 rhs) {
   for (size_t i = 4; i-- > 0;) {
-    if (lhs.limbs[i] != rhs.limbs[i]) return lhs.limbs[i] < rhs.limbs[i];
+    if (lhs.limbs[i] != rhs.limbs[i]) {
+      return lhs.limbs[i] < rhs.limbs[i];
+    }
   }
   return false;
 }
 
-static inline bool u256_eq_u128(const sail_u256 lhs, const sail_u128 rhs) {
-  return lhs.limbs[0] == rhs.limbs[0]
+static inline bool u256_eq_u128(const u256 lhs, const u128 rhs) {
+  return (bool)(lhs.limbs[0] == rhs.limbs[0]
       && lhs.limbs[1] == rhs.limbs[1]
       && lhs.limbs[2] == UINT64_C(0)
-      && lhs.limbs[3] == UINT64_C(0);
+      && lhs.limbs[3] == UINT64_C(0));
 }
 
-static inline bool u256_lt_u128(const sail_u256 lhs, const sail_u128 rhs) {
-  if ((lhs.limbs[2] | lhs.limbs[3]) != UINT64_C(0)) return false;
-  if (lhs.limbs[1] != rhs.limbs[1]) return lhs.limbs[1] < rhs.limbs[1];
+static inline bool u256_lt_u128(const u256 lhs, const u128 rhs) {
+  if ((lhs.limbs[2] | lhs.limbs[3]) != UINT64_C(0)) {
+    return false;
+  }
+  if (lhs.limbs[1] != rhs.limbs[1]) {
+    return lhs.limbs[1] < rhs.limbs[1];
+  }
   return lhs.limbs[0] < rhs.limbs[0];
 }
 
-static inline bool u128_lt_u256(const sail_u128 lhs, const sail_u256 rhs) {
-  if ((rhs.limbs[2] | rhs.limbs[3]) != UINT64_C(0)) return true;
-  if (lhs.limbs[1] != rhs.limbs[1]) return lhs.limbs[1] < rhs.limbs[1];
+static inline bool u128_lt_u256(const u128 lhs, const u256 rhs) {
+  if ((rhs.limbs[2] | rhs.limbs[3]) != UINT64_C(0)) {
+    return true;
+  }
+  if (lhs.limbs[1] != rhs.limbs[1]) {
+    return lhs.limbs[1] < rhs.limbs[1];
+  }
   return lhs.limbs[0] < rhs.limbs[0];
 }
 
-static inline bool u256_eq_u64(const sail_u256 lhs, const uint64_t rhs) {
-  return lhs.limbs[0] == rhs
+static inline bool u256_eq_u64(const u256 lhs, const uint64_t rhs) {
+  return (bool)(lhs.limbs[0] == rhs
       && lhs.limbs[1] == UINT64_C(0)
       && lhs.limbs[2] == UINT64_C(0)
-      && lhs.limbs[3] == UINT64_C(0);
+      && lhs.limbs[3] == UINT64_C(0));
 }
 
-static inline bool u256_lt_u64(const sail_u256 lhs, const uint64_t rhs) {
-  return lhs.limbs[1] == UINT64_C(0)
+static inline bool u256_lt_u64(const u256 lhs, const uint64_t rhs) {
+  return (bool)(lhs.limbs[1] == UINT64_C(0)
       && lhs.limbs[2] == UINT64_C(0)
       && lhs.limbs[3] == UINT64_C(0)
-      && lhs.limbs[0] < rhs;
+      && lhs.limbs[0] < rhs);
 }
 
-static inline bool u64_lt_u256(const uint64_t lhs, const sail_u256 rhs) {
-  return rhs.limbs[1] != UINT64_C(0)
+static inline bool u64_lt_u256(const uint64_t lhs, const u256 rhs) {
+  return (bool)(rhs.limbs[1] != UINT64_C(0)
       || rhs.limbs[2] != UINT64_C(0)
       || rhs.limbs[3] != UINT64_C(0)
-      || lhs < rhs.limbs[0];
+      || lhs < rhs.limbs[0]);
 }
 
-static inline sail_u256 u256_add_u64(const sail_u256 lhs,
+static inline u256 u256_add_u64(const u256 lhs,
                                      const uint64_t rhs) {
-  sail_u256 result = lhs;
+  u256 result = lhs;
   result.limbs[0] += rhs;
   uint64_t carry = result.limbs[0] < lhs.limbs[0];
   for (size_t i = 1; i < 4 && carry != UINT64_C(0); ++i) {
@@ -5524,9 +8997,9 @@ static inline sail_u256 u256_add_u64(const sail_u256 lhs,
   return result;
 }
 
-static inline sail_u256 u256_add_u128(const sail_u256 lhs,
-                                      const sail_u128 rhs) {
-  sail_u256 result = lhs;
+static inline u256 u256_add_u128(const u256 lhs,
+                                      const u128 rhs) {
+  u256 result = lhs;
   unsigned __int128 sum =
       (unsigned __int128)lhs.limbs[0] + rhs.limbs[0];
   result.limbs[0] = (uint64_t)sum;
@@ -5541,9 +9014,9 @@ static inline sail_u256 u256_add_u128(const sail_u256 lhs,
   return result;
 }
 
-static inline sail_u256 u256_sub_u64(const sail_u256 lhs,
+static inline u256 u256_sub_u64(const u256 lhs,
                                      const uint64_t rhs) {
-  sail_u256 result = lhs;
+  u256 result = lhs;
   result.limbs[0] -= rhs;
   uint64_t borrow = lhs.limbs[0] < rhs;
   for (size_t i = 1; i < 4 && borrow != UINT64_C(0); ++i) {
@@ -5554,9 +9027,9 @@ static inline sail_u256 u256_sub_u64(const sail_u256 lhs,
   return result;
 }
 
-static inline sail_u256 u256_sub_u128(const sail_u256 lhs,
-                                      const sail_u128 rhs) {
-  sail_u256 result = lhs;
+static inline u256 u256_sub_u128(const u256 lhs,
+                                      const u128 rhs) {
+  u256 result = lhs;
   const uint64_t low = lhs.limbs[0] - rhs.limbs[0];
   uint64_t borrow = lhs.limbs[0] < rhs.limbs[0];
   const uint64_t high = lhs.limbs[1] - rhs.limbs[1];
@@ -5575,9 +9048,9 @@ static inline sail_u256 u256_sub_u128(const sail_u256 lhs,
 
 /* A valid natural subtraction with a u128 minuend proves that the u256
  * subtrahend's upper limbs are zero. */
-static inline sail_u128 u128_sub_u256(const sail_u128 lhs,
-                                      const sail_u256 rhs) {
-  sail_u128 result;
+static inline u128 u128_sub_u256(const u128 lhs,
+                                      const u256 rhs) {
+  u128 result;
   result.limbs[0] = lhs.limbs[0] - rhs.limbs[0];
   const uint64_t borrow = lhs.limbs[0] < rhs.limbs[0];
   result.limbs[1] = lhs.limbs[1] - rhs.limbs[1] - borrow;
@@ -5588,44 +9061,46 @@ static inline sail_u128 u128_sub_u256(const sail_u128 lhs,
  * u64 - u256 call site.  The helper only expresses the selected C
  * representation; it does not add a second runtime semantics. */
 static inline uint64_t u64_sub_u256(const uint64_t lhs,
-                                    const sail_u256 rhs) {
+                                    const u256 rhs) {
   return lhs - rhs.limbs[0];
 }
 
-static inline sail_u256 u256_mul_u64(const sail_u256 lhs,
+static inline u256 u256_mul_u64(const u256 lhs,
                                      const uint64_t rhs) {
-  sail_u256 result = {{0}};
+  u256 result = {{0}};
   unsigned __int128 carry = 0;
   for (size_t i = 0; i < 4; ++i) {
     const unsigned __int128 product =
-        (unsigned __int128)lhs.limbs[i] * rhs + carry;
+        ((unsigned __int128)lhs.limbs[i] * rhs) + carry;
     result.limbs[i] = (uint64_t)product;
     carry = product >> 64;
   }
   return result;
 }
 
-static inline sail_u256 u256_mul_u128(const sail_u256 lhs,
-                                      const sail_u128 rhs) {
-  sail_u256 result = {{0}};
+static inline u256 u256_mul_u128(const u256 lhs,
+                                      const u128 rhs) {
+  u256 result = {{0}};
   for (size_t i = 0; i < 4; ++i) {
     unsigned __int128 carry = 0;
     for (size_t j = 0; j < 2 && i + j < 4; ++j) {
       const size_t k = i + j;
       const unsigned __int128 sum =
-          (unsigned __int128)lhs.limbs[i] * rhs.limbs[j]
+          ((unsigned __int128)lhs.limbs[i] * rhs.limbs[j])
           + result.limbs[k] + carry;
       result.limbs[k] = (uint64_t)sum;
       carry = sum >> 64;
     }
-    if (i + 2 < 4) result.limbs[i + 2] = (uint64_t)carry;
+    if (i + 2 < 4) {
+      result.limbs[i + 2] = (uint64_t)carry;
+    }
   }
   return result;
 }
 
-static inline sail_u256 u256_div_u64(const sail_u256 dividend,
+static inline u256 u256_div_u64(const u256 dividend,
                                      const uint64_t divisor) {
-  sail_u256 quotient = {{0}};
+  u256 quotient = {{0}};
   uint64_t remainder = UINT64_C(0);
   for (size_t i = 4; i-- > 0;) {
     const unsigned __int128 partial =
@@ -5636,9 +9111,9 @@ static inline sail_u256 u256_div_u64(const sail_u256 dividend,
   return quotient;
 }
 
-static inline sail_u256 u256_mod_u64(const sail_u256 dividend,
+static inline u256 u256_mod_u64(const u256 dividend,
                                      const uint64_t divisor) {
-  sail_u256 result = {{0}};
+  u256 result = {{0}};
   uint64_t remainder = UINT64_C(0);
   for (size_t i = 4; i-- > 0;) {
     const unsigned __int128 partial =
@@ -5651,7 +9126,9 @@ static inline sail_u256 u256_mod_u64(const sail_u256 dividend,
 
 static inline size_t u256_significant_words(const uint64_t *value,
                                             size_t count) {
-  while (count != 0 && value[count - 1] == UINT64_C(0)) count--;
+  while (count != 0 && value[count - 1] == UINT64_C(0)) {
+    count--;
+  }
   return count;
 }
 
@@ -5672,14 +9149,25 @@ static inline void u256_divrem_words(const uint64_t *numerator,
   const size_t un = u256_significant_words(numerator, numerator_count);
   const size_t vn = u256_significant_words(divisor, 4);
 
-  if (quotient != NULL)
-    for (size_t i = 0; i < 8; ++i) quotient[i] = UINT64_C(0);
-  if (remainder != NULL)
-    for (size_t i = 0; i < 4; ++i) remainder[i] = UINT64_C(0);
-  if (un == 0) return;
+  if (quotient != NULL) {
+    for (size_t i = 0; i < 8; ++i) {
+      quotient[i] = UINT64_C(0);
+    }
+  }
+  if (remainder != NULL) {
+    for (size_t i = 0; i < 4; ++i) {
+      remainder[i] = UINT64_C(0);
+    }
+  }
+  if (un == 0) {
+    return;
+  }
   if (un < vn) {
-    if (remainder != NULL)
-      for (size_t i = 0; i < un; ++i) remainder[i] = numerator[i];
+    if (remainder != NULL) {
+      for (size_t i = 0; i < un; ++i) {
+        remainder[i] = numerator[i];
+      }
+    }
     return;
   }
 
@@ -5688,18 +9176,25 @@ static inline void u256_divrem_words(const uint64_t *numerator,
     for (size_t i = un; i-- > 0;) {
       const unsigned __int128 partial =
           ((unsigned __int128)rem << 64) | numerator[i];
-      if (quotient != NULL)
+      if (quotient != NULL) {
         quotient[i] = (uint64_t)(partial / divisor[0]);
+      }
       rem = (uint64_t)(partial % divisor[0]);
     }
-    if (remainder != NULL) remainder[0] = rem;
+    if (remainder != NULL) {
+      remainder[0] = rem;
+    }
     return;
   }
 
   const unsigned shift = u256_leading_zeros(divisor[vn - 1]);
   if (shift == 0) {
-    for (size_t i = 0; i < vn; ++i) v[i] = divisor[i];
-    for (size_t i = 0; i < un; ++i) u[i] = numerator[i];
+    for (size_t i = 0; i < vn; ++i) {
+      v[i] = divisor[i];
+    }
+    for (size_t i = 0; i < un; ++i) {
+      u[i] = numerator[i];
+    }
   } else {
     uint64_t carry = UINT64_C(0);
     for (size_t i = 0; i < vn; ++i) {
@@ -5745,7 +9240,7 @@ static inline void u256_divrem_words(const uint64_t *numerator,
     uint64_t borrow = UINT64_C(0);
     for (size_t i = 0; i < vn; ++i) {
       const unsigned __int128 product =
-          (unsigned __int128)qhat * v[i] + borrow;
+          ((unsigned __int128)qhat * v[i]) + borrow;
       const uint64_t low = (uint64_t)product;
       borrow = (uint64_t)(product >> 64) + (u[j + i] < low);
       u[j + i] -= low;
@@ -5764,45 +9259,55 @@ static inline void u256_divrem_words(const uint64_t *numerator,
       }
       u[j + vn] += carry;
     }
-    if (quotient != NULL) quotient[j] = qhat;
+    if (quotient != NULL) {
+      quotient[j] = qhat;
+    }
   }
 
   if (remainder != NULL) {
     if (shift == 0) {
-      for (size_t i = 0; i < vn; ++i) remainder[i] = u[i];
+      for (size_t i = 0; i < vn; ++i) {
+        remainder[i] = u[i];
+      }
     } else {
       for (size_t i = 0; i < vn; ++i) {
         remainder[i] = u[i] >> shift;
-        if (i + 1 < vn) remainder[i] |= u[i + 1] << (64 - shift);
+        if (i + 1 < vn) {
+          remainder[i] |= u[i + 1] << (64 - shift);
+        }
       }
     }
   }
 }
 
-static inline sail_u256 u256_div_u128(const sail_u256 dividend,
-                                      const sail_u128 divisor) {
-  sail_u256 result = {{0}};
+static inline u256 u256_div_u128(const u256 dividend,
+                                      const u128 divisor) {
+  u256 result = {{0}};
   const uint64_t words[4] = {
       divisor.limbs[0], divisor.limbs[1], UINT64_C(0), UINT64_C(0)};
   uint64_t quotient[8] = {0};
   u256_divrem_words(dividend.limbs, 4, words, quotient, NULL);
-  for (size_t i = 0; i < 4; ++i) result.limbs[i] = quotient[i];
+  for (size_t i = 0; i < 4; ++i) {
+    result.limbs[i] = quotient[i];
+  }
   return result;
 }
 
-static inline sail_u256 u256_mod_u128(const sail_u256 dividend,
-                                      const sail_u128 divisor) {
-  sail_u256 result = {{0}};
+static inline u256 u256_mod_u128(const u256 dividend,
+                                      const u128 divisor) {
+  u256 result = {{0}};
   const uint64_t words[4] = {
       divisor.limbs[0], divisor.limbs[1], UINT64_C(0), UINT64_C(0)};
   u256_divrem_words(dividend.limbs, 4, words, NULL, result.limbs);
   return result;
 }
 
-static inline sail_u128 u128_div_u256(const sail_u128 dividend,
-                                      const sail_u256 divisor) {
-  sail_u128 result = {{0}};
-  if ((divisor.limbs[2] | divisor.limbs[3]) != UINT64_C(0)) return result;
+static inline u128 u128_div_u256(const u128 dividend,
+                                      const u256 divisor) {
+  u128 result = {{0}};
+  if ((divisor.limbs[2] | divisor.limbs[3]) != UINT64_C(0)) {
+    return result;
+  }
   uint64_t quotient[8] = {0};
   u256_divrem_words(dividend.limbs, 2, divisor.limbs, quotient, NULL);
   result.limbs[0] = quotient[0];
@@ -5810,35 +9315,39 @@ static inline sail_u128 u128_div_u256(const sail_u128 dividend,
   return result;
 }
 
-static inline sail_u128 u128_mod_u256(const sail_u128 dividend,
-                                      const sail_u256 divisor) {
-  if ((divisor.limbs[2] | divisor.limbs[3]) != UINT64_C(0)) return dividend;
+static inline u128 u128_mod_u256(const u128 dividend,
+                                      const u256 divisor) {
+  if ((divisor.limbs[2] | divisor.limbs[3]) != UINT64_C(0)) {
+    return dividend;
+  }
   uint64_t remainder[4] = {0};
   u256_divrem_words(dividend.limbs, 2, divisor.limbs, NULL, remainder);
-  sail_u128 result = {{remainder[0], remainder[1]}};
+  u128 result = {{remainder[0], remainder[1]}};
   return result;
 }
 
-static inline sail_u256 u256_div(const sail_u256 dividend,
-                                 const sail_u256 divisor) {
-  sail_u256 result = {{0}};
+static inline u256 u256_div(const u256 dividend,
+                                 const u256 divisor) {
+  u256 result = {{0}};
   uint64_t quotient[8] = {0};
   u256_divrem_words(dividend.limbs, 4, divisor.limbs, quotient, NULL);
-  for (size_t i = 0; i < 4; ++i) result.limbs[i] = quotient[i];
+  for (size_t i = 0; i < 4; ++i) {
+    result.limbs[i] = quotient[i];
+  }
   return result;
 }
 
-static inline sail_u256 u256_mod(const sail_u256 dividend,
-                                 const sail_u256 divisor) {
-  sail_u256 result = {{0}};
+static inline u256 u256_mod(const u256 dividend,
+                                 const u256 divisor) {
+  u256 result = {{0}};
   u256_divrem_words(dividend.limbs, 4, divisor.limbs, NULL, result.limbs);
   return result;
 }
 
-static inline sail_u256 u256_addmod(const sail_u256 lhs,
-                                    const sail_u256 rhs,
-                                    const sail_u256 modulus) {
-  sail_u256 result = {{0}};
+static inline u256 u256_addmod(const u256 lhs,
+                                    const u256 rhs,
+                                    const u256 modulus) {
+  u256 result = {{0}};
   uint64_t sum[5] = {0};
   uint64_t carry = UINT64_C(0);
   for (size_t i = 0; i < 4; ++i) {
@@ -5848,36 +9357,40 @@ static inline sail_u256 u256_addmod(const sail_u256 lhs,
     carry = (uint64_t)(wide >> 64);
   }
   sum[4] = carry;
-  if (!u256_is_zero(modulus))
+  if (!u256_is_zero(modulus)) {
     u256_divrem_words(sum, 5, modulus.limbs, NULL, result.limbs);
+  }
   return result;
 }
 
-static inline sail_u256 u256_mulmod(const sail_u256 lhs,
-                                    const sail_u256 rhs,
-                                    const sail_u256 modulus) {
-  sail_u256 result = {{0}};
+static inline u256 u256_mulmod(const u256 lhs,
+                                    const u256 rhs,
+                                    const u256 modulus) {
+  u256 result = {{0}};
   uint64_t product[8] = {0};
   for (size_t i = 0; i < 4; ++i) {
     uint64_t carry = UINT64_C(0);
     for (size_t j = 0; j < 4; ++j) {
       const size_t k = i + j;
       const unsigned __int128 wide =
-          (unsigned __int128)lhs.limbs[i] * rhs.limbs[j]
+          ((unsigned __int128)lhs.limbs[i] * rhs.limbs[j])
           + product[k] + carry;
       product[k] = (uint64_t)wide;
       carry = (uint64_t)(wide >> 64);
     }
     product[i + 4] = carry;
   }
-  if (!u256_is_zero(modulus))
+  if (!u256_is_zero(modulus)) {
     u256_divrem_words(product, 8, modulus.limbs, NULL, result.limbs);
+  }
   return result;
 }
 
-static inline sail_u256 u256_shiftl_u64(const sail_u256 value, const uint64_t amount) {
-  sail_u256 result = {{0}};
-  if (amount >= UINT64_C(256)) return result;
+static inline u256 u256_shiftl_u64(const u256 value, const uint64_t amount) {
+  u256 result = {{0}};
+  if (amount >= UINT64_C(256)) {
+    return result;
+  }
   const size_t words = (size_t)(amount >> 6);
   const unsigned bits = (unsigned)(amount & UINT64_C(63));
   for (size_t dst = 4; dst-- > words;) {
@@ -5889,9 +9402,11 @@ static inline sail_u256 u256_shiftl_u64(const sail_u256 value, const uint64_t am
   return result;
 }
 
-static inline sail_u256 u256_shiftr_u64(const sail_u256 value, const uint64_t amount) {
-  sail_u256 result = {{0}};
-  if (amount >= UINT64_C(256)) return result;
+static inline u256 u256_shiftr_u64(const u256 value, const uint64_t amount) {
+  u256 result = {{0}};
+  if (amount >= UINT64_C(256)) {
+    return result;
+  }
   const size_t words = (size_t)(amount >> 6);
   const unsigned bits = (unsigned)(amount & UINT64_C(63));
   for (size_t dst = 0; dst + words < 4; ++dst) {
@@ -5903,8 +9418,10 @@ static inline sail_u256 u256_shiftr_u64(const sail_u256 value, const uint64_t am
   return result;
 }
 
-static inline sail_u256 u256_arith_shiftr_u64(const sail_u256 value, const uint64_t amount) {
-  if ((value.limbs[3] >> 63) == 0) return u256_shiftr_u64(value, amount);
+static inline u256 u256_arith_shiftr_u64(const u256 value, const uint64_t amount) {
+  if ((value.limbs[3] >> 63) == 0) {
+    return u256_shiftr_u64(value, amount);
+  }
   return u256_not(u256_shiftr_u64(u256_not(value), amount));
 }
 
@@ -5912,20 +9429,20 @@ static inline uint64_t u256_abs_i64(const int64_t amount) {
   return amount < 0 ? (uint64_t)(-(amount + 1)) + UINT64_C(1) : (uint64_t)amount;
 }
 
-static inline sail_u256 u256_shiftl_i64(const sail_u256 value, const int64_t amount) {
+static inline u256 u256_shiftl_i64(const u256 value, const int64_t amount) {
   return u256_shiftl_u64(value, u256_abs_i64(amount));
 }
 
-static inline sail_u256 u256_shiftr_i64(const sail_u256 value, const int64_t amount) {
+static inline u256 u256_shiftr_i64(const u256 value, const int64_t amount) {
   return u256_shiftr_u64(value, u256_abs_i64(amount));
 }
 
-static inline sail_u256 u256_arith_shiftr_i64(const sail_u256 value, const int64_t amount) {
+static inline u256 u256_arith_shiftr_i64(const u256 value, const int64_t amount) {
   return u256_arith_shiftr_u64(value, u256_abs_i64(amount));
 }
 
-static inline sail_u256 u256_of_fbits(const uint64_t value) {
-  sail_u256 result = {{0}};
+static inline u256 u256_of_fbits(const uint64_t value) {
+  u256 result = {{0}};
   result.limbs[0] = value;
   return result;
 }
@@ -5934,7 +9451,7 @@ static inline sail_u256 u256_of_fbits(const uint64_t value) {
       let string_helpers =
         string
           {|
-static inline void string_of_u256(sail_string *result, const sail_u256 value) {
+static inline void string_of_u256(sail_string *result, const u256 value) {
   sail_free(*result);
   const int bytes = asprintf(
       result,
@@ -5949,17 +9466,17 @@ static inline void string_of_u256(sail_string *result, const sail_u256 value) {
       let generic_lbits_helpers =
         string
           {|
-static inline sail_u256 u256_of_lbits(const lbits value) {
-  sail_u256 result = {{0}};
+static inline u256 u256_of_lbits(const lbits value) {
+  u256 result = {{0}};
   sail_lbits_to_u64_array(result.limbs, 4, value);
   return result;
 }
 
-static inline void lbits_of_u256(lbits *result, const sail_u256 value) {
+static inline void lbits_of_u256(lbits *result, const u256 value) {
   sail_lbits_from_u64_array(result, value.limbs, 4, UINT64_C(256));
 }
 
-static inline void decimal_string_of_u256(sail_string *result, const sail_u256 value) {
+static inline void decimal_string_of_u256(sail_string *result, const u256 value) {
   lbits bits;
   CREATE(lbits)(&bits);
   lbits_of_u256(&bits, value);
@@ -5971,41 +9488,41 @@ static inline void decimal_string_of_u256(sail_string *result, const sail_u256 v
       let generic_sail_int_helpers =
         string
           {|
-static inline sail_u256 undefined_u256(const sail_int len) {
+static inline u256 undefined_u256(const sail_int len) {
   (void)len;
   return u256_zero();
 }
 
-static inline uint64_t vector_access_u256(const sail_u256 value, const sail_int index) {
+static inline uint64_t vector_access_u256(const u256 value, const sail_int index) {
   return u256_bit(value, (int64_t)sail_int_get_ui(index));
 }
 
-static inline sail_u256 u256_shiftl(const sail_u256 value, const sail_int amount) {
+static inline u256 u256_shiftl(const u256 value, const sail_int amount) {
   return u256_shiftl_u64(value, sail_int_get_ui(amount));
 }
 
-static inline sail_u256 u256_shiftr(const sail_u256 value, const sail_int amount) {
+static inline u256 u256_shiftr(const u256 value, const sail_int amount) {
   return u256_shiftr_u64(value, sail_int_get_ui(amount));
 }
 
-static inline sail_u256 u256_arith_shiftr(const sail_u256 value, const sail_int amount) {
+static inline u256 u256_arith_shiftr(const u256 value, const sail_int amount) {
   return u256_arith_shiftr_u64(value, sail_int_get_ui(amount));
 }
 
-static inline void u256_unsigned(sail_int *result, const sail_u256 value) {
+static inline void u256_unsigned(sail_int *result, const u256 value) {
   sail_int_from_u64_array(result, value.limbs, 4);
 }
 
-static inline void u128_unsigned(sail_int *result, const sail_u128 value) {
+static inline void u128_unsigned(sail_int *result, const u128 value) {
   sail_int_from_u64_array(result, value.limbs, 2);
 }
 
-static inline void u256_signed(sail_int *result, const sail_u256 value) {
+static inline void u256_signed(sail_int *result, const u256 value) {
   sail_int_from_twos_complement_u64_array(result, value.limbs, 4);
 }
 
-static inline sail_u256 u256_of_sail_int(const sail_int value) {
-  sail_u256 result = {{0}};
+static inline u256 u256_of_sail_int(const sail_int value) {
+  u256 result = {{0}};
   sail_int_to_u64_array(result.limbs, 4, value);
   return result;
 }
@@ -6029,47 +9546,47 @@ static inline sail_u256 u256_of_sail_int(const sail_int value) {
           {|
 #ifndef SAIL_U128_DEFINED
 #define SAIL_U128_DEFINED
-typedef struct { uint64_t limbs[2]; } sail_u128;
+typedef struct { uint64_t limbs[2]; } u128;
 #endif
 
 #ifndef SAIL_U256_DEFINED
 #define SAIL_U256_DEFINED
-typedef struct { uint64_t limbs[4]; } sail_u256;
+typedef struct { uint64_t limbs[4]; } u256;
 #endif
 
 #ifndef SAIL_U320_DEFINED
 #define SAIL_U320_DEFINED
-typedef struct { uint64_t limbs[5]; } sail_u320;
+typedef struct { uint64_t limbs[5]; } u320;
 #endif
 |}
       in
       let base_helpers =
         string
           {|
-static inline sail_u320 u320_zero(void) {
-  sail_u320 result = {{0}};
+static inline u320 u320_zero(void) {
+  u320 result = {{0}};
   return result;
 }
 
-static inline sail_u320 u320_of_u64(const uint64_t value) {
-  sail_u320 result = {{value, UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(0)}};
+static inline u320 u320_of_u64(const uint64_t value) {
+  u320 result = {{value, UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(0)}};
   return result;
 }
 
-static inline sail_u320 u320_of_u128(const sail_u128 value) {
-  sail_u320 result = {{
+static inline u320 u320_of_u128(const u128 value) {
+  u320 result = {{
       value.limbs[0], value.limbs[1], UINT64_C(0), UINT64_C(0), UINT64_C(0)}};
   return result;
 }
 
-static inline sail_u320 u320_of_u256(const sail_u256 value) {
-  sail_u320 result = {{
+static inline u320 u320_of_u256(const u256 value) {
+  u320 result = {{
       value.limbs[0], value.limbs[1], value.limbs[2], value.limbs[3],
       UINT64_C(0)}};
   return result;
 }
 
-static inline uint64_t u320_to_u64(const sail_u320 value) {
+static inline uint64_t u320_to_u64(const u320 value) {
   if ((value.limbs[1] | value.limbs[2] | value.limbs[3] | value.limbs[4])
       != UINT64_C(0)) {
     sail_native_conversion_failure("integer value is outside the uint64_t domain");
@@ -6077,39 +9594,43 @@ static inline uint64_t u320_to_u64(const sail_u320 value) {
   return value.limbs[0];
 }
 
-static inline sail_u128 u128_of_u320(const sail_u320 value) {
+static inline u128 u128_of_u320(const u320 value) {
   if ((value.limbs[2] | value.limbs[3] | value.limbs[4]) != UINT64_C(0)) {
     sail_native_conversion_failure("integer value is outside the uint128_t domain");
   }
-  sail_u128 result = {{value.limbs[0], value.limbs[1]}};
+  u128 result = {{value.limbs[0], value.limbs[1]}};
   return result;
 }
 
-static inline sail_u256 u256_of_u320(const sail_u320 value) {
+static inline u256 u256_of_u320(const u320 value) {
   if (value.limbs[4] != UINT64_C(0)) {
     sail_native_conversion_failure("integer value is outside the uint256_t domain");
   }
-  sail_u256 result = {{
+  u256 result = {{
       value.limbs[0], value.limbs[1], value.limbs[2], value.limbs[3]}};
   return result;
 }
 
-static inline bool eq_u320(const sail_u320 lhs, const sail_u320 rhs) {
+static inline bool eq_u320(const u320 lhs, const u320 rhs) {
   for (size_t i = 0; i < 5; ++i) {
-    if (lhs.limbs[i] != rhs.limbs[i]) return false;
+    if (lhs.limbs[i] != rhs.limbs[i]) {
+      return false;
+    }
   }
   return true;
 }
 
-static inline bool u320_lt(const sail_u320 lhs, const sail_u320 rhs) {
+static inline bool u320_lt(const u320 lhs, const u320 rhs) {
   for (size_t i = 5; i-- > 0;) {
-    if (lhs.limbs[i] != rhs.limbs[i]) return lhs.limbs[i] < rhs.limbs[i];
+    if (lhs.limbs[i] != rhs.limbs[i]) {
+      return lhs.limbs[i] < rhs.limbs[i];
+    }
   }
   return false;
 }
 
-static inline sail_u320 u320_add(const sail_u320 lhs, const sail_u320 rhs) {
-  sail_u320 result;
+static inline u320 u320_add(const u320 lhs, const u320 rhs) {
+  u320 result = {0};
   uint64_t carry = UINT64_C(0);
   for (size_t i = 0; i < 5; ++i) {
     const unsigned __int128 sum =
@@ -6120,8 +9641,8 @@ static inline sail_u320 u320_add(const sail_u320 lhs, const sail_u320 rhs) {
   return result;
 }
 
-static inline sail_u320 u320_sub(const sail_u320 lhs, const sail_u320 rhs) {
-  sail_u320 result;
+static inline u320 u320_sub(const u320 lhs, const u320 rhs) {
+  u320 result = {0};
   uint64_t borrow = UINT64_C(0);
   for (size_t i = 0; i < 5; ++i) {
     const uint64_t partial = lhs.limbs[i] - rhs.limbs[i];
@@ -6133,14 +9654,14 @@ static inline sail_u320 u320_sub(const sail_u320 lhs, const sail_u320 rhs) {
   return result;
 }
 
-static inline sail_u320 u320_mul(const sail_u320 lhs, const sail_u320 rhs) {
-  sail_u320 result = {{0}};
+static inline u320 u320_mul(const u320 lhs, const u320 rhs) {
+  u320 result = {{0}};
   for (size_t i = 0; i < 5; ++i) {
     unsigned __int128 carry = 0;
     for (size_t j = 0; i + j < 5; ++j) {
       const size_t k = i + j;
       const unsigned __int128 sum =
-          (unsigned __int128)lhs.limbs[i] * rhs.limbs[j]
+          ((unsigned __int128)lhs.limbs[i] * rhs.limbs[j])
           + result.limbs[k] + carry;
       result.limbs[k] = (uint64_t)sum;
       carry = sum >> 64;
@@ -6149,13 +9670,13 @@ static inline sail_u320 u320_mul(const sail_u320 lhs, const sail_u320 rhs) {
   return result;
 }
 
-static inline sail_u320 u320_identity(const sail_u320 value) {
+static inline u320 u320_identity(const u320 value) {
   return value;
 }
 
-static inline sail_u320 u320_add_scalar(
-    const sail_u320 lhs, const uint64_t rhs) {
-  sail_u320 result = lhs;
+static inline u320 u320_add_scalar(
+    const u320 lhs, const uint64_t rhs) {
+  u320 result = lhs;
   unsigned __int128 sum = (unsigned __int128)result.limbs[0] + rhs;
   result.limbs[0] = (uint64_t)sum;
   uint64_t carry = (uint64_t)(sum >> 64);
@@ -6167,13 +9688,13 @@ static inline sail_u320 u320_add_scalar(
   return result;
 }
 
-static inline sail_u320 u320_mul_scalar(
-    const sail_u320 lhs, const uint64_t rhs) {
-  sail_u320 result;
+static inline u320 u320_mul_scalar(
+    const u320 lhs, const uint64_t rhs) {
+  u320 result = {0};
   unsigned __int128 carry = 0;
   for (size_t i = 0; i < 5; ++i) {
     const unsigned __int128 product =
-        (unsigned __int128)lhs.limbs[i] * rhs + carry;
+        ((unsigned __int128)lhs.limbs[i] * rhs) + carry;
     result.limbs[i] = (uint64_t)product;
     carry = product >> 64;
   }
@@ -6188,16 +9709,16 @@ static inline sail_u320 u320_mul_scalar(
  */
 #define U320_SELECT_RHS(stem, rhs) \
   _Generic((rhs), \
-      sail_u320: stem##_u320, \
-      sail_u256: stem##_u256, \
-      sail_u128: stem##_u128, \
+      u320: stem##_u320, \
+      u256: stem##_u256, \
+      u128: stem##_u128, \
       default: stem##_u64)
 
 #define U320_SELECT_BINARY(operation, lhs, rhs) \
   _Generic((lhs), \
-      sail_u320: U320_SELECT_RHS(u320_##operation##_u320, rhs), \
-      sail_u256: U320_SELECT_RHS(u320_##operation##_u256, rhs), \
-      sail_u128: U320_SELECT_RHS(u320_##operation##_u128, rhs), \
+      u320: U320_SELECT_RHS(u320_##operation##_u320, rhs), \
+      u256: U320_SELECT_RHS(u320_##operation##_u256, rhs), \
+      u128: U320_SELECT_RHS(u320_##operation##_u128, rhs), \
       default: U320_SELECT_RHS(u320_##operation##_u64, rhs))
 
 #define u320_add_widen(lhs, rhs) \
@@ -6206,188 +9727,188 @@ static inline sail_u320 u320_mul_scalar(
 #define u320_mul_widen(lhs, rhs) \
   U320_SELECT_BINARY(mul, lhs, rhs)((lhs), (rhs))
 
-static inline sail_u320 u320_add_u320_u320(
-    const sail_u320 lhs, const sail_u320 rhs) {
+static inline u320 u320_add_u320_u320(
+    const u320 lhs, const u320 rhs) {
   return u320_add(lhs, rhs);
 }
 
-static inline sail_u320 u320_add_u320_u256(
-    const sail_u320 lhs, const sail_u256 rhs) {
+static inline u320 u320_add_u320_u256(
+    const u320 lhs, const u256 rhs) {
   return u320_add(lhs, u320_of_u256(rhs));
 }
 
-static inline sail_u320 u320_add_u320_u128(
-    const sail_u320 lhs, const sail_u128 rhs) {
+static inline u320 u320_add_u320_u128(
+    const u320 lhs, const u128 rhs) {
   return u320_add(lhs, u320_of_u128(rhs));
 }
 
-static inline sail_u320 u320_add_u320_u64(
-    const sail_u320 lhs, const uint64_t rhs) {
+static inline u320 u320_add_u320_u64(
+    const u320 lhs, const uint64_t rhs) {
   return u320_add_scalar(lhs, rhs);
 }
 
-static inline sail_u320 u320_add_u256_u320(
-    const sail_u256 lhs, const sail_u320 rhs) {
+static inline u320 u320_add_u256_u320(
+    const u256 lhs, const u320 rhs) {
   return u320_add(rhs, u320_of_u256(lhs));
 }
 
-static inline sail_u320 u320_add_u256_u256(
-    const sail_u256 lhs, const sail_u256 rhs) {
+static inline u320 u320_add_u256_u256(
+    const u256 lhs, const u256 rhs) {
   return u320_add(u320_of_u256(lhs), u320_of_u256(rhs));
 }
 
-static inline sail_u320 u320_add_u256_u128(
-    const sail_u256 lhs, const sail_u128 rhs) {
+static inline u320 u320_add_u256_u128(
+    const u256 lhs, const u128 rhs) {
   return u320_add(u320_of_u256(lhs), u320_of_u128(rhs));
 }
 
-static inline sail_u320 u320_add_u128_u256(
-    const sail_u128 lhs, const sail_u256 rhs) {
+static inline u320 u320_add_u128_u256(
+    const u128 lhs, const u256 rhs) {
   return u320_add_u256_u128(rhs, lhs);
 }
 
-static inline sail_u320 u320_add_u256_u64(
-    const sail_u256 lhs, const uint64_t rhs) {
+static inline u320 u320_add_u256_u64(
+    const u256 lhs, const uint64_t rhs) {
   return u320_add_scalar(u320_of_u256(lhs), rhs);
 }
 
-static inline sail_u320 u320_add_u64_u256(
-    const uint64_t lhs, const sail_u256 rhs) {
+static inline u320 u320_add_u64_u256(
+    const uint64_t lhs, const u256 rhs) {
   return u320_add_u256_u64(rhs, lhs);
 }
 
-static inline sail_u320 u320_add_u128_u128(
-    const sail_u128 lhs, const sail_u128 rhs) {
+static inline u320 u320_add_u128_u128(
+    const u128 lhs, const u128 rhs) {
   return u320_add(u320_of_u128(lhs), u320_of_u128(rhs));
 }
 
-static inline sail_u320 u320_add_u128_u320(
-    const sail_u128 lhs, const sail_u320 rhs) {
+static inline u320 u320_add_u128_u320(
+    const u128 lhs, const u320 rhs) {
   return u320_add(rhs, u320_of_u128(lhs));
 }
 
-static inline sail_u320 u320_add_u128_u64(
-    const sail_u128 lhs, const uint64_t rhs) {
+static inline u320 u320_add_u128_u64(
+    const u128 lhs, const uint64_t rhs) {
   return u320_add_scalar(u320_of_u128(lhs), rhs);
 }
 
-static inline sail_u320 u320_add_u64_u128(
-    const uint64_t lhs, const sail_u128 rhs) {
+static inline u320 u320_add_u64_u128(
+    const uint64_t lhs, const u128 rhs) {
   return u320_add_u128_u64(rhs, lhs);
 }
 
-static inline sail_u320 u320_add_u64_u64(
+static inline u320 u320_add_u64_u64(
     const uint64_t lhs, const uint64_t rhs) {
   return u320_add_scalar(u320_of_u64(lhs), rhs);
 }
 
-static inline sail_u320 u320_add_u64_u320(
-    const uint64_t lhs, const sail_u320 rhs) {
+static inline u320 u320_add_u64_u320(
+    const uint64_t lhs, const u320 rhs) {
   return u320_add_scalar(rhs, lhs);
 }
 
-static inline sail_u320 u320_mul_u320_u320(
-    const sail_u320 lhs, const sail_u320 rhs) {
+static inline u320 u320_mul_u320_u320(
+    const u320 lhs, const u320 rhs) {
   return u320_mul(lhs, rhs);
 }
 
-static inline sail_u320 u320_mul_u320_u256(
-    const sail_u320 lhs, const sail_u256 rhs) {
+static inline u320 u320_mul_u320_u256(
+    const u320 lhs, const u256 rhs) {
   return u320_mul(lhs, u320_of_u256(rhs));
 }
 
-static inline sail_u320 u320_mul_u320_u128(
-    const sail_u320 lhs, const sail_u128 rhs) {
+static inline u320 u320_mul_u320_u128(
+    const u320 lhs, const u128 rhs) {
   return u320_mul(lhs, u320_of_u128(rhs));
 }
 
-static inline sail_u320 u320_mul_u320_u64(
-    const sail_u320 lhs, const uint64_t rhs) {
+static inline u320 u320_mul_u320_u64(
+    const u320 lhs, const uint64_t rhs) {
   return u320_mul_scalar(lhs, rhs);
 }
 
-static inline sail_u320 u320_mul_u256_u320(
-    const sail_u256 lhs, const sail_u320 rhs) {
+static inline u320 u320_mul_u256_u320(
+    const u256 lhs, const u320 rhs) {
   return u320_mul(rhs, u320_of_u256(lhs));
 }
 
-static inline sail_u320 u320_mul_u256_u256(
-    const sail_u256 lhs, const sail_u256 rhs) {
+static inline u320 u320_mul_u256_u256(
+    const u256 lhs, const u256 rhs) {
   return u320_mul(u320_of_u256(lhs), u320_of_u256(rhs));
 }
 
-static inline sail_u320 u320_mul_u256_u128(
-    const sail_u256 lhs, const sail_u128 rhs) {
+static inline u320 u320_mul_u256_u128(
+    const u256 lhs, const u128 rhs) {
   return u320_mul(u320_of_u256(lhs), u320_of_u128(rhs));
 }
 
-static inline sail_u320 u320_mul_u128_u256(
-    const sail_u128 lhs, const sail_u256 rhs) {
+static inline u320 u320_mul_u128_u256(
+    const u128 lhs, const u256 rhs) {
   return u320_mul_u256_u128(rhs, lhs);
 }
 
-static inline sail_u320 u320_mul_u256_u64(
-    const sail_u256 lhs, const uint64_t rhs) {
+static inline u320 u320_mul_u256_u64(
+    const u256 lhs, const uint64_t rhs) {
   return u320_mul_scalar(u320_of_u256(lhs), rhs);
 }
 
-static inline sail_u320 u320_mul_u64_u256(
-    const uint64_t lhs, const sail_u256 rhs) {
+static inline u320 u320_mul_u64_u256(
+    const uint64_t lhs, const u256 rhs) {
   return u320_mul_u256_u64(rhs, lhs);
 }
 
-static inline sail_u320 u320_mul_u128_u128(
-    const sail_u128 lhs, const sail_u128 rhs) {
+static inline u320 u320_mul_u128_u128(
+    const u128 lhs, const u128 rhs) {
   return u320_mul(u320_of_u128(lhs), u320_of_u128(rhs));
 }
 
-static inline sail_u320 u320_mul_u128_u320(
-    const sail_u128 lhs, const sail_u320 rhs) {
+static inline u320 u320_mul_u128_u320(
+    const u128 lhs, const u320 rhs) {
   return u320_mul(rhs, u320_of_u128(lhs));
 }
 
-static inline sail_u320 u320_mul_u128_u64(
-    const sail_u128 lhs, const uint64_t rhs) {
+static inline u320 u320_mul_u128_u64(
+    const u128 lhs, const uint64_t rhs) {
   return u320_mul_scalar(u320_of_u128(lhs), rhs);
 }
 
-static inline sail_u320 u320_mul_u64_u128(
-    const uint64_t lhs, const sail_u128 rhs) {
+static inline u320 u320_mul_u64_u128(
+    const uint64_t lhs, const u128 rhs) {
   return u320_mul_u128_u64(rhs, lhs);
 }
 
-static inline sail_u320 u320_mul_u64_u64(
+static inline u320 u320_mul_u64_u64(
     const uint64_t lhs, const uint64_t rhs) {
   return u320_mul_scalar(u320_of_u64(lhs), rhs);
 }
 
-static inline sail_u320 u320_mul_u64_u320(
-    const uint64_t lhs, const sail_u320 rhs) {
+static inline u320 u320_mul_u64_u320(
+    const uint64_t lhs, const u320 rhs) {
   return u320_mul_scalar(rhs, lhs);
 }
 
-static inline sail_u256 u256_sub_u320(
-    const sail_u256 lhs, const sail_u320 rhs) {
+static inline u256 u256_sub_u320(
+    const u256 lhs, const u320 rhs) {
   return u256_of_u320(u320_sub(u320_of_u256(lhs), rhs));
 }
 
-static inline sail_u128 u128_sub_u320(
-    const sail_u128 lhs, const sail_u320 rhs) {
+static inline u128 u128_sub_u320(
+    const u128 lhs, const u320 rhs) {
   return u128_of_u320(u320_sub(u320_of_u128(lhs), rhs));
 }
 
 static inline uint64_t u64_sub_u320(
-    const uint64_t lhs, const sail_u320 rhs) {
+    const uint64_t lhs, const u320 rhs) {
   return u320_to_u64(u320_sub(u320_of_u64(lhs), rhs));
 }
 
 /* Base-2^64 long division for the common five-by-one-limb shape. */
 static inline void u320_divrem_u64(
-    const sail_u320 dividend,
+    const u320 dividend,
     const uint64_t divisor,
-    sail_u320 *quotient,
+    u320 *quotient,
     uint64_t *remainder) {
-  sail_u320 q = {{0}};
+  u320 q = {{0}};
   uint64_t rem = UINT64_C(0);
   for (size_t i = 5; i-- > 0;) {
     const unsigned __int128 partial =
@@ -6395,48 +9916,58 @@ static inline void u320_divrem_u64(
     q.limbs[i] = (uint64_t)(partial / divisor);
     rem = (uint64_t)(partial % divisor);
   }
-  if (quotient != NULL) *quotient = q;
-  if (remainder != NULL) *remainder = rem;
+  if (quotient != NULL) {
+    *quotient = q;
+  }
+  if (remainder != NULL) {
+    *remainder = rem;
+  }
 }
 
-static inline sail_u320 u320_div_u64(
-    const sail_u320 dividend, const uint64_t divisor) {
-  sail_u320 result;
+static inline u320 u320_div_u64(
+    const u320 dividend, const uint64_t divisor) {
+  u320 result;
   u320_divrem_u64(dividend, divisor, &result, NULL);
   return result;
 }
 
 static inline uint64_t u320_mod_u64(
-    const sail_u320 dividend, const uint64_t divisor) {
+    const u320 dividend, const uint64_t divisor) {
   uint64_t result;
   u320_divrem_u64(dividend, divisor, NULL, &result);
   return result;
 }
 
-static inline bool u320_is_zero(const sail_u320 value) {
+static inline bool u320_is_zero(const u320 value) {
   return (value.limbs[0] | value.limbs[1] | value.limbs[2]
           | value.limbs[3] | value.limbs[4]) == UINT64_C(0);
 }
 
 static inline bool u320_power_of_two_shift(
-    const sail_u320 value, uint32_t *shift) {
+    const u320 value, uint32_t *shift) {
   uint32_t found = UINT32_MAX;
   for (uint32_t i = 0; i < 5; ++i) {
     const uint64_t limb = value.limbs[i];
-    if (limb == UINT64_C(0)) continue;
+    if (limb == UINT64_C(0)) {
+      continue;
+    }
     if ((limb & (limb - UINT64_C(1))) != UINT64_C(0) || found != UINT32_MAX) {
       return false;
     }
-    found = i * 64U + (uint32_t)__builtin_ctzll(limb);
+    found = (i * 64U) + (uint32_t)__builtin_ctzll(limb);
   }
-  if (found == UINT32_MAX) return false;
+  if (found == UINT32_MAX) {
+    return false;
+  }
   *shift = found;
   return true;
 }
 
-static inline sail_u320 u320_shr(const sail_u320 value, const uint32_t shift) {
-  sail_u320 result = {{0}};
-  if (shift >= 320U) return result;
+static inline u320 u320_shr(const u320 value, const uint32_t shift) {
+  u320 result = {{0}};
+  if (shift >= 320U) {
+    return result;
+  }
   const uint32_t words = shift / 64U;
   const uint32_t bits = shift % 64U;
   for (uint32_t out = 0; out + words < 5U; ++out) {
@@ -6449,14 +9980,18 @@ static inline sail_u320 u320_shr(const sail_u320 value, const uint32_t shift) {
   return result;
 }
 
-static inline sail_u320 u320_mod_power_of_two(
-    const sail_u320 value, const uint32_t shift) {
-  if (shift >= 320U) return value;
-  sail_u320 result = value;
+static inline u320 u320_mod_power_of_two(
+    const u320 value, const uint32_t shift) {
+  if (shift >= 320U) {
+    return value;
+  }
+  u320 result = value;
   const uint32_t word = shift / 64U;
   const uint32_t bits = shift % 64U;
   if (bits == 0U) {
-    for (uint32_t i = word; i < 5U; ++i) result.limbs[i] = UINT64_C(0);
+    for (uint32_t i = word; i < 5U; ++i) {
+      result.limbs[i] = UINT64_C(0);
+    }
   } else {
     result.limbs[word] &= (UINT64_C(1) << bits) - UINT64_C(1);
     for (uint32_t i = word + 1U; i < 5U; ++i) {
@@ -6470,31 +10005,39 @@ static inline sail_u320 u320_mod_power_of_two(
  * EVM recurrence takes the one-limb fast path at runtime; the fallback keeps
  * the representation complete for other proved U320 expressions. */
 static inline void u320_divrem(
-    const sail_u320 dividend,
-    const sail_u320 divisor,
-    sail_u320 *quotient,
-    sail_u320 *remainder) {
+    const u320 dividend,
+    const u320 divisor,
+    u320 *quotient,
+    u320 *remainder) {
   if (u320_is_zero(divisor)) {
     sail_native_conversion_failure("division by zero");
   }
   if ((divisor.limbs[1] | divisor.limbs[2]
        | divisor.limbs[3] | divisor.limbs[4]) == UINT64_C(0)) {
-    sail_u320 q;
+    u320 q;
     uint64_t r;
     u320_divrem_u64(dividend, divisor.limbs[0], &q, &r);
-    if (quotient != NULL) *quotient = q;
-    if (remainder != NULL) *remainder = u320_of_u64(r);
+    if (quotient != NULL) {
+      *quotient = q;
+    }
+    if (remainder != NULL) {
+      *remainder = u320_of_u64(r);
+    }
     return;
   }
   uint32_t shift;
   if (u320_power_of_two_shift(divisor, &shift)) {
-    if (quotient != NULL) *quotient = u320_shr(dividend, shift);
-    if (remainder != NULL) *remainder = u320_mod_power_of_two(dividend, shift);
+    if (quotient != NULL) {
+      *quotient = u320_shr(dividend, shift);
+    }
+    if (remainder != NULL) {
+      *remainder = u320_mod_power_of_two(dividend, shift);
+    }
     return;
   }
 
-  sail_u320 q = {{0}};
-  sail_u320 rem = {{0}};
+  u320 q = {{0}};
+  u320 rem = {{0}};
   for (uint32_t bit = 320U; bit-- > 0U;) {
     const uint64_t carry = rem.limbs[4] >> 63;
     for (uint32_t i = 4U; i > 0U; --i) {
@@ -6508,20 +10051,24 @@ static inline void u320_divrem(
       q.limbs[bit / 64U] |= UINT64_C(1) << (bit % 64U);
     }
   }
-  if (quotient != NULL) *quotient = q;
-  if (remainder != NULL) *remainder = rem;
+  if (quotient != NULL) {
+    *quotient = q;
+  }
+  if (remainder != NULL) {
+    *remainder = rem;
+  }
 }
 
-static inline sail_u320 u320_div(
-    const sail_u320 dividend, const sail_u320 divisor) {
-  sail_u320 result;
+static inline u320 u320_div(
+    const u320 dividend, const u320 divisor) {
+  u320 result;
   u320_divrem(dividend, divisor, &result, NULL);
   return result;
 }
 
-static inline sail_u320 u320_mod(
-    const sail_u320 dividend, const sail_u320 divisor) {
-  sail_u320 result;
+static inline u320 u320_mod(
+    const u320 dividend, const u320 divisor) {
+  u320 result;
   u320_divrem(dividend, divisor, NULL, &result);
   return result;
 }
@@ -6530,13 +10077,13 @@ static inline sail_u320 u320_mod(
       let generic_sail_int_helpers =
         string
           {|
-static inline sail_u320 u320_of_sail_int(const sail_int value) {
-  sail_u320 result = {{0}};
+static inline u320 u320_of_sail_int(const sail_int value) {
+  u320 result = {{0}};
   sail_int_to_u64_array(result.limbs, 5, value);
   return result;
 }
 
-static inline void u320_unsigned(sail_int *result, const sail_u320 value) {
+static inline void u320_unsigned(sail_int *result, const u320 value) {
   sail_int_from_u64_array(result, value.limbs, 5);
 }
 |}
@@ -6550,27 +10097,50 @@ static inline void u320_unsigned(sail_int *result, const sail_u320 value) {
     if IdSet.mem id !generated then []
     else (
       generated := IdSet.add id !generated;
-      let ctyp = sprintf "sail_fixed_bytes_%d" length in
-      let type_name = sprintf "fixed_bytes_%d" length in
+      let ctyp = fixed_bytes_type_name (c_repr_fixed_bytes_ctyp length) in
+      let type_name = ctyp in
       let guard = sprintf "SAIL_FIXED_BYTES_%d_DEFINED" length in
       let typedef =
         ksprintf string "#ifndef %s\n#define %s\ntypedef struct { uint8_t bytes[%d]; } %s;\n#endif" guard guard length
           ctyp
       in
-      let base_helpers =
+      let zero_helper =
         ksprintf string
           {|
 static inline %s %s_zero(void) {
   %s result = {{0}};
   return result;
 }
+|}
+          ctyp type_name ctyp
+      in
+      let equality_helper =
+        if length = 20 then
+          ksprintf string
+            {|
 
-static inline bool eq_%s(const %s lhs, const %s rhs) {
-  return memcmp(lhs.bytes, rhs.bytes, %d) == 0;
+static inline bool eq_%s(const %s op1, const %s op2) {
+  if (memcmp(op1.bytes, op2.bytes, 8) != 0) {
+    return false;
+  }
+  if (memcmp(op1.bytes + 8, op2.bytes + 8, 8) != 0) {
+    return false;
+  }
+  return memcmp(op1.bytes + 16, op2.bytes + 16, 4) == 0;
 }
 |}
-          ctyp type_name ctyp type_name ctyp ctyp length
+            type_name ctyp ctyp
+        else
+          ksprintf string
+            {|
+
+static inline bool eq_%s(const %s op1, const %s op2) {
+  return memcmp(op1.bytes, op2.bytes, %d) == 0;
+}
+|}
+            type_name ctyp ctyp length
       in
+      let base_helpers = zero_helper ^^ equality_helper in
       let byte_u256_helpers =
         if length > 32 then empty
         else
@@ -6579,19 +10149,19 @@ static inline bool eq_%s(const %s lhs, const %s rhs) {
 
 #ifndef SAIL_U256_DEFINED
 #define SAIL_U256_DEFINED
-typedef struct { uint64_t limbs[4]; } sail_u256;
+typedef struct { uint64_t limbs[4]; } u256;
 #endif
 
-static inline sail_u256 u256_from_%s(const %s value) {
-  sail_u256 result = {{0}};
+static inline u256 u256_from_%s(const %s value) {
+  u256 result = {{0}};
   for (size_t i = 0; i < %d; ++i) {
     result.limbs[i >> 3] |= ((uint64_t)value.bytes[i]) << ((i & 7) * 8);
   }
   return result;
 }
 
-static inline %s %s_from_u256(const sail_u256 value) {
-  %s result;
+static inline %s %s_from_u256(const u256 value) {
+  %s result = {0};
   for (size_t i = 0; i < %d; ++i) {
     result.bytes[i] = (uint8_t)(value.limbs[i >> 3] >> ((i & 7) * 8));
   }
@@ -6606,8 +10176,10 @@ static inline %s %s_from_u256(const sail_u256 value) {
 
 static inline %s vector_init_%s(const sail_int length_arg, const uint64_t elem) {
   (void)length_arg;
-  %s result;
-  for (size_t i = 0; i < %d; ++i) result.bytes[i] = (uint8_t)elem;
+  %s result = {0};
+  for (size_t i = 0; i < %d; ++i) {
+    result.bytes[i] = (uint8_t)elem;
+  }
   return result;
 }
 
@@ -6617,7 +10189,9 @@ static inline %s undefined_vector_%s(const sail_int length_arg, const uint64_t e
 
 static inline %s vector_update_%s(%s value, const sail_int index, const uint64_t elem) {
   const uint64_t i = sail_int_get_ui(index);
-  if (i < %d) value.bytes[i] = (uint8_t)elem;
+  if (i < %d) {
+    value.bytes[i] = (uint8_t)elem;
+  }
   return value;
 }
 
@@ -6644,7 +10218,9 @@ static inline %s internal_vector_init_%s(const int64_t length_arg) {
 
 static inline %s internal_vector_update_%s(
     %s value, const int64_t index, const uint64_t elem) {
-  if (index >= 0 && index < %d) value.bytes[index] = (uint8_t)elem;
+  if (index >= 0 && index < %d) {
+    value.bytes[index] = (uint8_t)elem;
+  }
   return value;
 }
 
@@ -6659,7 +10235,9 @@ static inline uint64_t fast_vector_access_%s(const %s value, const int64_t index
           {|
 static inline %s fast_unsigned_vector_update_%s(
     %s value, const uint64_t index, const uint64_t elem) {
-  if (index < %d) value.bytes[index] = (uint8_t)elem;
+  if (index < %d) {
+    value.bytes[index] = (uint8_t)elem;
+  }
   return value;
 }
 
@@ -6675,15 +10253,19 @@ static inline uint64_t fast_unsigned_vector_access_%s(
           {|
 static inline %s fast_vector_init_%s(const int64_t length_arg, const uint64_t elem) {
   (void)length_arg;
-  %s result;
-  for (size_t i = 0; i < %d; ++i) result.bytes[i] = (uint8_t)elem;
+  %s result = {0};
+  for (size_t i = 0; i < %d; ++i) {
+    result.bytes[i] = (uint8_t)elem;
+  }
   return result;
 }
 
 static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const uint64_t elem) {
   (void)length_arg;
-  %s result;
-  for (size_t i = 0; i < %d; ++i) result.bytes[i] = (uint8_t)elem;
+  %s result = {0};
+  for (size_t i = 0; i < %d; ++i) {
+    result.bytes[i] = (uint8_t)elem;
+  }
   return result;
 }
 |}
@@ -6708,8 +10290,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         if tail_bytes = 0 then "UINT64_MAX"
         else sprintf "(UINT64_MAX >> %d)" (64 - (tail_bytes * 8))
       in
-      let ctyp = sprintf "sail_fixed_bytes_u64_lanes_%d" length in
-      let type_name = sprintf "fixed_bytes_u64_lanes_%d" length in
+      let ctyp = fixed_bytes_type_name (c_repr_fixed_bytes_u64_lanes_ctyp length) in
+      let type_name = ctyp in
       let guard = sprintf "SAIL_FIXED_BYTES_U64_LANES_%d_DEFINED" length in
       let typedef =
         ksprintf string
@@ -6724,11 +10306,13 @@ static inline %s %s_zero(void) {
   return result;
 }
 
-static inline bool eq_%s(const %s lhs, const %s rhs) {
+static inline bool eq_%s(const %s op1, const %s op2) {
   for (size_t i = 0; i + 1 < %d; ++i) {
-    if (lhs.lanes[i] != rhs.lanes[i]) return false;
+    if (op1.lanes[i] != op2.lanes[i]) {
+      return false;
+    }
   }
-  return ((lhs.lanes[%d] ^ rhs.lanes[%d]) & %s) == UINT64_C(0);
+  return ((op1.lanes[%d] ^ op2.lanes[%d]) & %s) == UINT64_C(0);
 }
 |}
           ctyp type_name ctyp type_name ctyp ctyp lane_count (lane_count - 1) (lane_count - 1) tail_mask
@@ -6741,19 +10325,23 @@ static inline bool eq_%s(const %s lhs, const %s rhs) {
 
 #ifndef SAIL_U256_DEFINED
 #define SAIL_U256_DEFINED
-typedef struct { uint64_t limbs[4]; } sail_u256;
+typedef struct { uint64_t limbs[4]; } u256;
 #endif
 
-static inline sail_u256 u256_from_%s(const %s value) {
-  sail_u256 result = {{0}};
-  for (size_t i = 0; i < %d; ++i) result.limbs[i] = value.lanes[i];
+static inline u256 u256_from_%s(const %s value) {
+  u256 result = {{0}};
+  for (size_t i = 0; i < %d; ++i) {
+    result.limbs[i] = value.lanes[i];
+  }
   result.limbs[%d] &= %s;
   return result;
 }
 
-static inline %s %s_from_u256(const sail_u256 value) {
+static inline %s %s_from_u256(const u256 value) {
   %s result = {{0}};
-  for (size_t i = 0; i < %d; ++i) result.lanes[i] = value.limbs[i];
+  for (size_t i = 0; i < %d; ++i) {
+    result.lanes[i] = value.limbs[i];
+  }
   result.lanes[%d] &= %s;
   return result;
 }
@@ -6767,9 +10355,11 @@ static inline %s %s_from_u256(const sail_u256 value) {
 
 static inline %s vector_init_%s(const sail_int length_arg, const uint64_t elem) {
   (void)length_arg;
-  %s result;
+  %s result = {0};
   const uint64_t fill = UINT64_C(0x0101010101010101) * (uint8_t)elem;
-  for (size_t i = 0; i < %d; ++i) result.lanes[i] = fill;
+  for (size_t i = 0; i < %d; ++i) {
+    result.lanes[i] = fill;
+  }
   result.lanes[%d] &= %s;
   return result;
 }
@@ -6822,7 +10412,9 @@ static inline %s internal_vector_update_%s(
 }
 
 static inline uint64_t fast_vector_access_%s(const %s value, const int64_t index) {
-  if (index < 0 || index >= %d) return UINT64_C(0);
+  if (index < 0 || index >= %d) {
+    return UINT64_C(0);
+  }
   const uint64_t i = (uint64_t)index;
   return (value.lanes[i >> 3] >> ((i & UINT64_C(7)) * UINT64_C(8))) & UINT64_C(0xff);
 }
@@ -6857,9 +10449,11 @@ static inline uint64_t fast_unsigned_vector_access_%s(
           {|
 static inline %s fast_vector_init_%s(const int64_t length_arg, const uint64_t elem) {
   (void)length_arg;
-  %s result;
+  %s result = {0};
   const uint64_t fill = UINT64_C(0x0101010101010101) * (uint8_t)elem;
-  for (size_t i = 0; i < %d; ++i) result.lanes[i] = fill;
+  for (size_t i = 0; i < %d; ++i) {
+    result.lanes[i] = fill;
+  }
   result.lanes[%d] &= %s;
   return result;
 }
@@ -6880,15 +10474,17 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     )
 
   let codegen_tup ctx ctyps =
-    let id = mk_id ("tuple_" ^ string_of_ctyp (CT_tup ctyps)) in
-    if IdSet.mem id !generated then []
+    let tuple_ctyp = CT_tup ctyps in
+    let key = mk_id ("tuple_" ^ string_of_ctyp tuple_ctyp) in
+    let id = if Config.no_mangle then mk_id (readable_ctyp_name tuple_ctyp) else key in
+    if IdSet.mem key !generated then []
     else (
       let _, fields =
         List.fold_left
           (fun (n, fields) ctyp -> (n + 1, Bindings.add (mk_id ("tup" ^ string_of_int n)) ctyp fields))
           (0, Bindings.empty) ctyps
       in
-      generated := IdSet.add id !generated;
+      generated := IdSet.add key !generated;
       codegen_type_def
         { ctx with records = Bindings.add id ([], fields) ctx.records }
         (CTD_struct (id, [], Bindings.bindings fields))
@@ -6914,7 +10510,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       let codegen_list_clear =
         let kill = sail_kill (sgen_id id) "%s *rop" (sgen_id id) in
         separate space [string "static void"; kill; char '{']
-        ^^ hardline ^^ string "  if (*rop == NULL) return;\n" ^^ string "  if ((*rop)->rc >= 1) {\n"
+        ^^ hardline ^^ string "  if (*rop == NULL) {\n    return;\n  }\n" ^^ string "  if ((*rop)->rc >= 1) {\n"
         ^^ string "    (*rop)->rc -= 1;\n" ^^ string "  }\n"
         ^^ ksprintf string "  %s node = *rop;\n" (sgen_id id)
         ^^ string "  while (node != NULL && node->rc == 0) {\n"
@@ -6935,12 +10531,12 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
 
       let codegen_inc_reference_count =
         string (sprintf "static void internal_inc_%s(%s l) {\n" (sgen_id id) (sgen_id id))
-        ^^ string "  if (l == NULL) return;\n" ^^ string "  l->rc += 1;\n" ^^ string "}"
+        ^^ string "  if (l == NULL) {\n    return;\n  }\n" ^^ string "  l->rc += 1;\n" ^^ string "}"
       in
 
       let codegen_dec_reference_count =
         string (sprintf "static void internal_dec_%s(%s l) {\n" (sgen_id id) (sgen_id id))
-        ^^ string "  if (l == NULL) return;\n" ^^ string "  l->rc -= 1;\n" ^^ string "}"
+        ^^ string "  if (l == NULL) {\n    return;\n  }\n" ^^ string "  l->rc -= 1;\n" ^^ string "}"
       in
 
       let codegen_list_copy =
@@ -6961,7 +10557,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
                sail_create ~prefix:"  " ~suffix:";\n" (sgen_ctyp_name ctyp) "&(*rop)->hd"
                ^^ sail_copy ~prefix:"  " ~suffix:";\n" (sgen_ctyp_name ctyp) "&(*rop)->hd, x"
            )
-        ^^ ksprintf string "  if (!same) internal_inc_%s(xs);\n" (sgen_id id)
+        ^^ ksprintf string "  if (!same) {\n    internal_inc_%s(xs);\n  }\n" (sgen_id id)
         ^^ string "  (*rop)->tl = xs;\n" ^^ string "}"
       in
 
@@ -7133,7 +10729,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       let internal_update = update "internal_vector_update" "int64_t" "n" in
       let equal =
         c_function ~return:"static bool" (sail_equal name "const %s op1, const %s op2" name name)
-          [c_stmt "if (op1.len != op2.len) return false"; c_stmt "bool result = true";
+          [c_if (string "(op1.len != op2.len)") [c_stmt "return false"]; c_stmt "bool result = true";
            c_for (string "(size_t i = 0; i < op1.len; ++i)")
              [c_assign (string "result") "&=" (codegen_equal ctyp "op1.data[i]" "op2.data[i]")];
            c_stmt "return result"]
@@ -7263,7 +10859,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
                    [sail_kill ~suffix:";" (sgen_ctyp_name ctyp) "(rop->data) + i"];
                ]
            )
-          @ [c_stmt "if (rop->data != NULL) sail_free(rop->data)"]
+          @ [c_if (string "(rop->data != NULL)") [c_stmt "sail_free(rop->data)"]]
           )
       in
       let vector_reinit =
@@ -7396,7 +10992,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         c_function ~return:"static bool"
           (sail_equal (sgen_id id) "const %s op1, const %s op2" (sgen_id id) (sgen_id id))
           [
-            c_stmt "if (op1.len != op2.len) return false";
+            c_if (string "(op1.len != op2.len)") [c_stmt "return false"];
             c_stmt "bool result = true";
             c_for
               (string "(int i = 0; i < op1.len; i++)")
@@ -7448,6 +11044,295 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     | _ -> assert false
 
   (* Generate C code for a global register, constant (let), function definition, etc. *)
+  (* A pure top-level Sail [let] whose initializer reduces to C constant
+     expressions needs neither writable storage nor a runtime create/kill pair.
+     The typed AST supplies declared [$[c_repr]] types before lowering; this
+     final-JIB evaluator then uses the represented C type and exact lowered
+     initializer.  Scalars, scalar aliases, fully-defined fixed vectors, and
+     zero-initialized fixed-byte values are supported.  Other computed or
+     managed values deliberately remain runtime initialized. *)
+  type static_let_value =
+    | Static_scalar of vl
+    | Static_vector of vl array
+
+  type static_let_initializer = id * ctyp * static_let_value
+
+  (* This cache is prepared from the complete final JIB program before C is
+     emitted.  Looking at one letbind in isolation misses aliases such as
+     [let SYSTEM_CALL_INPUT_LENGTH = WORD_BYTE_LENGTH]: C's file-scope
+     constant-expression rules do not permit the generated const object to be
+     used as an initializer, so the alias must inherit the original literal. *)
+  let static_letbinds : (int * static_let_initializer list) list ref = ref []
+
+  let static_letbind number = List.assoc_opt number !static_letbinds
+
+  let static_letbind_initializers ?(known_globals = NameMap.empty) ctx bindings instrs =
+    let static_literal = function
+      | VL_bits _ | VL_int _ | VL_bool _ | VL_unit | VL_enum _ -> true
+      | VL_real _ | VL_string _ | VL_ref _ | VL_undefined -> false
+    in
+    if not Config.optimized_model || not (List.for_all (fun (_, ctyp) -> is_stack_ctyp ctx ctyp) bindings) then None
+    else
+      let binding_names =
+        List.fold_left (fun names (id, _) -> NameSet.add (name id) names) NameSet.empty bindings
+      in
+      let locals = ref NameMap.empty in
+      let globals = ref NameMap.empty in
+      let valid = ref true in
+      let rec resolve = function
+        | V_lit (literal, _) when static_literal literal -> Some (Static_scalar literal)
+        | V_id (source, _) -> (
+            match NameMap.find_opt source !locals with
+            | Some value -> Some value
+            | None -> NameMap.find_opt source known_globals
+          )
+        | V_call ((Unsigned _ | Signed _ | Zero_extend _ | Sign_extend _), [value]) -> (
+            match resolve value with Some (Static_scalar _ as value) -> Some value | _ -> None
+          )
+        | _ -> None
+      in
+      let convert destination_ctyp = function
+        | Static_scalar literal -> Some (Static_scalar literal)
+        | Static_vector elements as value -> (
+            match destination_ctyp with
+            | CT_fvector (length, _) when length = Array.length elements -> Some value
+            | ctyp when is_c_repr_fixed_bytes ctyp -> (
+                match c_repr_fixed_bytes_length ctyp with
+                | Some length when length = Array.length elements -> Some value
+                | _ -> None
+              )
+            | _ -> None
+          )
+      in
+      let assign destination destination_ctyp value =
+        match Option.bind (resolve value) (convert destination_ctyp) with
+        | None -> valid := false
+        | Some value when NameSet.mem destination binding_names ->
+            if NameMap.mem destination !globals then valid := false
+            else globals := NameMap.add destination value !globals
+        | Some value -> locals := NameMap.add destination value !locals
+      in
+      let bit_literal_integer bits =
+        List.fold_left
+          (fun value bit ->
+            Option.bind value (fun value ->
+                match bit with
+                | Sail2_values.B0 -> Some (Big_int.mul value (Big_int.of_int 2))
+                | Sail2_values.B1 -> Some (Big_int.succ (Big_int.mul value (Big_int.of_int 2)))
+                | Sail2_values.BU -> None
+              )
+          )
+          (Some Big_int.zero) bits
+      in
+      let scalar_integer = function
+        | V_lit (VL_int value, _) -> Some value
+        | V_lit (VL_bits bits, _) -> bit_literal_integer bits
+        | value -> (
+            match resolve value with
+            | Some (Static_scalar (VL_int value)) -> Some value
+            | Some (Static_scalar (VL_bits bits)) -> bit_literal_integer bits
+            | _ -> None
+          )
+      in
+      let vector_init destination destination_ctyp args =
+        let destination_length =
+          match destination_ctyp with
+          | CT_fvector (length, _) -> Some length
+          | ctyp when is_c_repr_fixed_bytes ctyp -> c_repr_fixed_bytes_length ctyp
+          | _ -> None
+        in
+        match (destination_length, args) with
+        | Some length, [requested_length] -> (
+            match scalar_integer requested_length with
+            | Some requested_length when Big_int.equal requested_length (Big_int.of_int length) ->
+                let initial_element =
+                  if is_c_repr_fixed_bytes destination_ctyp then VL_int Big_int.zero else VL_undefined
+                in
+                locals := NameMap.add destination (Static_vector (Array.make length initial_element)) !locals
+            | _ -> valid := false
+          )
+        | _ -> valid := false
+      in
+      let vector_update destination destination_ctyp args =
+        match args with
+        | [source; index; element] -> (
+            match (resolve source, scalar_integer index, resolve element) with
+            | Some (Static_vector source), Some index, Some (Static_scalar element) -> (
+                try
+                  let index = Big_int.to_int index in
+                  if index < 0 || index >= Array.length source then valid := false
+                  else
+                    let updated = Array.copy source in
+                    updated.(index) <- element;
+                    ( match convert destination_ctyp (Static_vector updated) with
+                    | Some value -> locals := NameMap.add destination value !locals
+                    | None -> valid := false
+                    )
+                with _ -> valid := false
+              )
+            | _ -> valid := false
+          )
+        | _ -> valid := false
+      in
+      let fixed_bytes_of_integer length value =
+        let byte_mask = Big_int.of_int 0xff in
+        Static_vector
+          (Array.init length (fun index ->
+               let shift = 8 * (length - index - 1) in
+               VL_int (Big_int.bitwise_and (Big_int.shift_right value shift) byte_mask)
+           ))
+      in
+      let integer_conversion destination destination_ctyp args =
+        match args with
+        | [source] -> assign destination destination_ctyp source
+        | _ -> valid := false
+      in
+      let word_to_fixed_bytes destination destination_ctyp args =
+        match (c_repr_fixed_bytes_length destination_ctyp, args) with
+        | Some destination_length, [source] -> (
+            match scalar_integer source with
+            | Some value ->
+                locals :=
+                  NameMap.add destination (fixed_bytes_of_integer destination_length value) !locals
+            | None -> valid := false
+          )
+        | _ -> valid := false
+      in
+      let static_evaluator function_id =
+        match Bindings.find_opt function_id Config.c_static_evaluators with
+        | Some operation -> Some operation
+        | None ->
+            (* Representation specialization can clone a declaration under a
+               fresh identifier while retaining its emitted C name.  Static
+               evaluator annotations belong to that operation, so resolve the
+               clone by its source spelling as well as by identifier identity. *)
+            let function_name = string_of_id function_id in
+            Bindings.bindings Config.c_static_evaluators
+            |> List.find_map (fun (annotated_id, operation) ->
+                   if String.equal (string_of_id annotated_id) function_name then Some operation else None
+               )
+      in
+      let rec evaluate (I_aux (instr, _)) =
+          if !valid then
+            match instr with
+            | I_decl _ | I_clear _ | I_label _ | I_comment _ -> ()
+            | I_block instrs -> List.iter evaluate instrs
+            | I_init (_, destination, Init_cval value) | I_reinit (_, destination, value) ->
+                let destination_ctyp =
+                  match instr with I_init (ctyp, _, _) | I_reinit (ctyp, _, _) -> ctyp | _ -> assert false
+                in
+                assign destination destination_ctyp value
+            | I_copy (CL_id (destination, destination_ctyp), value) ->
+                assign destination destination_ctyp value
+            | I_funcall (CR_one (CL_id (destination, destination_ctyp)), _, (function_id, _), args) -> (
+                match string_of_id function_id with
+                | "vector_init" | "internal_vector_init" -> vector_init destination destination_ctyp args
+                | "vector_update" | "vector_update_inc" | "internal_vector_update" ->
+                    vector_update destination destination_ctyp args
+                | "u256_of_fbits" | "u256_of_u128" -> integer_conversion destination destination_ctyp args
+                | _ -> (
+                    match static_evaluator function_id with
+                    | Some "word_to_fixed_bytes" -> word_to_fixed_bytes destination destination_ctyp args
+                    | Some _ | None -> valid := false
+                  )
+              )
+            | _ -> valid := false
+      in
+      List.iter evaluate instrs;
+      if not !valid then None
+      else
+        let initializers =
+          List.filter_map
+            (fun (id, ctyp) ->
+              Option.bind (NameMap.find_opt (name id) !globals) (fun value ->
+                  match value with
+                  | Static_vector elements when Array.exists (fun value -> value = VL_undefined) elements -> None
+                  | value -> Some (id, ctyp, value)
+                )
+            )
+            bindings
+        in
+        if List.length initializers = List.length bindings then Some initializers else None
+
+  let prepare_static_letbinds ctx cdefs =
+    static_letbinds := [];
+    if Config.optimized_model then (
+      let candidates =
+        List.filter_map
+          (function
+            | CDEF_aux (CDEF_let (number, bindings, instrs), _) -> Some (number, bindings, instrs)
+            | _ -> None
+            )
+          cdefs
+      in
+      let rec discover known discovered pending =
+        let progress, known, discovered, pending =
+          List.fold_left
+            (fun (progress, known, discovered, pending) (number, bindings, instrs as candidate) ->
+              match static_letbind_initializers ~known_globals:known ctx bindings instrs with
+              | None ->
+                  if !Jib_compile.opt_debug_function_representations then
+                    Printf.eprintf "C static let: retained runtime initializer=%d bindings=[%s]\n%!" number
+                      (Util.string_of_list "," (fun (id, _) -> string_of_id id) bindings);
+                  (progress, known, discovered, candidate :: pending)
+              | Some initializers ->
+                  let known =
+                    List.fold_left
+                      (fun known (id, _, value) -> NameMap.add (name id) value known)
+                      known initializers
+                  in
+                  (true, known, (number, initializers) :: discovered, pending)
+            )
+            (false, known, discovered, []) pending
+        in
+        if progress then discover known discovered (List.rev pending) else List.rev discovered
+      in
+      static_letbinds := discover NameMap.empty [] candidates
+    )
+
+  (* A top-level let makes the stored C object immutable. For pointer-backed
+     representations that means a const pointer, not a pointer to const data:
+     Sail's value may still denote mutable host storage. *)
+  let static_const_ctyp ctyp =
+    if is_c_repr_byte_pointer ctyp then sgen_ctyp ctyp ^ " const" else "const " ^ sgen_ctyp ctyp
+
+  let codegen_static_let_definition id ctyp = function
+    | Static_scalar literal ->
+        string (Printf.sprintf "%s %s = %s;" (static_const_ctyp ctyp) (sgen_id id) (sgen_value ctyp literal))
+    | Static_vector elements ->
+        let element_ctyp, length_field, data_field =
+          match ctyp with
+          | CT_fvector (length, element_ctyp) when length = Array.length elements ->
+              (element_ctyp, Some length, "data")
+          | ctyp when is_c_repr_fixed_bytes ctyp -> (
+              match c_repr_fixed_bytes_length ctyp with
+              | Some length when length = Array.length elements -> (CT_fbits 8, None, "bytes")
+              | _ -> c_error "fixed-byte static initializer has the wrong length"
+            )
+          | _ -> c_error "static vector initializer has a non-fixed representation"
+        in
+        let rec chunks size values =
+          match values with
+          | [] -> []
+          | values ->
+              let chunk = Util.take size values in
+              chunk :: chunks size (Util.drop size values)
+        in
+        let element_lines =
+          Array.to_list elements
+          |> List.map (sgen_value element_ctyp)
+          |> chunks 8
+          |> List.map (String.concat ", ")
+          |> String.concat ",\n      "
+        in
+        let length_line =
+          match length_field with Some length -> Printf.sprintf "  .len = %d,\n" length | None -> ""
+        in
+        string
+          (Printf.sprintf "%s %s = {\n%s  .%s = {\n      %s\n  },\n};" (static_const_ctyp ctyp) (sgen_id id)
+             length_line data_field element_lines
+          )
+
   let codegen_def' ctx (CDEF_aux (aux, _)) =
     match aux with
     | CDEF_register (id, ctyp, _) ->
@@ -7476,23 +11361,46 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           | None -> None
         in
         let function_name = Option.value ~default:(sgen_function_id id) external_name in
+        let function_prefix =
+          if Config.optimized_model && String.equal function_name "fatal_error" then "_Noreturn " else ""
+        in
+        let parameter_names =
+          match Bindings.find_opt id !function_parameter_names with
+          | Some names when List.length names = List.length arg_ctyps -> names
+          | _ when Option.is_some external_name ->
+              List.mapi (fun index _ -> Printf.sprintf "/* arg_%d */" index) arg_ctyps
+          | _ -> List.mapi (fun index _ -> Printf.sprintf "arg_%d" index) arg_ctyps
+        in
+        let parameters = List.map2 (fun ctyp name -> (ctyp, name)) arg_ctyps parameter_names in
         if Option.is_some external_name && not Config.optimized_model then []
+        else if erase_unit_values && ctyp_equal ret_ctyp CT_unit then
+          [
+            FunctionDeclaration
+              (string
+                 (Printf.sprintf "%svoid %s(%s);" function_prefix function_name
+                    (c_parameter_list parameters)
+                 )
+              );
+          ]
         else if is_stack_ctyp ctx ret_ctyp then
           [
             FunctionDeclaration
               (string
-                 (Printf.sprintf "%s %s(%s%s);" (sgen_ctyp ret_ctyp) function_name (extra_params ())
-                    (Util.string_of_list ", " sgen_const_ctyp arg_ctyps)
+                 (Printf.sprintf "%s%s %s(%s);" function_prefix (sgen_ctyp ret_ctyp) function_name
+                    (c_parameter_list parameters)
                  )
               );
           ]
         else
+          let ordinary_args = c_parameter_items parameters in
+          let parameters =
+            extra_params ()
+            ^ String.concat ", " ((sgen_ctyp ret_ctyp ^ " *rop") :: ordinary_args)
+          in
           [
             FunctionDeclaration
               (string
-                 (Printf.sprintf "void %s(%s%s *rop, %s);" function_name (extra_params ()) (sgen_ctyp ret_ctyp)
-                    (Util.string_of_list ", " sgen_const_ctyp arg_ctyps)
-                 )
+                 (Printf.sprintf "%svoid %s(%s);" function_prefix function_name parameters)
               );
           ]
     | CDEF_fundef (id, ret_arg, args, instrs) ->
@@ -7516,37 +11424,100 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
               )
           else ();
 
-          let args =
-            Util.string_of_list ", "
-              (fun x -> x)
-              (List.map2 (fun ctyp arg -> sgen_const_ctyp ctyp ^ " " ^ sgen_name arg) arg_ctyps args)
+          (* Falling off the end of a C [void] function is equivalent to an
+             explicit [return;].  JIB still needs its unit-valued return while
+             control flow is being analysed, but retaining that administrative
+             instruction in the final optimized C creates noise in virtually
+             every unit function.  A terminal call assigned directly to JIB's
+             return destination is the same case: preserve the call and discard
+             only the erased unit result.  Early returns remain untouched. *)
+          let instrs =
+            if
+              Config.optimized_model
+              && not Config.cpp
+              && (match ret_arg with Return_plain -> true | Return_via _ -> false)
+              && erase_unit_values
+              && ctyp_equal ret_ctyp CT_unit
+            then
+              match List.rev instrs with
+              | I_aux (I_return value, _) :: reversed
+                when ctyp_equal (cval_ctyp value) CT_unit ->
+                  List.rev reversed
+              | I_aux
+                  ( I_funcall
+                      ( CR_one (CL_id (Return _, call_ctyp)),
+                        extern,
+                        callee,
+                        call_args
+                      ),
+                    aux
+                  )
+                :: reversed
+                when ctyp_equal call_ctyp CT_unit ->
+                  List.rev
+                    (I_aux
+                       ( I_funcall
+                           (CR_one (CL_void call_ctyp), extern, callee, call_args),
+                         aux
+                       )
+                    :: reversed
+                    )
+              | _ -> instrs
+            else instrs
           in
+
+          let named_parameters = List.map2 (fun ctyp arg -> (ctyp, sgen_name arg)) arg_ctyps args in
+          let referenced =
+            List.fold_left
+              (fun referenced instr -> NameSet.union referenced (instr_ids ~direct:false instr))
+              NameSet.empty instrs
+          in
+          let unused_parameters =
+            if Config.optimized_model && not Config.cpp then
+              List.map2
+                (fun (ctyp, parameter) jib_name ->
+                     if
+                       (erase_unit_values && ctyp_equal ctyp CT_unit)
+                       || NameSet.mem jib_name referenced
+                     then None
+                     else Some (string (Printf.sprintf "  (void)%s;" parameter))
+                )
+                named_parameters args
+              |> List.filter_map Fun.id
+            else []
+          in
+          let unused_parameter_markers = separate hardline unused_parameters in
+          let c_args = c_parameter_list named_parameters in
           let function_header =
             match ret_arg with
             | Return_plain ->
                 assert (is_stack_ctyp ctx ret_ctyp);
-                string (sgen_ctyp ret_ctyp)
+                string (if erase_unit_values && ctyp_equal ret_ctyp CT_unit then "void" else sgen_ctyp ret_ctyp)
                 ^^ space
                 ^^ string (class_impl_prefix ())
                 ^^ codegen_function_id id
-                ^^ parens (string (extra_params ()) ^^ string args)
+                ^^ parens (string c_args)
                 ^^ hardline
             | Return_via gs ->
                 assert (not (is_stack_ctyp ctx ret_ctyp));
+                let ordinary_args = c_parameter_items named_parameters in
+                let return_via_args =
+                  extra_params ()
+                  ^ String.concat ", "
+                      ((sgen_ctyp ret_ctyp ^ " *" ^ sgen_name gs) :: ordinary_args)
+                in
                 string "void" ^^ space
                 ^^ string (class_impl_prefix ())
                 ^^ codegen_function_id id
-                ^^ parens
-                     (string (extra_params ())
-                     ^^ string (sgen_ctyp ret_ctyp ^ " *" ^ sgen_name gs ^ ", ")
-                     ^^ string args
-                     )
+                ^^ parens (string return_via_args)
                 ^^ hardline
           in
           [
             FunctionDefinition
               (function_header ^^ string "{"
-              ^^ jump 0 2 (separate_map hardline (codegen_instr id ctx) instrs)
+              ^^ hardline ^^ unused_parameter_markers
+              ^^ (if Util.list_empty unused_parameters then empty else hardline)
+              ^^ codegen_instrs id ctx instrs
               ^^ hardline ^^ string "}"
               );
           ]
@@ -7576,48 +11547,67 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         let finish_impl =
           separate_map hardline codegen_decl (List.filter is_decl instrs)
           ^^ twice hardline ^^ finish_header ^^ hardline ^^ string "{"
-          ^^ jump 0 2 (separate_map hardline (codegen_instr id ctx) instrs)
+          ^^ jump 0 2 (codegen_instrs id ctx instrs)
           ^^ hardline ^^ string "}"
         in
         let finish_decl = string (Printf.sprintf "void finish_%s(void);" (sgen_function_id id)) in
         if Config.cpp then [FunctionDefinition finish_impl; FunctionDeclaration finish_decl]
         else [FunctionDefinition finish_impl]
-    | CDEF_let (number, bindings, instrs) ->
-        let setup = List.concat (List.map (fun (id, ctyp) -> [idecl (id_loc id) ctyp (name id)]) bindings) in
-        let cleanup = List.concat (List.map (fun (id, ctyp) -> [iclear ~loc:(id_loc id) ctyp (name id)]) bindings) in
-        let variable_defs =
-          separate_map hardline
-            (fun (id, ctyp) -> string (Printf.sprintf "%s %s%s;" (sgen_ctyp ctyp) (sgen_id id) (variable_zero_init ())))
-            bindings
-          ^^ hardline
-        in
-        let variable_decls =
-          separate_map hardline
-            (fun (id, ctyp) -> string (Printf.sprintf "extern %s %s;" (sgen_ctyp ctyp) (sgen_id id)))
-            bindings
-          ^^ hardline
-        in
-        let function_decls =
-          string (Printf.sprintf "void create_letbind_%d(void);" number)
-          ^^ hardline
-          ^^ string (Printf.sprintf "void kill_letbind_%d(void);" number)
-          ^^ hardline
-        in
-        let impl =
-          string (Printf.sprintf "void %screate_letbind_%d(void) " (class_impl_prefix ()) number)
-          ^^ string "{"
-          ^^ jump 0 2 (separate_map hardline (codegen_alloc ctx) setup)
-          ^^ hardline
-          ^^ jump 0 2 (separate_map hardline (codegen_instr (mk_id "let") { ctx with no_raw = true }) instrs)
-          ^^ hardline ^^ string "}" ^^ hardline
-          ^^ string (Printf.sprintf "void %skill_letbind_%d(void) " (class_impl_prefix ()) number)
-          ^^ string "{"
-          ^^ jump 0 2 (separate_map hardline (codegen_instr (mk_id "let") ctx) cleanup)
-          ^^ hardline ^^ string "}"
-        in
+    | CDEF_let (number, bindings, instrs) -> (
+        match static_letbind number with
+        | Some initializers ->
+            let variable_defs =
+              separate_map hardline
+                (fun (id, ctyp, value) -> codegen_static_let_definition id ctyp value)
+                initializers
+              ^^ hardline
+            in
+            let variable_decls =
+              separate_map hardline
+                (fun (id, ctyp, _) -> string (Printf.sprintf "extern %s %s;" (static_const_ctyp ctyp) (sgen_id id)))
+                initializers
+              ^^ hardline
+            in
+            [VariableDeclaration variable_decls; VariableDefinition variable_defs]
+        | None ->
+            let setup = List.concat (List.map (fun (id, ctyp) -> [idecl (id_loc id) ctyp (name id)]) bindings) in
+            let cleanup = List.concat (List.map (fun (id, ctyp) -> [iclear ~loc:(id_loc id) ctyp (name id)]) bindings) in
+            let variable_defs =
+              separate_map hardline
+                (fun (id, ctyp) ->
+                  string (Printf.sprintf "%s %s%s;" (sgen_ctyp ctyp) (sgen_id id) (variable_zero_init ()))
+                )
+                bindings
+              ^^ hardline
+            in
+            let variable_decls =
+              separate_map hardline
+                (fun (id, ctyp) -> string (Printf.sprintf "extern %s %s;" (sgen_ctyp ctyp) (sgen_id id)))
+                bindings
+              ^^ hardline
+            in
+            let function_decls =
+              string (Printf.sprintf "void create_letbind_%d(void);" number)
+              ^^ hardline
+              ^^ string (Printf.sprintf "void kill_letbind_%d(void);" number)
+              ^^ hardline
+            in
+            let impl =
+              string (Printf.sprintf "void %screate_letbind_%d(void) " (class_impl_prefix ()) number)
+              ^^ string "{"
+              ^^ jump 0 2 (separate_map hardline (codegen_alloc ctx) setup)
+              ^^ hardline
+              ^^ jump 0 2 (codegen_instrs (mk_id "let") { ctx with no_raw = true } instrs)
+              ^^ hardline ^^ string "}" ^^ hardline
+              ^^ string (Printf.sprintf "void %skill_letbind_%d(void) " (class_impl_prefix ()) number)
+              ^^ string "{"
+              ^^ jump 0 2 (codegen_instrs (mk_id "let") ctx cleanup)
+              ^^ hardline ^^ string "}"
+            in
 
-        (if Config.optimized_model then [VariableDeclaration variable_decls] else [])
-        @ [VariableDefinition variable_defs; FunctionDeclaration function_decls; FunctionDefinition impl]
+            (if Config.optimized_model then [VariableDeclaration variable_decls] else [])
+            @ [VariableDefinition variable_defs; FunctionDeclaration function_decls; FunctionDefinition impl]
+      )
     | CDEF_pragma _ -> []
 
   (** As we generate C we need to generate specialized version of tuple, list, and vector type. These must be generated
@@ -7760,6 +11750,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       let byte_pointer_fields = Config.byte_pointer_fields
       let byte_pointer_types = Config.byte_pointer_types
       let byte_pointer_signatures = Config.byte_pointer_signatures
+      let fixed_bytes_signatures = Config.fixed_bytes_signatures
+      let fixed_bytes_u64_lanes_signatures = Config.fixed_bytes_u64_lanes_signatures
       let specialize_c = Config.specialize_c
       let require_bounded_int = Config.require_bounded_int
       let optimized_model = Config.optimized_model
@@ -7811,8 +11803,19 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         )
     in
 
-    let letbind_initializers = List.map (fun n -> Printf.sprintf "  create_letbind_%d();" n) (List.rev ctx.letbinds) in
-    let letbind_finalizers = List.map (fun n -> Printf.sprintf "  kill_letbind_%d();" n) ctx.letbinds in
+    let static_letbinds =
+      List.filter_map
+        (function
+          | CDEF_aux (CDEF_let (number, _, _), _) when Option.is_some (static_letbind number) -> Some number
+          | _ -> None
+        )
+        cdefs
+    in
+    let runtime_letbinds = List.filter (fun number -> not (List.mem number static_letbinds)) ctx.letbinds in
+    let letbind_initializers =
+      List.map (fun n -> Printf.sprintf "  create_letbind_%d();" n) (List.rev runtime_letbinds)
+    in
+    let letbind_finalizers = List.map (fun n -> Printf.sprintf "  kill_letbind_%d();" n) runtime_letbinds in
 
     let set_abstract_types =
       Bindings.bindings ctx.abstracts
@@ -7846,13 +11849,22 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       separate hardline
         (List.map string
            ([Printf.sprintf "void %s%s(void)" (class_impl_prefix ()) model_init_name; "{"]
-           @ (if Config.optimized_model then ["  have_exception = false;"] else ["  setup_rts();"] @ fst exn_boilerplate)
+           @ (if Config.optimized_model then [] else ["  setup_rts();"] @ fst exn_boilerplate)
            @ List.concat (List.map (fun r -> fst (register_init_clear r)) early_regs)
            @ set_abstract_types @ startup cdefs @ letbind_initializers
            @ List.concat (List.map (fun r -> fst (register_init_clear r)) regs)
-           @ (if regs = [] then [] else [Printf.sprintf "  %s(UNIT);" (sgen_function_id (mk_id "initialize_registers"))])
+           @ ( if regs = [] then []
+               else
+                 [
+                   Printf.sprintf "  %s(%s);" (sgen_function_id (mk_id "initialize_registers"))
+                     (if erase_unit_values then "" else "UNIT");
+                 ]
+             )
            @ ( if ctx_has_val_spec init_config_id ctx then
-                 [Printf.sprintf "  %s(UNIT);" (sgen_function_id init_config_id)]
+                 [
+                   Printf.sprintf "  %s(%s);" (sgen_function_id init_config_id)
+                     (if erase_unit_values then "" else "UNIT");
+                 ]
                else []
              )
            @ ["}"]
@@ -7971,6 +11983,419 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         cdefs
     else cdefs
 
+  (* Representation inference may discover several proof-bound partitions for
+     one typed Sail function even when optimization leaves them with precisely
+     the same represented signature and JIB body.  Those partitions remain
+     distinct in the specialization plan, but they do not need distinct C
+     definitions.  Coalesce only after the final JIB optimization, and use a
+     partition refinement over specialized callees so recursive and mutually
+     dependent definitions are compared without their proof-bound names. *)
+  let deduplicate_representation_specializations ctx cdefs =
+    let traces_by_id =
+      List.fold_left
+        (fun traces (trace : Jib_compile.representation_specialization) ->
+          Bindings.add trace.specialized_id trace traces
+        )
+        Bindings.empty !Jib_compile.representation_specializations
+    in
+    let definitions =
+      List.filter_map
+        (function
+          | CDEF_aux (CDEF_fundef (id, heap_return, parameters, instrs), _)
+            when Bindings.mem id traces_by_id ->
+              Some (id, Bindings.find id traces_by_id, heap_return, parameters, instrs)
+          | _ -> None
+          )
+        cdefs
+    in
+    let emitted_signatures_by_id =
+      List.fold_left
+        (fun signatures -> function
+          | CDEF_aux (CDEF_val (id, _, parameter_types, result_type, _), _)
+            when Bindings.mem id traces_by_id ->
+              Bindings.add id (parameter_types, result_type) signatures
+          | _ -> signatures
+        )
+        Bindings.empty cdefs
+    in
+    let emitted_signature (id, _, _, _, _) = Bindings.find id emitted_signatures_by_id in
+    let signature_key ((_, trace, _, _, _) as definition) =
+      let parameter_types, result_type = emitted_signature definition in
+      String.concat "\x1f"
+        [
+          string_of_id trace.Jib_compile.source_id;
+          String.concat "," (List.map sgen_ctyp parameter_types);
+          sgen_ctyp result_type;
+        ]
+    in
+    let minimum_id left right = if Id.compare left right <= 0 then left else right in
+    let representatives_for key definitions =
+      let minima =
+        List.fold_left
+          (fun minima ((id, _, _, _, _) as definition) ->
+            let key = key definition in
+            Util.StringMap.update key
+              (function None -> Some id | Some prior -> Some (minimum_id prior id))
+              minima
+          )
+          Util.StringMap.empty definitions
+      in
+      List.fold_left
+        (fun representatives ((id, _, _, _, _) as definition) ->
+          Bindings.add id (Util.StringMap.find (key definition) minima) representatives
+        )
+        Bindings.empty definitions
+    in
+    let initial_representatives = representatives_for signature_key definitions in
+    let normalize_call representatives = function
+      | I_aux (I_funcall (result, Call _, (callee, type_arguments), arguments), annot) ->
+          let callee = Option.value ~default:callee (Bindings.find_opt callee representatives) in
+          I_aux (I_funcall (result, Call (([], None), []), (callee, type_arguments), arguments), annot)
+      | I_aux (I_funcall (result, kind, (callee, type_arguments), arguments), annot) ->
+          let callee = Option.value ~default:callee (Bindings.find_opt callee representatives) in
+          I_aux (I_funcall (result, kind, (callee, type_arguments), arguments), annot)
+      | instr -> instr
+    in
+    let body_key representatives ((id, _, heap_return, parameters, instrs) as definition) =
+      let prior = Option.value ~default:id (Bindings.find_opt id representatives) in
+      let heap_return_key =
+        match heap_return with
+        | Return_plain -> "return:plain"
+        | Return_via name -> "return:heap:" ^ string_of_name ~zencode:false name
+      in
+      let parameters_key = String.concat "," (List.map (string_of_name ~zencode:false) parameters) in
+      let body =
+        map_instr_list (normalize_call representatives) instrs
+        |> List.map string_of_instr |> String.concat "\n"
+      in
+      String.concat "\x1e" [signature_key definition; string_of_id prior; heap_return_key; parameters_key; body]
+    in
+    let rec refine representatives =
+      let refined = representatives_for (body_key representatives) definitions in
+      if Bindings.equal (fun left right -> Id.compare left right = 0) representatives refined then refined
+      else refine refined
+    in
+    let representatives = refine initial_representatives in
+    let classes_by_signature =
+      List.fold_left
+        (fun classes ((id, _, _, _, _) as definition) ->
+          let representative = Bindings.find id representatives in
+          Util.StringMap.update (signature_key definition)
+            (function
+              | None -> Some (IdSet.singleton representative)
+              | Some representatives -> Some (IdSet.add representative representatives)
+              )
+            classes
+        )
+        Util.StringMap.empty definitions
+    in
+    let specialized_ids =
+      List.fold_left (fun ids (id, _, _, _, _) -> IdSet.add id ids) IdSet.empty definitions
+    in
+    let occupied_ids =
+      List.fold_left
+        (fun ids -> function
+          | CDEF_aux
+              ( ( CDEF_val (id, _, _, _, _)
+                | CDEF_fundef (id, _, _, _)
+                | CDEF_startup (id, _)
+                | CDEF_finish (id, _)
+                ),
+                _
+              )
+            when not (IdSet.mem id specialized_ids) ->
+              IdSet.add id ids
+          | _ -> ids
+        )
+        IdSet.empty cdefs
+    in
+    let definition_for_id id =
+      List.find (fun (candidate, _, _, _, _) -> Id.compare candidate id = 0) definitions
+    in
+    let classes_by_source =
+      Util.StringMap.fold
+        (fun _ representatives classes ->
+          IdSet.fold
+            (fun representative classes ->
+              let (_, trace, _, _, _) = definition_for_id representative in
+              let source = string_of_id trace.Jib_compile.source_id in
+              Util.StringMap.update source
+                (function None -> Some [representative] | Some prior -> Some (representative :: prior))
+                classes
+            )
+            representatives classes
+        )
+        classes_by_signature Util.StringMap.empty
+    in
+    let signature_stem definition =
+      (* These components are embedded inside a larger function identifier, so
+         C type names such as uint8_t and bool are safe here even though the
+         ordinary standalone-name sanitizer quite correctly reserves them. *)
+      let stem ctyp =
+        let buffer = Buffer.create 32 in
+        let separator () =
+          let length = Buffer.length buffer in
+          if length > 0 && Buffer.nth buffer (length - 1) <> '_' then Buffer.add_char buffer '_'
+        in
+        String.iter
+          (fun character ->
+            match character with
+            | ('a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_') as character ->
+                Buffer.add_char buffer character
+            | '*' ->
+                separator ();
+                Buffer.add_string buffer "ptr"
+            | _ -> separator ()
+          )
+          (sgen_ctyp ctyp);
+        let stem = Buffer.contents buffer in
+        if stem = "" then "value" else stem
+      in
+      let parameter_types, result_type = emitted_signature definition in
+      let parameters =
+        match parameter_types with
+        | [] -> "void"
+        | parameters -> String.concat "_" (List.map stem parameters)
+      in
+      parameters ^ "_to_" ^ stem result_type
+    in
+    let representative_outputs =
+      Util.StringMap.fold
+        (fun source representatives outputs ->
+          let representatives = List.sort Id.compare representatives in
+          let source_id =
+            let (_, trace, _, _, _) = definition_for_id (List.hd representatives) in
+            trace.Jib_compile.source_id
+          in
+          if List.length representatives = 1 && not (IdSet.mem source_id occupied_ids) then
+            Bindings.add (List.hd representatives) source_id outputs
+          else
+            let by_signature =
+              List.fold_left
+                (fun signatures representative ->
+                  let definition = definition_for_id representative in
+                  Util.StringMap.update (signature_stem definition)
+                    (function None -> Some [representative] | Some prior -> Some (representative :: prior))
+                    signatures
+                )
+                Util.StringMap.empty representatives
+            in
+            Util.StringMap.fold
+              (fun stem variants outputs ->
+                List.sort Id.compare variants
+                |> List.mapi (fun index representative ->
+                       let suffix = if index = 0 then "" else Printf.sprintf "_variant_%d" (index + 1) in
+                       (representative, mk_id (source ^ "_" ^ stem ^ suffix))
+                   )
+                |> List.fold_left
+                     (fun outputs (representative, output) -> Bindings.add representative output outputs)
+                     outputs
+              )
+              by_signature outputs
+        )
+        classes_by_source Bindings.empty
+    in
+    let output_ids =
+      Bindings.fold
+        (fun id representative outputs ->
+          Bindings.add id (Bindings.find representative representative_outputs) outputs
+        )
+        representatives Bindings.empty
+    in
+    let rewrite_call = function
+      | I_aux (I_funcall (result, kind, (callee, type_arguments), arguments), annot) ->
+          let callee = Option.value ~default:callee (Bindings.find_opt callee output_ids) in
+          I_aux (I_funcall (result, kind, (callee, type_arguments), arguments), annot)
+      | instr -> instr
+    in
+    let emitted_valspecs = ref IdSet.empty and emitted_fundefs = ref IdSet.empty in
+    let cdefs =
+      List.filter_map
+        (fun (CDEF_aux (cdef, def_annot) as annotated) ->
+          let annotated = cdef_map_instr rewrite_call annotated in
+          match cdef with
+          | CDEF_val (id, type_parameters, parameter_types, result_type, extern)
+            when Bindings.mem id output_ids ->
+              let output = Bindings.find id output_ids in
+              if IdSet.mem output !emitted_valspecs then None
+              else (
+                emitted_valspecs := IdSet.add output !emitted_valspecs;
+                Some (CDEF_aux (CDEF_val (output, type_parameters, parameter_types, result_type, extern), def_annot))
+              )
+          | CDEF_fundef (id, heap_return, parameters, instrs) when Bindings.mem id output_ids ->
+              let output = Bindings.find id output_ids in
+              if IdSet.mem output !emitted_fundefs then None
+              else (
+                emitted_fundefs := IdSet.add output !emitted_fundefs;
+                let instrs = map_instr_list rewrite_call instrs in
+                Some (CDEF_aux (CDEF_fundef (output, heap_return, parameters, instrs), def_annot))
+              )
+          | _ -> Some annotated
+        )
+        cdefs
+    in
+    let valspecs =
+      Bindings.fold
+        (fun id output valspecs ->
+          match Bindings.find_opt id ctx.valspecs with
+          | Some valspec -> Bindings.add output valspec valspecs
+          | None -> valspecs
+        )
+        output_ids ctx.valspecs
+    in
+    let removed = List.length definitions - IdSet.cardinal !emitted_fundefs in
+    (cdefs, { ctx with valspecs }, output_ids, removed)
+
+  (* Specialization and constant folding can erase the runtime use of a
+     dependent proof/correlation parameter while leaving that parameter in
+     the represented C signature.  For internal functions, remove such
+     formals and the corresponding pure JIB call operands together.  Calls in
+     JIB are already in three-address form, so dropping a cval operand cannot
+     drop an effectful function call; any effectful producer remains as its
+     own instruction.
+
+     Preserved functions are part of the requested generated ABI and externs
+     are host contracts, so neither may change arity.  Raw C is opaque to JIB
+     dependency analysis and is therefore excluded as well.  Iterate because
+     deleting an argument at one call can make a forwarding parameter in its
+     caller dead on the next round. *)
+  let remove_unused_internal_parameters ctx cdefs specialization_output_ids =
+    let preserved_sources = IdSet.of_list (Specialize.get_initial_calls ()) in
+    let preserved =
+      List.fold_left
+        (fun preserved (trace : Jib_compile.representation_specialization) ->
+          if IdSet.mem trace.source_id preserved_sources then
+            let output =
+              Option.value ~default:trace.specialized_id
+                (Bindings.find_opt trace.specialized_id specialization_output_ids)
+            in
+            IdSet.add output preserved
+          else preserved
+        )
+        preserved_sources !Jib_compile.representation_specializations
+    in
+    let rec contains_raw instr =
+      match instr with
+      | I_aux (I_raw _, _) -> true
+      | I_aux (I_if (_, then_instrs, else_instrs), _) ->
+          List.exists contains_raw then_instrs || List.exists contains_raw else_instrs
+      | I_aux ((I_block instrs | I_try_block instrs), _) -> List.exists contains_raw instrs
+      | _ -> false
+    in
+    let referenced_names instrs =
+      List.fold_left
+        (fun referenced instr -> NameSet.union referenced (instr_ids ~direct:false instr))
+        NameSet.empty instrs
+    in
+    let filter_mask mask values =
+      if List.length mask <> List.length values then invalid_arg "remove_unused_internal_parameters"
+      else
+        List.fold_right2
+          (fun keep value kept -> if keep then value :: kept else kept)
+          mask values []
+    in
+    let one_pass ctx cdefs =
+      let candidate_masks =
+        List.fold_left
+          (fun masks -> function
+            | CDEF_aux (CDEF_fundef (id, _, parameters, instrs), _)
+              when Config.optimized_model
+                   && not (IdSet.mem id preserved)
+                   && not (ctx_is_extern id ctx)
+                   && not (List.exists contains_raw instrs) ->
+                let referenced = referenced_names instrs in
+                let mask = List.map (fun parameter -> NameSet.mem parameter referenced) parameters in
+                if List.for_all Fun.id mask then masks else Bindings.add id mask masks
+            | _ -> masks
+          )
+          Bindings.empty cdefs
+      in
+      (* A late JIB call can intentionally expose a different operand list
+         from the source-level valspec (for example after another ABI
+         lowering).  Parameter pruning is only valid when every view of the
+         function agrees on arity, so conservatively leave such functions
+         unchanged. *)
+      let invalid_masks = ref IdSet.empty in
+      let validate_arity id values =
+        match Bindings.find_opt id candidate_masks with
+        | Some mask when List.length mask <> List.length values ->
+            invalid_masks := IdSet.add id !invalid_masks
+        | _ -> ()
+      in
+      let inspect_call = function
+        | I_aux (I_funcall (_, _, (callee, _), arguments), _) as instr ->
+            validate_arity callee arguments;
+            instr
+        | instr -> instr
+      in
+      List.iter
+        (fun (CDEF_aux (cdef, _) as annotated) ->
+          (match cdef with
+          | CDEF_val (id, _, parameter_types, _, _) -> validate_arity id parameter_types
+          | CDEF_fundef (id, _, parameters, _) -> validate_arity id parameters
+          | _ -> ());
+          ignore (cdef_map_instr inspect_call annotated)
+        )
+        cdefs;
+      Bindings.iter
+        (fun id (_, parameter_types, _, _) -> validate_arity id parameter_types)
+        ctx.valspecs;
+      let masks =
+        IdSet.fold (fun id masks -> Bindings.remove id masks) !invalid_masks candidate_masks
+      in
+      if Bindings.is_empty masks then (cdefs, ctx, 0)
+      else
+        let rewrite_call = function
+          | I_aux (I_funcall (result, kind, (callee, type_arguments), arguments), annot)
+            when Bindings.mem callee masks ->
+              let arguments = filter_mask (Bindings.find callee masks) arguments in
+              I_aux (I_funcall (result, kind, (callee, type_arguments), arguments), annot)
+          | instr -> instr
+        in
+        let cdefs =
+          List.map
+            (fun (CDEF_aux (cdef, def_annot) as annotated) ->
+              match cdef with
+              | CDEF_val (id, type_parameters, parameter_types, result_type, extern)
+                when Bindings.mem id masks ->
+                  let parameter_types = filter_mask (Bindings.find id masks) parameter_types in
+                  CDEF_aux (CDEF_val (id, type_parameters, parameter_types, result_type, extern), def_annot)
+              | CDEF_fundef (id, heap_return, parameters, instrs) when Bindings.mem id masks ->
+                  let mask = Bindings.find id masks in
+                  let parameters = filter_mask mask parameters in
+                  let instrs = map_instr_list rewrite_call instrs in
+                  CDEF_aux (CDEF_fundef (id, heap_return, parameters, instrs), def_annot)
+              | _ -> cdef_map_instr rewrite_call annotated
+            )
+            cdefs
+        in
+        let valspecs =
+          Bindings.fold
+            (fun id (extern, parameter_types, result_type, annot) valspecs ->
+              let parameter_types =
+                match Bindings.find_opt id masks with
+                | Some mask -> filter_mask mask parameter_types
+                | None -> parameter_types
+              in
+              Bindings.add id (extern, parameter_types, result_type, annot) valspecs
+            )
+            ctx.valspecs Bindings.empty
+        in
+        let removed =
+          Bindings.fold
+            (fun _ mask removed ->
+              removed + List.fold_left (fun count keep -> if keep then count else count + 1) 0 mask
+            )
+            masks 0
+        in
+        (cdefs, { ctx with valspecs }, removed)
+    in
+    let rec fixpoint cdefs ctx removed =
+      let cdefs, ctx, removed_now = one_pass ctx cdefs in
+      if removed_now = 0 then (cdefs, ctx, removed) else fixpoint cdefs ctx (removed + removed_now)
+    in
+    fixpoint cdefs ctx 0
+
   let rec ctyp_contains pred ctyp =
     pred ctyp
     ||
@@ -8044,7 +12469,17 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       log_phase "optimizing JIB definitions=%d recursive-functions=%d" (List.length cdefs)
         (IdSet.cardinal recursive_functions);
       let cdefs =
-        optimize ~have_rts:(not Config.no_rts) ~specialize_c:Config.specialize_c ctx recursive_functions cdefs
+        optimize ~have_rts:(not Config.no_rts) ~specialize_c:Config.specialize_c
+          ~optimized_model:Config.optimized_model ctx recursive_functions cdefs
+      in
+      let cdefs, ctx =
+        if !optimize_dead_letbinds then (
+          let cdefs, live_letbinds = remove_dead_letbinds cdefs in
+          let dropped = List.length ctx.letbinds - List.length live_letbinds in
+          if dropped > 0 then log_phase "removed dead letbinds=%d" dropped;
+          (cdefs, { ctx with letbinds = List.filter (fun n -> List.mem n live_letbinds) ctx.letbinds })
+        )
+        else (cdefs, ctx)
       in
       log_phase "optimized JIB definitions=%d" (List.length cdefs);
 
@@ -8266,6 +12701,20 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       );
       emit_generic_sail_int_helpers := (not Config.specialize_c) || has_sail_int;
       emit_generic_lbits_helpers := (not Config.specialize_c) || has_lbits;
+      let language_exceptions = ref false in
+      let exception_visitor =
+        object
+          inherit empty_jib_visitor
+
+          method! vinstr = function
+            | I_aux ((I_throw _ | I_try_block _), _) ->
+                language_exceptions := true;
+                SkipChildren
+            | _ -> DoChildren
+        end
+      in
+      ignore (visit_cdefs exception_visitor cdefs);
+      emit_optimized_exception_state := (not Config.optimized_model) || !language_exceptions;
 
       let specialization_plan =
         if
@@ -8332,6 +12781,29 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       | _ -> ()
       );
 
+      let cdefs, ctx, specialization_output_ids, deduplicated_specializations =
+        if Config.specialize_c then deduplicate_representation_specializations ctx cdefs
+        else (cdefs, ctx, Bindings.empty, 0)
+      in
+      if deduplicated_specializations > 0 then
+        log_phase "deduplicated identical represented specializations=%d" deduplicated_specializations;
+
+      let rec remove_parameters_and_results ctx cdefs removed =
+        let cdefs, ctx, removed_now =
+          remove_unused_internal_parameters ctx cdefs specialization_output_ids
+        in
+        let cdefs =
+          if !optimize_unit_results then List.map (discard_unread_stack_results ctx) cdefs else cdefs
+        in
+        if removed_now = 0 then (cdefs, ctx, removed)
+        else remove_parameters_and_results ctx cdefs (removed + removed_now)
+      in
+      let cdefs, ctx, removed_parameters =
+        if Config.optimized_model then remove_parameters_and_results ctx cdefs 0 else (cdefs, ctx, 0)
+      in
+      if removed_parameters > 0 then
+        log_phase "removed unused internal parameters=%d" removed_parameters;
+
       generated := IdSet.empty;
       emitted_external_functions := Util.StringSet.empty;
       current_static_helper_demands := Util.StringSet.empty;
@@ -8339,6 +12811,9 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       static_equality_declaration_names := Util.StringSet.empty;
       readable_ctyp_names := CTMap.empty;
       readable_ctyp_names_used := Util.StringSet.empty;
+      List.iter
+        (fun (_, name) -> readable_ctyp_names_used := Util.StringSet.add name !readable_ctyp_names_used)
+        Config.c_repr_fixed_bytes_names;
       if Config.no_mangle then (
         let reserve_nominal_types =
           object
@@ -8463,6 +12938,27 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             List.stable_sort (fun left right -> Int.compare (module_index left) (module_index right)) cdefs
       in
 
+      (* Analyze all immutable globals together after their final C
+         representations and module order are known.  The fixpoint resolves
+         aliases even when modular ownership reorders their definitions. *)
+      prepare_static_letbinds ctx cdefs;
+
+      (* Valspecs carry parameter types but not their source names.  Recover
+         those names from matching JIB definitions before emitting module
+         headers.  Bodyless extern declarations use positional comments:
+         clang-tidy can still audit that every parameter is documented, while
+         the comment cannot disagree with the linked host definition's actual
+         identifier. *)
+      function_parameter_names :=
+        List.fold_left
+          (fun names (CDEF_aux (cdef, _)) ->
+            match cdef with
+            | CDEF_fundef (id, _, args, _) ->
+                Bindings.add id (List.map sgen_name args) names
+            | _ -> names
+          )
+          Bindings.empty cdefs;
+
       log_phase "generating C definitions=%d" (List.length cdefs);
       let codegen_with_helper_demands generate =
         current_static_helper_demands := Util.StringSet.empty;
@@ -8532,6 +13028,31 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         |> Util.StringSet.elements
       in
 
+      let optimized_base_preamble =
+        separate hardline
+          [
+            string "#include <stdbool.h>";
+            string "#include <stddef.h>";
+            string "#include <stdint.h>";
+            string "#include <stdio.h>";
+            string "#include <stdlib.h>";
+            string "#include <string.h>";
+            string "typedef uint64_t unit;";
+            string "#define UNIT UINT64_C(0)";
+            string "#define EQUAL(type) eq_ ## type";
+            string "#define UNDEFINED(type) undefined_ ## type";
+            string "static inline bool eq_unit(void) { return true; }";
+            string "static inline bool eq_bool(bool lhs, bool rhs) { return lhs == rhs; }";
+            string "static inline bool eq_fbits(uint64_t lhs, uint64_t rhs) { return lhs == rhs; }";
+            string "static inline void undefined_unit(void) {}";
+            string "static inline bool undefined_bool(void) { return false; }";
+            string "static inline uint64_t undefined_fbits(void) { return UINT64_C(0); }";
+            string
+              "static inline uint64_t safe_rshift(uint64_t value, uint64_t amount) { return amount >= UINT64_C(64) ? UINT64_C(0) : value >> amount; }";
+            string
+              "_Noreturn static inline void sail_match_failure(const char *function) { const int write_status = fprintf(stderr, \"Sail match failure in %s\\n\", function); (void)write_status; abort(); }";
+          ]
+      in
       let preamble in_header =
         let configured_headers =
           (if in_header then external_type_headers @ Config.header_includes else Config.includes)
@@ -8542,31 +13063,10 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         in
         separate hardline
           (( if Config.optimized_model then
-               [
-                 string "#include <stdbool.h>";
-                 string "#include <stddef.h>";
-                 string "#include <stdint.h>";
-                 string "#include <stdio.h>";
-                 string "#include <stdlib.h>";
-                 string "#include <string.h>";
-                 string "#ifndef SAIL_FIXED_ABI_BASE_DEFINED";
-                 string "#define SAIL_FIXED_ABI_BASE_DEFINED";
-                 string "typedef uint64_t unit;";
-                 string "#define UNIT UINT64_C(0)";
-                 string "#define EQUAL(type) eq_ ## type";
-                 string "#define UNDEFINED(type) undefined_ ## type";
-                 string "static inline bool eq_unit(unit lhs, unit rhs) { return lhs == rhs; }";
-                 string "static inline bool eq_bool(bool lhs, bool rhs) { return lhs == rhs; }";
-                 string "static inline bool eq_fbits(uint64_t lhs, uint64_t rhs) { return lhs == rhs; }";
-                 string "static inline unit undefined_unit(unit value) { return value; }";
-                 string "static inline bool undefined_bool(unit unused) { (void)unused; return false; }";
-                 string "static inline uint64_t undefined_fbits(unit unused) { (void)unused; return UINT64_C(0); }";
-                 string
-                   "static inline uint64_t safe_rshift(uint64_t value, uint64_t amount) { return amount >= UINT64_C(64) ? UINT64_C(0) : value >> amount; }";
-                 string
-                   "static inline void sail_match_failure(const char *function) { fprintf(stderr, \"Sail match failure in %s\\n\", function); abort(); }";
-                 string "#endif";
-               ]
+               ( match (!requested_modules, in_header) with
+               | Some (package, _), true -> [ksprintf string "#include \"%s/spec/abi.h\"" package]
+               | _ -> [optimized_base_preamble]
+               )
              else if Config.no_lib then []
              else
                [string "#include \"sail.h\""]
@@ -8741,7 +13241,12 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       in
 
       (match (Config.specialization_plan_human, specialization_plan) with
-      | Some path, Some plan -> Specialization_plan.write_human ~backend_symbol:sgen_function_id path plan
+      | Some path, Some plan ->
+          Specialization_plan.write_human
+            ~backend_symbol:(fun id ->
+              sgen_function_id (Option.value ~default:id (Bindings.find_opt id specialization_output_ids))
+            )
+            path plan
       | _ -> ()
       );
       ( match !requested_modules with
@@ -8810,6 +13315,20 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             ^^ (merge_file_docs ordinary_docs).static_func_def
             ^^ globally_required_static
           in
+          (* Shared type-support helpers (integer arithmetic, fixed-vector
+             access, equality and UNDEFINED families) are emitted once into a
+             generated support header included by every module translation
+             unit. The helpers stay [static], so each unit keeps the same
+             inlining and dead-code elimination behavior as when the text was
+             duplicated per module. *)
+          let support_header_doc =
+            string "#pragma once" ^^ twice hardline
+            ^^ ksprintf string "#include \"%s/spec.h\"" package
+            ^^ twice hardline ^^ all_static ^^ hardline
+          in
+          let base_header_doc = string "#pragma once" ^^ twice hardline ^^ optimized_base_preamble ^^ hardline in
+          generated_base_header := Some (Document.to_string base_header_doc);
+          generated_support_header := Some (Document.to_string support_header_doc);
           let include_module stem = ksprintf string "#include \"%s/spec/%s.h\"" package stem in
           let find_required name =
             Array.to_list modules
@@ -8847,7 +13366,9 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             in
             let implementation_doc =
               ksprintf string "#include \"%s/spec.h\"" package
-              ^^ twice hardline ^^ all_static ^^ required_static ^^ split.var_def ^^ split.func_def
+              ^^ hardline
+              ^^ ksprintf string "#include \"%s/spec/support.h\"" package
+              ^^ twice hardline ^^ required_static ^^ split.var_def ^^ split.func_def
             in
             {
               name = mdl.name;
@@ -8866,15 +13387,27 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
 
   let compile_ast_modules env effect_info ~package (modules : c_module list) ast =
     if modules = [] then c_error "--c-optimized-model requires a Sail project containing at least one module";
+    ( match
+        List.find_opt
+          (fun (mdl : c_module) -> String.equal mdl.file_stem "support" || String.equal mdl.file_stem "abi")
+          modules
+      with
+    | Some mdl ->
+        c_error
+          (Printf.sprintf "Sail module %s maps to the reserved generated file stem '%s'" mdl.name mdl.file_stem)
+    | None -> ()
+    );
     requested_modules := Some (package, modules);
     generated_modules := None;
+    generated_base_header := None;
+    generated_support_header := None;
     let _, _ =
       Fun.protect
         ~finally:(fun () -> requested_modules := None)
         (fun () -> compile_ast env effect_info package ast)
     in
-    match !generated_modules with
-    | Some outputs ->
+    match (!generated_modules, !generated_base_header, !generated_support_header) with
+    | Some outputs, Some base, Some support ->
         let umbrella =
           "#pragma once\n\n"
           ^ String.concat "\n"
@@ -8884,6 +13417,6 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
               )
           ^ "\n"
         in
-        (umbrella, outputs)
-    | None -> c_error "failed to produce modular optimized-model output"
+        (umbrella, base, support, outputs)
+    | _ -> c_error "failed to produce modular optimized-model output"
 end

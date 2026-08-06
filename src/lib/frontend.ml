@@ -62,6 +62,7 @@ let finalize_ast asserts_termination ctx env ast =
   Lint.warn_unused_variables ast;
   let ast = Scattered.descatter env ast in
   let side_effects = Effects.infer_side_effects asserts_termination ast in
+  if !Lint.opt_readability then Lint.warn_readability side_effects ast;
   if !opt_ddump_side_effect then Effects.dump_effects side_effects;
   Effects.check_side_effects side_effects ast;
   if !opt_ddump_tc_ast then Pretty_print_sail.output_ast stdout (Type_check.strip_ast ast);
