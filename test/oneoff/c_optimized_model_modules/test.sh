@@ -36,14 +36,17 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-optimized-external-type pair=evmsail/host/types.h \
   --c-optimized-external-type byte_slice=evmsail/host/types.h \
   --c-optimized-external-type byte_slice_small=evmsail/host/types.h \
+  --c-optimized-external-type canonical_slice=evmsail/host/types.h \
+  --c-optimized-external-type canonical_list=evmsail/host/types.h \
   --c-optimized-byte-pointer-field byte_slice.bytes=test_bytes_at \
   --c-optimized-byte-pointer-field byte_slice_small.bytes=test_bytes_at \
   --c-optimized-byte-pointer-field analyzed_code.bytes=test_bytes_at \
   --c-optimized-byte-pointer-type jump_table_index=test_jumpdests_at \
-  --c-preserve-type pair --c-preserve-type byte_slice --c-preserve-type byte_slice_small \
+  --c-preserve-type pair --c-preserve-type byte_slice --c-preserve-type byte_slice_small --c-preserve-type canonical_slice \
+  --c-preserve-type canonical_list \
   --c-preserve-type analyzed_code \
   --c-preserve-type sample_choice --c-preserve-type erased_unit_choice \
-  --c-preserve-type wide_word --c-preserve-type four_bytes --c-preserve-type twenty_bytes --c-preserve-type fixed_ids \
+  --c-preserve-type wide_word --c-preserve-type four_bytes --c-preserve-type twenty_bytes --c-preserve-type lane_five_bytes --c-preserve-type fixed_ids \
   --c-preserve-type fixed_ids_box --c-preserve-type equality_pair \
   --c-preserve pair_sum --c-preserve sample_choice_value --c-preserve added_is_nonzero \
   --c-preserve boolean_cleanup --c-preserve positive_branch --c-preserve early_wide_guard --c-preserve widened_tuple_match \
@@ -53,8 +56,9 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve preserve_unused_parameter \
   --c-preserve widen_optional_byte \
   --c-preserve test_gas --c-preserve test_gas_alias --c-preserve test_fixed_bytes_zero \
-  --c-preserve test_fixed_bytes_one --c-preserve twenty_bytes_equal \
+  --c-preserve test_fixed_bytes_one --c-preserve test_lane_bytes --c-preserve twenty_bytes_equal \
   --c-preserve runtime_label_test --c-preserve runtime_pair --c-preserve always_fatal --c-preserve fatal_error \
+  --c-preserve terminal_assertion \
   --c-preserve decrement_byte --c-preserve increment_to --c-preserve count_four \
   --c-preserve increment_to_via_call \
   --c-preserve wide_identity --c-preserve aggregate_early_return \
@@ -68,6 +72,9 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve four_bytes_identity \
   --c-preserve identity_one --c-preserve identity_two --c-preserve branch_one --c-preserve branch_five \
   --c-preserve byte_slice_at --c-preserve byte_slice_small_at \
+  --c-preserve canonical_slice_len \
+  --c-preserve canonical_list_count --c-preserve canonical_list_identity \
+  --c-preserve canonical_list_count_after_identity \
   --c-preserve byte_slice_same_start \
   --c-preserve byte_slice_next --c-preserve byte_slice_advance --c-preserve byte_slice_distance \
   --c-preserve jumpdest_from_offset --c-preserve empty_jumpdest --c-preserve empty_direct_jumpdest \
@@ -82,7 +89,11 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve machine_pick_zero --c-preserve reset_counter --c-preserve preserve_counter_snapshot \
   --c-preserve make_public_pair --c-preserve save_pair_then_read --c-preserve initialized_comparison_return \
   --c-preserve call_specialized_comparison --c-preserve call_specialized_enum_comparison \
-  --c-preserve terminal_choice --c-preserve terminal_enum_match --c-preserve terminal_enum_match_or_fatal \
+  --c-preserve conditional_word --c-preserve conditional_bool --c-preserve conditional_bool_false \
+  --c-preserve terminal_choice --c-preserve terminal_enum_match --c-preserve terminal_enum_grouped \
+  --c-preserve terminal_enum_match_or_fatal \
+  --c-preserve fatal_guard_result_is_unread \
+  --c-preserve terminal_unit_variant_match \
   --c-preserve terminal_fixed_bytes_match \
   --c-preserve catch_byte \
   "$TEST_DIR/model.sail_project"
@@ -105,6 +116,22 @@ grep -Fq '#include "evmsail/spec/base.h"' "$SPEC_INCLUDE/evmsail/spec.h"
 grep -Fq '#include "evmsail/host/types.h"' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint8_t' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint16_t pair_sum(struct pair value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'uint8_t canonical_slice_len(TestBytes value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'uint8_t canonical_list_count(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'TestList canonical_list_identity(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'uint8_t canonical_list_count_after_identity(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+if grep -Fq 'struct canonical_slice' "$SPEC_INCLUDE/evmsail/spec/base.h"; then
+  echo 'optimized extraction emitted a nominal definition for a canonically named external representation' >&2
+  exit 1
+fi
+if grep -Fq 'struct canonical_list' "$SPEC_INCLUDE/evmsail/spec/base.h"; then
+  echo 'optimized extraction emitted a managed nominal definition for an external representation' >&2
+  exit 1
+fi
+if grep -Fq 'bool eq_anything(' "$SPEC_INCLUDE/evmsail/spec/base.h"; then
+  echo 'optimized extraction exposed a polymorphic compiler intrinsic as a C ABI symbol' >&2
+  exit 1
+fi
 grep -Fq 'extern const uint16_t TEST_GAS;' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'const uint16_t TEST_GAS = UINT16_C(21000);' "$SPEC_SOURCE/base.c"
 test "$(grep -Fc 'TEST_GAS =' "$SPEC_SOURCE/base.c")" -eq 1
@@ -130,6 +157,10 @@ if grep -Fq 'test_word_to_four(' "$SPEC_SOURCE/base.c"; then
   echo 'optimized extraction retained an explicitly static-evaluable fixed-byte initializer call' >&2
   exit 1
 fi
+grep -Fq 'typedef struct { uint64_t lanes[1]; } lane_bytes5;' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'extern const lane_bytes5 TEST_LANE_BYTES;' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'const lane_bytes5 TEST_LANE_BYTES = {' "$SPEC_SOURCE/base.c"
+grep -Fq 'UINT64_C(4886718345)' "$SPEC_SOURCE/base.c"
 awk '
   /^uint8_t decrement_byte\(/ { printing = 1 }
   printing { print }
@@ -256,6 +287,7 @@ test "$(grep -Fc 'return ((struct tuple_uint_16_uint_16){' "$TMP_DIR/widened_tup
 grep -Fq '.tup0 = UINT16_C(1), .tup1 = UINT16_C(2)' "$TMP_DIR/widened_tuple_match.c"
 grep -Fq '.tup0 = UINT16_C(3), .tup1 = UINT16_C(4)' "$TMP_DIR/widened_tuple_match.c"
 grep -Fq '.tup0 = UINT16_C(5), .tup1 = UINT16_C(6)' "$TMP_DIR/widened_tuple_match.c"
+grep -Fq 'switch (choice)' "$TMP_DIR/widened_tuple_match.c"
 if grep -Eq 'goto |finish_match_|tmp_|result_' "$TMP_DIR/widened_tuple_match.c"; then
   echo 'optimized extraction retained a mutable join or labels for a widened tuple match' >&2
   exit 1
@@ -264,8 +296,25 @@ sed -n \
   '/^uint8_t terminal_enum_match(/,/^}/p' \
   "$SPEC_SOURCE/machine.c" > "$TMP_DIR/terminal_enum_match.c"
 test "$(grep -Fc 'return UINT8_C(' "$TMP_DIR/terminal_enum_match.c")" -eq 4
+grep -Fq 'switch (choice)' "$TMP_DIR/terminal_enum_match.c"
+test "$(grep -Fc 'case Terminal' "$TMP_DIR/terminal_enum_match.c")" -eq 4
+if grep -Fq 'default:' "$TMP_DIR/terminal_enum_match.c"; then
+  echo 'optimized extraction retained a default arm instead of explicit exhaustive enum cases' >&2
+  exit 1
+fi
 if grep -Eq 'goto |finish_match_|tmp_|result_' "$TMP_DIR/terminal_enum_match.c"; then
   echo 'optimized extraction retained a mutable join or labels for a terminal enum match' >&2
+  exit 1
+fi
+sed -n \
+  '/^uint8_t terminal_enum_grouped(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/terminal_enum_grouped.c"
+grep -Fq 'switch (choice)' "$TMP_DIR/terminal_enum_grouped.c"
+test "$(grep -Fc 'case Terminal' "$TMP_DIR/terminal_enum_grouped.c")" -eq 4
+test "$(grep -Fc 'return UINT8_C(1);' "$TMP_DIR/terminal_enum_grouped.c")" -eq 1
+test "$(grep -Fc 'return UINT8_C(2);' "$TMP_DIR/terminal_enum_grouped.c")" -eq 1
+if grep -Eq 'default:|/\* complete \*/' "$TMP_DIR/terminal_enum_grouped.c"; then
+  echo 'optimized extraction failed to group identical exhaustive enum arms' >&2
   exit 1
 fi
 sed -n \
@@ -273,8 +322,55 @@ sed -n \
   "$SPEC_SOURCE/machine.c" > "$TMP_DIR/terminal_enum_match_or_fatal.c"
 test "$(grep -Fc 'return UINT8_C(' "$TMP_DIR/terminal_enum_match_or_fatal.c")" -eq 2
 grep -Fq 'fatal_error(TestFatal);' "$TMP_DIR/terminal_enum_match_or_fatal.c"
-if grep -Eq 'goto |finish_match_|tmp_|result_' "$TMP_DIR/terminal_enum_match_or_fatal.c"; then
+grep -Fq 'switch (choice)' "$TMP_DIR/terminal_enum_match_or_fatal.c"
+test "$(grep -Fc 'case Terminal' "$TMP_DIR/terminal_enum_match_or_fatal.c")" -eq 4
+if grep -Fq 'default:' "$TMP_DIR/terminal_enum_match_or_fatal.c"; then
+  echo 'optimized extraction retained a default arm for an exhaustive fatal enum match' >&2
+  exit 1
+fi
+if grep -Fq '    return;' "$TMP_DIR/terminal_enum_match_or_fatal.c"; then
+  echo 'optimized extraction appended a void return after a noreturn match arm' >&2
+  exit 1
+fi
+if grep -Eq 'goto |finish_match_|uint8_t (tmp_|result_)' "$TMP_DIR/terminal_enum_match_or_fatal.c"; then
   echo 'optimized extraction retained a mutable join for a fatal match arm' >&2
+  exit 1
+fi
+
+sed -n \
+  '/^uint8_t fatal_guard_result_is_unread(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/fatal_guard_result_is_unread.c"
+grep -Fq 'if (flag)' "$TMP_DIR/fatal_guard_result_is_unread.c"
+grep -Fq 'fatal_error(TestFatal);' "$TMP_DIR/fatal_guard_result_is_unread.c"
+grep -Fq 'return UINT8_C(7);' "$TMP_DIR/fatal_guard_result_is_unread.c"
+sed -n \
+  '/^void terminal_unit_variant_match(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/terminal_unit_variant_match.c"
+grep -Fq 'switch (choice.kind)' "$TMP_DIR/terminal_unit_variant_match.c"
+test "$(grep -Fc 'case Kind_' "$TMP_DIR/terminal_unit_variant_match.c")" -eq 3
+if grep -Fq 'default:' "$TMP_DIR/terminal_unit_variant_match.c"; then
+  echo 'optimized extraction retained a default arm instead of explicit exhaustive variant cases' >&2
+  exit 1
+fi
+grep -Fq 'terminal_unit_empty(' "$TMP_DIR/terminal_unit_variant_match.c"
+grep -Fq 'terminal_unit_other_empty(' "$TMP_DIR/terminal_unit_variant_match.c"
+grep -Fq 'terminal_unit_byte(' "$TMP_DIR/terminal_unit_variant_match.c"
+test "$(grep -Fc '    return;' "$TMP_DIR/terminal_unit_variant_match.c")" -eq 3
+if grep -Fq '  {' "$TMP_DIR/terminal_unit_variant_match.c" || \
+   grep -Fq '    break;' "$TMP_DIR/terminal_unit_variant_match.c"; then
+  echo 'optimized extraction retained redundant scopes or a fallthrough break in a terminal unit match' >&2
+  exit 1
+fi
+if grep -Fq 'if (choice.kind' "$TMP_DIR/terminal_unit_variant_match.c"; then
+  echo 'optimized extraction lowered a terminal unit variant match as an if ladder' >&2
+  exit 1
+fi
+sed -n \
+  '/^uint8_t terminal_assertion(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/terminal_assertion.c"
+grep -Fq '__builtin_trap();' "$TMP_DIR/terminal_assertion.c"
+if grep -Fq 'sail_match_failure' "$TMP_DIR/terminal_assertion.c"; then
+  echo 'optimized extraction emitted a match failure after a terminal assertion' >&2
   exit 1
 fi
 sed -n \
@@ -335,7 +431,7 @@ grep -Fq 'uint8_t sample_choice_value(struct sample_choice value);' "$SPEC_INCLU
 grep -Fq 'struct byte_slice byte_slice_at(uint8_t off, uint8_t len);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'test_bytes_at((uint64_t)off)' "$SPEC_SOURCE/base.c"
 grep -Fq 'struct analyzed_code {' "$SPEC_INCLUDE/evmsail/spec/base.h"
-test "$(grep -Fc 'uint8_t *' "$SPEC_INCLUDE/evmsail/spec/base.h")" -ge 2
+test "$(grep -Fc 'const uint8_t *' "$HOST_INCLUDE/types.h")" -ge 3
 grep -Fq 'test_jumpdests_at((uint64_t)off)' "$SPEC_SOURCE/base.c"
 grep -Eq 'uint8_t \* *jumpdest_from_offset\(uint8_t off\);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'extern uint8_t * const EMPTY_DIRECT_JUMP_TABLE;' "$SPEC_INCLUDE/evmsail/spec/base.h"
@@ -346,6 +442,11 @@ if grep -Rq 'let_end_[0-9]' "$SPEC_SOURCE"; then
 fi
 grep -Fq '_Noreturn void fatal_error(enum fatal_reason _reason);' \
   "$SPEC_INCLUDE/evmsail/spec/host_contracts.h"
+test "$(grep -RhF '_Noreturn void fatal_error(enum fatal_reason _reason);' "$SPEC_INCLUDE/evmsail/spec" | wc -l | tr -d ' ')" -eq 1
+if grep -Rq 'SAIL_TEST_' "$SPEC_SOURCE"; then
+  echo 'optimized modular extraction emitted unused unit-test tables' >&2
+  exit 1
+fi
 grep -Eq 'uint8_t \* *empty_direct_jumpdest\(void\);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'typedef uint64_t unit;' "$SPEC_INCLUDE/evmsail/spec/abi.h"
 grep -Fq 'typedef struct { uint8_t bytes[4]; } bytes4;' "$SPEC_INCLUDE/evmsail/spec/base.h"
@@ -521,7 +622,8 @@ awk '
   printing { print }
   printing && /^}/ { printing = 0 }
 ' "$SPEC_SOURCE/base.c" > "$TMP_DIR/sample_choice_value.c"
-grep -Fq 'if (value.kind != Kind_InputChoice)' "$TMP_DIR/sample_choice_value.c"
+grep -Fq 'switch (value.kind)' "$TMP_DIR/sample_choice_value.c"
+grep -Fq 'case Kind_InputChoice:' "$TMP_DIR/sample_choice_value.c"
 test "$(grep -Fc 'return value.variants.' "$TMP_DIR/sample_choice_value.c")" -eq 2
 if grep -Eq 'goto |finish_match_|case_|tmp_' "$TMP_DIR/sample_choice_value.c"; then
   echo 'optimized extraction retained a flattened two-arm match result diamond' >&2
@@ -638,6 +740,36 @@ fi
 grep -Fq 'extern uint32_t public_counter;' "$SPEC_INCLUDE/evmsail/spec/machine.h"
 grep -Fq 'uint32_t public_counter' "$SPEC_SOURCE/machine.c"
 grep -Fq 'void reset_counter(void);' "$SPEC_INCLUDE/evmsail/spec/machine.h"
+awk '
+  /^bool conditional_word\(/ { printing = 1 }
+  printing { print }
+  printing && /^}/ { printing = 0 }
+' "$SPEC_SOURCE/machine.c" > "$TMP_DIR/conditional_word.c"
+grep -Eq 'uint32_t [A-Za-z0-9_]+ = flag \? left : right;' "$TMP_DIR/conditional_word.c"
+if grep -Eq '} else \{|^[[:space:]]+uint32_t [A-Za-z0-9_]+;$' "$TMP_DIR/conditional_word.c"; then
+  echo 'optimized extraction did not recover a pure conditional value initializer' >&2
+  exit 1
+fi
+awk '
+  /^bool conditional_bool\(/ { printing = 1 }
+  printing { print }
+  printing && /^}/ { printing = 0 }
+' "$SPEC_SOURCE/machine.c" > "$TMP_DIR/conditional_bool.c"
+grep -Fq 'return (bool)(flag || fallback);' "$TMP_DIR/conditional_bool.c"
+if grep -Fq '?' "$TMP_DIR/conditional_bool.c"; then
+  echo 'optimized extraction retained a ternary for a simple boolean selection' >&2
+  exit 1
+fi
+awk '
+  /^bool conditional_bool_false\(/ { printing = 1 }
+  printing { print }
+  printing && /^}/ { printing = 0 }
+' "$SPEC_SOURCE/machine.c" > "$TMP_DIR/conditional_bool_false.c"
+grep -Fq 'return (bool)(flag && fallback);' "$TMP_DIR/conditional_bool_false.c"
+if grep -Eq '\?|!\(flag\)|!\(fallback\)' "$TMP_DIR/conditional_bool_false.c"; then
+  echo 'optimized extraction retained a ternary or redundant boolean parentheses for a false selection' >&2
+  exit 1
+fi
 awk '
   /^void reset_counter\(/ { printing = 1 }
   printing { print }
@@ -802,6 +934,7 @@ done
 
 for source in "$SPEC_SOURCE"/*.c; do
   "$CC" ${CFLAGS:-} -std=c11 -Wall -Werror=implicit-function-declaration -Werror=unused-label \
+    -Werror=uninitialized \
     -I "$SPEC_INCLUDE" -c "$source" -o "$TMP_DIR/$(basename "$source" .c).o"
 done
 
@@ -841,6 +974,8 @@ if "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
     --c-optimized-model --c-package evmsail \
     --c-output-dir "$TMP_DIR/missing-type/ffi/optimized" \
     --c-optimized-include-dir "$TMP_DIR/ffi/optimized/include" \
+    --c-optimized-external-type canonical_slice=evmsail/host/types.h \
+    --c-optimized-external-type canonical_list=evmsail/host/types.h \
     --c-optimized-external-type missing_type=evmsail/host/types.h \
     "$TEST_DIR/model.sail_project" \
     >"$TMP_DIR/missing-type.stdout" 2>"$TMP_DIR/missing-type.stderr"; then

@@ -50,7 +50,7 @@ expect_boundary_failure() {
 }
 
 expect_boundary_failure negative 'Sail C backend: negative integer cannot be represented as uint64_t'
-grep -Fq 'INT64_C(-1)' "$TMP_DIR/negative.c"
+grep -Eq 'INT(8|16|32|64)_C\(-1\)' "$TMP_DIR/negative.c"
 if grep -Fq 'neg_int(' "$TMP_DIR/negative.c"; then
   echo 'bounded negative literal detoured through the Sail integer runtime' >&2
   exit 1

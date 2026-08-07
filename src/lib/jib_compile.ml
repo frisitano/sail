@@ -90,23 +90,34 @@ let reset_representation_specializations () = representation_specializations := 
    specialization justified by their semantic facts or compilation stops. *)
 let opt_max_function_specializations = ref 64
 
-let jib_readability_warning rule l message =
-  if not (is_gen_loc l) then Reporting.warn ("Jib readability lint [" ^ rule ^ "]") l message
+let rec jib_source_loc = function
+  | Parse_ast.Generated l | Parse_ast.Unique (_, l) -> jib_source_loc l
+  | Parse_ast.Hint (_, primary, fallback) -> (
+      match jib_source_loc primary with Parse_ast.Unknown -> jib_source_loc fallback | l -> l
+    )
+  | l -> l
+
+type jib_readability_finding = { rule : string; location : Parse_ast.l; message : string }
+
+let report_jib_readability_finding finding =
+  match jib_source_loc finding.location with
+  | Parse_ast.Unknown -> ()
+  | l -> Reporting.warn ("Jib readability lint [" ^ finding.rule ^ "]") l finding.message
 
 let same_name lhs rhs = Name.compare lhs rhs = 0
 
 let rec cval_read_count name = function
   | V_id (id, _) -> if same_name name id then 1 else 0
   | V_lit _ | V_member _ -> 0
-  | V_field (value, _, _) | V_tuple_member (value, _, _) | V_ctor_kind (value, _)
-  | V_ctor_unwrap (value, _, _) ->
+  | V_field (value, _, _) | V_tuple_member (value, _, _) | V_ctor_kind (value, _) | V_ctor_unwrap (value, _, _) ->
       cval_read_count name value
   | V_call (_, values) | V_tuple values ->
       List.fold_left (fun count value -> count + cval_read_count name value) 0 values
-  | V_struct (fields, _) ->
-      List.fold_left (fun count (_, value) -> count + cval_read_count name value) 0 fields
+  | V_struct (fields, _) -> List.fold_left (fun count (_, value) -> count + cval_read_count name value) 0 fields
 
-let init_read_count name = function Init_cval value -> cval_read_count name value | Init_static _ | Init_json_key _ -> 0
+let init_read_count name = function
+  | Init_cval value -> cval_read_count name value
+  | Init_static _ | Init_json_key _ -> 0
 
 let rec clexp_read_count name = function
   | CL_id _ | CL_void _ -> 0
@@ -123,18 +134,46 @@ let rec instr_read_count name (I_aux (instr, _)) =
   | I_init (_, _, init) -> init_read_count name init
   | I_jump (value, _) | I_throw value | I_return value | I_reinit (_, _, value) -> cval_read_count name value
   | I_funcall (returns, _, _, args) ->
-      creturn_read_count name returns
-      + List.fold_left (fun count value -> count + cval_read_count name value) 0 args
+      creturn_read_count name returns + List.fold_left (fun count value -> count + cval_read_count name value) 0 args
   | I_copy (lexp, value) -> clexp_read_count name lexp + cval_read_count name value
   | I_end id -> if same_name name id then 1 else 0
   | I_if (condition, then_instrs, else_instrs) ->
       cval_read_count name condition + instrs_read_count name then_instrs + instrs_read_count name else_instrs
   | I_block instrs | I_try_block instrs -> instrs_read_count name instrs
 
-and instrs_read_count name instrs =
-  List.fold_left (fun count instr -> count + instr_read_count name instr) 0 instrs
+and instrs_read_count name instrs = List.fold_left (fun count instr -> count + instr_read_count name instr) 0 instrs
 
-let is_generated_temporary = function Gen (_, _, _, Some _, _) -> true | _ -> false
+let is_generated_temporary = function Gen _ -> true | _ -> false
+
+let is_bool_literal = function V_lit (VL_bool _, CT_bool) -> true | _ -> false
+
+let rec lint_jib_cval warn l value =
+  ( match value with
+  | V_call (Bnot, [V_lit (VL_bool _, CT_bool)]) ->
+      warn "jib-redundant-bool" l "Lowering retained a negation of a boolean literal."
+  | V_call (Bnot, [V_call (Bnot, [_])]) -> warn "jib-redundant-bool" l "Lowering retained a double boolean negation."
+  | V_call ((Eq | Neq), [lhs; rhs]) when is_bool_literal lhs || is_bool_literal rhs ->
+      warn "jib-redundant-bool" l "Lowering retained a boolean comparison with a boolean literal."
+  | _ -> ()
+  );
+  match value with
+  | V_field (value, _, _) | V_tuple_member (value, _, _) | V_ctor_kind (value, _) | V_ctor_unwrap (value, _, _) ->
+      lint_jib_cval warn l value
+  | V_call (_, values) | V_tuple values -> List.iter (lint_jib_cval warn l) values
+  | V_struct (fields, _) -> List.iter (fun (_, value) -> lint_jib_cval warn l value) fields
+  | V_id _ | V_lit _ | V_member _ -> ()
+
+let lint_jib_instr_cvals warn l = function
+  | I_init (_, _, Init_cval value) | I_reinit (_, _, value) | I_jump (value, _) | I_throw value | I_return value ->
+      lint_jib_cval warn l value
+  | I_funcall (_, _, _, args) -> List.iter (lint_jib_cval warn l) args
+  | I_copy (_, value) -> lint_jib_cval warn l value
+  | I_if (condition, _, _) -> lint_jib_cval warn l condition
+  | I_decl _
+  | I_init (_, _, (Init_static _ | Init_json_key _))
+  | I_clear _ | I_undefined _ | I_exit _ | I_comment _ | I_raw _ | I_label _ | I_goto _ | I_reset _ | I_end _
+  | I_block _ | I_try_block _ ->
+      ()
 
 let rec collect_jump_targets targets (I_aux (instr, _)) =
   match instr with
@@ -144,11 +183,62 @@ let rec collect_jump_targets targets (I_aux (instr, _)) =
   | I_block instrs | I_try_block instrs -> List.fold_left collect_jump_targets targets instrs
   | _ -> targets
 
-let lint_jib_instrs instrs =
+let rec erase_jib_instruction_locations (I_aux (instr, _)) =
+  let instr =
+    match instr with
+    | I_if (condition, then_instrs, else_instrs) ->
+        I_if
+          ( condition,
+            List.map erase_jib_instruction_locations then_instrs,
+            List.map erase_jib_instruction_locations else_instrs
+          )
+    | I_block instrs -> I_block (List.map erase_jib_instruction_locations instrs)
+    | I_try_block instrs -> I_try_block (List.map erase_jib_instruction_locations instrs)
+    | instr -> instr
+  in
+  I_aux (instr, (0, Parse_ast.Unknown))
+
+let instruction_sequences_equal lhs rhs =
+  List.compare Stdlib.compare
+    (List.map erase_jib_instruction_locations lhs)
+    (List.map erase_jib_instruction_locations rhs)
+  = 0
+
+let clexps_equal lhs rhs = Stdlib.compare lhs rhs = 0
+
+let rec instruction_sequence_terminates = function
+  | [] -> false
+  | instrs -> (
+      match List.hd (List.rev instrs) with
+      | I_aux ((I_return _ | I_throw _ | I_exit _), _) -> true
+      | I_aux ((I_block nested | I_try_block nested), _) -> instruction_sequence_terminates nested
+      | I_aux (I_if (_, then_instrs, else_instrs), _) ->
+          instruction_sequence_terminates then_instrs && instruction_sequence_terminates else_instrs
+      | _ -> false
+    )
+
+let instruction_sequence_writes name instrs = List.exists (instr_references ~write:name ~direct:false) instrs
+
+let jib_readability_findings instrs =
+  let findings = ref [] in
+  let warn rule location message = findings := { rule; location; message } :: !findings in
   let targets = List.fold_left collect_jump_targets Util.StringSet.empty instrs in
-  let rec scan instrs =
+  let rec scan_sequence instrs =
     ( match instrs with
-    | I_aux (I_decl (ctyp, declared), (_, l)) :: I_aux (next, _) :: _ -> (
+    | I_aux (I_decl (_, name), (_, l)) :: I_aux (I_if (_, then_instrs, else_instrs), _) :: I_aux (next, _) :: _ ->
+        let then_writes = instruction_sequence_writes name then_instrs in
+        let else_writes = instruction_sequence_writes name else_instrs in
+        let missing_branch_falls_through =
+          if then_writes then not (instruction_sequence_terminates else_instrs)
+          else not (instruction_sequence_terminates then_instrs)
+        in
+        if
+          Bool.compare then_writes else_writes <> 0
+          && missing_branch_falls_through
+          && instr_read_count name (I_aux (next, (0, Parse_ast.Unknown))) > 0
+        then
+          warn "jib-partial-branch-initialization" l "A local is read after only one fallthrough branch initializes it."
+    | I_aux (I_decl (ctyp, declared), (_, l)) :: I_aux (next, _) :: _ ->
         let assigned =
           match next with
           | I_copy (CL_id (destination, _), _) -> same_name declared destination
@@ -156,34 +246,62 @@ let lint_jib_instrs instrs =
           | _ -> false
         in
         if assigned then
-          jib_readability_warning "jib-declaration-assignment-split" l
+          warn "jib-declaration-assignment-split" l
             "Lowering separated a local declaration from its immediate initialization.";
         if ctyp = CT_unit then
-          jib_readability_warning "jib-unit-plumbing" l
-            "Lowering introduced a unit-valued local that a backend can erase."
-      )
+          warn "jib-unit-plumbing" l "Lowering introduced a unit-valued local that a backend can erase."
     | I_aux (I_decl (CT_unit, _), (_, l)) :: _ ->
-        jib_readability_warning "jib-unit-plumbing" l "Lowering introduced a unit-valued local that a backend can erase."
+        warn "jib-unit-plumbing" l "Lowering introduced a unit-valued local that a backend can erase."
     | I_aux (I_init (_, name, Init_cval _), (_, l)) :: rest
       when is_generated_temporary name && instrs_read_count name rest = 1 ->
         let is_rewritten = List.exists (instr_references ~write:name ~direct:false) rest in
         if not is_rewritten then
-          jib_readability_warning "jib-single-use-pure-temporary" l
+          warn "jib-single-use-pure-temporary" l
             "Lowering introduced a single-use pure temporary that can be inlined without reordering effects."
+    | I_aux (I_init (_, name, Init_cval _), (_, l)) :: rest
+      when is_generated_temporary name && instrs_read_count name rest = 0 ->
+        let is_rewritten = List.exists (instr_references ~write:name ~direct:false) rest in
+        if not is_rewritten then
+          warn "jib-dead-pure-temporary" l
+            "Lowering introduced an unread pure temporary that can be removed without reordering effects."
     | I_aux (I_goto target, (_, l)) :: I_aux (I_label label, _) :: _ when String.equal target label ->
-        jib_readability_warning "jib-redundant-join" l "A jump to the immediately following label is redundant."
+        warn "jib-redundant-join" l "A jump to the immediately following label is redundant."
     | _ -> ()
     );
+    match instrs with _ :: rest -> scan_sequence rest | [] -> ()
+  in
+  let rec scan instrs =
+    scan_sequence instrs;
     List.iter
       (fun (I_aux (instr, (_, l))) ->
+        lint_jib_instr_cvals warn l instr;
         ( match instr with
-        | I_block ([] | [_]) ->
-            jib_readability_warning "jib-redundant-scope" l "Lowering introduced an empty or single-instruction block."
+        | I_block ([] | [_]) | I_try_block ([] | [_]) ->
+            warn "jib-redundant-scope" l "Lowering introduced an empty or single-instruction block."
+        | I_if (V_lit (VL_bool _, CT_bool), _, _) ->
+            warn "jib-constant-conditional" l "Lowering retained a conditional with a constant condition."
+        | I_if (_, [], []) ->
+            warn "jib-empty-conditional" l "Lowering retained a conditional whose branches are both empty."
+        | I_if (_, then_instrs, else_instrs)
+          when then_instrs <> [] && instruction_sequences_equal then_instrs else_instrs ->
+            warn "jib-duplicate-branches" l
+              "Lowering retained identical conditional branches; keep the shared body once."
+        | I_if (_, [I_aux (I_copy (then_destination, _), _)], [I_aux (I_copy (else_destination, _), _)])
+          when clexps_equal then_destination else_destination ->
+            warn "jib-conditional-assignment" l
+              "Both branches assign pure values to the same destination; a value-selecting backend can emit one \
+               conditional assignment."
+        | I_if (_, then_instrs, _ :: _) when instruction_sequence_terminates then_instrs ->
+            warn "jib-else-after-terminal" l "Lowering retained an else branch after a terminal return, throw, or exit."
+        | I_copy (CL_id (destination, _), V_id (source, _)) when same_name destination source ->
+            warn "jib-identity-copy" l "Lowering introduced a local self-copy."
+        | I_return (V_lit (VL_unit, CT_unit)) ->
+            warn "jib-unit-plumbing" l
+              "Lowering retained an explicit unit return that void-returning backends can erase."
         | I_label label when not (Util.StringSet.mem label targets) ->
-            jib_readability_warning "jib-dead-label" l "Lowering introduced a label with no incoming jump."
+            warn "jib-dead-label" l "Lowering introduced a label with no incoming jump."
         | I_decl (_, Gen (_, _, _, None, _)) | I_init (_, Gen (_, _, _, None, _), _) ->
-            jib_readability_warning "jib-lost-source-name" l
-              "A generated local has no retained Sail source-name provenance."
+            warn "jib-lost-source-name" l "A generated local has no retained Sail source-name provenance."
         | _ -> ()
         );
         match instr with
@@ -195,7 +313,8 @@ let lint_jib_instrs instrs =
       )
       instrs
   in
-  scan instrs
+  scan instrs;
+  List.rev !findings
 
 let lint_jib_cdefs cdefs =
   List.iter
@@ -206,10 +325,11 @@ let lint_jib_cdefs cdefs =
             | CDEF_fundef (_, _, _, instrs)
             | CDEF_startup (_, instrs)
             | CDEF_finish (_, instrs) ),
-            _ ) ->
-          lint_jib_instrs instrs
+            _
+          ) ->
+          List.iter report_jib_readability_finding (jib_readability_findings instrs)
       | _ -> ()
-    )
+      )
     cdefs
 
 let optimize_aarch64_fast_struct = ref false
@@ -980,10 +1100,12 @@ module Make (C : CONFIG) = struct
     | None -> (
         match destruct_bitvector env typ with
         | Some width ->
-            Option.bind (solve_unique env (nexp_simp width)) (fun width ->
+            Option.bind
+              (solve_unique env (nexp_simp width))
+              (fun width ->
                 if Big_int.less width Big_int.zero || Big_int.greater width (Big_int.of_int Stdlib.max_int) then None
                 else Jib_semantics.fixed_unsigned_bounds (Big_int.to_int width)
-            )
+              )
         | None -> None
       )
 
@@ -1071,7 +1193,7 @@ module Make (C : CONFIG) = struct
            [represented]; call specialization or [make_calls_precise] handles
            the representation boundary after unification. *)
         if ctyp_equal ctyp semantic then ctyp
-        else
+        else (
           match C.function_argument_unification_type ~expected:ctyp ~represented with
           | Some semantic_representation -> semantic_representation
           | None ->
@@ -1081,6 +1203,7 @@ module Make (C : CONFIG) = struct
               then ctyp
               else if C.representation_refines ~semantic ~represented then semantic
               else represented
+        )
       in
       instantiation := KBindings.union merge_call_unifiers (ctyp_unify l ctyp unification_ctyp) !instantiation;
       setup := List.rev arg_setup @ !setup;
@@ -1210,10 +1333,7 @@ module Make (C : CONFIG) = struct
       in
       let semantic_proofs =
         match (proven_native_op, operation_representation, args, argument_intervals) with
-        | ( Some (Proven_idiv | Proven_imod),
-            Some represented,
-            [left; right],
-            [left_interval; right_interval] ) ->
+        | Some (Proven_idiv | Proven_imod), Some represented, [left; right], [left_interval; right_interval] ->
             let argument_bounds =
               prove_exact_arithmetic_bounds ~env:ctx.local_env
                 ~operands:[(aval_typ left, left_interval); (aval_typ right, right_interval)]
@@ -1241,7 +1361,9 @@ module Make (C : CONFIG) = struct
           | None -> "?"
         in
         Printf.eprintf
-          "C semantic proof: primitive=%s args=[%s] intervals=[%s] source-result=%s return=%s destination=%s operation=%s proofs=%d\n%!"
+          "C semantic proof: primitive=%s args=[%s] intervals=[%s] source-result=%s return=%s destination=%s \
+           operation=%s proofs=%d\n\
+           %!"
           (string_of_id id)
           (Util.string_of_list "," (fun arg -> string_of_typ (aval_typ arg)) args)
           (Util.string_of_list "," string_of_interval argument_intervals)
@@ -1258,16 +1380,18 @@ module Make (C : CONFIG) = struct
              to the same native [V_call] if no larger transformation applies. *)
           if ctyp_equal (clexp_ctyp clexp) represented then
             ifuncall_with_bounds ~semantic_proofs l (argument_intervals, result_interval) clexp (id, []) setup_args
-          else
+          else (
             let temporary = ngensym ~source_name:"integer_result" ~source_type:(string_of_ctyp represented) () in
             iblock
               [
                 idecl l represented temporary;
                 ifuncall_with_bounds ~semantic_proofs l (argument_intervals, result_interval)
-                  (CL_id (temporary, represented)) (id, []) setup_args;
+                  (CL_id (temporary, represented))
+                  (id, []) setup_args;
                 icopy l clexp (V_id (temporary, represented));
                 iclear ~loc:l represented temporary;
               ]
+          )
       | _, _, _, _ :: _ ->
           ifuncall_with_bounds ~semantic_proofs l (argument_intervals, result_interval) clexp (id, []) setup_args
       | Some ((Proven_iadd | Proven_isub | Proven_imul) as op), Some represented, [left; right], [] ->
@@ -1867,7 +1991,7 @@ module Make (C : CONFIG) = struct
     | AE_let (mut, id, binding_typ, binding, (AE_aux (_, { env = body_env; _ }) as body), body_typ) ->
         let semantic_binding_ctyp = ctyp_of_typ { ctx with local_env = body_env } binding_typ in
         let represented_aval local_representations ctx = function
-          | AV_id (id, _) | AV_cval (V_id (id, _), _) as aval -> (
+          | (AV_id (id, _) | AV_cval (V_id (id, _), _)) as aval -> (
               match NameMap.find_opt id local_representations with
               | Some represented -> represented
               | None -> represented_aval_ctyp ctx aval
@@ -1909,7 +2033,7 @@ module Make (C : CONFIG) = struct
         let represented_binding () = represented_expression NameMap.empty semantic_binding_ctyp binding in
         let binding_ctyp =
           match mut with
-          | Mutable -> (
+          | Mutable ->
               (* ANF introduces mutable temporaries for nested primitive calls
                  even when the source expression is pure.  Preserve the same
                  proved representation choices here as for immutable lets;
@@ -1917,12 +2041,8 @@ module Make (C : CONFIG) = struct
                  converted back to its semantic integer coordinate before it
                  reaches the enclosing function call. *)
               let represented = represented_binding () in
-              if
-                C.propagate_anf_temporary_representation
-                  ~semantic:semantic_binding_ctyp ~represented
-              then represented
+              if C.propagate_anf_temporary_representation ~semantic:semantic_binding_ctyp ~represented then represented
               else semantic_binding_ctyp
-            )
           | Immutable -> (
               match demanded_newtype_representation body_env id semantic_binding_ctyp body with
               | Some represented -> represented
@@ -1961,10 +2081,7 @@ module Make (C : CONFIG) = struct
           match args with
           | [cond; _msg] ->
               let cond_setup, cond_cval, cond_cleanup = compile_aval l ctx cond in
-              ( cond_setup,
-                (fun clexp -> iextern l clexp (mk_id "__sail_fixed_assert", []) [cond_cval]),
-                cond_cleanup
-              )
+              (cond_setup, (fun clexp -> iextern l clexp (mk_id "__sail_fixed_assert", []) [cond_cval]), cond_cleanup)
           | _ -> Reporting.unreachable l __POS__ "Bad arity for sail_assert"
         )
         else if str = "sail_assert" && C.assert_to_exception then (
@@ -2111,12 +2228,13 @@ module Make (C : CONFIG) = struct
         )
     (* Compile try statement *)
     | AE_try (aexp, cases, typ) ->
+        let is_complete = Option.is_some (get_attribute "complete" uannot) || has_infallible_mapping_case ctx cases in
         let ctyp = ctyp_of_typ ctx typ in
         let aexp_setup, aexp_call, aexp_cleanup = compile_aexp ctx aexp in
         let try_return_id = ngensym () in
         let post_exception_handlers_label = label "post_exception_handlers_" in
         let exn_cval = V_id (current_exception, ctyp_of_typ ctx (mk_typ (Typ_id (mk_id "exception")))) in
-        let compile_case (apat, guard, body, case_uannot) =
+        let compile_case is_last (apat, guard, body, case_uannot) =
           let trivial_guard =
             match guard with
             | AE_aux (AE_val (AV_lit (L_aux (L_true, _), _)), _)
@@ -2126,7 +2244,9 @@ module Make (C : CONFIG) = struct
           in
           let try_label = label "try_" in
           let pre_destructure, destructure, destructure_cleanup, ctx =
-            compile_match ctx apat exn_cval (fun l b -> ijump l b try_label)
+            compile_match ctx apat exn_cval (fun l b ->
+                if is_last && is_complete then icomment "complete" else ijump l b try_label
+            )
           in
           let guard_setup, guard_call, guard_cleanup = compile_aexp ctx guard in
           let body_setup, body_call, body_cleanup = compile_aexp ctx body in
@@ -2166,12 +2286,11 @@ module Make (C : CONFIG) = struct
                 ]
               else []
             )
-          @ List.concat (List.map compile_case cases)
-          @ [
-              (* fallthrough *)
-              icopy l (CL_id (have_exception, CT_bool)) (V_lit (VL_bool true, CT_bool));
-              ilabel post_exception_handlers_label;
-            ],
+          @ List.concat (Util.map_last compile_case cases)
+          @ ( if is_complete then []
+              else [(* fallthrough *) icopy l (CL_id (have_exception, CT_bool)) (V_lit (VL_bool true, CT_bool))]
+            )
+          @ [ilabel post_exception_handlers_label],
           (fun clexp -> icopy l clexp (V_id (try_return_id, ctyp))),
           []
         )
@@ -3129,9 +3248,7 @@ module Make (C : CONFIG) = struct
         let generic_signature = generic_signature quant arg_typs ret_typ in
         let ctx' = { ctx with local_env = Env.add_typquant (id_loc id) quant ctx.local_env } in
         let arg_ctyps =
-          List.mapi
-            (fun index typ -> C.specialize_declared_function_argument id index (ctyp_of_typ ctx' typ))
-            arg_typs
+          List.mapi (fun index typ -> C.specialize_declared_function_argument id index (ctyp_of_typ ctx' typ)) arg_typs
         in
         let ret_ctyp = C.specialize_declared_function_result id (ctyp_of_typ ctx' ret_typ) in
         ( Compiled [CDEF_aux (CDEF_val (id, params, arg_ctyps, ret_ctyp, extern), def_annot)],
@@ -3164,9 +3281,7 @@ module Make (C : CONFIG) = struct
         let globals = apat_globals apat in
         let ctyp =
           let semantic = ctyp_of_typ ctx (typ_of_pat pat) in
-          match globals with
-          | [(id, _, _)] -> C.specialize_declared_function_result id semantic
-          | _ -> semantic
+          match globals with [(id, _, _)] -> C.specialize_declared_function_result id semantic | _ -> semantic
         in
         let aexp = C.optimize_anf ctx (no_shadow (letbind_ids ctx) (anf exp)) in
         let setup, call, cleanup = compile_aexp ctx aexp in
@@ -3574,39 +3689,44 @@ module Make (C : CONFIG) = struct
             )
             (Some Big_int.zero) bits
         in
-        Option.fold ~none:(ctyp_integer_lifetime ctyp)
-          ~some:(fun value -> Lifetime_range (value, value)) value
+        Option.fold ~none:(ctyp_integer_lifetime ctyp) ~some:(fun value -> Lifetime_range (value, value)) value
     | V_call ((Slice width | Proven_slice (width, _)), [source; start]) ->
         let source = integer_lifetime_interval (cval_integer_lifetime ranges source) in
         let start = integer_lifetime_interval (cval_integer_lifetime ranges start) in
-        Option.fold ~none:Lifetime_top ~some:(fun (lower, upper) -> Lifetime_range (lower, upper))
+        Option.fold ~none:Lifetime_top
+          ~some:(fun (lower, upper) -> Lifetime_range (lower, upper))
           (Jib_semantics.slice_result_bounds ~width ~source ~start)
     | V_call (Concat, [left; right]) ->
         let fixed_width = function CT_fbits width | CT_sbits width -> Some width | _ -> None in
         let left = integer_lifetime_interval (cval_integer_lifetime ranges left) in
         let right_bounds = integer_lifetime_interval (cval_integer_lifetime ranges right) in
-        Option.fold ~none:Lifetime_top ~some:(fun (lower, upper) -> Lifetime_range (lower, upper))
-          (Option.bind (fixed_width (cval_ctyp right)) (fun right_width ->
-               Jib_semantics.concat_result_bounds ~right_width ~left ~right:right_bounds
-           )
+        Option.fold ~none:Lifetime_top
+          ~some:(fun (lower, upper) -> Lifetime_range (lower, upper))
+          (Option.bind
+             (fixed_width (cval_ctyp right))
+             (fun right_width -> Jib_semantics.concat_result_bounds ~right_width ~left ~right:right_bounds)
           )
     | V_call (Set_slice, [base; start; inserted]) ->
         let fixed_width = function CT_fbits width | CT_sbits width -> Some width | _ -> None in
         let base_bounds = integer_lifetime_interval (cval_integer_lifetime ranges base) in
         let start_bounds = integer_lifetime_interval (cval_integer_lifetime ranges start) in
         let inserted_bounds = integer_lifetime_interval (cval_integer_lifetime ranges inserted) in
-        Option.fold ~none:Lifetime_top ~some:(fun (lower, upper) -> Lifetime_range (lower, upper))
-          (Option.bind (fixed_width (cval_ctyp base)) (fun carrier_width ->
+        Option.fold ~none:Lifetime_top
+          ~some:(fun (lower, upper) -> Lifetime_range (lower, upper))
+          (Option.bind
+             (fixed_width (cval_ctyp base))
+             (fun carrier_width ->
                Jib_semantics.bit_insert_result_bounds ~carrier_width ~base:base_bounds ~start:start_bounds
                  ~inserted:inserted_bounds
-           )
+             )
           )
     | V_call ((Unsigned _ | Zero_extend _), [source]) -> cval_integer_lifetime ranges source
     | V_call (op, [left; right]) as call -> (
         let left = cval_integer_lifetime ranges left in
         let right = cval_integer_lifetime ranges right in
         let derived_bounds derive =
-          Option.fold ~none:Lifetime_top ~some:(fun (lower, upper) -> Lifetime_range (lower, upper))
+          Option.fold ~none:Lifetime_top
+            ~some:(fun (lower, upper) -> Lifetime_range (lower, upper))
             (derive ~left:(integer_lifetime_interval left) ~right:(integer_lifetime_interval right))
         in
         match op with
@@ -3874,8 +3994,8 @@ module Make (C : CONFIG) = struct
      Keeping the two facts separate lets a guard specialize arithmetic and
      call-graph edges in one arm without incorrectly narrowing the variable's
      function-wide storage. *)
-  let infer_path_integer_lifetimes ?(call_result_lifetime = fun _ -> None)
-      ?(call_predicate_fact = fun _ _ -> None) ctx function_id global_ranges body =
+  let infer_path_integer_lifetimes ?(call_result_lifetime = fun _ -> None) ?(call_predicate_fact = fun _ _ -> None) ctx
+      function_id global_ranges body =
     let paths = ref PathInstructionMap.empty in
     let decisions = ref PathInstructionMap.empty in
     let storage_ranges = ref NameMap.empty in
@@ -3940,14 +4060,11 @@ module Make (C : CONFIG) = struct
     let write name lifetime state =
       let state = invalidate name state in
       note_storage name lifetime;
-      {state with ranges = NameMap.add name lifetime state.ranges}
+      { state with ranges = NameMap.add name lifetime state.ranges }
     in
     let write_aggregate_field name field lifetime state =
       let state = invalidate_conditions name state in
-      {
-        state with
-        aggregate_fields = AggregateFieldMap.add (name, field) lifetime state.aggregate_fields;
-      }
+      { state with aggregate_fields = AggregateFieldMap.add (name, field) lifetime state.aggregate_fields }
     in
     let rec invalidate_clexp clexp state =
       match clexp with
@@ -3990,16 +4107,14 @@ module Make (C : CONFIG) = struct
     let install_aggregate_fields destination fields state =
       match (destination, fields) with
       | CL_id (name, _), Some fields ->
-          List.fold_left
-            (fun state (field, lifetime) -> write_aggregate_field name field lifetime state)
-            state fields
+          List.fold_left (fun state (field, lifetime) -> write_aggregate_field name field lifetime state) state fields
       | _ -> state
     in
     let rec cval_dependencies = function
       | V_id (name, _) -> NameSet.singleton name
       | V_lit _ | V_member _ -> NameSet.empty
-      | V_field (value, _, _) | V_tuple_member (value, _, _) | V_ctor_kind (value, _)
-      | V_ctor_unwrap (value, _, _) -> cval_dependencies value
+      | V_field (value, _, _) | V_tuple_member (value, _, _) | V_ctor_kind (value, _) | V_ctor_unwrap (value, _, _) ->
+          cval_dependencies value
       | V_call (_, values) | V_tuple values ->
           List.fold_left
             (fun dependencies value -> NameSet.union dependencies (cval_dependencies value))
@@ -4040,7 +4155,7 @@ module Make (C : CONFIG) = struct
       | V_id (name, _) -> NameMap.find_opt name state.conditions
       | V_call (Bnot, [condition]) ->
           Option.map
-            (fun fact -> {fact with comparison_when_true = not fact.comparison_when_true})
+            (fun fact -> { fact with comparison_when_true = not fact.comparison_when_true })
             (condition_from_cval state condition)
       | V_call (comparison, [left; right]) -> condition_fact state comparison left right
       | _ -> None
@@ -4048,7 +4163,7 @@ module Make (C : CONFIG) = struct
       match (boolean_negation_name ctx id, args) with
       | true, [condition] ->
           Option.map
-            (fun fact -> {fact with comparison_when_true = not fact.comparison_when_true})
+            (fun fact -> { fact with comparison_when_true = not fact.comparison_when_true })
             (condition_from_cval state condition)
       | _ -> (
           match (integer_comparison_name ctx id, args) with
@@ -4063,9 +4178,7 @@ module Make (C : CONFIG) = struct
     in
     let condition_fact_value state fact =
       Option.map
-        (fun comparison_value ->
-          if fact.comparison_when_true then comparison_value else not comparison_value
-        )
+        (fun comparison_value -> if fact.comparison_when_true then comparison_value else not comparison_value)
         (constant_semantic_integer_comparison fact.comparison
            (path_cval_integer_lifetime state fact.left)
            (path_cval_integer_lifetime state fact.right)
@@ -4079,7 +4192,7 @@ module Make (C : CONFIG) = struct
     in
     let remember_condition destination fact state =
       match (destination, fact) with
-      | CL_id (name, _), Some fact -> {state with conditions = NameMap.add name fact state.conditions}
+      | CL_id (name, _), Some fact -> { state with conditions = NameMap.add name fact state.conditions }
       | _ -> state
     in
     let refine_cval ranges cval lifetime =
@@ -4108,7 +4221,8 @@ module Make (C : CONFIG) = struct
                 ranges =
                   refine_cval
                     (refine_cval state.ranges fact.left (Lifetime_range (left_lower, left_upper)))
-                    fact.right (Lifetime_range (right_lower, right_upper));
+                    fact.right
+                    (Lifetime_range (right_lower, right_upper));
               }
           | None -> state
         )
@@ -4117,7 +4231,8 @@ module Make (C : CONFIG) = struct
     let rec refine_condition condition truth state =
       match condition with
       | V_call (Bnot, [condition]) -> refine_condition condition (not truth) state
-      | V_id (name, _) -> Option.fold ~none:state ~some:(fun fact -> refine fact truth state) (NameMap.find_opt name state.conditions)
+      | V_id (name, _) ->
+          Option.fold ~none:state ~some:(fun fact -> refine fact truth state) (NameMap.find_opt name state.conditions)
       | condition ->
           Option.fold ~none:state ~some:(fun fact -> refine fact truth state) (condition_from_cval state condition)
     in
@@ -4133,9 +4248,7 @@ module Make (C : CONFIG) = struct
     in
     let join_conditions left right =
       NameMap.merge
-        (fun _ left right ->
-          match (left, right) with Some left, Some right when left = right -> Some left | _ -> None
-        )
+        (fun _ left right -> match (left, right) with Some left, Some right when left = right -> Some left | _ -> None)
         left right
     in
     let join_aggregate_fields left right =
@@ -4191,8 +4304,7 @@ module Make (C : CONFIG) = struct
           in
           let state = write_clexp clexp lifetime state in
           remember_condition clexp (condition_from_call state id args) state
-      | I_funcall (CR_one clexp, _, _, _) ->
-          write_clexp clexp (ctyp_integer_lifetime (clexp_ctyp clexp)) state
+      | I_funcall (CR_one clexp, _, _, _) -> write_clexp clexp (ctyp_integer_lifetime (clexp_ctyp clexp)) state
       | I_funcall (creturn, _, _, _) -> reset_creturn creturn state
       | I_clear (_, name) -> invalidate name state
       | _ -> state
@@ -4228,9 +4340,9 @@ module Make (C : CONFIG) = struct
       | instr :: instrs ->
           let continuation = build_sequence instrs continuation in
           Some (build_instr instr continuation)
-    and build_instr ((I_aux (instr, (instruction, _))) as whole_instr) continuation =
+    and build_instr (I_aux (instr, (instruction, _)) as whole_instr) continuation =
       Hashtbl.replace nodes instruction whole_instr;
-      (match instr with
+      ( match instr with
       | I_if (condition, then_instrs, else_instrs) ->
           let then_entry = build_sequence then_instrs continuation in
           let else_entry = build_sequence else_instrs continuation in
@@ -4246,7 +4358,8 @@ module Make (C : CONFIG) = struct
           add_edge instruction (Some (condition, true)) (label_target label);
           add_edge instruction (Some (condition, false)) continuation
       | I_end _ | I_exit _ | I_undefined _ -> ()
-      | _ -> add_edge instruction None continuation);
+      | _ -> add_edge instruction None continuation
+      );
       instruction
     in
     let entry = build_sequence body None in
@@ -4267,7 +4380,7 @@ module Make (C : CONFIG) = struct
           )
           joined_state.ranges
       in
-      {joined_state with ranges}
+      { joined_state with ranges }
     in
     let enqueue target incoming =
       match Hashtbl.find_opt input_states target with
@@ -4283,8 +4396,7 @@ module Make (C : CONFIG) = struct
     in
     Option.iter
       (fun entry ->
-        enqueue entry
-          {ranges = global_ranges; conditions = NameMap.empty; aggregate_fields = AggregateFieldMap.empty}
+        enqueue entry { ranges = global_ranges; conditions = NameMap.empty; aggregate_fields = AggregateFieldMap.empty }
       )
       entry;
     while not (Queue.is_empty worklist) do
@@ -4310,12 +4422,13 @@ module Make (C : CONFIG) = struct
       (fun instruction state ->
         paths := PathInstructionMap.add instruction state.ranges !paths;
         let whole_instr = Hashtbl.find nodes instruction in
-        (match whole_instr with
+        ( match whole_instr with
         | I_aux ((I_if (condition, _, _) | I_jump (condition, _)), _) ->
             Option.iter
               (fun decision -> decisions := PathInstructionMap.add instruction decision !decisions)
               (constant_condition state condition)
-        | _ -> ());
+        | _ -> ()
+        );
         ignore (transfer_instr state whole_instr)
       )
       input_states;
@@ -4349,7 +4462,7 @@ module Make (C : CONFIG) = struct
       List.filter_map
         (fun (I_aux (instr, ((instruction, _) as aux)) as original) ->
           if not (PathInstructionMap.mem instruction path_ranges) then None
-          else
+          else (
             match instr with
             | I_if (condition, then_instrs, else_instrs) -> (
                 match PathInstructionMap.find_opt instruction path_decisions with
@@ -4366,6 +4479,7 @@ module Make (C : CONFIG) = struct
             | I_block instrs -> Some (I_aux (I_block (rewrite instrs), aux))
             | I_try_block instrs -> Some (I_aux (I_try_block (rewrite instrs), aux))
             | _ -> Some original
+          )
         )
         instrs
     in
@@ -5548,8 +5662,7 @@ module Make (C : CONFIG) = struct
     let predicate_summaries =
       let predicate_operand_of_literal = function
         | V_lit (VL_int _, _) as literal -> Some (Predicate_literal literal)
-        | V_lit (VL_string literal, CT_string) as value
-          when Option.is_some (Sail_lib.int_of_string_opt literal) ->
+        | V_lit (VL_string literal, CT_string) as value when Option.is_some (Sail_lib.int_of_string_opt literal) ->
             Some (Predicate_literal value)
         | _ -> None
       in
@@ -5559,14 +5672,13 @@ module Make (C : CONFIG) = struct
         | value -> predicate_operand_of_literal value
       in
       let instantiate_symbolic_operand operands args = function
-        | Predicate_argument index ->
-            Option.bind (List.nth_opt args index) (predicate_operand_of_value operands)
+        | Predicate_argument index -> Option.bind (List.nth_opt args index) (predicate_operand_of_value operands)
         | Predicate_literal _ as literal -> Some literal
       in
       let instantiate_symbolic_summary operands args summary =
         Option.bind (instantiate_symbolic_operand operands args summary.predicate_left) (fun predicate_left ->
             Option.map
-              (fun predicate_right -> {summary with predicate_left; predicate_right})
+              (fun predicate_right -> { summary with predicate_left; predicate_right })
               (instantiate_symbolic_operand operands args summary.predicate_right)
         )
       in
@@ -5587,12 +5699,7 @@ module Make (C : CONFIG) = struct
               Option.bind (predicate_operand_of_value operands left) (fun predicate_left ->
                   Option.map
                     (fun predicate_right ->
-                      {
-                        predicate_comparison;
-                        predicate_left;
-                        predicate_right;
-                        predicate_comparison_when_true = true;
-                      }
+                      { predicate_comparison; predicate_left; predicate_right; predicate_comparison_when_true = true }
                     )
                     (predicate_operand_of_value operands right)
               )
@@ -5603,10 +5710,7 @@ module Make (C : CONFIG) = struct
           | V_call (Bnot, [value]) ->
               Option.map
                 (fun summary ->
-                  {
-                    summary with
-                    predicate_comparison_when_true = not summary.predicate_comparison_when_true;
-                  }
+                  { summary with predicate_comparison_when_true = not summary.predicate_comparison_when_true }
                 )
                 (predicate_from_value operands predicates value)
           | V_call (comparison, [left; right]) -> predicate_from_comparison operands comparison left right
@@ -5617,17 +5721,13 @@ module Make (C : CONFIG) = struct
           | true, [value] ->
               Option.map
                 (fun summary ->
-                  {
-                    summary with
-                    predicate_comparison_when_true = not summary.predicate_comparison_when_true;
-                  }
+                  { summary with predicate_comparison_when_true = not summary.predicate_comparison_when_true }
                 )
                 (predicate_from_value operands predicates value)
           | _ -> (
               match (integer_comparison_name ctx id, args) with
               | Some comparison, [left; right] -> predicate_from_comparison operands comparison left right
-              | _ ->
-                  Option.bind (Bindings.find_opt id summaries) (instantiate_symbolic_summary operands args)
+              | _ -> Option.bind (Bindings.find_opt id summaries) (instantiate_symbolic_summary operands args)
             )
         in
         let invalidate name (operands, predicates, observations) =
@@ -5641,10 +5741,10 @@ module Make (C : CONFIG) = struct
           in
           (operands, predicates, observations)
         in
-        let assign_value name value (operands, predicates, _ as state) =
+        let assign_value name value ((operands, predicates, _) as state) =
           assign name (predicate_operand_of_value operands value) (predicate_from_value operands predicates value) state
         in
-        let assign_call name id args (operands, predicates, _ as state) =
+        let assign_call name id args ((operands, predicates, _) as state) =
           assign name None (predicate_from_call operands predicates id args) state
         in
         let join_state (left_operands, left_predicates, left_observations)
@@ -5657,19 +5757,16 @@ module Make (C : CONFIG) = struct
         let rec scan_instrs state = function
           | [] -> state
           | instr :: instrs -> scan_instrs (scan_instr state instr) instrs
-        and scan_instr (operands, predicates, observations as state) (I_aux (instr, _)) =
+        and scan_instr ((operands, predicates, observations) as state) (I_aux (instr, _)) =
           match instr with
           | I_init (_, name, Init_cval value) | I_reinit (_, name, value) -> assign_value name value state
-          | I_init (_, name, _) | I_decl (_, name) | I_reset (_, name) | I_clear (_, name) ->
-              invalidate name state
+          | I_init (_, name, _) | I_decl (_, name) | I_reset (_, name) | I_clear (_, name) -> invalidate name state
           | I_copy (CL_id (name, _), value) -> assign_value name value state
           | I_funcall (CR_one (CL_id (name, _)), _, (id, _), args) -> assign_call name id args state
-          | I_if (_, then_body, else_body) ->
-              join_state (scan_instrs state then_body) (scan_instrs state else_body)
+          | I_if (_, then_body, else_body) -> join_state (scan_instrs state then_body) (scan_instrs state else_body)
           | I_block body | I_try_block body -> scan_instrs state body
           | I_end _ -> (operands, predicates, NameMap.find_opt return predicates :: observations)
-          | I_return value ->
-              (operands, predicates, predicate_from_value operands predicates value :: observations)
+          | I_return value -> (operands, predicates, predicate_from_value operands predicates value :: observations)
           | _ -> state
         in
         let _, _, observations = scan_instrs (operands, NameMap.empty, []) body in
@@ -5710,13 +5807,7 @@ module Make (C : CONFIG) = struct
       Option.bind (Bindings.find_opt id predicate_summaries) (fun summary ->
           Option.bind (instantiate summary.predicate_left) (fun left ->
               Option.map
-                (fun right ->
-                  ( summary.predicate_comparison,
-                    left,
-                    right,
-                    summary.predicate_comparison_when_true
-                  )
-                )
+                (fun right -> (summary.predicate_comparison, left, right, summary.predicate_comparison_when_true))
                 (instantiate summary.predicate_right)
           )
       )
@@ -5748,7 +5839,7 @@ module Make (C : CONFIG) = struct
               summaries := Bindings.add id Lifetime_bottom !summaries;
               result_domains := Bindings.add id (ctyp_integer_lifetime ret_ctyp) !result_domains
           | _ -> ()
-          )
+        )
         fundefs;
       let widening_counts = ref Bindings.empty in
       let changed = ref true in
@@ -5757,8 +5848,7 @@ module Make (C : CONFIG) = struct
         Bindings.iter
           (fun id (_, params, body, _) ->
             match (Bindings.find_opt id valspecs, Bindings.find_opt id !summaries) with
-            | Some ([], param_ctyps, _, None, _), Some prior
-              when List.compare_lengths params param_ctyps = 0 ->
+            | Some ([], param_ctyps, _, None, _), Some prior when List.compare_lengths params param_ctyps = 0 ->
                 let parameter_intervals =
                   List.map (fun ctyp -> integer_lifetime_interval (ctyp_integer_lifetime ctyp)) param_ctyps
                 in
@@ -5787,7 +5877,7 @@ module Make (C : CONFIG) = struct
                   changed := true
                 )
             | _ -> ()
-            )
+          )
           fundefs
       done;
       !summaries
@@ -5798,12 +5888,12 @@ module Make (C : CONFIG) = struct
           let lower = Big_int.max prior_lower inferred_lower in
           let upper = Big_int.min prior_upper inferred_upper in
           if Big_int.less_equal lower upper then Some (lower, upper) else prior
-      | Some _ as prior, None -> prior
+      | (Some _ as prior), None -> prior
       | None, inferred -> inferred
     in
     let propagate_return_summary = function
-      | I_aux (I_funcall (creturn, Call ((argument_intervals, result_interval), proofs), (id, tyargs), args), aux)
-        as instr -> (
+      | I_aux (I_funcall (creturn, Call ((argument_intervals, result_interval), proofs), (id, tyargs), args), aux) as
+        instr -> (
           match Option.bind (Bindings.find_opt id function_return_summaries) integer_lifetime_interval with
           | Some _ as inferred ->
               let result_interval = strengthen_interval result_interval inferred in
@@ -5867,8 +5957,7 @@ module Make (C : CONFIG) = struct
       in
       let can_specialize_result =
         ctyp_equal ret_ctyp actual_ret_ctyp
-        ||
-        C.specialize_function_result_representation ~semantic:ret_ctyp ~represented:actual_ret_ctyp
+        || C.specialize_function_result_representation ~semantic:ret_ctyp ~represented:actual_ret_ctyp
       in
       let has_specialized_representation =
         List.exists2
@@ -5898,7 +5987,7 @@ module Make (C : CONFIG) = struct
                    is conservative until reachability is represented
                    explicitly in the path domain. *)
                 if Big_int.less_equal lower upper then Some (lower, upper) else prior
-            | Some _ as prior, None -> prior
+            | (Some _ as prior), None -> prior
             | None, inferred -> inferred
           in
           let argument_intervals =
@@ -5912,14 +6001,13 @@ module Make (C : CONFIG) = struct
           in
           let result_interval =
             match result with
-            | CL_id (name, ctyp) -> (
+            | CL_id (name, ctyp) ->
                 let inferred =
                   match NameMap.find_opt name ranges with
                   | Some lifetime -> integer_lifetime_interval lifetime
                   | None -> integer_lifetime_interval (ctyp_integer_lifetime ctyp)
                 in
                 strengthen prior_result inferred
-              )
             | _ -> prior_result
           in
           (argument_intervals, result_interval)
@@ -6047,10 +6135,7 @@ module Make (C : CONFIG) = struct
         )
       in
       let value_primitive_representation lifetime_ranges representations = function
-        | V_call
-            ( (Iadd | Proven_iadd | Widening_iadd _ | Wrapping_iadd _),
-              [left; right]
-            ) ->
+        | V_call ((Iadd | Proven_iadd | Widening_iadd _ | Wrapping_iadd _), [left; right]) ->
             represented_integer_lifetime ctx
               (integer_primitive_carrier_lifetime `Add
                  (cval_integer_lifetime lifetime_ranges left)
@@ -6094,27 +6179,28 @@ module Make (C : CONFIG) = struct
       let rec primitive_representations representations (I_aux (instr, (instruction, _)) as whole_instr) =
         let instruction_ranges = instruction_lifetime_ranges lifetime_ranges path_lifetime_ranges whole_instr in
         if not (PathInstructionMap.mem instruction path_lifetime_ranges) then representations
-        else
+        else (
           match instr with
-        | I_funcall (CR_one _, _, (primitive_id, _), [left; right]) -> (
-            match integer_primitive_name ctx primitive_id with
-            | Some primitive ->
-                let carrier =
-                  integer_primitive_carrier_lifetime primitive
-                    (cval_integer_lifetime instruction_ranges left)
-                    (cval_integer_lifetime instruction_ranges right)
-                in
-                represented_integer_lifetime ctx carrier :: representations
-            | None -> representations
-          )
-        | I_if (_, then_instrs, else_instrs) ->
-            List.fold_left primitive_representations
-              (List.fold_left primitive_representations representations then_instrs)
-              else_instrs
-        | I_block instrs | I_try_block instrs -> List.fold_left primitive_representations representations instrs
-        | I_init (_, _, Init_cval value) | I_reinit (_, _, value) | I_copy (_, value) ->
-            value_primitive_representation instruction_ranges representations value
-        | _ -> representations
+          | I_funcall (CR_one _, _, (primitive_id, _), [left; right]) -> (
+              match integer_primitive_name ctx primitive_id with
+              | Some primitive ->
+                  let carrier =
+                    integer_primitive_carrier_lifetime primitive
+                      (cval_integer_lifetime instruction_ranges left)
+                      (cval_integer_lifetime instruction_ranges right)
+                  in
+                  represented_integer_lifetime ctx carrier :: representations
+              | None -> representations
+            )
+          | I_if (_, then_instrs, else_instrs) ->
+              List.fold_left primitive_representations
+                (List.fold_left primitive_representations representations then_instrs)
+                else_instrs
+          | I_block instrs | I_try_block instrs -> List.fold_left primitive_representations representations instrs
+          | I_init (_, _, Init_cval value) | I_reinit (_, _, value) | I_copy (_, value) ->
+              value_primitive_representation instruction_ranges representations value
+          | _ -> representations
+        )
       in
       let primitive_representations = List.fold_left primitive_representations [] body |> List.rev in
       (* Bounds that reach another local function are part of this body's
@@ -6126,23 +6212,24 @@ module Make (C : CONFIG) = struct
       let rec call_edges edges (I_aux (instr, (instruction, _)) as whole_instr) =
         let instruction_ranges = instruction_lifetime_ranges lifetime_ranges path_lifetime_ranges whole_instr in
         if not (PathInstructionMap.mem instruction path_lifetime_ranges) then edges
-        else
+        else (
           match instr with
-        | I_funcall (CR_one result, Call (bounds, _), (callee, []), args) -> (
-            match (Bindings.find_opt callee valspecs, Bindings.find_opt callee fundefs) with
-            | Some ([], param_ctyps, _, None, _), Some _ when List.compare_lengths args param_ctyps = 0 ->
-                let generic_signature = generic_signature_for callee (List.length param_ctyps) in
-                let bounds =
-                  infer_call_bounds (Some instruction_ranges) result args bounds
-                  |> normalize_call_bounds generic_signature param_ctyps
-                in
-                (instruction, callee, List.map cval_ctyp args, clexp_ctyp result, bounds) :: edges
-            | _ -> edges
-          )
-        | I_if (_, then_instrs, else_instrs) ->
-            List.fold_left call_edges (List.fold_left call_edges edges then_instrs) else_instrs
-        | I_block instrs | I_try_block instrs -> List.fold_left call_edges edges instrs
-        | _ -> edges
+          | I_funcall (CR_one result, Call (bounds, _), (callee, []), args) -> (
+              match (Bindings.find_opt callee valspecs, Bindings.find_opt callee fundefs) with
+              | Some ([], param_ctyps, _, None, _), Some _ when List.compare_lengths args param_ctyps = 0 ->
+                  let generic_signature = generic_signature_for callee (List.length param_ctyps) in
+                  let bounds =
+                    infer_call_bounds (Some instruction_ranges) result args bounds
+                    |> normalize_call_bounds generic_signature param_ctyps
+                  in
+                  (instruction, callee, List.map cval_ctyp args, clexp_ctyp result, bounds) :: edges
+              | _ -> edges
+            )
+          | I_if (_, then_instrs, else_instrs) ->
+              List.fold_left call_edges (List.fold_left call_edges edges then_instrs) else_instrs
+          | I_block instrs | I_try_block instrs -> List.fold_left call_edges edges instrs
+          | _ -> edges
+        )
       in
       let call_edges = List.fold_left call_edges [] body |> List.rev in
       ( lifetime_ranges,
@@ -6169,15 +6256,13 @@ module Make (C : CONFIG) = struct
         let _, _, source_decisions, _, source_values, source_primitives, source_calls =
           analyze_demand id actual_ctyps source_bounds
         in
-        log_progress "body-bounds function=%s bounded-primitives=[%s] source-primitives=[%s]"
-          (string_of_id id)
+        log_progress "body-bounds function=%s bounded-primitives=[%s] source-primitives=[%s]" (string_of_id id)
           (Util.string_of_list "," (Option.fold ~none:"unbounded" ~some:string_of_ctyp) bounded_primitives)
           (Util.string_of_list "," (Option.fold ~none:"unbounded" ~some:string_of_ctyp) source_primitives);
         Stdlib.compare bounded_values source_values <> 0
         || Stdlib.compare bounded_primitives source_primitives <> 0
         || Stdlib.compare bounded_calls source_calls <> 0
-        || Stdlib.compare (PathInstructionMap.bindings bounded_decisions)
-             (PathInstructionMap.bindings source_decisions)
+        || Stdlib.compare (PathInstructionMap.bindings bounded_decisions) (PathInstructionMap.bindings source_decisions)
            <> 0
       )
     in
@@ -6210,8 +6295,7 @@ module Make (C : CONFIG) = struct
             lifetime_writes,
             value_representations,
             primitive_representations,
-            call_edges
-          ) =
+            call_edges ) =
         analyze_demand id actual_ctyps bounds
       in
       let path_decision_fingerprint = PathInstructionMap.bindings path_decisions in
@@ -6221,35 +6305,39 @@ module Make (C : CONFIG) = struct
       let prior = Option.value ~default:RepresentationDemandMap.empty (Bindings.find_opt id !demanded) in
       let compatible_partition =
         RepresentationDemandMap.bindings prior
-        |> List.find_map (fun ((candidate_signature, _) as key, candidate) ->
-               if Stdlib.compare candidate_signature signature <> 0 then None
-               else
-                 let merged_bounds = merge_call_bounds !(candidate.RepresentationDemand.bounds) bounds in
-                 if Stdlib.compare merged_bounds !(candidate.RepresentationDemand.bounds) = 0 then
-                   Some
-                     ( key,
-                       candidate,
-                       merged_bounds,
-                       !(candidate.RepresentationDemand.lifetime_ranges),
-                     !(candidate.RepresentationDemand.path_lifetime_ranges),
-                     !(candidate.RepresentationDemand.path_decisions)
-                     )
-                 else
-                   let merged_ranges, merged_path_ranges, merged_path_decisions, _, merged_values, merged_primitives,
-                       merged_calls =
-                     analyze_demand id actual_ctyps merged_bounds
-                   in
-                   if
-                     Stdlib.compare merged_values value_representations = 0
-                     && Stdlib.compare merged_primitives primitive_representations = 0
-                     && Stdlib.compare merged_calls call_edges = 0
-                     && Stdlib.compare (PathInstructionMap.bindings merged_path_decisions)
-                          path_decision_fingerprint
-                        = 0
-                   then Some
-                     (key, candidate, merged_bounds, merged_ranges, merged_path_ranges, merged_path_decisions)
-                   else None
-           )
+        |> List.find_map (fun (((candidate_signature, _) as key), candidate) ->
+            if Stdlib.compare candidate_signature signature <> 0 then None
+            else (
+              let merged_bounds = merge_call_bounds !(candidate.RepresentationDemand.bounds) bounds in
+              if Stdlib.compare merged_bounds !(candidate.RepresentationDemand.bounds) = 0 then
+                Some
+                  ( key,
+                    candidate,
+                    merged_bounds,
+                    !(candidate.RepresentationDemand.lifetime_ranges),
+                    !(candidate.RepresentationDemand.path_lifetime_ranges),
+                    !(candidate.RepresentationDemand.path_decisions)
+                  )
+              else (
+                let ( merged_ranges,
+                      merged_path_ranges,
+                      merged_path_decisions,
+                      _,
+                      merged_values,
+                      merged_primitives,
+                      merged_calls ) =
+                  analyze_demand id actual_ctyps merged_bounds
+                in
+                if
+                  Stdlib.compare merged_values value_representations = 0
+                  && Stdlib.compare merged_primitives primitive_representations = 0
+                  && Stdlib.compare merged_calls call_edges = 0
+                  && Stdlib.compare (PathInstructionMap.bindings merged_path_decisions) path_decision_fingerprint = 0
+                then Some (key, candidate, merged_bounds, merged_ranges, merged_path_ranges, merged_path_decisions)
+                else None
+              )
+            )
+        )
       in
       match compatible_partition with
       | Some (key, demand, merged_bounds, merged_ranges, merged_path_ranges, merged_path_decisions) ->
@@ -6313,9 +6401,7 @@ module Make (C : CONFIG) = struct
               (* Even when the callee already has its final representation and
                  needs no clone, the later precise-call pass consumes these
                  path-refined bounds to prove argument conversions safe. *)
-              let instr =
-                I_aux (I_funcall (creturn, Call (bounds, semantic_proofs), (id, []), args), (n, l))
-              in
+              let instr = I_aux (I_funcall (creturn, Call (bounds, semantic_proofs), (id, []), args), (n, l)) in
               let representation_eligible =
                 specialization_is_eligible l id param_ctyps ret_ctyp actual_ctyps actual_ret_ctyp
               in
@@ -6342,8 +6428,7 @@ module Make (C : CONFIG) = struct
                         && List.for_all2 ctyp_equal actual_ctyps current_ctyps
                         && ctyp_equal actual_ret_ctyp current_ret_ctyp
                       in
-                      if same_representation && call_arguments_within bounds current_bounds then
-                        current_specialized_id
+                      if same_representation && call_arguments_within bounds current_bounds then current_specialized_id
                       else if same_representation then
                         (* A recursive edge which escapes the proof partition
                            of its current clone must not reuse any branches
@@ -6386,7 +6471,7 @@ module Make (C : CONFIG) = struct
         (function
           | CDEF_aux (CDEF_fundef _, _) as cdef -> cdef
           | cdef -> cdef_map_instr (rewrite_call ?lifetime_ranges:None) cdef
-        )
+          )
         cdefs
       |> List.rev
     in
@@ -6462,24 +6547,24 @@ module Make (C : CONFIG) = struct
       proven_fixed_integer_conversion represented (integer_lifetime_interval lifetime) value
     in
     let specialize_proven_integer_conversion lifetime_ranges = function
-      | I_aux (I_copy (result, value), aux) as instr -> (
+      | I_aux (I_copy (result, value), aux) as instr ->
           let represented = clexp_ctyp result in
           let source = cval_ctyp value in
           if ctyp_equal source represented then instr
           else
-            Option.fold ~none:instr ~some:(fun value -> I_aux (I_copy (result, value), aux))
+            Option.fold ~none:instr
+              ~some:(fun value -> I_aux (I_copy (result, value), aux))
               (proven_native_conversion represented (cval_integer_lifetime lifetime_ranges value) value)
-        )
       | instr -> instr
     in
     let specialize_proven_bitvector_shift lifetime_ranges = function
-      | I_aux (I_copy (result, V_call ((Bvshiftl | Bvshiftr | Bvarith_shiftr as op), [value; amount])), aux)
-        as instr -> (
+      | I_aux (I_copy (result, V_call (((Bvshiftl | Bvshiftr | Bvarith_shiftr) as op), [value; amount])), aux) as instr
+        -> (
           match cval_ctyp value with
           | CT_fbits width when 0 < width && width <= 64 ->
               let interval = integer_lifetime_interval (cval_integer_lifetime lifetime_ranges amount) in
               let proof = Jib_semantics.prove_shift_count_interval ~index:1 ~interval ~carrier_width:64 in
-              if Jib_semantics.has_shift_count_bounds ~index:1 ~carrier_width:64 (Option.to_list proof) then
+              if Jib_semantics.has_shift_count_bounds ~index:1 ~carrier_width:64 (Option.to_list proof) then (
                 let op =
                   match op with
                   | Bvshiftl -> Proven_bvshiftl 64
@@ -6488,27 +6573,28 @@ module Make (C : CONFIG) = struct
                   | _ -> assert false
                 in
                 I_aux (I_copy (result, V_call (op, [value; amount])), aux)
+              )
               else instr
           | _ -> instr
         )
       | instr -> instr
     in
     let specialize_proven_bitvector_slice lifetime_ranges = function
-      | I_aux (I_copy (result, V_call (Slice width, [value; start])), aux) as instr -> (
+      | I_aux (I_copy (result, V_call (Slice width, [value; start])), aux) as instr ->
           let scalar_source =
             match cval_ctyp value with
             | CT_fbits source_width -> 0 < source_width && source_width <= 64
             | CT_sbits 64 | CT_fuint _ -> true
             | _ -> false
           in
-          if scalar_source then
+          if scalar_source then (
             let interval = integer_lifetime_interval (cval_integer_lifetime lifetime_ranges start) in
             let proof = Jib_semantics.prove_shift_count_interval ~index:1 ~interval ~carrier_width:64 in
             if Jib_semantics.has_shift_count_bounds ~index:1 ~carrier_width:64 (Option.to_list proof) then
               I_aux (I_copy (result, V_call (Proven_slice (width, 64), [value; start])), aux)
             else instr
+          )
           else instr
-        )
       | instr -> instr
     in
     let plain_fixed_vector_element = function
@@ -6521,18 +6607,16 @@ module Make (C : CONFIG) = struct
       | I_aux (I_funcall (CR_one result, _, (id, _), [vector; index]), aux) as instr
         when C.specialize_c
              &&
-             (match string_of_id id with
+             match string_of_id id with
              | "vector_access" | "vector_access_inc" | "fast_vector_access" | "fast_unsigned_vector_access" -> true
-             | _ -> false) -> (
+             | _ -> false -> (
           match cval_ctyp vector with
           | CT_fvector (length, element_ctyp)
-            when 0 < length
-                 && plain_fixed_vector_element element_ctyp
-                 && ctyp_equal (clexp_ctyp result) element_ctyp -> (
+            when 0 < length && plain_fixed_vector_element element_ctyp && ctyp_equal (clexp_ctyp result) element_ctyp
+            -> (
               match integer_lifetime_interval (cval_integer_lifetime lifetime_ranges index) with
               | Some (lower, upper)
-                when Big_int.less_equal Big_int.zero lower
-                     && Big_int.less upper (Big_int.of_int length) ->
+                when Big_int.less_equal Big_int.zero lower && Big_int.less upper (Big_int.of_int length) ->
                   I_aux (I_copy (result, V_call (Proven_vector_access length, [vector; index])), aux)
               | Some _ | None -> instr
             )
@@ -6552,7 +6636,7 @@ module Make (C : CONFIG) = struct
       in
       match (as_unsigned_representation left, as_unsigned_representation right) with
       | Some left, Some right
-        when not (ctyp_equal (cval_ctyp left) (cval_ctyp right))
+        when (not (ctyp_equal (cval_ctyp left) (cval_ctyp right)))
              && (has_custom_unsigned_representation left || has_custom_unsigned_representation right) ->
           Some (left, right)
       | Some _, Some _ | None, _ | _, None -> None
@@ -6582,8 +6666,7 @@ module Make (C : CONFIG) = struct
               let right_lifetime = cval_integer_lifetime lifetime_ranges right in
               let carrier_lifetime = integer_primitive_carrier_lifetime primitive left_lifetime right_lifetime in
               match represented_integer_lifetime ctx carrier_lifetime with
-              | Some ((CT_fint _ | CT_fuint _) as carrier)
-                when not (ctyp_equal (clexp_ctyp result) carrier) ->
+              | Some ((CT_fint _ | CT_fuint _) as carrier) when not (ctyp_equal (clexp_ctyp result) carrier) ->
                   let l = snd aux in
                   let promote lifetime value =
                     if ctyp_equal (cval_ctyp value) carrier then ([], value, [])
@@ -6692,7 +6775,9 @@ module Make (C : CONFIG) = struct
                       Lifetime_range (Big_int.max Big_int.zero lower, upper)
                   | result -> result
                 in
-                (result_lifetime, join_integer_lifetime result_lifetime (join_integer_lifetime left_lifetime right_lifetime))
+                ( result_lifetime,
+                  join_integer_lifetime result_lifetime (join_integer_lifetime left_lifetime right_lifetime)
+                )
             | None -> (Lifetime_top, Lifetime_top)
           in
           let comparison_carrier =
@@ -6707,8 +6792,8 @@ module Make (C : CONFIG) = struct
             match primitive with
             | Some (`Div | `Mod) ->
                 let prove index lifetime value =
-                  Jib_semantics.prove_argument_excludes_interval ~index
-                    ~interval:(integer_lifetime_interval lifetime) ~value
+                  Jib_semantics.prove_argument_excludes_interval ~index ~interval:(integer_lifetime_interval lifetime)
+                    ~value
                 in
                 let signed_exclusions =
                   match carrier with
@@ -6716,8 +6801,7 @@ module Make (C : CONFIG) = struct
                       [prove 0 left_lifetime (min_int width); prove 1 right_lifetime (Big_int.of_int (-1))]
                   | _ -> []
                 in
-                List.filter_map Fun.id (prove 1 right_lifetime Big_int.zero :: signed_exclusions)
-                @ semantic_proofs
+                List.filter_map Fun.id (prove 1 right_lifetime Big_int.zero :: signed_exclusions) @ semantic_proofs
             | Some (`Add | `Sub | `Mul | `Ediv | `Emod) | None -> semantic_proofs
           in
           let l = snd aux in
@@ -6744,8 +6828,7 @@ module Make (C : CONFIG) = struct
           let c_arithmetic_carrier left right =
             match (c_integer_promotion (cval_ctyp left), c_integer_promotion (cval_ctyp right)) with
             | Some (CT_fint left_width), Some (CT_fint right_width) -> Some (CT_fint (Int.max left_width right_width))
-            | Some (CT_fuint left_width), Some (CT_fuint right_width) ->
-                Some (CT_fuint (Int.max left_width right_width))
+            | Some (CT_fuint left_width), Some (CT_fuint right_width) -> Some (CT_fuint (Int.max left_width right_width))
             | Some (CT_fint signed_width), Some (CT_fuint unsigned_width)
             | Some (CT_fuint unsigned_width), Some (CT_fint signed_width) ->
                 if signed_width > unsigned_width then Some (CT_fint signed_width)
@@ -6754,7 +6837,7 @@ module Make (C : CONFIG) = struct
           in
           let exact_mixed_fixed_comparison left right =
             if ctyp_equal (cval_ctyp left) (cval_ctyp right) then false
-            else
+            else (
               match (cval_ctyp left, cval_ctyp right, c_arithmetic_carrier left right) with
               | CT_fint _, CT_fint _, Some _ | CT_fuint _, CT_fuint _, Some _ -> true
               | CT_fint _, CT_fuint _, Some (CT_fint _) | CT_fuint _, CT_fint _, Some (CT_fint _) -> true
@@ -6769,12 +6852,16 @@ module Make (C : CONFIG) = struct
                   | Lifetime_bottom | Lifetime_top -> false
                 )
               | _ -> false
+            )
           in
-          match (comparison, constant_comparison, comparison_carrier) with
-          | Some _, Some value, _ -> I_aux (I_copy (result, V_lit (VL_bool value, CT_bool)), aux)
-          | Some op, None, Some _ when exact_mixed_fixed_comparison left right ->
+          let mixed_custom_comparison = mixed_custom_unsigned_representations left right in
+          match (comparison, constant_comparison, comparison_carrier, mixed_custom_comparison) with
+          | Some _, Some value, _, _ -> I_aux (I_copy (result, V_lit (VL_bool value, CT_bool)), aux)
+          | Some op, None, Some _, Some (left, right) ->
               I_aux (I_copy (result, V_call (op, [left; right])), aux)
-          | Some op, None, Some carrier ->
+          | Some op, None, Some _, None when exact_mixed_fixed_comparison left right ->
+              I_aux (I_copy (result, V_call (op, [left; right])), aux)
+          | Some op, None, Some carrier, None ->
               let left_setup, left, left_cleanup = promote carrier left_lifetime left in
               let right_setup, right, right_cleanup = promote carrier right_lifetime right in
               iblock
@@ -6788,193 +6875,197 @@ module Make (C : CONFIG) = struct
                   let semantic_proofs = division_semantic_proofs carrier in
                   let division_is_defined =
                     match primitive with
-                    | `Div | `Mod ->
+                    | `Div | `Mod -> (
                         Jib_semantics.has_argument_excludes ~index:1 ~value:Big_int.zero semantic_proofs
                         &&
-                        (match carrier with
+                        match carrier with
                         | CT_fint width ->
                             Jib_semantics.has_argument_excludes ~index:0 ~value:(min_int width) semantic_proofs
-                            || Jib_semantics.has_argument_excludes ~index:1 ~value:(Big_int.of_int (-1))
-                                 semantic_proofs
-                        | _ -> true)
+                            || Jib_semantics.has_argument_excludes ~index:1 ~value:(Big_int.of_int (-1)) semantic_proofs
+                        | _ -> true
+                      )
                     | `Add | `Sub | `Mul | `Ediv | `Emod -> true
                   in
                   if
                     (ctyp_equal (clexp_ctyp result) CT_lint && primitive <> `Div && primitive <> `Mod)
                     || not division_is_defined
                   then instr
-                  else
-                  let custom_unsigned_carrier =
-                    match carrier with
-                    | CT_fint _ | CT_fuint _ -> false
-                    | _ -> (
-                        match C.integer_representation_bounds carrier with
-                        | Some (lower, _) -> Big_int.equal lower Big_int.zero
-                        | None -> false
+                  else (
+                    let custom_unsigned_carrier =
+                      match carrier with
+                      | CT_fint _ | CT_fuint _ -> false
+                      | _ -> (
+                          match C.integer_representation_bounds carrier with
+                          | Some (lower, _) -> Big_int.equal lower Big_int.zero
+                          | None -> false
+                        )
+                    in
+                    let as_native_unsigned value =
+                      match as_unsigned_representation value with
+                      | Some value when match cval_ctyp value with CT_fuint _ -> true | _ -> false -> Some value
+                      | Some _ | None -> None
+                    in
+                    let left, right, left_lifetime, right_lifetime =
+                      match (primitive, as_native_unsigned left, ctyp_equal (cval_ctyp right) carrier) with
+                      | (`Add | `Mul), Some left, true -> (right, left, right_lifetime, left_lifetime)
+                      | _ -> (left, right, left_lifetime, right_lifetime)
+                    in
+                    let proven_mixed_operands =
+                      if custom_unsigned_carrier then exact_mixed_unsigned_representations carrier left right else None
+                    in
+                    let result_carrier = represented_integer_lifetime ctx result_lifetime in
+                    let power_of_two_operation =
+                      match (primitive, left_lifetime, right_lifetime, carrier) with
+                      | ( (`Div | `Mod),
+                          Lifetime_range (left_lower, _),
+                          Lifetime_range (right_lower, right_upper),
+                          (CT_fint _ | CT_fuint _) )
+                        when Big_int.less_equal Big_int.zero left_lower && Big_int.equal right_lower right_upper ->
+                          Option.map
+                            (fun exponent ->
+                              match primitive with
+                              | `Div -> Power_of_two_idiv exponent
+                              | `Mod -> Power_of_two_imod exponent
+                              | `Add | `Sub | `Mul | `Ediv | `Emod -> assert false
+                            )
+                            (power_of_two_width right_lower)
+                      | _ -> None
+                    in
+                    let mixed_fixed_operation =
+                      match (power_of_two_operation, primitive, result_carrier, c_arithmetic_carrier left right) with
+                      | ( None,
+                          ((`Div | `Mod) as primitive),
+                          Some ((CT_fint _ | CT_fuint _) as result_ctyp),
+                          Some ((CT_fint _ | CT_fuint _) as operation_ctyp) )
+                        when not (ctyp_equal (cval_ctyp left) (cval_ctyp right)) ->
+                          let conversion_is_exact =
+                            match (cval_ctyp left, cval_ctyp right, operation_ctyp) with
+                            | CT_fint _, CT_fint _, _ | CT_fuint _, CT_fuint _, _ -> true
+                            | CT_fint _, CT_fuint _, CT_fint _ | CT_fuint _, CT_fint _, CT_fint _ -> true
+                            | CT_fint _, CT_fuint _, CT_fuint _ -> (
+                                match left_lifetime with
+                                | Lifetime_range (lower, _) -> Big_int.less_equal Big_int.zero lower
+                                | Lifetime_bottom | Lifetime_top -> false
+                              )
+                            | CT_fuint _, CT_fint _, CT_fuint _ -> (
+                                match right_lifetime with
+                                | Lifetime_range (lower, _) -> Big_int.less_equal Big_int.zero lower
+                                | Lifetime_bottom | Lifetime_top -> false
+                              )
+                            | _ -> false
+                          in
+                          let argument_excludes index lifetime value =
+                            Jib_semantics.has_argument_excludes ~index ~value semantic_proofs
+                            || Option.is_some
+                                 (Jib_semantics.prove_argument_excludes_interval ~index
+                                    ~interval:(integer_lifetime_interval lifetime) ~value
+                                 )
+                          in
+                          let operation_is_defined =
+                            match operation_ctyp with
+                            | CT_fint width ->
+                                argument_excludes 0 left_lifetime (min_int width)
+                                || argument_excludes 1 right_lifetime (Big_int.of_int (-1))
+                            | CT_fuint _ -> true
+                            | _ -> false
+                          in
+                          if conversion_is_exact && operation_is_defined then
+                            Some
+                              ( match primitive with
+                              | `Div -> Mixed_proven_idiv (operation_ctyp, result_ctyp)
+                              | `Mod -> Mixed_proven_imod (operation_ctyp, result_ctyp)
+                              | `Add | `Sub | `Mul | `Ediv | `Emod -> assert false
+                              )
+                          else None
+                      | _ -> None
+                    in
+                    let preserve_native_operands =
+                      Option.is_some power_of_two_operation || Option.is_some mixed_fixed_operation
+                    in
+                    log_progress "primitive=%s carrier=%s result=%s left=%s right=%s preserve-mixed=%b"
+                      (string_of_id id) (string_of_ctyp carrier)
+                      (Option.fold ~none:"?" ~some:string_of_ctyp result_carrier)
+                      (string_of_ctyp (cval_ctyp left))
+                      (string_of_ctyp (cval_ctyp right))
+                      (Option.is_some proven_mixed_operands || preserve_native_operands);
+                    let promote lifetime value =
+                      if ctyp_equal (cval_ctyp value) carrier then ([], value, [])
+                      else (
+                        match (proven_native_conversion carrier lifetime value, value) with
+                        | Some converted, _ -> ([], converted, [])
+                        | None, V_lit (VL_int literal, _) -> ([], V_lit (VL_int literal, carrier), [])
+                        | None, _ ->
+                            let temporary = ngensym () in
+                            ( [idecl l carrier temporary; icopy l (CL_id (temporary, carrier)) value],
+                              V_id (temporary, carrier),
+                              [iclear ~loc:l carrier temporary]
+                            )
                       )
-                  in
-                  let as_native_unsigned value =
-                    match as_unsigned_representation value with
-                    | Some value when match cval_ctyp value with CT_fuint _ -> true | _ -> false -> Some value
-                    | Some _ | None -> None
-                  in
-                  let left, right, left_lifetime, right_lifetime =
-                    match (primitive, as_native_unsigned left, ctyp_equal (cval_ctyp right) carrier) with
-                    | (`Add | `Mul), Some left, true -> (right, left, right_lifetime, left_lifetime)
-                    | _ -> (left, right, left_lifetime, right_lifetime)
-                  in
-                  let proven_mixed_operands =
-                    if custom_unsigned_carrier then exact_mixed_unsigned_representations carrier left right else None
-                  in
-                  let result_carrier = represented_integer_lifetime ctx result_lifetime in
-                  let power_of_two_operation =
-                    match (primitive, left_lifetime, right_lifetime, carrier) with
-                    | ( (`Div | `Mod),
-                        Lifetime_range (left_lower, _),
-                        Lifetime_range (right_lower, right_upper),
-                        (CT_fint _ | CT_fuint _) )
-                      when Big_int.less_equal Big_int.zero left_lower && Big_int.equal right_lower right_upper ->
-                        Option.map
-                          (fun exponent ->
-                            match primitive with
-                            | `Div -> Power_of_two_idiv exponent
-                            | `Mod -> Power_of_two_imod exponent
-                            | `Add | `Sub | `Mul | `Ediv | `Emod -> assert false
-                          )
-                          (power_of_two_width right_lower)
-                    | _ -> None
-                  in
-                  let mixed_fixed_operation =
-                    match (power_of_two_operation, primitive, result_carrier, c_arithmetic_carrier left right) with
-                    | ( None,
-                        (`Div | `Mod as primitive),
-                        Some ((CT_fint _ | CT_fuint _) as result_ctyp),
-                        Some ((CT_fint _ | CT_fuint _) as operation_ctyp) )
-                      when not (ctyp_equal (cval_ctyp left) (cval_ctyp right)) ->
-                        let conversion_is_exact =
-                          match (cval_ctyp left, cval_ctyp right, operation_ctyp) with
-                          | CT_fint _, CT_fint _, _ | CT_fuint _, CT_fuint _, _ -> true
-                          | CT_fint _, CT_fuint _, CT_fint _ | CT_fuint _, CT_fint _, CT_fint _ -> true
-                          | CT_fint _, CT_fuint _, CT_fuint _ -> (
-                              match left_lifetime with
-                              | Lifetime_range (lower, _) -> Big_int.less_equal Big_int.zero lower
-                              | Lifetime_bottom | Lifetime_top -> false
-                            )
-                          | CT_fuint _, CT_fint _, CT_fuint _ -> (
-                              match right_lifetime with
-                              | Lifetime_range (lower, _) -> Big_int.less_equal Big_int.zero lower
-                              | Lifetime_bottom | Lifetime_top -> false
-                            )
-                          | _ -> false
+                    in
+                    let left_setup, left, left_cleanup =
+                      match (preserve_native_operands, proven_mixed_operands) with
+                      | true, _ -> ([], left, [])
+                      | false, Some (left, _) -> ([], left, [])
+                      | false, None -> promote left_lifetime left
+                    in
+                    let right_setup, right, right_cleanup =
+                      match (preserve_native_operands, proven_mixed_operands) with
+                      | true, _ -> ([], right, [])
+                      | false, Some (_, right) -> ([], right, [])
+                      | false, None when custom_unsigned_carrier -> (
+                          match as_native_unsigned right with
+                          | Some right -> ([], right, [])
+                          | None -> promote right_lifetime right
+                        )
+                      | false, None -> promote right_lifetime right
+                    in
+                    let op =
+                      match (primitive, carrier) with
+                      | `Add, (CT_fint _ | CT_fuint _) -> Proven_iadd
+                      | `Sub, (CT_fint _ | CT_fuint _) -> Proven_isub
+                      | `Mul, (CT_fint _ | CT_fuint _) -> Proven_imul
+                      | `Div, (CT_fint _ | CT_fuint _) -> Proven_idiv
+                      | `Mod, (CT_fint _ | CT_fuint _) -> Proven_imod
+                      | `Ediv, (CT_fint _ | CT_fuint _) -> Proven_idiv
+                      | `Emod, (CT_fint _ | CT_fuint _) -> Proven_imod
+                      | `Add, _ -> Iadd
+                      | `Sub, _ -> Isub
+                      | `Mul, _ -> Imul
+                      | `Div, _ -> Idiv
+                      | `Mod, _ -> Imod
+                      | `Ediv, _ -> Idiv
+                      | `Emod, _ -> Imod
+                    in
+                    let operation =
+                      match (power_of_two_operation, mixed_fixed_operation) with
+                      | Some op, _ -> V_call (op, [left])
+                      | None, Some op -> V_call (op, [left; right])
+                      | None, None -> V_call (op, [left; right])
+                    in
+                    let operation_result_carrier =
+                      match (power_of_two_operation, mixed_fixed_operation, result_carrier) with
+                      | Some _, _, Some result_carrier | None, Some _, Some result_carrier -> result_carrier
+                      | _ -> carrier
+                    in
+                    let operation_instrs =
+                      if ctyp_equal (clexp_ctyp result) operation_result_carrier then
+                        [I_aux (I_copy (result, operation), aux)]
+                      else (
+                        let temporary =
+                          ngensym ~source_name:"integer_result"
+                            ~source_type:(string_of_ctyp operation_result_carrier)
+                            ()
                         in
-                        let argument_excludes index lifetime value =
-                          Jib_semantics.has_argument_excludes ~index ~value semantic_proofs
-                          || Option.is_some
-                               (Jib_semantics.prove_argument_excludes_interval ~index
-                                  ~interval:(integer_lifetime_interval lifetime) ~value
-                               )
-                        in
-                        let operation_is_defined =
-                          match operation_ctyp with
-                          | CT_fint width ->
-                              argument_excludes 0 left_lifetime (min_int width)
-                              || argument_excludes 1 right_lifetime (Big_int.of_int (-1))
-                          | CT_fuint _ -> true
-                          | _ -> false
-                        in
-                        if conversion_is_exact && operation_is_defined then
-                          Some
-                            (match primitive with
-                            | `Div -> Mixed_proven_idiv (operation_ctyp, result_ctyp)
-                            | `Mod -> Mixed_proven_imod (operation_ctyp, result_ctyp)
-                            | `Add | `Sub | `Mul | `Ediv | `Emod -> assert false
-                            )
-                        else None
-                    | _ -> None
-                  in
-                  let preserve_native_operands =
-                    Option.is_some power_of_two_operation || Option.is_some mixed_fixed_operation
-                  in
-                  log_progress "primitive=%s carrier=%s result=%s left=%s right=%s preserve-mixed=%b" (string_of_id id)
-                    (string_of_ctyp carrier)
-                    (Option.fold ~none:"?" ~some:string_of_ctyp result_carrier)
-                    (string_of_ctyp (cval_ctyp left)) (string_of_ctyp (cval_ctyp right))
-                    (Option.is_some proven_mixed_operands || preserve_native_operands);
-                  let promote lifetime value =
-                    if ctyp_equal (cval_ctyp value) carrier then ([], value, [])
-                    else (
-                      match (proven_native_conversion carrier lifetime value, value) with
-                      | Some converted, _ -> ([], converted, [])
-                      | None, V_lit (VL_int literal, _) -> ([], V_lit (VL_int literal, carrier), [])
-                      | None, _ ->
-                          let temporary = ngensym () in
-                          ( [idecl l carrier temporary; icopy l (CL_id (temporary, carrier)) value],
-                            V_id (temporary, carrier),
-                            [iclear ~loc:l carrier temporary]
-                          )
-                    )
-                  in
-                  let left_setup, left, left_cleanup =
-                    match (preserve_native_operands, proven_mixed_operands) with
-                    | true, _ -> ([], left, [])
-                    | false, Some (left, _) -> ([], left, [])
-                    | false, None -> promote left_lifetime left
-                  in
-                  let right_setup, right, right_cleanup =
-                    match (preserve_native_operands, proven_mixed_operands) with
-                    | true, _ -> ([], right, [])
-                    | false, Some (_, right) -> ([], right, [])
-                    | false, None when custom_unsigned_carrier -> (
-                        match as_native_unsigned right with
-                        | Some right -> ([], right, [])
-                        | None -> promote right_lifetime right
+                        [
+                          idecl l operation_result_carrier temporary;
+                          icopy l (CL_id (temporary, operation_result_carrier)) operation;
+                          icopy l result (V_id (temporary, operation_result_carrier));
+                          iclear ~loc:l operation_result_carrier temporary;
+                        ]
                       )
-                    | false, None -> promote right_lifetime right
-                  in
-                  let op =
-                    match (primitive, carrier) with
-                    | `Add, (CT_fint _ | CT_fuint _) -> Proven_iadd
-                    | `Sub, (CT_fint _ | CT_fuint _) -> Proven_isub
-                    | `Mul, (CT_fint _ | CT_fuint _) -> Proven_imul
-                    | `Div, (CT_fint _ | CT_fuint _) -> Proven_idiv
-                    | `Mod, (CT_fint _ | CT_fuint _) -> Proven_imod
-                    | `Ediv, (CT_fint _ | CT_fuint _) -> Proven_idiv
-                    | `Emod, (CT_fint _ | CT_fuint _) -> Proven_imod
-                    | `Add, _ -> Iadd
-                    | `Sub, _ -> Isub
-                    | `Mul, _ -> Imul
-                    | `Div, _ -> Idiv
-                    | `Mod, _ -> Imod
-                    | `Ediv, _ -> Idiv
-                    | `Emod, _ -> Imod
-                  in
-                  let operation =
-                    match (power_of_two_operation, mixed_fixed_operation) with
-                    | Some op, _ -> V_call (op, [left])
-                    | None, Some op -> V_call (op, [left; right])
-                    | None, None -> V_call (op, [left; right])
-                  in
-                  let operation_result_carrier =
-                    match (power_of_two_operation, mixed_fixed_operation, result_carrier) with
-                    | Some _, _, Some result_carrier | None, Some _, Some result_carrier -> result_carrier
-                    | _ -> carrier
-                  in
-                  let operation_instrs =
-                    if ctyp_equal (clexp_ctyp result) operation_result_carrier then
-                      [I_aux (I_copy (result, operation), aux)]
-                    else (
-                      let temporary =
-                        ngensym ~source_name:"integer_result" ~source_type:(string_of_ctyp operation_result_carrier) ()
-                      in
-                      [
-                        idecl l operation_result_carrier temporary;
-                        icopy l (CL_id (temporary, operation_result_carrier)) operation;
-                        icopy l result (V_id (temporary, operation_result_carrier));
-                        iclear ~loc:l operation_result_carrier temporary;
-                      ]
-                    )
-                  in
-                  iblock (left_setup @ right_setup @ operation_instrs @ right_cleanup @ left_cleanup)
+                    in
+                    iblock (left_setup @ right_setup @ operation_instrs @ right_cleanup @ left_cleanup)
+                  )
               | _ -> instr
             )
         )
@@ -7176,32 +7267,32 @@ module Make (C : CONFIG) = struct
                 in
                 [call; iend l]
             | None ->
-            prune_proved_unreachable path_lifetime_ranges path_decisions body
-            |> List.map (visit_instr visitor)
-            |> List.map (visit_instr restore_aggregate_field_representations)
-            |> rewrite_wrapping_arithmetic
-            |> List.map
-                 (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
-                    specialize_proven_integer_conversion
-                 )
-            |> List.map
-                 (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
-                    specialize_proven_bitvector_shift
-                 )
-            |> List.map
-                 (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
-                    specialize_proven_bitvector_slice
-                 )
-            |> List.map
-                 (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
-                    specialize_proven_fixed_vector_access
-                 )
-            |> List.map
-                 (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
-                    specialize_structural_integer_primitive
-                 )
-            |> List.map
-                 (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges specialize_integer_primitive)
+                prune_proved_unreachable path_lifetime_ranges path_decisions body
+                |> List.map (visit_instr visitor)
+                |> List.map (visit_instr restore_aggregate_field_representations)
+                |> rewrite_wrapping_arithmetic
+                |> List.map
+                     (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                        specialize_proven_integer_conversion
+                     )
+                |> List.map
+                     (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                        specialize_proven_bitvector_shift
+                     )
+                |> List.map
+                     (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                        specialize_proven_bitvector_slice
+                     )
+                |> List.map
+                     (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                        specialize_proven_fixed_vector_access
+                     )
+                |> List.map
+                     (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges
+                        specialize_structural_integer_primitive
+                     )
+                |> List.map
+                     (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges specialize_integer_primitive)
                 |> remove_unused_literal_temporaries
                 |> List.map
                      (map_instr_with_lifetime_ranges lifetime_ranges path_lifetime_ranges (fun lifetime_ranges ->
@@ -7224,8 +7315,7 @@ module Make (C : CONFIG) = struct
                     ( callee,
                       ctyps,
                       creturn_ctyp creturn,
-                      ctx_is_extern callee ctx
-                      || match call_kind with Extern _ -> true | Call _ -> false
+                      ctx_is_extern callee ctx || match call_kind with Extern _ -> true | Call _ -> false
                     )
                     :: !calls
               | I_aux (I_copy (destination, value), _) ->
@@ -7294,8 +7384,7 @@ module Make (C : CONFIG) = struct
                 let name = name id in
                 match NameMap.find_opt name lifetime_writes with
                 | Some semantic
-                  when not (ctyp_equal semantic represented)
-                       && C.representation_refines ~semantic ~represented ->
+                  when (not (ctyp_equal semantic represented)) && C.representation_refines ~semantic ~represented ->
                     NameMap.add name represented replacements
                 | Some _ | None -> replacements
               )
@@ -7411,23 +7500,25 @@ module Make (C : CONFIG) = struct
         let l = snd aux in
         let promote value =
           if ctyp_equal (cval_ctyp value) CT_lint then ([], value, [])
-          else
+          else (
             let temporary = ngensym ~source_name:"integer_operand" ~source_type:(string_of_ctyp CT_lint) () in
             ( [idecl l CT_lint temporary; icopy l (CL_id (temporary, CT_lint)) value],
               V_id (temporary, CT_lint),
               [iclear ~loc:l CT_lint temporary]
             )
+          )
         in
         let left_setup, left, left_cleanup = promote left in
         let right_setup, right, right_cleanup = promote right in
         let result_setup, call_result, result_cleanup =
           if ctyp_equal (clexp_ctyp result) CT_lint then ([], result, [])
-          else
+          else (
             let temporary = ngensym ~source_name:"integer_result" ~source_type:(string_of_ctyp CT_lint) () in
             ( [idecl l CT_lint temporary],
               CL_id (temporary, CT_lint),
               [icopy l result (V_id (temporary, CT_lint)); iclear ~loc:l CT_lint temporary]
             )
+          )
         in
         iblock
           (left_setup @ right_setup @ result_setup
@@ -7458,15 +7549,15 @@ module Make (C : CONFIG) = struct
                    match string_of_id id with
                    | "__sail_proven_native_add" | "__sail_proven_native_sub" | "__sail_proven_native_mul" ->
                        Jib_semantics.has_result_bounds ~lower ~upper semantic_proofs
-                   | "__sail_proven_native_div" | "__sail_proven_native_mod" ->
+                   | "__sail_proven_native_div" | "__sail_proven_native_mod" -> (
                        Jib_semantics.has_argument_excludes ~index:1 ~value:Big_int.zero semantic_proofs
                        &&
-                       (match represented with
+                       match represented with
                        | CT_fint width ->
                            Jib_semantics.has_argument_excludes ~index:0 ~value:(min_int width) semantic_proofs
-                           || Jib_semantics.has_argument_excludes ~index:1 ~value:(Big_int.of_int (-1))
-                                semantic_proofs
-                       | _ -> true)
+                           || Jib_semantics.has_argument_excludes ~index:1 ~value:(Big_int.of_int (-1)) semantic_proofs
+                       | _ -> true
+                     )
                    | _ -> false
                  in
                  operation_is_proved ->
@@ -7492,18 +7583,12 @@ module Make (C : CONFIG) = struct
                 )
               in
               let fixed = match represented with CT_fint _ | CT_fuint _ -> true | _ -> false in
-              let proven_mixed_operands =
-                if fixed then None else mixed_custom_unsigned_representations left right
-              in
+              let proven_mixed_operands = if fixed then None else mixed_custom_unsigned_representations left right in
               let left_setup, left, left_cleanup =
-                match proven_mixed_operands with
-                | Some (left, _) -> ([], left, [])
-                | None -> promote left
+                match proven_mixed_operands with Some (left, _) -> ([], left, []) | None -> promote left
               in
               let right_setup, right, right_cleanup =
-                match proven_mixed_operands with
-                | Some (_, right) -> ([], right, [])
-                | None -> promote right
+                match proven_mixed_operands with Some (_, right) -> ([], right, []) | None -> promote right
               in
               let operation =
                 match (string_of_id id, fixed) with
@@ -7538,8 +7623,7 @@ module Make (C : CONFIG) = struct
         )
       | I_aux (I_funcall (_, Call _, (id, _), _), (_, l))
         when String.starts_with ~prefix:"__sail_proven_native_" (string_of_id id) ->
-          Reporting.unreachable l __POS__
-            ("Malformed proven native arithmetic marker " ^ string_of_id id)
+          Reporting.unreachable l __POS__ ("Malformed proven native arithmetic marker " ^ string_of_id id)
       | instr -> instr
     in
     let generated =

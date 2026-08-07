@@ -88,30 +88,30 @@ run_sail --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
   --c-preserve bytes20_inc_update \
   "$SOURCE" -o "$TMP_DIR/model"
 
-grep -Fq 'typedef struct { uint64_t limbs[4]; } sail_u256;' "$TMP_DIR/model.h"
-grep -Fq 'typedef struct { uint8_t bytes[20]; } sail_fixed_bytes_20;' "$TMP_DIR/model.h"
-grep -Fq 'typedef struct { uint8_t bytes[32]; } sail_fixed_bytes_32;' "$TMP_DIR/model.h"
-grep -Fq 'typedef struct { uint8_t bytes[48]; } sail_fixed_bytes_48;' "$TMP_DIR/model.h"
-grep -Fq 'sail_u256 zu256_add(sail_u256, sail_u256);' "$TMP_DIR/model.h"
-grep -Fq 'sail_u256 zu256_from_lbits(lbits);' "$TMP_DIR/model.h"
-grep -Fq 'void zu256_to_nat(sail_int *rop, sail_u256);' "$TMP_DIR/model.h"
-grep -Fq 'uint64_t zu256_bit(sail_u256, uint8_t);' "$TMP_DIR/model.h"
-grep -Fq 'sail_fixed_bytes_20 zaddress_update(sail_fixed_bytes_20, uint8_t, uint64_t);' "$TMP_DIR/model.h"
-grep -Fq 'sail_fixed_bytes_32 zb256_fill(uint64_t);' "$TMP_DIR/model.h"
-grep -Fq 'sail_fixed_bytes_20 zbytes20_inc_update(sail_fixed_bytes_20, uint8_t, uint64_t);' "$TMP_DIR/model.h"
-grep -Fq 'sail_u256 zb256_to_u256(sail_fixed_bytes_32);' "$TMP_DIR/model.h"
-grep -Fq 'sail_fixed_bytes_32 zu256_to_b256(sail_u256);' "$TMP_DIR/model.h"
-grep -Fq 'sail_u256 zaddress_to_word(sail_fixed_bytes_20);' "$TMP_DIR/model.h"
-grep -Fq 'sail_fixed_bytes_20 zword_to_address(sail_u256);' "$TMP_DIR/model.h"
-grep -Fq 'uint64_t zaddress_alias_low_byte(sail_fixed_bytes_20);' "$TMP_DIR/model.h"
-grep -Fq 'uint64_t zword_address_alias_low_byte(sail_u256);' "$TMP_DIR/model.h"
+grep -Fq 'typedef struct { uint64_t limbs[4]; } u256;' "$TMP_DIR/model.h"
+grep -Fq 'typedef struct { uint8_t bytes[20]; } bytes20;' "$TMP_DIR/model.h"
+grep -Fq 'typedef struct { uint8_t bytes[32]; } bytes32;' "$TMP_DIR/model.h"
+grep -Fq 'typedef struct { uint8_t bytes[48]; } bytes48;' "$TMP_DIR/model.h"
+grep -Eq '^u256 zu256_add\(u256( [[:alnum:]_]+)?, u256( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^u256 zu256_from_lbits\(lbits( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^void zu256_to_nat\(sail_int \*rop, u256( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^uint64_t zu256_bit\(u256( [[:alnum:]_]+)?, uint8_t( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^bytes20 zaddress_update\(bytes20( [[:alnum:]_]+)?, uint8_t( [[:alnum:]_]+)?, uint64_t( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^bytes32 zb256_fill\(uint64_t( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^bytes20 zbytes20_inc_update\(bytes20( [[:alnum:]_]+)?, uint8_t( [[:alnum:]_]+)?, uint64_t( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^u256 zb256_to_u256\(bytes32( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^bytes32 zu256_to_b256\(u256( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^u256 zaddress_to_word\(bytes20( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^bytes20 zword_to_address\(u256( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^uint64_t zaddress_alias_low_byte\(bytes20( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
+grep -Eq '^uint64_t zword_address_alias_low_byte\(u256( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
 
 # Container width is structural. Only the bit start is dynamic; the slice width
 # is compiled into the selected helper/mask.
-grep -Fq 'u256_extract_u64(const sail_u256 value, const uint64_t start)' "$TMP_DIR/model.c"
+grep -Fq 'u256_extract_u64(const u256 value, const uint64_t start)' "$TMP_DIR/model.c"
 grep -Fq 'sail_lbits_to_u64_array(result.limbs, 4, value);' "$TMP_DIR/model.c"
 grep -Fq 'sail_lbits_from_u64_array(result, value.limbs, 4, UINT64_C(256));' "$TMP_DIR/model.c"
-awk '/^static inline sail_u256 u256_of_lbits\(/,/^}/' \
+awk '/^static inline u256 u256_of_lbits\(/,/^}/' \
   "$TMP_DIR/model.c" > "$TMP_DIR/u256_of_lbits.helper"
 awk '/^static inline void lbits_of_u256\(/,/^}/' \
   "$TMP_DIR/model.c" > "$TMP_DIR/lbits_of_u256.helper"
@@ -177,17 +177,17 @@ assert_native_function b256_to_u256 'zfrom_bytes_le'
 assert_native_function u256_to_b256 'zto_bytes_le'
 assert_native_function address_to_word 'zfrom_bytes_le'
 assert_native_function word_to_address 'zto_bytes_le'
-assert_native_function address_alias_low_byte 'fast_unsigned_vector_access_fixed_bytes_20('
+assert_native_function address_alias_low_byte 'fast_unsigned_vector_access_bytes20('
 assert_native_function word_address_alias_low_byte 'zaddress_alias_low_byte('
 assert_native_function word_low_byte 'u256_extract_u64('
 if grep -Fq 'u256_and(' "$TMP_DIR/word_to_address.body"; then
   echo 'word_to_address masked bits that the fixed-byte conversion already drops' >&2
   exit 1
 fi
-grep -Fq 'u256_from_fixed_bytes_20(zv)' "$TMP_DIR/model.c"
-grep -Fq 'fixed_bytes_20_from_u256(zb)' "$TMP_DIR/model.c"
-grep -Fq 'u256_from_fixed_bytes_32(zv)' "$TMP_DIR/model.c"
-grep -Fq 'fixed_bytes_32_from_u256(zb)' "$TMP_DIR/model.c"
+grep -Fq 'u256_from_bytes20(zv)' "$TMP_DIR/model.c"
+grep -Fq 'bytes20_from_u256(zb)' "$TMP_DIR/model.c"
+grep -Fq 'u256_from_bytes32(zv)' "$TMP_DIR/model.c"
+grep -Fq 'bytes32_from_u256(zb)' "$TMP_DIR/model.c"
 # This preserved function is the deliberate mixed-representation control.  It
 # proves that pruning native-only output does not remove bridges required by a
 # real generic result.
@@ -203,7 +203,7 @@ if grep -Eq '(^|[^[:alnum:]_])lbits([^[:alnum:]_]|$)|sail_unsigned' \
   echo 'u256-to-integer conversion detoured through lbits' >&2
   exit 1
 fi
-assert_native_function limb_unsigned '((uint64_t) zvalue)'
+assert_native_function limb_unsigned 'uint64_t'
 assert_native_function limb_signed 'fast_signed(zvalue, 64)'
 assert_native_function limb_shift_left '? UINT64_C(0) : ((zvalue << zamount)'
 assert_native_function limb_shift_right 'safe_rshift(zvalue, zamount)'
@@ -247,7 +247,7 @@ fi
 # ABIs are both bits(64).  Equal proof partitions are shared, while the
 # preserved full-width control retains its u128 multiplication.
 assert_native_function multiply_bit_words 'u128_mul_u64_u64('
-assert_native_function multiply_masked_bytes 'zmultiply_bit_wordszIrepr'
+assert_native_function multiply_masked_bytes 'multiply_bit_words'
 grep -Fq 'UINT64_C(0xFF) & (zvalue >> UINT64_C(8))' "$TMP_DIR/multiply_masked_bytes.body"
 if grep -Fq '= (zvalue >> UINT64_C(8));' "$TMP_DIR/multiply_masked_bytes.body"; then
   echo 'multiply_masked_bytes retained its private shift temporary' >&2
@@ -255,8 +255,8 @@ if grep -Fq '= (zvalue >> UINT64_C(8));' "$TMP_DIR/multiply_masked_bytes.body"; 
 fi
 assert_native_function shift_noncontiguous_mask 'UINT64_C(0x00000000000000F5)'
 grep -Fq '= (zvalue >> UINT64_C(8));' "$TMP_DIR/shift_noncontiguous_mask.body"
-assert_native_function multiply_sliced_bytes 'zmultiply_bit_wordszIrepr'
-assert_native_function multiply_concatenated_bytes 'zmultiply_bit_wordszIrepr'
+assert_native_function multiply_sliced_bytes 'multiply_bit_words'
+assert_native_function multiply_concatenated_bytes 'multiply_bit_words'
 grep -Fq 'zvalue & UINT64_C(0xFFFF)' "$TMP_DIR/multiply_concatenated_bytes.body"
 grep -Fq '>> 8' "$TMP_DIR/multiply_concatenated_bytes.body"
 grep -Fq '<< 8' "$TMP_DIR/multiply_concatenated_bytes.body"
@@ -269,13 +269,13 @@ if grep -Fq 'UINT64_C(0xFFFF)' "$TMP_DIR/concatenate_distinct_sources.body"; the
   echo 'concatenate_distinct_sources incorrectly fused slices from distinct sources' >&2
   exit 1
 fi
-assert_native_function multiply_inserted_byte 'zmultiply_bit_wordszIrepr'
+assert_native_function multiply_inserted_byte 'multiply_bit_words'
 awk '
-  /^sail_u128 zmultiply_bit_wordszIrepr/ { printing = 1 }
+  /^u128 zmultiply_bit_words[^(]+\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/multiply_bit_words.clones"
-test "$(grep -Ec '^sail_u128 zmultiply_bit_wordszIrepr' "$TMP_DIR/multiply_bit_words.clones")" -eq 2
+test "$(grep -Ec '^u128 zmultiply_bit_words[^(]+\(' "$TMP_DIR/multiply_bit_words.clones")" -eq 2
 grep -Eq 'uint16_t [^;]+;' "$TMP_DIR/multiply_bit_words.clones"
 grep -Eq 'uint32_t [^;]+;' "$TMP_DIR/multiply_bit_words.clones"
 if grep -Eq 'u128_mul_u64_u64|sail_native_conversion_failure|sail_int|mpz_|lbits|CONVERT_OF' \
@@ -292,18 +292,18 @@ if ! grep -Eq 'sail_int|lbits|CONVERT_OF' "$TMP_DIR/insert_byte_at_unproven.body
   echo 'insert_byte_at_unproven unexpectedly selected native fixed-width insertion' >&2
   exit 1
 fi
-assert_native_function address_equal 'eq_fixed_bytes_20('
-assert_native_function address_equal_vector 'eq_fixed_bytes_20('
-assert_native_function address_byte 'fast_unsigned_vector_access_fixed_bytes_20('
-assert_native_function address_update 'fast_unsigned_vector_update_fixed_bytes_20('
-assert_native_function b160_equal 'eq_fixed_bytes_20('
-assert_native_function b256_equal 'eq_fixed_bytes_32('
-assert_native_function b256_fill 'fast_unsigned_vector_init_fixed_bytes_32('
-assert_native_function b384_equal 'eq_fixed_bytes_48('
-assert_native_function b384_byte 'fast_unsigned_vector_access_fixed_bytes_48('
-assert_native_function b384_update 'fast_unsigned_vector_update_fixed_bytes_48('
-assert_native_function bytes20_inc_byte 'fast_unsigned_vector_access_fixed_bytes_20('
-assert_native_function bytes20_inc_update 'fast_unsigned_vector_update_fixed_bytes_20('
+assert_native_function address_equal 'eq_bytes20('
+assert_native_function address_equal_vector 'eq_bytes20('
+assert_native_function address_byte 'fast_unsigned_vector_access_bytes20('
+assert_native_function address_update 'fast_unsigned_vector_update_bytes20('
+assert_native_function b160_equal 'eq_bytes20('
+assert_native_function b256_equal 'eq_bytes32('
+assert_native_function b256_fill 'fast_unsigned_vector_init_bytes32('
+assert_native_function b384_equal 'eq_bytes48('
+assert_native_function b384_byte 'fast_unsigned_vector_access_bytes48('
+assert_native_function b384_update 'fast_unsigned_vector_update_bytes48('
+assert_native_function bytes20_inc_byte 'fast_unsigned_vector_access_bytes20('
+assert_native_function bytes20_inc_update 'fast_unsigned_vector_update_bytes20('
 
 # A second extraction from the same source preserves only native entry points.
 # Dead generic declarations and fallback definitions must not force their

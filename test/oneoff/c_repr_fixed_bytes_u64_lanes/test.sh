@@ -31,10 +31,17 @@ run_sail --no-color --no-memo-z3 -O -c --c-specialize --c-no-main \
   --c-preserve u256_to_lane_b256 \
   "$SOURCE" -o "$TMP_DIR/model"
 
-grep -Fq 'typedef struct { uint64_t lanes[3]; } sail_fixed_bytes_u64_lanes_20;' "$TMP_DIR/model.h"
-grep -Fq 'typedef struct { uint64_t lanes[4]; } sail_fixed_bytes_u64_lanes_32;' "$TMP_DIR/model.h"
-grep -Fq 'sail_fixed_bytes_u64_lanes_20 zlane_address_update(sail_fixed_bytes_u64_lanes_20, uint8_t, uint64_t);' "$TMP_DIR/model.h"
-grep -Fq 'sail_fixed_bytes_u64_lanes_32 zlane_b256_fill(uint64_t);' "$TMP_DIR/model.h"
+grep -Fq 'typedef struct { uint64_t lanes[3]; } bytes20;' "$TMP_DIR/model.h"
+grep -Fq 'typedef struct { uint64_t lanes[4]; } bytes32;' "$TMP_DIR/model.h"
+grep -Fq 'bytes20 zlane_address_update(bytes20 zvalue, uint8_t zindex, uint64_t zelem);' "$TMP_DIR/model.h"
+grep -Fq 'bytes32 zlane_b256_fill(uint64_t zelem);' "$TMP_DIR/model.h"
+grep -Fq 'static inline bool eq_bytes20(const bytes20 op1, const bytes20 op2)' "$TMP_DIR/model.c"
+grep -Fq 'for (size_t i = 0; i < 3; ++i)' "$TMP_DIR/model.c"
+if grep -A8 -F 'static inline bool eq_bytes20' "$TMP_DIR/model.c" | grep -Fq 'UINT64_MAX'; then
+  echo 'bytes20 equality must rely on its canonical zero-padded representation' >&2
+  exit 1
+fi
+grep -Fq 'static inline bool eq_bytes32(const bytes32 op1, const bytes32 op2)' "$TMP_DIR/model.c"
 
 extract_function() {
   function_name=$1
@@ -58,15 +65,15 @@ assert_native_function() {
   fi
 }
 
-assert_native_function lane_address_equal 'eq_fixed_bytes_u64_lanes_20('
-assert_native_function lane_address_byte 'fast_unsigned_vector_access_fixed_bytes_u64_lanes_20('
-assert_native_function lane_address_update 'fast_unsigned_vector_update_fixed_bytes_u64_lanes_20('
-assert_native_function lane_b256_equal 'eq_fixed_bytes_u64_lanes_32('
-assert_native_function lane_b256_fill 'fast_unsigned_vector_init_fixed_bytes_u64_lanes_32('
+assert_native_function lane_address_equal 'eq_bytes20('
+assert_native_function lane_address_byte 'fast_unsigned_vector_access_bytes20('
+assert_native_function lane_address_update 'fast_unsigned_vector_update_bytes20('
+assert_native_function lane_b256_equal 'eq_bytes32('
+assert_native_function lane_b256_fill 'fast_unsigned_vector_init_bytes32('
 assert_native_function lane_b256_to_u256 'zfrom_bytes_le'
 assert_native_function u256_to_lane_b256 'zto_bytes_le'
-grep -Fq 'u256_from_fixed_bytes_u64_lanes_32(zv)' "$TMP_DIR/model.c"
-grep -Fq 'fixed_bytes_u64_lanes_32_from_u256(zb)' "$TMP_DIR/model.c"
+grep -Fq 'u256_from_bytes32(zv)' "$TMP_DIR/model.c"
+grep -Fq 'bytes32_from_u256(zb)' "$TMP_DIR/model.c"
 
 if command -v pkg-config >/dev/null 2>&1; then
   GMP_CFLAGS=$(pkg-config --cflags gmp)

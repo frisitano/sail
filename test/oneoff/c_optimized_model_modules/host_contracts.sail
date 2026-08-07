@@ -5,7 +5,8 @@ val host_reset = impure {c: "host_reset_exact"} : unit -> unit
 
 enum fatal_reason = { TestFatal }
 
-val fatal_error = impure {c: "fatal_error"} : fatal_reason -> unit
+val fatal_error = impure {c: "fatal_error"} :
+  forall ('a : Type). fatal_reason -> 'a
 function fatal_error(_reason) = exit(())
 
 function always_fatal() -> unit = fatal_error(TestFatal)

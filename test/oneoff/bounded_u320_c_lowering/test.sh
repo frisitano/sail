@@ -40,7 +40,7 @@ fi
   --c-preserve widen_u320_to_nat \
   "$TEST_DIR/model.sail" -o "$OUT"
 
-grep -Fq 'typedef struct { uint64_t limbs[5]; } sail_u320;' "$OUT.h"
+grep -Fq 'typedef struct { uint64_t limbs[5]; } u320;' "$OUT.h"
 grep -Fq 'UINT64_C(18446744073709551615)' "$OUT.c"
 sed -n '/^.* ztop_level_int_identity(/,/^}/p' "$OUT.c" | grep -Fq 'sail_int'
 if grep -Fq 'convert_mach_uint_of_sail_string' "$OUT.c"; then

@@ -1,0 +1,31 @@
+function classify(first, second) = {
+  if first then {
+    1
+  } else {
+    if second then {
+      2
+    } else {
+      3
+    }
+  }
+}
+
+function maybe_act(first, second) = {
+  if first then {
+    ()
+  } else {
+    if second then {
+      ()
+    }
+  }
+}
+
+type selected_width('wide : Bool) = bits(if 'wide then 64 else 32)
+type selected_pair('left : Int, 'right : Int) = (int('left), int('right))
+
+val select_pair : forall 'left 'right, 0 <= 'left & 0 <= 'right. unit -> selected_pair(
+    if 'left < 'right then 'left else 'right,
+    if (if 'left < 'right then 'left else 'right) < 'right
+    then (if 'left < 'right then 'left else 'right)
+    else 'right,
+  )

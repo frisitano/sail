@@ -125,20 +125,18 @@ module type CODEGEN_CONFIG = sig
   (** Fixed byte-array representation lengths, keyed by annotated type. *)
   val c_repr_fixed_bytes : int Ast_compare.Bindings.t
 
-  (** Fixed byte-array representation lengths stored in native 64-bit lanes,
-      keyed by annotated type. *)
+  (** Fixed byte-array representation lengths stored in native 64-bit lanes, keyed by annotated type. *)
   val c_repr_fixed_bytes_u64_lanes : int Ast_compare.Bindings.t
 
-  (** Widths of transparent byte-vector aliases represented as native
-      64-bit lanes. Transparent aliases are erased before JIB lowering, so
-      their representation is necessarily structural at that byte width. *)
+  (** Widths of transparent byte-vector aliases represented as native 64-bit lanes. Transparent aliases are erased
+      before JIB lowering, so their representation is necessarily structural at that byte width. *)
   val c_repr_fixed_bytes_u64_lane_alias_lengths : int list
 
   (** Explicit C carrier names for structurally represented fixed-byte widths. *)
   val c_repr_fixed_bytes_names : (int * string) list
 
-  (** Pure functions explicitly authorized by the typed Sail AST for static
-      evaluation of top-level represented constants. *)
+  (** Pure functions explicitly authorized by the typed Sail AST for static evaluation of top-level represented
+      constants. *)
   val c_static_evaluators : string Ast_compare.Bindings.t
 
   (** Preserve fixed integer representations through generic specialization. *)
@@ -149,6 +147,7 @@ module type CODEGEN_CONFIG = sig
 
   (** Optional backend-neutral representation-specialization plan outputs. *)
   val specialization_plan_json : string option
+
   val specialization_plan_human : string option
   val specialization_obligations_lean : string option
   val specialization_obligations_coq : string option
@@ -156,28 +155,31 @@ module type CODEGEN_CONFIG = sig
   (** Generate the strict, allocation-free optimized-model ABI. *)
   val optimized_model : bool
 
-  (** Nominal Sail types whose final C declaration is supplied by an external
-      header in an optimized-model build. *)
+  (** Nominal Sail types whose final C declaration is supplied by an external header in an optimized-model build. *)
   val external_types : string Ast_compare.Bindings.t
 
-  (** Record fields represented by byte pointers in optimized C, together
-      with the C adapter that maps the semantic integer offset to its backing
-      region. The record may be generated or supplied as an external type. *)
+  (** External optimized-model record types whose C spelling is selected by
+      [$[c_repr {representation = external, name = ...}]]. Multiple nominal Sail records may intentionally share one C
+      type name. *)
+  val external_type_names : string Ast_compare.Bindings.t
+
+  (** Record fields represented by byte pointers in optimized C, together with the C adapter that maps the semantic
+      integer offset to its backing region. The record may be generated or supplied as an external type. *)
   val byte_pointer_fields : (Ast.id * Ast.id * string) list
 
-  (** Nominal integer types represented by byte pointers throughout optimized
-      C. Each value is either the adapter that maps semantic offsets to their
-      backing region, or the internal direct-pointer marker selected by
+  (** Nominal integer types represented by byte pointers throughout optimized C. Each value is either the adapter that
+      maps semantic offsets to their backing region, or the internal direct-pointer marker selected by
       [$[c_repr byte_pointer]]. *)
   val byte_pointer_types : string Ast_compare.Bindings.t
 
-  (** Source function arguments and results that use configured nominal
-      byte-pointer types, captured before rewriting expands type aliases. *)
+  (** Source function arguments and results that use configured nominal byte-pointer types, captured before rewriting
+      expands type aliases. *)
   val byte_pointer_signatures : (string option list * string option) Ast_compare.Bindings.t
 
-  (** Source function arguments and results that use fixed-byte nominal
-      aliases, captured from the typed AST before rewriting expands them. *)
+  (** Source function arguments and results that use fixed-byte nominal aliases, captured from the typed AST before
+      rewriting expands them. *)
   val fixed_bytes_signatures : (int option list * int option) Ast_compare.Bindings.t
+
   val fixed_bytes_u64_lanes_signatures : (int option list * int option) Ast_compare.Bindings.t
 
   (** Package prefix for strict optimized-model entry points. *)
@@ -197,19 +199,9 @@ module type CODEGEN_CONFIG = sig
 end
 
 module Codegen (Config : CODEGEN_CONFIG) : sig
-  type c_module = {
-    name : string;
-    file_stem : string;
-    files : string list;
-    requires : string list;
-  }
+  type c_module = { name : string; file_stem : string; files : string list; requires : string list }
 
-  type c_module_output = {
-    name : string;
-    file_stem : string;
-    header : string;
-    implementation : string;
-  }
+  type c_module_output = { name : string; file_stem : string; header : string; implementation : string }
 
   val jib_of_ast : Env.t -> Effects.side_effect_info -> typed_ast -> cdef list * Jib_compile.ctx
   val compile_ast : Env.t -> Effects.side_effect_info -> string -> typed_ast -> string * string
@@ -217,6 +209,7 @@ module Codegen (Config : CODEGEN_CONFIG) : sig
     Env.t ->
     Effects.side_effect_info ->
     package:string ->
+    emit_module:(c_module_output -> unit) ->
     c_module list ->
     typed_ast ->
     string * string * string * c_module_output list

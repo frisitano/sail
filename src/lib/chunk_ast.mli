@@ -104,6 +104,7 @@ and chunk =
   | Block_binder of binder * chunks * chunks
   | If_then of bool * chunks * chunks
   | If_then_else of if_format * chunks * chunks * chunks
+  | Type_if_then_else of chunks * chunks * chunks
   | Struct_update of chunks * chunks list
   | Match of { kind : match_kind; exp : chunks; aligned : bool; cases : pexp_chunks list }
   | Foreach of {

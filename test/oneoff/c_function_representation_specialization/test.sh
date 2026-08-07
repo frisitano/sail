@@ -8,7 +8,7 @@ TMP_ROOT=${AGENT_TMPDIR:-"$TEST_DIR/../../../.agent-tmp"}
 
 mkdir -p "$TMP_ROOT"
 TMP_DIR=$(mktemp -d "$TMP_ROOT/c_function_representation_specialization.XXXXXX")
-trap 'rm -rf "$TMP_DIR"' EXIT
+trap '[ -n "${KEEP_TEST_TMP:-}" ] || rm -rf "$TMP_DIR"' EXIT
 
 if [ -n "${SAIL_PLUGIN:-}" ]; then
   set -- -plugin "$SAIL_PLUGIN"
@@ -104,6 +104,7 @@ fi
   --c-preserve consume_unbounded_callee_result \
   --c-preserve aggregate_encoded_length \
   --c-preserve bounded_guarded_comparison \
+  --c-preserve bounded_guarded_wide_charge \
   "$TEST_DIR/model.sail" -o "$TMP_DIR/model"
 
 # Immutable top-level initializers use their complete proven lifetime.  The
@@ -112,8 +113,8 @@ fi
 "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c --c-specialize \
   --c-require-bounded-int --c-no-main \
   "$TEST_DIR/top_level_bound.sail" -o "$TMP_DIR/top_level_bound"
-grep -Fq 'sail_u256 zWORD_ALL_ONES;' "$TMP_DIR/top_level_bound.c"
-grep -Fq '((sail_u256){{UINT64_C(18446744073709551615), UINT64_C(18446744073709551615), UINT64_C(18446744073709551615), UINT64_C(18446744073709551615)}})' "$TMP_DIR/top_level_bound.c"
+grep -Fq 'u256 zWORD_ALL_ONES;' "$TMP_DIR/top_level_bound.c"
+grep -Fq '(u256){{UINT64_C(18446744073709551615), UINT64_C(18446744073709551615), UINT64_C(18446744073709551615), UINT64_C(18446744073709551615)}}' "$TMP_DIR/top_level_bound.c"
 if grep -Fq 'convert_u256_of_sail_string' "$TMP_DIR/top_level_bound.c"; then
   echo 'fixed-width u256 literal was materialized through a runtime decimal parser' >&2
   exit 1
@@ -126,14 +127,14 @@ fi
   --c-preserve concrete_add \
   --c-preserve concrete_specialization \
   "$TEST_DIR/concrete_signature.sail" -o "$TMP_DIR/concrete_signature"
-grep -Fq 'sail_u256 zconcrete_add(sail_u256, sail_u256);' "$TMP_DIR/concrete_signature.h"
-grep -Eq 'sail_u256 zconcrete_add.*repr.*\(sail_u256, uint8_t\);' "$TMP_DIR/concrete_signature.h"
+grep -Eq '^u256 zconcrete_add\(u256( [[:alnum:]_]+)?, u256( [[:alnum:]_]+)?\);$' "$TMP_DIR/concrete_signature.h"
+grep -Eq 'u256 zconcrete_add[^ (]+\(u256 [^,]+, uint8_t [^)]+\);' "$TMP_DIR/concrete_signature.h"
 awk '
-  /^sail_u256 zconcrete_special.*\(/ { printing = 1 }
+  /^u256 zconcrete_special.*\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/concrete_signature.c" > "$TMP_DIR/concrete_specialization.c"
-grep -Eq 'zconcrete_add.*repr.*\(' "$TMP_DIR/concrete_specialization.c"
+grep -Eq 'zconcrete_add[^ (]+\(' "$TMP_DIR/concrete_specialization.c"
 if grep -Fq 'u256_of_mach_int(' "$TMP_DIR/concrete_specialization.c"; then
   echo 'concrete representation specialization widened its bounded argument' >&2
   exit 1
@@ -162,9 +163,9 @@ grep -Fq 'Function budgeted_square requires more than 1 C representation special
 "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c --c-specialize --c-no-main \
   --c-preserve from_wide \
   "$TEST_DIR/bounds_only_widening.sail" -o "$TMP_DIR/bounds_only_widening"
-grep -Fq 'uint64_t zlowered_byte(uint8_t);' "$TMP_DIR/bounds_only_widening.h"
+grep -Eq '^uint64_t zlowered_byte\(uint8_t( [[:alnum:]_]+)?\);$' "$TMP_DIR/bounds_only_widening.h"
 grep -Fq 'CONVERT_OF(mach_uint, sail_int)(zvalue)' "$TMP_DIR/bounds_only_widening.c"
-if grep -Eq 'zlowered_byte.*repr' "$TMP_DIR/bounds_only_widening.h"; then
+if grep -Eq 'zlowered_byte[^ (]+' "$TMP_DIR/bounds_only_widening.h"; then
   echo 'bounds-only specialization cloned a fixed-width helper with a wider representation' >&2
   exit 1
 fi
@@ -196,13 +197,13 @@ GMP_CFLAGS=$(${PKG_CONFIG:-pkg-config} --cflags gmp)
   --c-preserve widening_countup \
   --c-preserve low_widening_countup \
   "$TEST_DIR/recursive_bound_partition.sail" -o "$TMP_DIR/recursive_bound_partition"
-test "$(grep -Ec 'unit zdescending_to_zzero.*repr.*\(uint8_t\);' \
+test "$(grep -Ec 'unit zdescending_to_zzero[^ (]+\(uint8_t [^)]+\);' \
   "$TMP_DIR/recursive_bound_partition.h")" -eq 2
-test "$(grep -Ec 'unit zascending_to_eight.*repr.*\(uint8_t\);' \
+test "$(grep -Ec 'unit zascending_to_eight[^ (]+\(uint8_t [^)]+\);' \
   "$TMP_DIR/recursive_bound_partition.h")" -eq 2
-grep -Eq 'unit zwidening_countup.*repr.*\(uint8_t\);' \
+grep -Eq 'unit zwidening_countup[^ (]+\(uint8_t [^)]+\);' \
   "$TMP_DIR/recursive_bound_partition.h"
-grep -Eq 'unit zwidening_countup.*repr.*\(uint16_t\);' \
+grep -Eq 'unit zwidening_countup[^ (]+\(uint16_t [^)]+\);' \
   "$TMP_DIR/recursive_bound_partition.h"
 if grep -Eq '[^[:alnum:]_]zwidening_countup\(' "$TMP_DIR/recursive_bound_partition.c"; then
   grep -Eq '^unit zwidening_countup\(' "$TMP_DIR/recursive_bound_partition.c"
@@ -253,7 +254,7 @@ fi
 # remain in optimized C.  Keeping it would reintroduce sail_int/GMP even though
 # no execution path can call it.
 for function_name in top_add middle_add; do
-  if grep -Fq "sail_u256 z${function_name}(sail_u256, sail_u256);" "$TMP_DIR/model.h"; then
+  if grep -Fq "u256 z${function_name}(u256, u256);" "$TMP_DIR/model.h"; then
     echo "unreachable generic implementation ${function_name} was retained" >&2
     exit 1
   fi
@@ -262,9 +263,9 @@ done
 # A full-width caller keeps the canonical u256/u256 body alive. Its explicit
 # modulo-2^256 observation is one wrapping operation, so no exact u320
 # intermediate is needed.
-grep -Fq 'sail_u256 zleaf_add(sail_u256, sail_u256);' "$TMP_DIR/model.h"
+grep -Eq '^u256 zleaf_add\(u256( [[:alnum:]_]+)?, u256( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
 awk '
-  /^sail_u256 zleaf_add\(sail_u256 zleft, sail_u256 zright\)/ { printing = 1 }
+  /^u256 zleaf_add\(u256 zleft, u256 zright\)/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/full_width_leaf_add.c"
@@ -277,7 +278,7 @@ fi
 # Without a modulo-2^256 observation, or with a different modulus, addition
 # remains exact and must not inherit wrapping semantics from its destination.
 awk '
-  /^sail_u320 zexact_add_full\(/ { printing = 1 }
+  /^u320 zexact_add_full\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/exact_addition.c"
@@ -288,7 +289,7 @@ if grep -Fq 'u256_add(zleft, zright)' "$TMP_DIR/exact_addition.c"; then
 fi
 
 awk '
-  /^sail_u256 znon_power_of_two_addmod\(/ { printing = 1 }
+  /^u256 znon_power_of_two_addmod\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/non_power_of_two_addition.c"
@@ -302,7 +303,7 @@ fi
 # The same semantic evidence projects onto the fixed u128 carrier and selects
 # its mixed-width wrapping helpers; it is not specific to the u256 EVM case.
 awk '
-  /^sail_u128 zwrapping_(add|mul)_u128/ { printing = 1 }
+  /^u128 zwrapping_(add|mul)_u128/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/u128_wrapping_arithmetic.c"
@@ -317,7 +318,7 @@ fi
 # when the mathematical difference is negative.  Truncating remainder does
 # not have that property and must retain its exact signed intermediate.
 awk '
-  /^sail_u256 zwrapping_sub_(full|u64)\(/ { printing = 1 }
+  /^u256 zwrapping_sub_(full|u64)\(/ { printing = 1 }
   printing { print }
   printing && /^}/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/wrapping_subtractions.c"
@@ -340,7 +341,7 @@ if grep -Eq 'emod_int|sail_int' "$TMP_DIR/wrapping_subtraction_u8.c"; then
 fi
 
 awk '
-  /^sail_u256 znon_power_of_two_submod\(/ { printing = 1 }
+  /^u256 znon_power_of_two_submod\(/ { printing = 1 }
   printing { print }
   printing && /^}/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/non_power_of_two_subtraction.c"
@@ -367,7 +368,7 @@ fi
 # the relation between two full-width operands; the callsite proof certificate
 # is established while the symbolic Sail environment is still available.
 awk '
-  /^sail_u256 zordered_truncating_submod\(sail_u256 zleft, sail_u256 zright\)/ { printing = 1 }
+  /^u256 zordered_truncating_submod\(u256 zleft, u256 zright\)/ { printing = 1 }
   printing { print }
   printing && /^}/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/ordered_truncating_subtraction.c"
@@ -384,7 +385,7 @@ fi
 # Its native u256 remainder remains explicit because this modulus is not a
 # low-bit mask.
 awk '
-  /^sail_u256 zordered_non_power_of_two_submod\(sail_u256 zleft, sail_u256 zright\)/ { printing = 1 }
+  /^u256 zordered_non_power_of_two_submod\(u256 zleft, u256 zright\)/ { printing = 1 }
   printing { print }
   printing && /^}/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/ordered_non_power_of_two_subtraction.c"
@@ -399,20 +400,20 @@ fi
 # their all-u256 representation clones call overflow-safe native reducers.
 grep -Fq 'u256_addmod(zleft, zright, zmodulus)' "$TMP_DIR/model.c"
 grep -Fq 'u256_mulmod(zleft, zright, zmodulus)' "$TMP_DIR/model.c"
-if grep -Eq '__sail_u256_(addmod|mulmod)' "$TMP_DIR/model.c"; then
+if grep -Eq '__u256_(addmod|mulmod)' "$TMP_DIR/model.c"; then
   echo 'representation-specialized modular arithmetic extern was not lowered' >&2
   exit 1
 fi
 
 # The demanded variants carry uint64_t through every local call boundary.
-grep -Eq 'sail_u256 ztop_add.*repr.*\(sail_u256, uint64_t\);' "$TMP_DIR/model.h"
-grep -Eq 'sail_u256 zmiddle_add.*repr.*\(sail_u256, uint64_t\);' "$TMP_DIR/model.h"
-grep -Eq 'sail_u256 zleaf_add.*repr.*\(sail_u256, uint64_t\);' "$TMP_DIR/model.h"
+grep -Eq 'u256 ztop_add[^ (]*\(u256 [^,]+, uint64_t [^)]+\);' "$TMP_DIR/model.h"
+grep -Eq 'u256 zmiddle_add[^ (]*\(u256 [^,]+, uint64_t [^)]+\);' "$TMP_DIR/model.h"
+grep -Eq 'u256 zleaf_add[^ (]*\(u256 [^,]+, uint64_t [^)]+\);' "$TMP_DIR/model.h"
 
 # Widening happens at the arithmetic operation, not at an intermediate call.
 grep -Fq 'u256_add_u64(' "$TMP_DIR/model.c"
 awk '
-  /^sail_u256 z(top_add|middle_add|leaf_add).*repr.*\(/ { printing = 1 }
+  /^u256 z(top_add|middle_add|leaf_add)[^ (]*\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/specialized_functions.c"
@@ -425,7 +426,7 @@ fi
 # operation. Its u256/u64 representation clone must select the mixed-width
 # wrapping helper directly, including when the source operands are reversed.
 awk '
-  /^sail_u256 zleaf_mul.*repr.*\(sail_u256 zleft, uint64_t zright\)/ { printing = 1 }
+  /^u256 zleaf_mul[^ (]+\(u256 zleft, uint64_t zright\)/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/specialized_wrapping_multiplications.c"
@@ -436,7 +437,7 @@ if grep -Eq 'u320_mul|u320_mod|sail_int' "$TMP_DIR/specialized_wrapping_multipli
 fi
 
 awk '
-  /^sail_u256 zleaf_mul.*repr.*\(sail_u256 zleft, sail_u128 zright\)/ { printing = 1 }
+  /^u256 zleaf_mul[^ (]+\(u256 zleft, u128 zright\)/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/specialized_u256_u128_wrapping_multiplications.c"
@@ -447,7 +448,7 @@ if grep -Eq 'u320_mul|u320_mod|sail_int' "$TMP_DIR/specialized_u256_u128_wrappin
 fi
 
 awk '
-  /^sail_u256 zleaf_mul\(sail_u256 zleft, sail_u256 zright\)/ { printing = 1 }
+  /^u256 zleaf_mul\(u256 zleft, u256 zright\)/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/full_width_wrapping_multiplication.c"
@@ -461,7 +462,7 @@ fi
 # exact. A different modulus likewise may not inherit wrapping semantics merely
 # because its result is eventually stored in a u256.
 awk '
-  /^sail_u320 zexact_mul_u64\(/ { printing = 1 }
+  /^u320 zexact_mul_u64\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/exact_multiplication.c"
@@ -472,7 +473,7 @@ if grep -Fq 'u256_mul_u64(' "$TMP_DIR/exact_multiplication.c"; then
 fi
 
 awk '
-  /^sail_u256 znon_power_of_two_mulmod\(/ { printing = 1 }
+  /^u256 znon_power_of_two_mulmod\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/non_power_of_two_multiplication.c"
@@ -484,7 +485,7 @@ if grep -Fq 'u256_mul_u64(' "$TMP_DIR/non_power_of_two_multiplication.c"; then
 fi
 
 awk '
-  /^sail_u256 zshared_product_mulmod\(/ { printing = 1 }
+  /^u256 zshared_product_mulmod\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/shared_product_multiplication.c"
@@ -499,7 +500,7 @@ fi
 # arithmetic and reduction to occupy a fixed adjacent instruction window.  An
 # independent side effect may remain scheduled between those nodes.
 awk '
-  /^sail_u256 zinterleaved_mulmod\(/ { printing = 1 }
+  /^u256 zinterleaved_mulmod\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/interleaved_multiplication.c"
@@ -518,11 +519,11 @@ grep -Fq 'u256_extract_u64(' "$TMP_DIR/model.c"
 # and exact interval demanded by each bounded caller. The word clone may need
 # arbitrary precision because word_max + 31 is 257 bits. The bounded native
 # clones use the smallest proved carrier: u8 for 0..255 and u64 for full u64.
-grep -Eq 'sail_u256 zwords_for_bytes.*repr.*\(sail_u256\);' "$TMP_DIR/model.h"
-test "$(grep -Ec 'uint64_t zwords_for_bytes.*repr.*\(uint64_t\);' "$TMP_DIR/model.h")" -eq 1
-test "$(grep -Ec 'uint8_t zwords_for_bytes.*repr.*\(uint8_t\);' "$TMP_DIR/model.h")" -eq 1
+grep -Eq 'u256 zwords_for_bytes[^ (]+\(u256 [^)]+\);' "$TMP_DIR/model.h"
+test "$(grep -Ec 'uint64_t zwords_for_bytes[^ (]+\(uint64_t [^)]+\);' "$TMP_DIR/model.h")" -eq 1
+test "$(grep -Ec 'uint8_t zwords_for_bytes[^ (]+\(uint8_t [^)]+\);' "$TMP_DIR/model.h")" -eq 1
 awk '
-  /^uint(8|64)_t zwords_for_bytes.*repr.*\(/ { printing = 1 }
+  /^uint(8|64)_t zwords_for_bytes[^ (]+\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/specialized_integer_helpers.c"
@@ -536,14 +537,14 @@ grep -Fq 'u128_add_u64(' "$TMP_DIR/specialized_integer_helpers.c"
 # of the function ABI. Both wrappers pass uint8_t and return bool, but the
 # 0..8 caller proves an 8-bit square while the 0..200 caller needs a 16-bit
 # exact product. They must therefore demand distinct clones and body carriers.
-test "$(grep -Ec '^bool zcaller_sensitive_square_le.*\(uint8_t\);' "$TMP_DIR/model.h")" -eq 2
+test "$(grep -Ec '^bool zcaller_sensitive_square_le[^ (]*\(uint8_t [^)]+\);' "$TMP_DIR/model.h")" -eq 2
 awk '
   /^bool zcaller_sensitive_square_le.*\(uint8_t zvalue\)/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/caller_sensitive_square_le.c"
-test "$(grep -Fc '((uint8_t)(((uint32_t)zvalue) * ((uint32_t)zvalue)))' "$TMP_DIR/caller_sensitive_square_le.c")" -eq 1
-test "$(grep -Fc '((uint16_t)(((uint32_t)' "$TMP_DIR/caller_sensitive_square_le.c")" -eq 1
+test "$(grep -Ec '\(uint8_t\).*\(uint32_t\)zvalue \* \(uint32_t\)zvalue' "$TMP_DIR/caller_sensitive_square_le.c")" -eq 1
+test "$(grep -Ec '\(uint16_t\).*\(uint32_t\).*zvalue \* \(uint32_t\).*zvalue' "$TMP_DIR/caller_sensitive_square_le.c")" -eq 1
 if grep -Eq 'sail_int|mult_int' "$TMP_DIR/caller_sensitive_square_le.c"; then
   echo 'caller-sensitive body specialization fell back to arbitrary precision' >&2
   exit 1
@@ -557,7 +558,7 @@ awk '
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/equivalent_tiny_square_callers.c"
-test "$(grep -Eo 'zcaller_sensitive_square_le[^ (]*repr[^ (]*' \
+test "$(grep -Eo 'zcaller_sensitive_square_le[^ (]+' \
   "$TMP_DIR/equivalent_tiny_square_callers.c" | sort -u | wc -l | tr -d ' ')" -eq 1
 
 # A forwarding body can have identical local carriers while its argument
@@ -565,26 +566,26 @@ test "$(grep -Eo 'zcaller_sensitive_square_le[^ (]*repr[^ (]*' \
 # edges therefore participate in the body fingerprint: the tight caller uses
 # a forwarding clone and reaches the tight square clone, while the broad
 # caller remains on the canonical forwarding/callee path.
-grep -Eq 'bool zforward_caller_sensitive_square_le.*repr.*\(uint8_t\);' "$TMP_DIR/model.h"
+grep -Eq 'bool zforward_caller_sensitive_square_le[^ (]+\(uint8_t [^)]+\);' "$TMP_DIR/model.h"
 awk '
   /^bool ztiny_forwarded_square_le\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/tiny_forwarded_square_le.c"
-grep -Eq 'zforward_caller_sensitive_square_le.*repr.*\(' "$TMP_DIR/tiny_forwarded_square_le.c"
+grep -Eq 'zforward_caller_sensitive_square_le[^ (]+\(' "$TMP_DIR/tiny_forwarded_square_le.c"
 awk '
-  /^bool zforward_caller_sensitive_square_le.*repr.*\(uint8_t zvalue\)/ { printing = 1 }
+  /^bool zforward_caller_sensitive_square_le[^ (]+\(uint8_t zvalue\)/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/tight_forwarding_clone.c"
-grep -Eq 'zcaller_sensitive_square_le.*repr.*\(' "$TMP_DIR/tight_forwarding_clone.c"
+grep -Eq 'zcaller_sensitive_square_le[^ (]+\(' "$TMP_DIR/tight_forwarding_clone.c"
 awk '
   /^bool zmedium_forwarded_square_le\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/medium_forwarded_square_le.c"
 grep -Eq 'zforward_caller_sensitive_square_le\(zvalue\)' "$TMP_DIR/medium_forwarded_square_le.c"
-if grep -Eq 'zforward_caller_sensitive_square_le.*repr.*\(' "$TMP_DIR/medium_forwarded_square_le.c"; then
+if grep -Eq 'zforward_caller_sensitive_square_le[^ (]+\(' "$TMP_DIR/medium_forwarded_square_le.c"; then
   echo 'broad forwarding caller was routed through the strict specialization' >&2
   exit 1
 fi
@@ -594,9 +595,9 @@ fi
 # propagated ranges discharge the deferred operand-fit obligation in the clone,
 # allowing the same body-specialization pipeline to select wrapping uint8_t
 # multiplication without an exact sail_int product or remainder.
-grep -Eq 'uint8_t zcaller_bounded_wrapping_mul.*repr.*\(uint8_t, uint8_t\);' "$TMP_DIR/model.h"
+grep -Eq 'uint8_t zcaller_bounded_wrapping_mul[^ (]+\(uint8_t [^,]+, uint8_t [^)]+\);' "$TMP_DIR/model.h"
 awk '
-  /^uint8_t zcaller_bounded_wrapping_mul.*repr.*\(uint8_t zleft, uint8_t zright\)/ { printing = 1 }
+  /^uint8_t zcaller_bounded_wrapping_mul[^ (]+\(uint8_t zleft, uint8_t zright\)/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/caller_bounded_wrapping_mul.c"
@@ -609,9 +610,9 @@ fi
 # A wider caller reaches the same provisional web but does not satisfy its
 # operand-fit obligation. It must keep the exact product and reduction rather
 # than selecting byte-width wrapping multiplication from non-negativity alone.
-grep -Eq 'uint8_t zcaller_bounded_wrapping_mul.*repr.*\(uint16_t, uint16_t\);' "$TMP_DIR/model.h"
+grep -Eq 'uint8_t zcaller_bounded_wrapping_mul[^ (]+\(uint16_t [^,]+, uint16_t [^)]+\);' "$TMP_DIR/model.h"
 awk '
-  /^uint8_t zcaller_bounded_wrapping_mul.*repr.*\(uint16_t zleft, uint16_t zright\)/ { printing = 1 }
+  /^uint8_t zcaller_bounded_wrapping_mul[^ (]+\(uint16_t zleft, uint16_t zright\)/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/wide_caller_bounded_wrapping_mul.c"
@@ -628,9 +629,9 @@ fi
 # representation. Here the arguments remain u64 while the caller deliberately
 # demands an unbounded result; native operand types must not leak into the
 # sail_int return pointer.
-grep -Fq '(sail_int *rop, uint64_t, uint64_t);' "$TMP_DIR/model.h"
+grep -Eq '\(sail_int \*rop, uint64_t( [[:alnum:]_]+)?, uint64_t( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
 awk '
-  /^void zdependent_add.*repr.*\(/ { printing = 1 }
+  /^void zdependent_add[^ (]*\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/specialized_unbounded_result.c"
@@ -645,13 +646,13 @@ fi
 # and multiply all use a uint8_t logical carrier.  The uint32_t casts below are
 # only C's integer-promotion discipline; no wider value is stored.
 for operation in add sub mul; do
-  grep -Eq "uint8_t zdependent_tiny_${operation}.*\(uint8_t, uint8_t\);" "$TMP_DIR/model.h"
+  grep -Eq "uint8_t zdependent_tiny_${operation}[^ (]*\\(uint8_t [^,]+, uint8_t [^)]+\\);" "$TMP_DIR/model.h"
   awk -v operation="$operation" '
     $0 ~ "^uint8_t zdependent_tiny_" operation ".*\\(" { printing = 1 }
     printing { print }
     printing && /^}$/ { printing = 0 }
   ' "$TMP_DIR/model.c" > "$TMP_DIR/dependent_tiny_${operation}.c"
-  grep -Fq '((uint8_t)(((uint32_t)' "$TMP_DIR/dependent_tiny_${operation}.c"
+  grep -Eq '\(uint8_t\).*\(uint32_t\)' "$TMP_DIR/dependent_tiny_${operation}.c"
   if grep -Eq 'sail_int|u128_|uint16_t|int16_t' "$TMP_DIR/dependent_tiny_${operation}.c"; then
     echo "symbolic tiny ${operation} lost its uint8_t semantic lifetime" >&2
     exit 1
@@ -664,9 +665,9 @@ grep -Fq ' * ' "$TMP_DIR/dependent_tiny_mul.c"
 # A native operand ABI is not itself a proof that an exact mathematical result
 # fits a native carrier.  With no upper bounds on the dependent result, the
 # multiplication clone deliberately retains Sail's arbitrary-precision path.
-grep -Fq 'void zunbounded_dependent_mul(sail_int *rop, uint64_t, uint64_t);' "$TMP_DIR/model.h"
+grep -Eq '^void zunbounded_dependent_mul\(sail_int \*rop, uint64_t( [[:alnum:]_]+)?, uint64_t( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
 awk '
-  /^void zdependent_mul.*repr.*\(/ { printing = 1 }
+  /^void zdependent_mul[^ (]+\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/specialized_unbounded_multiplication.c"
@@ -680,13 +681,13 @@ fi
 # keeps its full uint64_t ABI, but the call edge carries value <= 8 into the
 # dependent helper and demands a separate clone whose exact square is uint8_t.
 # The unguarded caller above must continue to use its arbitrary-precision clone.
-grep -Eq 'uint8_t zdependent_mul.*repr.*\(uint64_t, uint64_t\);' "$TMP_DIR/model.h"
+grep -Eq 'uint8_t zdependent_mul[^ (]+\(uint64_t [^,]+, uint64_t [^)]+\);' "$TMP_DIR/model.h"
 awk '
-  /^uint8_t zdependent_mul.*repr.*\(uint64_t zleft, uint64_t zright\)/ { printing = 1 }
+  /^uint8_t zdependent_mul[^ (]+\(uint64_t zleft, uint64_t zright\)/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/guarded_dependent_multiplication.c"
-grep -Fq '((uint8_t)(((uint32_t)((uint8_t) zleft)) * ((uint32_t)((uint8_t) zright))))' \
+grep -Eq '\(uint8_t\).*\(uint32_t\).*\(uint8_t\).*zleft.*\*.*\(uint32_t\).*\(uint8_t\).*zright' \
   "$TMP_DIR/guarded_dependent_multiplication.c"
 if grep -Eq 'sail_int|mult_int|u128_|sail_native_conversion_failure' "$TMP_DIR/guarded_dependent_multiplication.c"; then
   echo 'branch-refined multiplication clone lost its uint8_t semantic carrier' >&2
@@ -700,7 +701,7 @@ awk '
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/else_guarded_u64_tiny_square.c"
-grep -Eq 'zdependent_mul.*repr.*\(zvalue, zvalue\)' "$TMP_DIR/else_guarded_u64_tiny_square.c"
+grep -Eq 'zdependent_mul[^ (]+\(zvalue, zvalue\)' "$TMP_DIR/else_guarded_u64_tiny_square.c"
 
 # Boolean helper calls retain their source function boundaries.  Their
 # interprocedural predicate summaries nevertheless carry value <= 8 through a
@@ -713,18 +714,18 @@ awk '
   printing && /^}/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/helper_guarded_u64_tiny_square.c"
 grep -Fq 'zforwarded_is_tiny_u64(zvalue)' "$TMP_DIR/helper_guarded_u64_tiny_square.c"
-grep -Eq 'zpredicate_sensitive_square_le.*repr.*\(zvalue\)' "$TMP_DIR/helper_guarded_u64_tiny_square.c"
+grep -Eq 'zpredicate_sensitive_square_le[^ (]+\(zvalue\)' "$TMP_DIR/helper_guarded_u64_tiny_square.c"
 if grep -Eq 'sail_native_conversion_failure|zvalue *>|zvalue >' "$TMP_DIR/helper_guarded_u64_tiny_square.c"; then
   echo 'interprocedural predicate refinement inserted a generated bounds check' >&2
   exit 1
 fi
 
 awk '
-  /^bool zpredicate_sensitive_square_le.*repr.*\(uint64_t zvalue\)/ { printing = 1 }
+  /^bool zpredicate_sensitive_square_le[^ (]+\(uint64_t zvalue\)/ { printing = 1 }
   printing { print }
   printing && /^}/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/predicate_sensitive_square_le.c"
-grep -Fq '((uint8_t)(((uint32_t)((uint8_t) zvalue)) * ((uint32_t)((uint8_t) zvalue))))' \
+grep -Eq '\(uint8_t\).*\(uint32_t\).*\(uint8_t\).*zvalue.*\*.*\(uint32_t\).*\(uint8_t\).*zvalue' \
   "$TMP_DIR/predicate_sensitive_square_le.c"
 grep -Fq 'u128_mul_u64(' "$TMP_DIR/predicate_sensitive_square_le.c"
 
@@ -736,7 +737,7 @@ awk '
   printing && /^}/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/negated_helper_guarded_square.c"
 grep -Fq 'zis_not_tiny_u64(zvalue)' "$TMP_DIR/negated_helper_guarded_square.c"
-grep -Eq 'zpredicate_sensitive_square_le.*repr.*\(zvalue\)' "$TMP_DIR/negated_helper_guarded_square.c"
+grep -Eq 'zpredicate_sensitive_square_le[^ (]+\(zvalue\)' "$TMP_DIR/negated_helper_guarded_square.c"
 if grep -Eq 'sail_native_conversion_failure|zvalue *>|zvalue >' "$TMP_DIR/negated_helper_guarded_square.c"; then
   echo 'negated predicate refinement inserted a generated bounds check' >&2
   exit 1
@@ -790,7 +791,7 @@ for function_name in comparison_fold_true comparison_fold_false; do
     exit 1
   fi
 done
-if grep -Eq 'zcomparison_unreachable_specialization.*repr' "$TMP_DIR/model.h"; then
+if grep -Eq 'zcomparison_unreachable_specialization[^ (]+' "$TMP_DIR/model.h"; then
   echo 'a proved unreachable call created a representation specialization demand' >&2
   exit 1
 fi
@@ -878,17 +879,17 @@ awk '
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/invalidated_u64_square.c"
-grep -Eq 'zdependent_mul.*repr.*\(&' "$TMP_DIR/invalidated_u64_square.c"
-if grep -Eq 'zdependent_mul.*repr.*\(zcurrent, zcurrent\)' "$TMP_DIR/invalidated_u64_square.c"; then
+grep -Eq 'zdependent_mul[^ (]*_to_sail_int\([^;]*&' "$TMP_DIR/invalidated_u64_square.c"
+if grep -Eq 'zdependent_mul[^ (]*_to_uint8_t\(zcurrent, zcurrent\)' "$TMP_DIR/invalidated_u64_square.c"; then
   echo 'stale branch fact survived a write to one of its operands' >&2
   exit 1
 fi
 
 # Specializing a result does not change the stored representation of an
 # aggregate field. The generated clone narrows at that field-read boundary.
-grep -Eq 'uint8_t zinteger_box_value.*repr.*\(struct zIntegerBox\);' "$TMP_DIR/model.h"
+grep -Eq 'uint8_t zinteger_box_value[^ (]*\(struct zIntegerBox [^)]+\);' "$TMP_DIR/model.h"
 awk '
-  /^uint8_t zinteger_box_value.*repr.*\(/ { printing = 1 }
+  /^uint8_t zinteger_box_value[^ (]*\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/specialized_aggregate_reader.c"
@@ -937,7 +938,7 @@ grep -Fq 'add_int(' "$TMP_DIR/unbounded_guarded_loop.c"
 # A signed value spanning the full u64 input range needs i128.  Mixed-width
 # operands must be promoted before subtraction, and the complete arithmetic
 # lifetime must remain free of arbitrary-precision integers.
-grep -Fq '__int128 zsigned_state_gas_lifecycle(uint64_t, uint64_t, uint8_t);' "$TMP_DIR/model.h"
+grep -Eq '^__int128 zsigned_state_gas_lifecycle\(uint64_t( [[:alnum:]_]+)?, uint64_t( [[:alnum:]_]+)?, uint8_t( [[:alnum:]_]+)?\);$' "$TMP_DIR/model.h"
 awk '
   /^__int128 zsigned_state_gas_lifecycle\(/ { printing = 1 }
   printing { print }
@@ -952,30 +953,30 @@ grep -Fq '(__int128)' "$TMP_DIR/signed_state_gas_lifecycle.c"
 # Exception bookkeeping names remain stable map keys during lifetime analysis.
 # In particular, analyzing a specialized throwing helper must terminate and
 # retain the caller-proven u64 representation.
-grep -Eq 'uint64_t zthrow_if_zzero.*repr.*\(uint64_t\);' "$TMP_DIR/model.h"
+grep -Eq 'uint64_t zthrow_if_zzero[^ (]*\(uint64_t [^)]+\);' "$TMP_DIR/model.h"
 
 # A recursive edge reuses its current representation clone. It must not
 # recursively invoke specialization or enqueue one clone per decreasing bound.
-test "$(grep -Ec 'unit zrecursive_once.*repr.*\(uint64_t, bool\);' "$TMP_DIR/model.h")" -eq 1
+test "$(grep -Ec 'unit zrecursive_once[^ (]*\(uint64_t [^,]+, bool [^)]+\);' "$TMP_DIR/model.h")" -eq 1
 awk '
-  /^unit zrecursive_once.*repr.*\(/ { printing = 1 }
+  /^unit zrecursive_once[^ (]*\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/specialized_recursive_once.c"
-test "$(grep -Ec 'zrecursive_once.*repr.*\(' "$TMP_DIR/specialized_recursive_once.c")" -ge 2
+test "$(grep -Ec 'zrecursive_once[^ (]*\(' "$TMP_DIR/specialized_recursive_once.c")" -ge 2
 
 # The nonzero branch proves that subtracting one stays in u64. Assignment
 # ranges accumulated under that path proof keep the recursive temporary in
 # u64, so the back edge targets the current clone without generating a wider
 # i128 variant.
-test "$(grep -Ec 'unit zrecursive_countdown.*repr.*\(uint64_t\);' "$TMP_DIR/model.h")" -eq 1
-test "$(grep -Ec 'unit zrecursive_countdown.*repr.*\(__int128\);' "$TMP_DIR/model.h")" -eq 0
+test "$(grep -Ec 'unit zrecursive_countdown[^ (]*\(uint64_t [^)]+\);' "$TMP_DIR/model.h")" -eq 1
+test "$(grep -Ec 'unit zrecursive_countdown[^ (]*\(__int128 [^)]+\);' "$TMP_DIR/model.h")" -eq 0
 awk '
-  /^unit zrecursive_countdown.*repr.*\(uint64_t/ { printing = 1 }
+  /^unit zrecursive_countdown[^ (]*\(uint64_t/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/specialized_recursive_countdown.c"
-test "$(grep -Ec 'zrecursive_countdown.*repr.*\(' "$TMP_DIR/specialized_recursive_countdown.c")" -ge 2
+test "$(grep -Ec 'zrecursive_countdown[^ (]*\(' "$TMP_DIR/specialized_recursive_countdown.c")" -ge 2
 if grep -Eq '__int128|sail_int' "$TMP_DIR/specialized_recursive_countdown.c"; then
   echo 'guarded recursive countdown widened despite its decreasing u64 invariant' >&2
   exit 1
@@ -984,13 +985,13 @@ fi
 # A native-width aggregate field may pass through a source local before it
 # reaches a generic helper.  Whole-body lifetime propagation must retain that
 # width and demand the u64 helper clone without changing the canonical ABI.
-grep -Eq 'uint64_t zgeneric_local_length.*repr.*\(uint64_t\);' "$TMP_DIR/model.h"
+grep -Eq 'uint64_t zgeneric_local_length[^ (]+\(uint64_t [^)]+\);' "$TMP_DIR/model.h"
 awk '
   /^uint64_t zaggregate_local_length\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/aggregate_local_length.c"
-grep -Eq 'zgeneric_local_length.*repr.*\(' "$TMP_DIR/aggregate_local_length.c"
+grep -Eq 'zgeneric_local_length[^ (]+\(' "$TMP_DIR/aggregate_local_length.c"
 if grep -Fq 'sail_int' "$TMP_DIR/aggregate_local_length.c"; then
   echo 'native aggregate local fell back to sail_int before a generic call' >&2
   exit 1
@@ -999,14 +1000,14 @@ fi
 # Constructor facts survive JIB's field-write, whole-aggregate-copy, and
 # field-read sequence.  Although this source aggregate still owns a managed
 # nat field, the recovered value and its generic call edge are proved u8.
-grep -Eq 'zgeneric_local_length.*repr.*\([^;]*uint8_t\);' "$TMP_DIR/model.h"
+grep -Eq 'zgeneric_local_length[^ (]+\([^;]*uint8_t [^)]+\);' "$TMP_DIR/model.h"
 awk '
   /^void zaggregate_constructor_fact\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/aggregate_constructor_fact.c"
 grep -Fq 'uint8_t zrecovered;' "$TMP_DIR/aggregate_constructor_fact.c"
-grep -Eq 'zgeneric_local_length.*repr.*\(' "$TMP_DIR/aggregate_constructor_fact.c"
+grep -Eq 'zgeneric_local_length[^ (]+\(' "$TMP_DIR/aggregate_constructor_fact.c"
 
 # Replacing the field with an unbounded nat replaces its constructor fact.
 # The later read and call must not reuse the original u8 proof.
@@ -1017,7 +1018,7 @@ awk '
 ' "$TMP_DIR/model.c" > "$TMP_DIR/invalidated_aggregate_constructor_fact.c"
 grep -Fq 'COPY(sail_int)' "$TMP_DIR/invalidated_aggregate_constructor_fact.c"
 grep -Eq 'zgeneric_local_length\(.*zgh' "$TMP_DIR/invalidated_aggregate_constructor_fact.c"
-if grep -Eq 'zgeneric_local_length.*repr.*\(' "$TMP_DIR/invalidated_aggregate_constructor_fact.c"; then
+if grep -Eq 'zgeneric_local_length[^ (]+\(' "$TMP_DIR/invalidated_aggregate_constructor_fact.c"; then
   echo 'aggregate field mutation retained a stale constructor bound' >&2
   exit 1
 fi
@@ -1025,8 +1026,8 @@ fi
 # Return summaries carry semantic result bounds back across call edges before
 # representation selection.  The source ABI still returns an unbounded nat,
 # while these callers demand u64 -> u8 clones and square the results natively.
-grep -Eq 'uint8_t zbounded_callee_result.*repr.*\(uint64_t\);' "$TMP_DIR/model.h"
-grep -Eq 'uint8_t zrecursive_bounded_callee.*repr.*\(uint64_t\);' "$TMP_DIR/model.h"
+grep -Eq 'uint8_t zbounded_callee_result[^ (]+\(uint64_t [^)]+\);' "$TMP_DIR/model.h"
+grep -Eq 'uint8_t zrecursive_bounded_callee[^ (]+\(uint64_t [^)]+\);' "$TMP_DIR/model.h"
 for function_name in consume_bounded_callee_result consume_recursive_bounded_callee; do
   awk -v function_name="$function_name" '
     $0 ~ "^bool z" function_name "\\(" { printing = 1 }
@@ -1034,7 +1035,7 @@ for function_name in consume_bounded_callee_result consume_recursive_bounded_cal
     printing && /^}$/ { printing = 0 }
   ' "$TMP_DIR/model.c" > "$TMP_DIR/${function_name}.c"
   grep -Fq 'uint8_t zbounded;' "$TMP_DIR/${function_name}.c"
-  grep -Fq '((uint8_t)(((uint32_t)zbounded) * ((uint32_t)zbounded)))' \
+  grep -Eq '\(uint8_t\).*\(uint32_t\)zbounded \* \(uint32_t\)zbounded' \
     "$TMP_DIR/${function_name}.c"
   if grep -Eq 'sail_int|mult_int' "$TMP_DIR/${function_name}.c"; then
     echo "callee return bound was not propagated into ${function_name}" >&2
@@ -1046,11 +1047,11 @@ done
 # The bounded recursive clone must call a representation clone, not fall back
 # through the managed source ABI on its back edge.
 awk '
-  /^uint8_t zrecursive_bounded_callee.*repr.*\(uint8_t zvalue\)/ { printing = 1 }
+  /^uint8_t zrecursive_bounded_callee[^ (]+\(uint8_t zvalue\)/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/recursive_bounded_callee.c"
-grep -Eq 'zrecursive_bounded_callee.*repr.*\(' "$TMP_DIR/recursive_bounded_callee.c"
+grep -Eq 'zrecursive_bounded_callee[^ (]+\(' "$TMP_DIR/recursive_bounded_callee.c"
 if grep -Fq 'sail_int' "$TMP_DIR/recursive_bounded_callee.c"; then
   echo 'recursive return-summary clone fell back to a managed integer' >&2
   exit 1
@@ -1069,13 +1070,13 @@ grep -Fq 'mult_int(' "$TMP_DIR/consume_unbounded_callee_result.c"
 # Generic argument and result positions carry independent proof-backed
 # representations.  A full-u64 payload length plus RLP-style framing headroom
 # therefore specializes one generic source body as u64 -> u128.
-grep -Eq 'sail_u128 zgeneric_encoded_length.*repr.*\(uint64_t\);' "$TMP_DIR/model.h"
+grep -Eq 'u128 zgeneric_encoded_length[^ (]*\(uint64_t [^)]+\);' "$TMP_DIR/model.h"
 awk '
-  /^sail_u128 zaggregate_encoded_length\(/ { printing = 1 }
+  /^u128 zaggregate_encoded_length\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/aggregate_encoded_length.c"
-grep -Eq 'zgeneric_encoded_length.*repr.*\(' "$TMP_DIR/aggregate_encoded_length.c"
+grep -Eq 'zgeneric_encoded_length[^ (]*\(' "$TMP_DIR/aggregate_encoded_length.c"
 if grep -Fq 'sail_int' "$TMP_DIR/aggregate_encoded_length.c"; then
   echo 'dependent u64-to-u128 generic call fell back to sail_int' >&2
   exit 1
@@ -1085,13 +1086,28 @@ fi
 # operand is too large for either operand's native carrier.  Fold the guard
 # from the clone's complete argument interval, and remove the now-dead literal
 # temporary rather than retaining GMP solely for `2^256`.
-grep -Eq 'bool zguarded_comparison.*repr.*\(sail_u128\);' "$TMP_DIR/model.h"
+grep -Eq 'bool zguarded_comparison[^ (]*\(u128 [^)]+\);' "$TMP_DIR/model.h"
 awk '
-  /^bool zguarded_comparison.*repr.*\(/ { printing = 1 }
+  /^bool zguarded_comparison[^ (]*\(/ { printing = 1 }
   printing { print }
   printing && /^}$/ { printing = 0 }
 ' "$TMP_DIR/model.c" > "$TMP_DIR/specialized_guarded_comparison.c"
 if grep -Fq 'sail_int' "$TMP_DIR/specialized_guarded_comparison.c"; then
   echo 'proved generic guard retained an arbitrary-precision literal temporary' >&2
+  exit 1
+fi
+
+# A wide charge may exceed the native gas counter before its affordability
+# guard. Preserve the mixed u128/u64 comparison and narrow the charge only on
+# the true edge, where the source relation proves that conversion safe.
+grep -Eq 'uint64_t zguarded_wide_charge[^ (]*\(u128 [^,]+, uint64_t [^)]+\);' "$TMP_DIR/model.h"
+awk '
+  /^uint64_t zguarded_wide_charge[^ (]*\(u128 zamount, uint64_t zremaining\)/ { printing = 1 }
+  printing { print }
+  printing && /^}/ { printing = 0 }
+' "$TMP_DIR/model.c" > "$TMP_DIR/specialized_guarded_wide_charge.c"
+grep -Fq 'u64_lt_u128(zremaining, zamount)' "$TMP_DIR/specialized_guarded_wide_charge.c"
+if sed -n '1,/if (/p' "$TMP_DIR/specialized_guarded_wide_charge.c" | grep -Fq 'u128_to_u64'; then
+  echo 'wide charge was narrowed before its affordability comparison' >&2
   exit 1
 fi

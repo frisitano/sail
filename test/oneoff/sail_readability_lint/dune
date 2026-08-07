@@ -1,0 +1,3 @@
+(executable
+ (name jib_rules)
+ (libraries libsail))

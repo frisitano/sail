@@ -1,5 +1,9 @@
 function f(b) = if b == bitone then bitzero else bitone
-function f(b) = if b == bitone then { bitzero } else { bitone }
+function f(b) = if b == bitone then {
+  bitzero
+} else {
+  bitone
+}
 function f(b) = if b == bitone then {
   let a = 1;
   bitzero
@@ -7,8 +11,16 @@ function f(b) = if b == bitone then {
   bitone
 }
 
-function f(b) = if b == bitone then { { bitzero } } else { bitone }
-function f(b) = if b == bitone then { { { bitzero } } } else { bitone }
+function f(b) = if b == bitone then {
+  { bitzero }
+} else {
+  bitone
+}
+function f(b) = if b == bitone then {
+  { { bitzero } }
+} else {
+  bitone
+}
 function f(b) = if b == bitone then {
   {
     let a = 1;

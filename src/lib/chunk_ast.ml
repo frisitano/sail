@@ -118,6 +118,7 @@ and chunk =
   | Block_binder of binder * chunks * chunks
   | If_then of bool * chunks * chunks
   | If_then_else of if_format * chunks * chunks * chunks
+  | Type_if_then_else of chunks * chunks * chunks
   | Struct_update of chunks * chunks list
   | Match of { kind : match_kind; exp : chunks; aligned : bool; cases : pexp_chunks list }
   | Foreach of {
@@ -378,6 +379,14 @@ let rec prerr_chunk indent = function
         [("if", i); ("then", t)]
   | If_then_else (_, i, t, e) ->
       Printf.eprintf "%sIf_then_else:\n" indent;
+      List.iter
+        (fun (name, arg) ->
+          Printf.eprintf "%s  %s:\n" indent name;
+          Queue.iter (prerr_chunk (indent ^ "    ")) arg
+        )
+        [("if", i); ("then", t); ("else", e)]
+  | Type_if_then_else (i, t, e) ->
+      Printf.eprintf "%sType_if_then_else:\n" indent;
       List.iter
         (fun (name, arg) ->
           Printf.eprintf "%s  %s:\n" indent name;
@@ -718,11 +727,10 @@ let rec chunk_atyp comments chunks (ATyp_aux (aux, l)) =
       let arg_chunks = rec_chunk_atyp arg in
       Queue.add (Unary ("-", arg_chunks)) chunks
   | ATyp_if (i, t, e) ->
-      let if_format = { then_brace = false; else_brace = false } in
       let i_chunks = rec_chunk_atyp i in
       let t_chunks = rec_chunk_atyp t in
       let e_chunks = rec_chunk_atyp e in
-      Queue.add (If_then_else (if_format, i_chunks, t_chunks, e_chunks)) chunks
+      Queue.add (Type_if_then_else (i_chunks, t_chunks, e_chunks)) chunks
   | ATyp_inc -> Queue.add (Atom "inc") chunks
   | ATyp_dec -> Queue.add (Atom "dec") chunks
   | ATyp_fn (lhs, rhs, _) ->

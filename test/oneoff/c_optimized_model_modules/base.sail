@@ -47,6 +47,29 @@ struct byte_slice_small = {
   len : byte,
 }
 
+$[c_repr {representation = external, name = TestBytes}]
+struct canonical_slice = {
+  bytes : byte,
+  len : byte,
+}
+
+function canonical_slice_len(value : canonical_slice) -> byte = value.len
+
+$[c_repr {representation = external, name = TestList}]
+struct canonical_list = {
+  values : list(byte),
+  count : byte,
+}
+
+function canonical_list_count(value : canonical_list) -> byte = value.count
+
+function canonical_list_identity(value : canonical_list) -> canonical_list = value
+
+function canonical_list_count_after_identity(value : canonical_list) -> byte = {
+  let remaining = canonical_list_identity(value);
+  remaining.count
+}
+
 struct analyzed_code = {
   bytes : byte_offset,
   len : byte,
@@ -57,6 +80,8 @@ $[c_repr {representation = fixed_bytes, name = bytes4}]
 type four_bytes = vector(4, inc, byte)
 $[c_repr {representation = fixed_bytes, name = test_bytes20}]
 type twenty_bytes = vector(20, inc, byte)
+$[c_repr {representation = fixed_bytes_u64_lanes, name = lane_bytes5}]
+type lane_five_bytes = vector(5, inc, byte)
 type fixed_ids = vector(17, fixed_id)
 
 let TEST_FIXED_BYTES_ZERO : four_bytes = vector_init(4, 0)
@@ -69,6 +94,7 @@ function test_word_to_four(value) = [
   unsigned(value[7 .. 0]),
 ]
 let TEST_FIXED_BYTES_ONE : four_bytes = test_word_to_four(0x00000001)
+let TEST_LANE_BYTES : lane_five_bytes = [1, 35, 69, 103, 137]
 let TEST_DISCOUNT : fixed_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 256]
 
 struct fixed_ids_box = {
@@ -167,6 +193,8 @@ function test_gas_alias() -> int(21000) = TEST_GAS_ALIAS
 function test_fixed_bytes_zero() -> four_bytes = TEST_FIXED_BYTES_ZERO
 
 function test_fixed_bytes_one() -> four_bytes = TEST_FIXED_BYTES_ONE
+
+function test_lane_bytes() -> lane_five_bytes = TEST_LANE_BYTES
 
 function twenty_bytes_equal(left : twenty_bytes, right : twenty_bytes) -> bool =
   eq_anything(left, right)

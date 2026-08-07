@@ -530,4 +530,13 @@ function guarded_comparison(value) = value < 2 ^ 256
 function bounded_guarded_comparison(value : wide_length) -> bool =
   guarded_comparison(value)
 
+val guarded_wide_charge : forall 'amount, 0 <= 'amount.
+  (atom('amount), full_u64) -> full_u64
+
+function guarded_wide_charge(amount, remaining) =
+  if amount <= remaining then remaining - amount else remaining
+
+function bounded_guarded_wide_charge(amount : wide_length, remaining : full_u64) -> full_u64 =
+  guarded_wide_charge(amount, remaining)
+
 function main() -> unit = ()

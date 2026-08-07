@@ -62,6 +62,23 @@ function specialized_enum_comparison(n) = {
 
 function call_specialized_enum_comparison() -> bool = specialized_enum_comparison(256)
 
+function conditional_word(flag : bool, left : word, right : word) -> bool = {
+  let selected : word = if flag then left else right;
+  selected == public_counter
+}
+
+function conditional_bool(flag : bool, fallback : bool) -> bool = {
+  let selected = if flag then true else fallback;
+  public_counter = 0;
+  selected
+}
+
+function conditional_bool_false(flag : bool, fallback : bool) -> bool = {
+  let selected = if flag then fallback else false;
+  public_counter = 0;
+  selected
+}
+
 enum terminal_choice = {
   TerminalOne,
   TerminalTwo,
@@ -77,15 +94,49 @@ function terminal_enum_match(choice : terminal_choice) -> byte =
     TerminalFour => 4,
   }
 
+function terminal_enum_grouped(choice : terminal_choice) -> byte =
+  match choice {
+    TerminalOne => 1,
+    TerminalTwo => 1,
+    TerminalThree => 2,
+    TerminalFour => 2,
+  }
+
 function terminal_enum_match_or_fatal(choice : terminal_choice) -> byte =
   match choice {
     TerminalOne => 1,
     TerminalTwo => 2,
     _ => {
-      fatal_error(TestFatal);
-      exit(())
+      if public_counter != 0 then public_counter = 0;
+      fatal_error(TestFatal)
     },
   }
+
+function fatal_guard_result_is_unread(flag : bool) -> byte = {
+  if flag then {
+    fatal_error(TestFatal)
+  };
+  7
+}
+
+function terminal_unit_empty() -> unit = reset_counter()
+
+function terminal_unit_other_empty() -> unit = public_counter = 1
+
+function terminal_unit_byte(value : byte) -> unit = public_counter = value
+
+function terminal_unit_variant_match(choice : erased_unit_choice) -> unit =
+  match choice {
+    EmptyChoice() => terminal_unit_empty(),
+    OtherEmptyChoice() => terminal_unit_other_empty(),
+    ByteChoice(value) => terminal_unit_byte(value),
+  }
+
+function terminal_assertion(flag : bool) -> byte =
+  if not_bool(flag) then {
+    assert(false, "terminal assertion");
+    0
+  } else 1
 
 function terminal_fixed_bytes_match(bytes : four_bytes) -> byte =
   match bytes {

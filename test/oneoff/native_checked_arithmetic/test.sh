@@ -125,7 +125,7 @@ done
 # operations retain their mathematical helpers rather than being rewritten.
 awk '
   /^int64_t zsigned_tdiv_by_eight\(/ { in_function = 1 }
-  in_function && /\(int64_t\)zvalue.*\/.*\(int64_t\)zdivisor/ { found_divide = 1 }
+  in_function && /zvalue.*\/.*\(int64_t\)zdivisor/ { found_divide = 1 }
   in_function && /integer_operand/ { found_widened_operand = 1 }
   in_function && />> 3/ { found_shift = 1 }
   in_function && /^}/ { exit !found_divide || found_widened_operand || found_shift }
@@ -133,7 +133,7 @@ awk '
 ' "$OUT.c"
 awk '
   /^int64_t zsigned_tmod_by_eight\(/ { in_function = 1 }
-  in_function && /\(int64_t\)zvalue.*%.*\(int64_t\)zdivisor/ { found_remainder = 1 }
+  in_function && /zvalue.*%.*\(int64_t\)zdivisor/ { found_remainder = 1 }
   in_function && /integer_operand/ { found_widened_operand = 1 }
   in_function && /UINT64_C\(7\)/ { found_mask = 1 }
   in_function && /^}/ { exit !found_remainder || found_widened_operand || found_mask }
@@ -153,37 +153,37 @@ done
 # Mixed fixed operands retain their independently proved ABI widths. The
 # operation records a separate semantic result carrier: the u64 quotient stays
 # u64, while the remainder bounded by the u8 divisor is computed into u8.
-grep -Fq 'uint64_t zmixed_u64_u8_div(uint64_t, uint8_t);' "$OUT.h"
-grep -Fq 'uint64_t zmixed_u64_u8_mod(uint64_t, uint8_t);' "$OUT.h"
+grep -Eq '^uint64_t zmixed_u64_u8_div\(uint64_t [^,]+, uint8_t [^)]+\);$' "$OUT.h"
+grep -Eq '^uint64_t zmixed_u64_u8_mod\(uint64_t [^,]+, uint8_t [^)]+\);$' "$OUT.h"
 awk '
   /^uint64_t zmixed_u64_u8_div\(/ { in_function = 1 }
-  in_function && /\(uint64_t\)zleft.*\/.*\(uint64_t\)zright/ { found_mixed_divide = 1 }
+  in_function && /zleft.*\/.*\(uint64_t\)zright/ { found_mixed_divide = 1 }
   in_function && /uint64_t .*integer_operand/ { found_widened_operand = 1 }
   in_function && /^}/ { exit !found_mixed_divide || found_widened_operand }
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
 awk '
   /^uint64_t zmixed_u64_u8_mod\(/ { in_function = 1 }
-  in_function && /\(uint64_t\)zleft.*%.*\(uint64_t\)zright/ { found_mixed_remainder = 1 }
-  in_function && /= \(\(uint8_t\)\(\(\(uint64_t\)zleft\).*%/ { found_narrow_result = 1 }
+  in_function && /zleft.*%.*\(uint64_t\)zright/ { found_mixed_remainder = 1 }
+  in_function && /= \(\(uint8_t\).*zleft.*%/ { found_narrow_result = 1 }
   in_function && /uint64_t .*integer_operand/ { found_widened_operand = 1 }
   in_function && /^}/ { exit !found_mixed_remainder || !found_narrow_result || found_widened_operand }
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
 
-grep -Fq 'int64_t zmixed_i64_i8_div(int64_t, int8_t);' "$OUT.h"
-grep -Fq 'int64_t zmixed_i64_i8_mod(int64_t, int8_t);' "$OUT.h"
+grep -Eq '^int64_t zmixed_i64_i8_div\(int64_t [^,]+, int8_t [^)]+\);$' "$OUT.h"
+grep -Eq '^int64_t zmixed_i64_i8_mod\(int64_t [^,]+, int8_t [^)]+\);$' "$OUT.h"
 awk '
   /^int64_t zmixed_i64_i8_div\(/ { in_function = 1 }
-  in_function && /\(int64_t\)zleft.*\/.*\(int64_t\)zright/ { found_mixed_divide = 1 }
+  in_function && /zleft.*\/.*\(int64_t\)zright/ { found_mixed_divide = 1 }
   in_function && /int64_t .*integer_operand/ { found_widened_operand = 1 }
   in_function && /^}/ { exit !found_mixed_divide || found_widened_operand }
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
 awk '
   /^int64_t zmixed_i64_i8_mod\(/ { in_function = 1 }
-  in_function && /\(int64_t\)zleft.*%.*\(int64_t\)zright/ { found_mixed_remainder = 1 }
-  in_function && /= \(\(int8_t\)\(\(\(int64_t\)zleft\).*%/ { found_narrow_result = 1 }
+  in_function && /zleft.*%.*\(int64_t\)zright/ { found_mixed_remainder = 1 }
+  in_function && /= \(\(int8_t\).*zleft.*%/ { found_narrow_result = 1 }
   in_function && /int64_t .*integer_operand/ { found_widened_operand = 1 }
   in_function && /^}/ { exit !found_mixed_remainder || !found_narrow_result || found_widened_operand }
   END { if (!in_function) exit 2 }
@@ -192,10 +192,10 @@ awk '
 # A negative signed operand cannot be converted to an equally wide unsigned
 # arithmetic carrier without changing its semantic value.  Keep the fixed
 # representations, but fall back to a sufficiently wide signed operation.
-grep -Fq 'int64_t zmixed_u32_negative_i8_div(uint32_t, int8_t);' "$OUT.h"
+grep -Eq '^int64_t zmixed_u32_negative_i8_div\(uint32_t [^,]+, int8_t [^)]+\);$' "$OUT.h"
 awk '
   /^int64_t zmixed_u32_negative_i8_div\(/ { in_function = 1 }
-  in_function && index($0, "(((int64_t) zleft) / ((int64_t) zright))") { found_exact_signed = 1 }
+  in_function && /\(int64_t\)[[:space:]]*zleft.*\/.*\(int64_t\)[[:space:]]*zright/ { found_exact_signed = 1 }
   in_function && /[[:space:]]\/[[:space:]]/ && /uint(32|64)_t/ { found_inexact_unsigned = 1 }
   in_function && /^}/ { exit !found_exact_signed || found_inexact_unsigned }
   END { if (!in_function) exit 2 }
@@ -203,7 +203,7 @@ awk '
 
 # A mathematical result remains mathematical even when both operands use a
 # represented uint64 ABI. The subtraction must happen after widening.
-grep -Fq 'void zsigned_u64_difference(sail_int *rop, uint64_t, uint64_t);' "$OUT.h"
+grep -Eq '^void zsigned_u64_difference\(sail_int \*rop, uint64_t [^,]+, uint64_t [^)]+\);$' "$OUT.h"
 awk '
   /^void zsigned_u64_difference\(/ { in_function = 1 }
   in_function && /sub_int/ { found_wide_sub = 1 }
@@ -214,7 +214,7 @@ awk '
 
 # A dependent result bound proves this addition cannot overflow its native
 # representation, so the generated C uses the machine operation directly.
-grep -Fq 'uint64_t zproven_u64_add_32(uint64_t);' "$OUT.h"
+grep -Eq '^uint64_t zproven_u64_add_32\(uint64_t [^)]+\);$' "$OUT.h"
 awk '
   /^uint64_t zproven_u64_add_32\(/ { in_function = 1 }
   in_function && /\+ .*UINT64_C\(32\)/ { found_add = 1 }
@@ -222,7 +222,7 @@ awk '
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
 
-grep -Fq 'uint64_t zproven_u64_sub_95(uint64_t);' "$OUT.h"
+grep -Eq '^uint64_t zproven_u64_sub_95\(uint64_t [^)]+\);$' "$OUT.h"
 awk '
   /^uint64_t zproven_u64_sub_95\(/ { in_function = 1 }
   in_function && /- .*UINT64_C\(95\)/ { found_sub = 1 }
@@ -230,21 +230,21 @@ awk '
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
 
-grep -Fq 'uint16_t zproven_u64_mul(uint8_t, uint8_t);' "$OUT.h"
+grep -Eq '^uint16_t zproven_u64_mul\(uint8_t [^,]+, uint8_t [^)]+\);$' "$OUT.h"
 grep -Fq ' = (zleft * zright);' "$OUT.c"
 
 # Division and modulo additionally require a proof that the divisor is nonzero;
 # signed division must also exclude INT64_MIN / -1.
-grep -Fq 'void zproven_u64_div(sail_int *rop, uint8_t, uint8_t);' "$OUT.h"
-grep -Fq 'void zproven_u64_mod(sail_int *rop, uint8_t, uint8_t);' "$OUT.h"
+grep -Eq '^void zproven_u64_div\(sail_int \*rop, uint8_t [^,]+, uint8_t [^)]+\);$' "$OUT.h"
+grep -Eq '^void zproven_u64_mod\(sail_int \*rop, uint8_t [^,]+, uint8_t [^)]+\);$' "$OUT.h"
 grep -Fq '(zleft / zright)' "$OUT.c"
 grep -Fq '(zleft % zright)' "$OUT.c"
 
-grep -Fq 'int16_t zproven_i64_add(int8_t, int8_t);' "$OUT.h"
-grep -Fq 'int16_t zproven_i64_sub(int8_t, int8_t);' "$OUT.h"
-grep -Fq 'int16_t zproven_i64_mul(int8_t, int8_t);' "$OUT.h"
-grep -Fq 'void zproven_i64_div(sail_int *rop, int8_t, int8_t);' "$OUT.h"
-grep -Fq 'void zproven_i64_mod(sail_int *rop, int8_t, int8_t);' "$OUT.h"
+grep -Eq '^int16_t zproven_i64_add\(int8_t [^,]+, int8_t [^)]+\);$' "$OUT.h"
+grep -Eq '^int16_t zproven_i64_sub\(int8_t [^,]+, int8_t [^)]+\);$' "$OUT.h"
+grep -Eq '^int16_t zproven_i64_mul\(int8_t [^,]+, int8_t [^)]+\);$' "$OUT.h"
+grep -Eq '^void zproven_i64_div\(sail_int \*rop, int8_t [^,]+, int8_t [^)]+\);$' "$OUT.h"
+grep -Eq '^void zproven_i64_mod\(sail_int \*rop, int8_t [^,]+, int8_t [^)]+\);$' "$OUT.h"
 grep -Fq ' = (zleft + zright);' "$OUT.c"
 grep -Fq ' = (zleft - zright);' "$OUT.c"
 grep -Fq ' = (zleft * zright);' "$OUT.c"
@@ -254,19 +254,19 @@ grep -Fq '(zleft % zright)' "$OUT.c"
 # Signed values whose honest semantic envelope exceeds i64 use the native
 # signed 128-bit carrier.  The same proof-gated arithmetic rules apply: there
 # are no overflow checks or saturating fallbacks in the generated operation.
-grep -Fq '__int128 zproven_i128_add(__int128, __int128);' "$OUT.h"
-grep -Fq '__int128 zproven_i128_sub(__int128, __int128);' "$OUT.h"
-grep -Fq '__int128 zproven_i128_mul(__int128, __int128);' "$OUT.h"
-grep -Fq '__int128 zproven_i128_div(sail_u128, sail_u128);' "$OUT.h"
-grep -Fq '__int128 zproven_i128_mod(sail_u128, sail_u128);' "$OUT.h"
+grep -Eq '^__int128 zproven_i128_add\(__int128 [^,]+, __int128 [^)]+\);$' "$OUT.h"
+grep -Eq '^__int128 zproven_i128_sub\(__int128 [^,]+, __int128 [^)]+\);$' "$OUT.h"
+grep -Eq '^__int128 zproven_i128_mul\(__int128 [^,]+, __int128 [^)]+\);$' "$OUT.h"
+grep -Eq '^__int128 zproven_i128_div\(u128 [^,]+, u128 [^)]+\);$' "$OUT.h"
+grep -Eq '^__int128 zproven_i128_mod\(u128 [^,]+, u128 [^)]+\);$' "$OUT.h"
 for operator in '+' '-' '*'
 do
   grep -Fq " = (zleft $operator zright);" "$OUT.c"
 done
 grep -Fq 'u128_div(zleft, zright)' "$OUT.c"
 grep -Fq 'u128_mod(zleft, zright)' "$OUT.c"
-grep -Fq 'bool zmixed_i128_u64_lte(__int128, uint64_t);' "$OUT.h"
-grep -Fq 'bool zmixed_u64_i128_lte(uint64_t, __int128);' "$OUT.h"
+grep -Eq '^bool zmixed_i128_u64_lte\(__int128 [^,]+, uint64_t [^)]+\);$' "$OUT.h"
+grep -Eq '^bool zmixed_u64_i128_lte\(uint64_t [^,]+, __int128 [^)]+\);$' "$OUT.h"
 if awk '
   /^bool zmixed_i128_u64_lte\(/ { in_function = 1 }
   in_function && /(sail_int|lteq_int|lt_int)/ { found_wide = 1 }
@@ -285,15 +285,15 @@ if awk '
   echo "mixed u64/i128 comparison used arbitrary-precision integers" >&2
   exit 1
 fi
-grep -Fq 'bool zmixed_i8_u8_lt(int8_t, uint8_t);' "$OUT.h"
+grep -Eq '^bool zmixed_i8_u8_lt\(int8_t [^,]+, uint8_t [^)]+\);$' "$OUT.h"
 awk '
   /^bool zmixed_i8_u8_lt\(/ { in_function = 1 }
-  in_function && /zleft < zright/ { found_native_comparison = 1 }
+  in_function && /zleft.*<.*zright/ { found_native_comparison = 1 }
   in_function && /(sail_int|cmp_int)/ { found_math = 1 }
   in_function && /^}/ { exit !found_native_comparison || found_math }
   END { if (!in_function) exit 2 }
 ' "$OUT.c"
-grep -Fq 'bool zpath_narrow_signed_lt(int64_t, int64_t);' "$OUT.h"
+grep -Eq '^bool zpath_narrow_signed_lt\(int64_t [^,]+, int64_t [^)]+\);$' "$OUT.h"
 awk '
   /^bool zpath_narrow_signed_lt\(/ { in_function = 1 }
   in_function && /zbounded_signed_lt.*\(int8_t\).*zleft.*\(int8_t\).*zright/ { found_narrow_call = 1 }

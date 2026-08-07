@@ -65,18 +65,21 @@ val optimize_aarch64_fast_struct : bool ref
     version compiled without said changes. *)
 val opt_memo_cache : bool ref
 
-(** Emit progress for fixed-integer representation inference and iterative
-    function-clone worklist processing. The C backend exposes this as
-    [--c-specialize-log]. *)
+(** Emit progress for fixed-integer representation inference and iterative function-clone worklist processing. The C
+    backend exposes this as [--c-specialize-log]. *)
 val opt_debug_function_representations : bool ref
 
-(** Emit opt-in diagnostics for readability artifacts introduced by the
-    common AST-to-Jib lowering. *)
+(** Emit opt-in diagnostics for readability artifacts introduced by the common AST-to-Jib lowering. *)
 val opt_lint_readability : bool ref
 
-(** Backend-neutral provenance captured when representation-specialized
-    function clones are generated. Names are diagnostic only; consumers use
-    the content-derived identities emitted by [Specialization_plan]. *)
+type jib_readability_finding = { rule : string; location : Parse_ast.l; message : string }
+
+(** Analyze an instruction body without emitting diagnostics. This pure entry point keeps the post-Jib lint rules
+    directly testable. *)
+val jib_readability_findings : Jib.instr list -> jib_readability_finding list
+
+(** Backend-neutral provenance captured when representation-specialized function clones are generated. Names are
+    diagnostic only; consumers use the content-derived identities emitted by [Specialization_plan]. *)
 type representation_specialization = {
   source_id : id;
   specialized_id : id;
@@ -95,9 +98,8 @@ type representation_specialization = {
 val representation_specializations : representation_specialization list ref
 val reset_representation_specializations : unit -> unit
 
-(** Maximum number of distinct proof-backed C representation specializations
-    generated for one source function. Exceeding the limit is an error rather
-    than permission to route a caller through a weaker specialization. *)
+(** Maximum number of distinct proof-backed C representation specializations generated for one source function.
+    Exceeding the limit is an error rather than permission to route a caller through a weaker specialization. *)
 val opt_max_function_specializations : int ref
 
 (** {2 Jib context} *)
@@ -108,10 +110,7 @@ val opt_max_function_specializations : int ref
 *)
 type abstract_type_initialised = Initialised | Uninitialised
 
-type generic_signature = {
-  generic_parameters : KidSet.t list;
-  generic_result : KidSet.t;
-}
+type generic_signature = { generic_parameters : KidSet.t list; generic_result : KidSet.t }
 
 (** Dynamic context for compiling Sail to Jib. We need to pass a (global) typechecking environment given by checking the
     full AST. *)
@@ -179,23 +178,20 @@ module type CONFIG = sig
   (** Optionally replace the compiled payload of a nominal newtype. *)
   val specialize_newtype_payload : id -> ctyp -> ctyp
 
-  (** Optionally replace the backend representation of a record field.  This
-      changes only the JIB/backend carrier; the source-language field keeps
-      its original semantic type. *)
+  (** Optionally replace the backend representation of a record field. This changes only the JIB/backend carrier; the
+      source-language field keeps its original semantic type. *)
   val specialize_struct_field : id -> id -> ctyp -> ctyp
 
-  (** Optionally select backend representations for source-declared function
-      arguments and results. The source type has already passed Sail's type
-      checker; this hook changes only the JIB/backend carrier. *)
+  (** Optionally select backend representations for source-declared function arguments and results. The source type has
+      already passed Sail's type checker; this hook changes only the JIB/backend carrier. *)
   val specialize_declared_function_argument : id -> int -> ctyp -> ctyp
+
   val specialize_declared_function_result : id -> ctyp -> ctyp
 
-  (** Whether an ANF temporary whose semantic type is [semantic] may retain
-      [represented] even when the temporary is marked mutable by ANF
-      construction.  This is intentionally narrower than
-      [representation_refines]: most mutable source values require
-      whole-lifetime analysis, while representation-preserving address
-      arithmetic must not immediately convert a pointer back to an integer. *)
+  (** Whether an ANF temporary whose semantic type is [semantic] may retain [represented] even when the temporary is
+      marked mutable by ANF construction. This is intentionally narrower than [representation_refines]: most mutable
+      source values require whole-lifetime analysis, while representation-preserving address arithmetic must not
+      immediately convert a pointer back to an integer. *)
   val propagate_anf_temporary_representation : semantic:ctyp -> represented:ctyp -> bool
 
   (** Return true when [represented] is a backend-specific, lossless representation of [semantic]. This keeps such
@@ -219,14 +215,13 @@ module type CONFIG = sig
       clone. *)
   val specialize_function_body_representation : semantic:ctyp -> represented:ctyp -> bool
 
-  (** Permit immutable top-level [int] bindings to use the exact finite
-      lifetime inferred from their initializer. Specializing backends use this
-      for expressions such as [unsigned(0x...)]; ordinary backends retain the
-      semantic mathematical-integer representation. *)
+  (** Permit immutable top-level [int] bindings to use the exact finite lifetime inferred from their initializer.
+      Specializing backends use this for expressions such as [unsigned(0x...)]; ordinary backends retain the semantic
+      mathematical-integer representation. *)
   val specialize_c : bool
 
-  (** Reject arbitrary-precision integers that remain after specialization.
-      This is an audit only and must not affect representation selection. *)
+  (** Reject arbitrary-precision integers that remain after specialization. This is an audit only and must not affect
+      representation selection. *)
   val require_bounded_int : bool
 
   val integer_representation_bounds : ctyp -> (Big_int.num * Big_int.num) option
@@ -236,10 +231,9 @@ module type CONFIG = sig
       signature has demanded a clone. *)
   val specialized_function_external : id -> ctyp list -> ctyp -> id option
 
-  (** Return the compatibility view used while unifying a function argument.
-      This allows a semantic fixed vector and its backend representation to
-      meet at a call boundary before [make_calls_precise] inserts any required
-      adapter.  The argument itself retains [represented]. *)
+  (** Return the compatibility view used while unifying a function argument. This allows a semantic fixed vector and its
+      backend representation to meet at a call boundary before [make_calls_precise] inserts any required adapter. The
+      argument itself retains [represented]. *)
   val function_argument_unification_type : expected:ctyp -> represented:ctyp -> ctyp option
 
   (** Return true when an argument whose typed source expression is [source] may cross an [expected] function boundary
@@ -304,9 +298,8 @@ module type CONFIG = sig
   (** Assertions in the Sail code will be compiled to exceptions in the Jib output *)
   val assert_to_exception : bool
 
-  (** Compile assertion conditions without carrying their diagnostic Sail
-      strings into Jib. Used by fixed-representation backends that lower a
-      failed assertion directly to a target trap. *)
+  (** Compile assertion conditions without carrying their diagnostic Sail strings into Jib. Used by fixed-representation
+      backends that lower a failed assertion directly to a target trap. *)
   val erase_assert_messages : bool
 
   val use_void : bool

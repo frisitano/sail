@@ -10,26 +10,26 @@ type word = range(0, 2 ^ 256 - 1)
 $[c_repr u256]
 newtype u256 = U256 : bits(256)
 
-$[c_repr fixed_bytes]
+$[c_repr {representation = fixed_bytes, name = bytes20}]
 newtype address = Address : vector(20, dec, byte)
 
 /* The EVM model uses a transparent alias rather than a nominal wrapper. */
-$[c_repr fixed_bytes]
+$[c_repr {representation = fixed_bytes, name = bytes20}]
 type address_alias = vector(20, dec, byte)
 
-$[c_repr fixed_bytes]
+$[c_repr {representation = fixed_bytes, name = bytes20}]
 newtype b160 = B160 : vector(20, dec, byte)
 
-$[c_repr fixed_bytes]
+$[c_repr {representation = fixed_bytes, name = bytes32}]
 newtype b256 = B256 : vector(32, dec, byte)
 
 /* Fixed-byte lowering is structural rather than a closed B160/B256 list.
    This extra width guards the extensible B<N> container path. */
-$[c_repr fixed_bytes]
+$[c_repr {representation = fixed_bytes, name = bytes48}]
 newtype b384 = B384 : vector(48, dec, byte)
 
 /* The representation annotation is independent of the source vector order. */
-$[c_repr fixed_bytes]
+$[c_repr {representation = fixed_bytes, name = bytes20}]
 newtype bytes20_inc = Bytes20Inc : vector(20, inc, byte)
 
 /* The standard runtime primitive returns the low 256 bits at this result width. */

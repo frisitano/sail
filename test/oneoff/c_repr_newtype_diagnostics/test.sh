@@ -39,7 +39,7 @@ expect_error wrong_fixed_bytes_element.sail 'C backend: $[c_repr] fixed_bytes re
 expect_error wrong_fixed_bytes_length.sail 'C backend: $[c_repr] fixed_bytes requires a statically sized, positive vector payload'
 
 run_sail --no-color -c --c-specialize --c-preserve keep "$TEST_DIR/u256_range.sail" -o "$TMP_DIR/u256_range"
-grep -Fq 'sail_u256 zkeep(sail_u256);' "$TMP_DIR/u256_range.h"
+grep -Eq 'u256 zkeep\(u256( [[:alnum:]_]+)?\);' "$TMP_DIR/u256_range.h"
 
 if run_sail --no-color -c --c-specialize --c-require-bounded-int --c-preserve keep \
     "$TEST_DIR/unbounded_int.sail" -o "$TMP_DIR/unbounded_int" 2> "$TMP_DIR/unbounded_int.result"; then
@@ -62,8 +62,8 @@ grep -Fq 'use a finite signed range and narrow the sum at the semantic update bo
 run_sail --no-color -c --c-specialize --c-require-bounded-int --c-preserve main \
   "$TEST_DIR/bounded_accumulator.sail" -o "$TMP_DIR/bounded_accumulator"
 grep -Fq '__int128 ztotal;' "$TMP_DIR/bounded_accumulator.h"
-grep -Fq 'unit zkeep(__int128);' "$TMP_DIR/bounded_accumulator.h"
-grep -Eq 'unit zkeep.*repr.*\(int16_t\);' "$TMP_DIR/bounded_accumulator.h"
+grep -Eq '^unit zkeep\(__int128( [[:alnum:]_]+)?\);$' "$TMP_DIR/bounded_accumulator.h"
+grep -Eq '^unit zkeep_int16_t_to_unit\(int16_t( [[:alnum:]_]+)?\);$' "$TMP_DIR/bounded_accumulator.h"
 if grep -Eq 'sail_int|CREATE\(sail_int\)|add_int' "$TMP_DIR/bounded_accumulator.c"; then
   echo 'range-bounded accumulator retained arbitrary-precision arithmetic' >&2
   exit 1

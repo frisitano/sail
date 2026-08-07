@@ -76,10 +76,11 @@ let opt_strict_var = ref false
 
 let orig_kid (Kid_aux (Var v, l) as kid) =
   let rec strip_fresh_prefix v =
-    if String.length v >= 3 && String.sub v 0 3 = "'fv" then
+    if String.length v >= 3 && String.sub v 0 3 = "'fv" then (
       match String.index_from_opt v 3 '#' with
       | Some i -> strip_fresh_prefix ("'" ^ String.sub v (i + 1) (String.length v - i - 1))
       | None -> v
+    )
     else v
   in
   let original = strip_fresh_prefix v in
@@ -2216,7 +2217,18 @@ let rec check_exp env (E_aux (exp_aux, (l, uannot)) as exp : uannot exp) (Typ_au
       annot_exp (E_match (inferred_exp, checked_cases)) typ |> update_uannot attr_update
   | E_try (exp, cases), _ ->
       let checked_exp = crule check_exp env exp typ in
-      annot_exp (E_try (checked_exp, List.filter_map (fun case -> check_case env exc_typ case typ) cases)) typ
+      let checked_cases = List.filter_map (fun case -> check_case env exc_typ case typ) cases in
+      let checked_cases, attr_update =
+        if Option.is_some (get_attribute "complete" uannot) || Option.is_some (get_attribute "incomplete" uannot) then
+          (checked_cases, fun attrs -> attrs)
+        else (
+          let ctx = pattern_completeness_ctx env in
+          match PC.is_complete_wildcarded l ctx checked_cases exc_typ with
+          | Some wildcarded -> (wildcarded, add_attribute (gen_loc l) "complete" None)
+          | None -> (checked_cases, add_attribute (gen_loc l) "incomplete" None)
+        )
+      in
+      annot_exp (E_try (checked_exp, checked_cases)) typ |> update_uannot attr_update
   | E_struct_update (exp, fexps), _ ->
       let checked_exp = crule check_exp env exp typ in
       let rectyp_id =
@@ -4109,7 +4121,6 @@ and infer_funapp' l env f (typq, f_typ) xs uannot expected_ret_typ =
   let instantiate_return_type typ_args =
     match expected_ret_typ with
     | None -> typ_args
-    | Some expect when is_exist (Env.expand_synonyms env expect) -> typ_args
     | Some expect when is_exist !typ_ret -> typ_args
     | Some expect -> (
         let goals = quant_kopts !quants |> List.map kopt_kid |> KidSet.of_list in

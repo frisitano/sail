@@ -11,10 +11,10 @@ newtype u256 = U256 : bits(256)
 /* These aliases deliberately match evm-sail's transparent, increasing-order
    address and digest types. The optimized representation is selected
    structurally after Sail erases the alias name. */
-$[c_repr fixed_bytes_u64_lanes]
+$[c_repr {representation = fixed_bytes_u64_lanes, name = bytes20}]
 type lane_address = vector(20, inc, byte)
 
-$[c_repr fixed_bytes_u64_lanes]
+$[c_repr {representation = fixed_bytes_u64_lanes, name = bytes32}]
 type lane_b256 = vector(32, inc, byte)
 
 val lane_address_equal : (lane_address, lane_address) -> bool

@@ -41,8 +41,8 @@ int main(void) {
   if (zproven_i128_sub(wide, wide) != 0) return 14;
   if (zproven_i128_mul((__int128)6, -(__int128)7) != -(__int128)42) return 15;
   const __int128 wide_divisor = ((__int128)UINT64_MAX) + 6;
-  const sail_u128 wide_value = {{UINT64_C(13), UINT64_C(1)}};
-  const sail_u128 wide_divisor_value = {{UINT64_C(5), UINT64_C(1)}};
+  const u128 wide_value = {{UINT64_C(13), UINT64_C(1)}};
+  const u128 wide_divisor_value = {{UINT64_C(5), UINT64_C(1)}};
   if (zproven_i128_div(wide_value, wide_divisor_value) != wide / wide_divisor) return 16;
   if (zproven_i128_mod(wide_value, wide_divisor_value) != wide % wide_divisor) return 17;
   if (!zmixed_i128_u64_lte(-(__int128)1, UINT64_MAX)) return 18;

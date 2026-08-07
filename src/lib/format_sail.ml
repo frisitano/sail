@@ -381,6 +381,7 @@ let can_hang chunks =
   | Some (Comment (t, _, _, contents, _)) -> (
       match t with Comment_block -> is_single_line_block_comment contents | _ -> false
     )
+  | Some (If_then_else _ | If_then _) -> false
   | _ -> true
 
 let can_hang_bracketed chunks =
@@ -502,12 +503,26 @@ let rec can_chunks_list_wrap cqs =
           (* {{{ Atom }}} is ok *)
           | Block (_, exps) -> can_chunks_list_wrap exps
           | If_then_else (_, i, t, e) -> can_chunks_list_wrap [t; e]
+          | Type_if_then_else (_, t, e) -> can_chunks_list_wrap [t; e]
           | _ -> false
         )
       | c :: cq ->
           can_chunks_list_wrap [Queue.of_seq (List.to_seq [c])] && can_chunks_list_wrap [Queue.of_seq (List.to_seq cq)]
     )
   | cq :: cqs -> can_chunks_list_wrap [cq] && can_chunks_list_wrap cqs
+
+let direct_else_if chunks =
+  match List.of_seq (Queue.to_seq chunks) with
+  | [If_then_else _] | [If_then _] -> Some chunks
+  | [Block (true, [nested])] -> (
+      match List.of_seq (Queue.to_seq nested) with
+      | [If_then_else _] | [If_then _] -> Some nested
+      | _ -> None
+    )
+  | _ -> None
+
+let direct_branch_expression chunks =
+  match List.of_seq (Queue.to_seq chunks) with [Block (_, [exp])] -> Some exp | _ -> None
 
 module Make (Config : CONFIG) = struct
   let indent = Config.config.indent
@@ -619,15 +634,31 @@ module Make (Config : CONFIG) = struct
             if outer_prec > opts.precedence then parens doc else doc
       )
     | If_then_else (bracing, i, t, e) ->
-        let have_braces = bracing.then_brace || bracing.else_brace in
+        let else_if = if preserve_structure then None else direct_else_if e in
+        let e = Option.value ~default:e else_if in
+        let then_brace, t =
+          if (not opts.statement) && not preserve_structure then
+            match direct_branch_expression t with Some t -> (false, t) | None -> (bracing.then_brace, t)
+          else (bracing.then_brace, t)
+        in
+        let else_brace, e =
+          if Option.is_some else_if then (false, e)
+          else if (not opts.statement) && not preserve_structure then
+            match direct_branch_expression e with Some e -> (false, e) | None -> (bracing.else_brace, e)
+          else (bracing.else_brace, e)
+        in
+        let have_braces = then_brace || else_brace in
         let insert_braces = (opts.statement || have_braces) && not preserve_structure in
         let i = doc_chunks (opts |> nonatomic |> expression_like) i in
         let t =
-          if insert_braces && not bracing.then_brace then doc_chunk opts (Block (true, [t]))
+          if insert_braces && not then_brace then doc_forced_block opts [t]
+          else if then_brace then doc_conditional_branch opts t
           else doc_chunks (opts |> nonatomic |> expression_like) t
         in
         let e =
-          if insert_braces && not bracing.else_brace then doc_chunk opts (Block (true, [e]))
+          if insert_braces && not else_brace && Option.is_none else_if then doc_forced_block opts [e]
+          else if else_brace then doc_conditional_branch opts e
+          else if Option.is_some else_if then doc_chunks (nonatomic opts) e
           else doc_chunks (opts |> nonatomic |> expression_like) e
         in
         if not (have_braces || insert_braces) then
@@ -638,10 +669,23 @@ module Make (Config : CONFIG) = struct
           ite_part "if" i ^^ weak_space ^^ ite_part "then" t ^^ weak_space ^^ ite_part "else" e
           |> atomic_parens opts |> group
         )
+    | Type_if_then_else (i, t, e) ->
+        let doc_infix_typ chunks =
+          let doc = doc_chunks (opts |> nonatomic |> expression_like) chunks in
+          match Queue.peek_opt chunks with Some (Type_if_then_else _) -> parens doc | _ -> doc
+        in
+        string "if" ^^ space
+        ^^ doc_infix_typ i
+        ^^ break 1 ^^ string "then" ^^ space
+        ^^ doc_infix_typ t
+        ^^ break 1 ^^ string "else" ^^ space
+        ^^ doc_chunks (opts |> nonatomic |> expression_like) e
+        |> atomic_parens opts |> align |> group
     | If_then (bracing, i, t) ->
         let i = doc_chunks (opts |> nonatomic |> expression_like) i in
         let t =
-          if opts.statement && (not preserve_structure) && not bracing then doc_chunk opts (Block (true, [t]))
+          if opts.statement && (not preserve_structure) && not bracing then doc_forced_block opts [t]
+          else if bracing then doc_conditional_branch opts t
           else doc_chunks (opts |> nonatomic |> expression_like) t
         in
         separate space [string "if"; i; string "then"; t] |> atomic_parens opts
@@ -780,15 +824,25 @@ module Make (Config : CONFIG) = struct
         (* If the body is braced or otherwise bracketed, then the bracketing construct will take care of indentation *)
         if can_hang_bracketed y then
           separate space
-            [string (binder_keyword binder); doc_chunks (atomic opts) x; char '='; doc_chunks (nonatomic opts) y]
+            [
+              string (binder_keyword binder);
+              doc_chunks (atomic opts) x;
+              char '=';
+              doc_chunks (opts |> nonatomic |> expression_like) y;
+            ]
         else if can_hang y then
           nest indent
             (separate space
-               [string (binder_keyword binder); doc_chunks (atomic opts) x; char '='; doc_chunks (nonatomic opts) y]
+               [
+                 string (binder_keyword binder);
+                 doc_chunks (atomic opts) x;
+                 char '=';
+                 doc_chunks (opts |> nonatomic |> expression_like) y;
+               ]
             )
         else
           separate space [string (binder_keyword binder); doc_chunks (atomic opts) x; char '=']
-          ^^ nest indent (hardline ^^ doc_chunks (nonatomic opts) y)
+          ^^ nest indent (hardline ^^ doc_chunks (opts |> nonatomic |> expression_like) y)
     | Binder (binder, x, y, z) ->
         group
           (separate space
@@ -849,6 +903,20 @@ module Make (Config : CONFIG) = struct
         else string "while" ^^ space ^^ cond ^^ space ^^ measure ^^ string "do" ^^ space ^^ body
     | Field (exp, id) -> doc_chunks (subatomic opts) exp ^^ char '.' ^^ doc_id id
     | Raw str -> separate hardline (lines str)
+
+  and doc_forced_block opts exps =
+    let exps =
+      map_last
+        (fun no_semi chunks -> doc_block_exp_chunks (opts |> nonatomic |> statement_like) no_semi chunks)
+        exps
+    in
+    let exps = List.map fst exps in
+    surround_hardline true indent 1 (char '{') (separate hardline exps) (char '}') |> atomic_parens opts
+
+  and doc_conditional_branch opts chunks =
+    match List.of_seq (Queue.to_seq chunks) with
+    | [Block (_, exps)] -> doc_forced_block opts exps
+    | _ -> doc_chunks (opts |> nonatomic |> expression_like) chunks
 
   and doc_pexp_chunks_pair opts pexp =
     let pat = doc_chunks opts pexp.pat in

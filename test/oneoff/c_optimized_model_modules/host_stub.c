@@ -11,7 +11,7 @@ _Noreturn void fatal_error(enum fatal_reason reason)
 static uint8_t test_bytes[256];
 static uint8_t test_jumpdests[256];
 
-uint8_t *test_bytes_at(uint64_t off)
+const uint8_t *test_bytes_at(uint64_t off)
 {
   return test_bytes + off;
 }
