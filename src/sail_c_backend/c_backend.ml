@@ -5086,6 +5086,8 @@ module type CODEGEN_CONFIG = sig
   val specialization_obligations_lean : string option
   val specialization_obligations_coq : string option
   val optimized_model : bool
+  val register_file : bool
+  val register_file_excluded_modules : string list
   val external_types : string Bindings.t
   val external_type_names : string Bindings.t
   val byte_pointer_fields : (id * id * string) list
@@ -5219,6 +5221,58 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | [] -> NameGen.to_string () id
     | _ -> NameGen.translate () (string_of_id id ^ "#" ^ Util.string_of_list "_" string_of_ctyp ctyps)
 
+  (* == --c-register-file ====================================================
+     With [Config.register_file] the model registers are emitted as members of
+     one file-scope [struct model_registers] instead of individual C globals.
+     Rationale: the zkVM guests build with -mcmodel=medany -mno-relax and
+     RISC-V gcc has no section anchors, so every distinct global referenced by
+     a function pays its own auipc/addi address materialization; members of one
+     struct share a single base address.
+
+     The mode is semantics-neutral:
+     - Generated code spells every member register access as
+       [model_registers.NAME] directly (via [sgen_name]).  Sail rejects local
+       bindings and parameters that shadow a register ("Cannot shadow register
+       in pattern"), so inside generated bodies any [Name] matching a register
+       identifier is necessarily a register access.
+     - Hand-written FFI keeps compiling unchanged: the anchor module header
+       (the last generated module that declares a member register; every
+       module header transitively includes its predecessors, and any C file
+       that could previously see a register's extern declaration therefore
+       also sees the anchor block) defines one object-like macro per member,
+       [#define NAME (model_registers.NAME)].  The member token after '.' in
+       the replacement list is the macro currently being expanded and is not
+       rescanned (C11 6.10.3.4 "blue paint"), so the self-reference is safe.
+       Generated translation units suppress these aliases by defining
+       [<PACKAGE>_REGISTER_FILE_DIRECT] before including the umbrella header;
+       otherwise the macros would corrupt the direct member spelling
+       (model_registers.NAME would rescan NAME) and could capture generated
+       struct-field names.
+     - Registers declared in [Config.register_file_excluded_modules] (for
+       example the EVM_DEBUG-gated host/debug_enabled module, whose registers
+       are read by hand-written platform code through its own extern
+       declarations without including the generated headers) keep today's
+       plain-global emission so their linker symbols survive. *)
+  let register_file_variable = "model_registers"
+
+  (* Measured-hot interpreter registers are placed first so they share the
+     smallest offsets from the register-file base (and one cache line where
+     possible).  This is a simple name-based priority list; names that do not
+     exist in the model are skipped, and all remaining members follow in
+     source declaration order. *)
+  let register_file_hot_priority =
+    ["pc"; "gas_remaining"; "state_gas_remaining"; "state_gas_spilled"; "frame_status"; "call_depth"; "frame_refund"]
+
+  let register_file_member_ids = ref IdSet.empty
+  let register_file_members : (name * ctyp) list ref = ref []
+  let register_file_anchor_index = ref (-1)
+
+  let register_file_member = function
+    | Name (id, _) -> Config.register_file && IdSet.mem id !register_file_member_ids
+    | _ -> false
+
+  let register_file_compat_guard () = String.uppercase_ascii Config.package_name ^ "_REGISTER_FILE_DIRECT"
+
   let sgen_name =
     let ssa_num n = if n = -1 then "" else "/" ^ string_of_int n in
     function
@@ -5226,6 +5280,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         let source_name = Option.value ~default:"tmp" source_name in
         NameGen.translate () (sprintf "%s#%d.%d" source_name v1 v2) ^ ssa_num n
     | Gen (v1, v2, n, _, _) -> NameGen.to_string () (mk_id (sprintf "%d.%d" v1 v2)) ^ ssa_num n
+    | Name (id, n) when Config.register_file && IdSet.mem id !register_file_member_ids ->
+        register_file_variable ^ "." ^ NameGen.to_string () id ^ ssa_num n
     | Name (id, n) -> NameGen.to_string () id ^ ssa_num n
     | Abstract id -> NameGen.to_string ~prefix:"abstract_" () id
     | Have_exception n -> "have_exception" ^ ssa_num n
@@ -5237,6 +5293,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | Channel (chan, n) -> (
         match chan with Chan_stdout -> "stdout" ^ ssa_num n | Chan_stderr -> "stderr" ^ ssa_num n
       )
+
+  (* The register's plain C symbol, without the register-file member prefix:
+     used for the struct field names and the compatibility macros themselves. *)
+  let sgen_register_file_symbol = function
+    | Name (id, _) -> NameGen.to_string () id
+    | reg -> c_error ("register " ^ string_of_name reg ^ " cannot be a model register file member")
 
   let codegen_id id = string (sgen_id id)
 
@@ -11303,6 +11365,13 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
 
   let codegen_def' ctx (CDEF_aux (aux, _)) =
     match aux with
+    | CDEF_register (id, _, _) when register_file_member id ->
+        (* This register is a member of the model register file: its field,
+           the struct's extern declaration, and its FFI compatibility macro
+           are all emitted once by the anchor module (see
+           [codegen_register_file_docs]); its storage is the single
+           [struct model_registers model_registers] definition. *)
+        []
     | CDEF_register (id, ctyp, _) ->
         let definition =
           VariableDefinition
@@ -11706,6 +11775,99 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         (id, ctyp, instrs) :: c_ast_registers ~early ast
     | _ :: ast -> c_ast_registers ~early ast
     | [] -> []
+
+  (* Select the model register file members before any definition is rendered:
+     [sgen_name] consults the member set for every register reference.
+     Membership follows source declaration order (the definitions were just
+     stable-sorted by module), except that measured-hot registers from
+     [register_file_hot_priority] are hoisted to the front of the struct.
+     Registers owned by an excluded module keep the plain-global emission.
+     The anchor is the last module that declares a member register: its header
+     transitively includes every earlier module header, so all member types
+     are complete there, and any translation unit that could previously see a
+     member register's extern declaration also sees the anchor's struct
+     definition and compatibility macros. *)
+  let prepare_register_file (modules : c_module array) module_index cdefs =
+    let members, anchor =
+      List.fold_left
+        (fun (members, anchor) annotated ->
+          match annotated with
+          | CDEF_aux (CDEF_register (reg, ctyp, _), _) ->
+              let index = module_index annotated in
+              if List.mem modules.(index).file_stem Config.register_file_excluded_modules then (members, anchor)
+              else ((reg, ctyp) :: members, max anchor index)
+          | _ -> (members, anchor)
+        )
+        ([], -1) cdefs
+    in
+    let members = List.rev members in
+    let priority (reg, _) =
+      let symbol = sgen_register_file_symbol reg in
+      let rec find rank = function
+        | [] -> Stdlib.max_int
+        | hot :: hots -> if String.equal hot symbol then rank else find (rank + 1) hots
+      in
+      find 0 register_file_hot_priority
+    in
+    let members = List.stable_sort (fun left right -> Int.compare (priority left) (priority right)) members in
+    register_file_members := members;
+    register_file_member_ids :=
+      List.fold_left
+        (fun ids (reg, _) -> match reg with Name (id, _) -> IdSet.add id ids | _ -> ids)
+        IdSet.empty members;
+    register_file_anchor_index := anchor
+
+  (* The anchor module's register-file block: the struct declaration and its
+     extern (header), the guarded FFI compatibility macros (header), and the
+     single storage definition (implementation).  File-scope storage is
+     zero-initialized like the plain globals it replaces; the Sail-level
+     initial values still run in initialize_registers()/model_init(). *)
+  let codegen_register_file_docs () =
+    if !register_file_members = [] then []
+    else (
+      let fields =
+        List.map
+          (fun (reg, ctyp) -> Printf.sprintf "  %s %s;" (sgen_ctyp ctyp) (sgen_register_file_symbol reg))
+          !register_file_members
+      in
+      let macros =
+        List.map
+          (fun (reg, _) ->
+            let symbol = sgen_register_file_symbol reg in
+            Printf.sprintf "#define %s (%s.%s)" symbol register_file_variable symbol
+          )
+          !register_file_members
+      in
+      let declaration =
+        List.map string
+          ([
+             "// Model register file (--c-register-file): every model register outside the";
+             "// configured excluded modules is a member of this struct, so all register";
+             "// accesses share one base address instead of one address materialization per";
+             "// distinct global.  Hot registers are placed first; the remaining members";
+             "// follow their Sail source declaration order.";
+             Printf.sprintf "struct %s {" register_file_variable;
+           ]
+          @ fields
+          @ [
+              "};";
+              Printf.sprintf "extern struct %s %s;" register_file_variable register_file_variable;
+              "";
+              Printf.sprintf "#ifndef %s" (register_file_compat_guard ());
+              "// Compatibility aliases so hand-written FFI keeps naming registers directly.";
+              "// The member token after '.' is the macro currently being expanded and is";
+              "// not rescanned, so the self-reference is well-defined.  Generated";
+              "// translation units define the guard and spell members directly instead.";
+            ]
+          @ macros @ ["#endif"]
+          )
+        |> separate hardline
+      in
+      [
+        VariableDeclaration declaration;
+        VariableDefinition (string (Printf.sprintf "struct %s %s;" register_file_variable register_file_variable));
+      ]
+    )
 
   let get_unit_tests cdefs =
     List.fold_left
@@ -12852,6 +13014,14 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
          aliases even when modular ownership reorders their definitions. *)
       prepare_static_letbinds ctx cdefs;
 
+      (* The register-file member set must be fixed before any definition is
+         rendered because [sgen_name] consults it for every reference. *)
+      if Config.register_file then (
+        match modular_layout with
+        | Some (modules, module_index) -> prepare_register_file modules module_index cdefs
+        | None -> c_error "--c-register-file requires --c-optimized-model modular output"
+      );
+
       (* Valspecs carry parameter types but not their source names.  Recover
          those names from matching JIB definitions before emitting module
          headers.  Bodyless extern declarations use positional comments:
@@ -13275,6 +13445,16 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
                   [] module_cdefs.(index)
               in
               let reversed_docs =
+                (* The anchor module declares the model register file after its
+                   own definitions: its header transitively includes every
+                   earlier module header, so all member field types are
+                   complete, and its own declarations precede the
+                   compatibility macros. *)
+                if Config.register_file && index = !register_file_anchor_index then
+                  collect_docs reversed_docs (codegen_register_file_docs ())
+                else reversed_docs
+              in
+              let reversed_docs =
                 if index = Array.length modules - 1 then (
                   let generated_model_docs, helper_demands =
                     codegen_with_helper_demands (fun () -> gen_model_init_fini ctx cdefs)
@@ -13303,7 +13483,14 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
                 ^^ separate hardline extern_cpp_end ^^ hardline
               in
               let implementation_doc =
-                ksprintf string "#include \"%s/spec.h\"" package
+                (* Generated code spells register-file members directly as
+                   model_registers.NAME; the guard suppresses the header's FFI
+                   compatibility macros, which would otherwise rescan the
+                   member token (and could capture generated field names). *)
+                ( if Config.register_file then ksprintf string "#define %s 1" (register_file_compat_guard ()) ^^ hardline
+                  else empty
+                )
+                ^^ ksprintf string "#include \"%s/spec.h\"" package
                 ^^ hardline
                 ^^ ksprintf string "#include \"%s/spec/support.h\"" package
                 ^^ twice hardline ^^ split.var_def ^^ split.func_def

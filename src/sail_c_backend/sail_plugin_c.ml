@@ -72,6 +72,8 @@ let opt_specialization_plan_human = ref None
 let opt_specialization_obligations_lean = ref None
 let opt_specialization_obligations_coq = ref None
 let opt_optimized_model = ref false
+let opt_register_file = ref false
+let opt_register_file_excluded_modules : string list ref = ref []
 let opt_c_optimized_source_root = ref None
 let opt_c_optimized_include_dir = ref None
 let opt_c_external_types : string Bindings.t ref = ref Bindings.empty
@@ -340,6 +342,23 @@ let c_options =
     ( Flag.create ~prefix:["c"] "optimized_model",
       Arg.Set opt_optimized_model,
       "generate a strict allocation-free specialized C model split by Sail module or source file"
+    );
+    ( Flag.create ~prefix:["c"] "register_file",
+      Arg.Set opt_register_file,
+      "emit model registers as members of one 'struct model_registers' so accesses share a single base address \
+       (requires --c-optimized-model; generated headers keep per-register compatibility macros for hand-written FFI)"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"module" "register_file_exclude",
+      Arg.String
+        (fun stem ->
+          let stem = String.trim stem in
+          if stem = "" then raise (Arg.Bad "--c-register-file-exclude expects a generated module file stem")
+          else if List.mem stem !opt_register_file_excluded_modules then
+            raise (Arg.Bad ("duplicate --c-register-file-exclude module " ^ stem))
+          else opt_register_file_excluded_modules := stem :: !opt_register_file_excluded_modules
+        ),
+      "keep registers declared in this generated module (by file stem, for example host/debug_enabled) as plain C \
+       globals when --c-register-file is enabled"
     );
     ( Flag.create ~prefix:["c"] ~arg:"directory" "optimized_source_root",
       Arg.String (fun directory -> opt_c_optimized_source_root := Some directory),
@@ -816,6 +835,10 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
   );
   if Option.is_some !opt_c_optimized_source_root && not !opt_optimized_model then
     raise (Reporting.err_general Parse_ast.Unknown "--c-optimized-source-root requires --c-optimized-model");
+  if !opt_register_file && not !opt_optimized_model then
+    raise (Reporting.err_general Parse_ast.Unknown "--c-register-file requires --c-optimized-model");
+  if (not (Util.list_empty !opt_register_file_excluded_modules)) && not !opt_register_file then
+    raise (Reporting.err_general Parse_ast.Unknown "--c-register-file-exclude requires --c-register-file");
   let ( reserveds,
         overrides,
         c_repr_unsigned,
@@ -989,6 +1012,8 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let specialization_obligations_lean = !opt_specialization_obligations_lean
     let specialization_obligations_coq = !opt_specialization_obligations_coq
     let optimized_model = !opt_optimized_model
+    let register_file = !opt_register_file
+    let register_file_excluded_modules = !opt_register_file_excluded_modules
     let external_types = !opt_c_external_types
     let external_type_names = c_repr_external_names
     let byte_pointer_fields = !opt_c_byte_pointer_fields

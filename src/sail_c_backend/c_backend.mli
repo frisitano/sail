@@ -160,6 +160,18 @@ module type CODEGEN_CONFIG = sig
   (** Generate the strict, allocation-free optimized-model ABI. *)
   val optimized_model : bool
 
+  (** Emit model registers as members of one [struct model_registers] register file instead of individual C globals, so
+      every register access shares a single base-address materialization (RISC-V medany codegen pays one [auipc] per
+      distinct global per function otherwise). Requires [optimized_model]. Generated code references members directly as
+      [model_registers.NAME]; the generated headers additionally provide guarded [#define NAME (model_registers.NAME)]
+      compatibility aliases for hand-written FFI translation units. *)
+  val register_file : bool
+
+  (** Generated-module file stems (for example ["host/debug_enabled"]) whose registers stay plain C globals when
+      [register_file] is enabled. Hand-written platform code may declare its own [extern] for such registers without
+      including the generated headers, so their symbols must survive. *)
+  val register_file_excluded_modules : string list
+
   (** Nominal Sail types whose final C declaration is supplied by an external header in an optimized-model build. *)
   val external_types : string Ast_compare.Bindings.t
 
