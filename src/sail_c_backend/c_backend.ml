@@ -5257,7 +5257,9 @@ module type CODEGEN_CONFIG = sig
   val specialization_obligations_coq : string option
   val optimized_model : bool
   val register_file : bool
+  val register_file_thread : bool
   val register_file_excluded_modules : string list
+  val preserved_functions : IdSet.t
   val external_types : string Bindings.t
   val external_type_names : string Bindings.t
   val byte_pointer_fields : (id * id * string) list
@@ -5437,6 +5439,37 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let register_file_members : (name * ctyp) list ref = ref []
   let register_file_anchor_index = ref (-1)
 
+  (* == --c-register-file-thread =============================================
+     Under -mcmodel=medany -mno-relax even the single shared register-file
+     base still costs one auipc/addi materialization per function (sometimes
+     re-materialized per branch).  With [Config.register_file_thread] every
+     generated function whose own body accesses a member register instead
+     takes the base as a leading parameter [struct model_registers *const
+     regs] and spells accesses [regs->NAME]: the base arrives in an argument
+     register and each access is a single offset load/store.
+
+     - The footprint is per function and syntactic: a function is threaded
+       exactly when its own JIB body (including nested blocks, but not its
+       callees) reads or writes a member register.  Call sites forward their
+       own [regs] when the caller is threaded and pass [&model_registers]
+       otherwise, so the pointer always equals the global's address and
+       aliasing with extern/FFI accesses through the compatibility macros is
+       trivially coherent.
+     - Entry points reached from hand-written FFI (zmain, every --c-preserve
+       function, and initialize_registers/__InitConfig called from
+       model_init) keep their existing signatures; they are the region roots
+       that materialize the base themselves.
+     - The plain parameter name [regs] is reserved in [Config.reserved_words]
+       while the mode is on, so generated names can never collide with it.
+     - Heap-return functions order the parameter before the return pointer:
+       [f(regs, *rop, args...)]. *)
+  let register_file_param = "regs"
+  let register_file_thread_parameter = "struct " ^ register_file_variable ^ " *const " ^ register_file_param
+  let register_file_threaded_functions = ref IdSet.empty
+  let current_function_threaded = ref false
+
+  let register_file_threaded_function id = Config.register_file_thread && IdSet.mem id !register_file_threaded_functions
+
   let register_file_member = function
     | Name (id, _) -> Config.register_file && IdSet.mem id !register_file_member_ids
     | _ -> false
@@ -5451,7 +5484,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         NameGen.translate () (sprintf "%s#%d.%d" source_name v1 v2) ^ ssa_num n
     | Gen (v1, v2, n, _, _) -> NameGen.to_string () (mk_id (sprintf "%d.%d" v1 v2)) ^ ssa_num n
     | Name (id, n) when Config.register_file && IdSet.mem id !register_file_member_ids ->
-        register_file_variable ^ "." ^ NameGen.to_string () id ^ ssa_num n
+        if !current_function_threaded then register_file_param ^ "->" ^ NameGen.to_string () id ^ ssa_num n
+        else register_file_variable ^ "." ^ NameGen.to_string () id ^ ssa_num n
     | Name (id, n) -> NameGen.to_string () id ^ ssa_num n
     | Abstract id -> NameGen.to_string ~prefix:"abstract_" () id
     | Have_exception n -> "have_exception" ^ ssa_num n
@@ -6900,8 +6934,9 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     let parameters = List.filter (fun (ctyp, _) -> retain_c_parameter ctyp) parameters in
     List.map (fun (ctyp, name) -> sgen_const_ctyp ctyp ^ if String.equal name "" then "" else " " ^ name) parameters
 
-  let c_parameter_list parameters =
+  let c_parameter_list ?(thread_regs = false) parameters =
     let parameters = c_parameter_items parameters in
+    let parameters = if thread_regs then register_file_thread_parameter :: parameters else parameters in
     match (erase_unit_values, !opt_extra_params, parameters) with
     | true, None, [] -> "void"
     | _ -> extra_params () ^ String.concat ", " parameters
@@ -7571,6 +7606,20 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
               sgen_cval value
           | _ -> default_c_args
         in
+        (* --c-register-file-thread: a threaded callee takes the register-file
+           base as its leading argument.  A threaded caller forwards its own
+           [regs] parameter; every other context materializes the global's
+           address, so the pointer always equals [&model_registers]. *)
+        let regs_argument =
+          if (not is_extern) && register_file_threaded_function (fst f) then
+            if !current_function_threaded then register_file_param else "&" ^ register_file_variable
+          else ""
+        in
+        let with_regs_argument arguments =
+          if regs_argument = "" then arguments
+          else if arguments = "" then regs_argument
+          else regs_argument ^ ", " ^ arguments
+        in
         current_static_helper_demands := Util.StringSet.add fname !current_static_helper_demands;
         if is_extern && raw_fname <> "__sail_fixed_assert" && fname <> "reg_deref" then
           emitted_external_functions := Util.StringSet.add fname !emitted_external_functions;
@@ -7620,20 +7669,25 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             ksprintf string "  %s = *(%s);" (sgen_stack_call_destination l ctyp x) c_args
           else sail_copy ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp) "&%s, *(%s)" (sgen_clexp_pure l x) c_args
         else if match x with CL_void _ -> true | _ -> false then
-          string (Printf.sprintf "  %s(%s%s);" fname (extra_arguments is_extern) c_args)
+          string (Printf.sprintf "  %s(%s%s);" fname (extra_arguments is_extern) (with_regs_argument c_args))
         else if erase_unit_values && ctyp_equal ctyp CT_unit then
           if match x with CL_id (Return _, _) -> true | _ -> false then
-            string (Printf.sprintf "  %s(%s%s);" fname (extra_arguments is_extern) c_args)
+            string (Printf.sprintf "  %s(%s%s);" fname (extra_arguments is_extern) (with_regs_argument c_args))
             ^^ hardline ^^ string "  return;"
-          else string (Printf.sprintf "  %s(%s%s);" fname (extra_arguments is_extern) c_args)
+          else string (Printf.sprintf "  %s(%s%s);" fname (extra_arguments is_extern) (with_regs_argument c_args))
         else if match x with CL_id (Return _, _) -> true | _ -> false then
-          string (Printf.sprintf "  return %s(%s%s);" fname (extra_arguments is_extern) c_args)
+          string (Printf.sprintf "  return %s(%s%s);" fname (extra_arguments is_extern) (with_regs_argument c_args))
         else if is_stack_ctyp ctx ctyp then
           string
             (Printf.sprintf "  %s = %s(%s%s);" (sgen_stack_call_destination l ctyp x) fname (extra_arguments is_extern)
+               (with_regs_argument c_args)
+            )
+        else
+          string
+            (Printf.sprintf "  %s(%s%s, %s);" fname (extra_arguments is_extern)
+               (with_regs_argument (sgen_clexp l x))
                c_args
             )
-        else string (Printf.sprintf "  %s(%s%s, %s);" fname (extra_arguments is_extern) (sgen_clexp l x) c_args)
     | I_clear (ctyp, _) when is_stack_ctyp ctx ctyp -> empty
     | I_clear (ctyp, id) -> sail_kill ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp) "&%s" (sgen_name id)
     | I_init (ctyp, id, init) -> (
@@ -11577,6 +11631,30 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           | _ -> List.mapi (fun index _ -> Printf.sprintf "arg_%d" index) arg_ctyps
         in
         let parameters = List.map2 (fun ctyp name -> (ctyp, name)) arg_ctyps parameter_names in
+        let thread_regs = Option.is_none external_name && register_file_threaded_function id in
+        (* Hand-written FFI translation units keep calling threaded functions
+           with their canonical argument lists: next to each declaration the
+           header defines a guarded function-like macro that passes the
+           register-file base implicitly.  The macro name being expanded is not
+           rescanned (C11 6.10.3.4), and the GNU [, ##__VA_ARGS__] comma
+           deletion covers zero-argument calls.  Generated translation units
+           define the guard and spell the leading argument directly instead. *)
+        let with_call_compat declaration =
+          if not thread_regs then [FunctionDeclaration declaration]
+          else
+            [
+              FunctionDeclaration
+                (declaration ^^ hardline
+                ^^ string (Printf.sprintf "#ifndef %s" (register_file_compat_guard ()))
+                ^^ hardline
+                ^^ string
+                     (Printf.sprintf "#define %s(...) %s(&%s, ##__VA_ARGS__)" function_name function_name
+                        register_file_variable
+                     )
+                ^^ hardline ^^ string "#endif"
+                );
+            ]
+        in
         if is_fatal_error then
           [
             FunctionDeclaration
@@ -11584,16 +11662,21 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           ]
         else if Option.is_some external_name && not Config.optimized_model then []
         else if erase_unit_values && ctyp_equal ret_ctyp CT_unit then
-          [FunctionDeclaration (string (Printf.sprintf "void %s(%s);" function_name (c_parameter_list parameters)))]
+          with_call_compat
+            (string (Printf.sprintf "void %s(%s);" function_name (c_parameter_list ~thread_regs parameters)))
         else if is_stack_ctyp ctx ret_ctyp then
-          [
-            FunctionDeclaration
-              (string (Printf.sprintf "%s %s(%s);" (sgen_ctyp ret_ctyp) function_name (c_parameter_list parameters)));
-          ]
+          with_call_compat
+            (string
+               (Printf.sprintf "%s %s(%s);" (sgen_ctyp ret_ctyp) function_name
+                  (c_parameter_list ~thread_regs parameters)
+               )
+            )
         else (
           let ordinary_args = c_parameter_items parameters in
-          let parameters = extra_params () ^ String.concat ", " ((sgen_ctyp ret_ctyp ^ " *rop") :: ordinary_args) in
-          [FunctionDeclaration (string (Printf.sprintf "void %s(%s);" function_name parameters))]
+          let ordinary_args = (sgen_ctyp ret_ctyp ^ " *rop") :: ordinary_args in
+          let ordinary_args = if thread_regs then register_file_thread_parameter :: ordinary_args else ordinary_args in
+          let parameters = extra_params () ^ String.concat ", " ordinary_args in
+          with_call_compat (string (Printf.sprintf "void %s(%s);" function_name parameters))
         )
     | CDEF_fundef (id, ret_arg, args, instrs) ->
         (* We can skip the Sail version of a function if we're going to call the
@@ -11639,6 +11722,10 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             else instrs
           in
 
+          (* Threaded functions spell member-register accesses through their
+             [regs] parameter for the whole body being rendered here. *)
+          let thread_regs = register_file_threaded_function id in
+          current_function_threaded := thread_regs;
           let named_parameters = List.map2 (fun ctyp arg -> (ctyp, sgen_name arg)) arg_ctyps args in
           let referenced =
             List.fold_left
@@ -11657,7 +11744,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             else []
           in
           let unused_parameter_markers = separate hardline unused_parameters in
-          let c_args = c_parameter_list named_parameters in
+          let c_args = c_parameter_list ~thread_regs named_parameters in
           let function_header =
             match ret_arg with
             | Return_plain ->
@@ -11671,23 +11758,27 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             | Return_via gs ->
                 assert (not (is_stack_ctyp ctx ret_ctyp));
                 let ordinary_args = c_parameter_items named_parameters in
-                let return_via_args =
-                  extra_params () ^ String.concat ", " ((sgen_ctyp ret_ctyp ^ " *" ^ sgen_name gs) :: ordinary_args)
+                let ordinary_args = (sgen_ctyp ret_ctyp ^ " *" ^ sgen_name gs) :: ordinary_args in
+                let ordinary_args =
+                  if thread_regs then register_file_thread_parameter :: ordinary_args else ordinary_args
                 in
+                let return_via_args = extra_params () ^ String.concat ", " ordinary_args in
                 string "void" ^^ space
                 ^^ string (class_impl_prefix ())
                 ^^ codegen_function_id id
                 ^^ parens (string return_via_args)
                 ^^ hardline
           in
-          [
+          let definition =
             FunctionDefinition
               (function_header ^^ string "{" ^^ hardline ^^ unused_parameter_markers
               ^^ (if Util.list_empty unused_parameters then empty else hardline)
               ^^ codegen_instrs ~function_tail:true id ctx instrs
               ^^ hardline ^^ string "}"
-              );
-          ]
+              )
+          in
+          current_function_threaded := false;
+          [definition]
         )
     | CDEF_type ctype_def ->
         let docs = codegen_type_def ctx ctype_def in
@@ -11986,6 +12077,34 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         (fun ids (reg, _) -> match reg with Name (id, _) -> IdSet.add id ids | _ -> ids)
         IdSet.empty members;
     register_file_anchor_index := anchor
+
+  (* Select the threaded functions (--c-register-file-thread) after the member
+     set is fixed: a generated function is threaded exactly when its own body
+     reads or writes a member register.  Entry points reached from hand-written
+     FFI or from the generated model_init keep their existing signatures and
+     stay unthreaded: zmain, every --c-preserve function, and the register and
+     configuration initializers called by [gen_model_init_fini]'s hand-emitted
+     statements. *)
+  let prepare_register_file_threading cdefs =
+    let entry_points =
+      IdSet.union Config.preserved_functions
+        (IdSet.of_list [mk_id "main"; mk_id "initialize_registers"; mk_id "__InitConfig"])
+    in
+    let accesses_member_register body =
+      let names =
+        List.fold_left (fun names instr -> NameSet.union names (instr_ids ~direct:false instr)) NameSet.empty body
+      in
+      NameSet.exists (function Name (id, _) -> IdSet.mem id !register_file_member_ids | _ -> false) names
+    in
+    register_file_threaded_functions :=
+      List.fold_left
+        (fun threaded (CDEF_aux (aux, _)) ->
+          match aux with
+          | CDEF_fundef (id, _, _, body) when (not (IdSet.mem id entry_points)) && accesses_member_register body ->
+              IdSet.add id threaded
+          | _ -> threaded
+        )
+        IdSet.empty cdefs
 
   (* The anchor module's register-file block: the struct declaration and its
      extern (header), the guarded FFI compatibility macros (header), and the
@@ -13192,7 +13311,9 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
          rendered because [sgen_name] consults it for every reference. *)
       if Config.register_file then (
         match modular_layout with
-        | Some (modules, module_index) -> prepare_register_file modules module_index cdefs
+        | Some (modules, module_index) ->
+            prepare_register_file modules module_index cdefs;
+            if Config.register_file_thread then prepare_register_file_threading cdefs
         | None -> c_error "--c-register-file requires --c-optimized-model modular output"
       );
 
@@ -13338,30 +13459,35 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
 
       let optimized_base_preamble =
         separate hardline
-          [
-            string "#include <stdbool.h>";
-            string "#include <stddef.h>";
-            string "#include <stdint.h>";
-            string "#include <stdio.h>";
-            string "#include <stdlib.h>";
-            string "#include <string.h>";
-            string "typedef uint64_t unit;";
-            string "#define UNIT UINT64_C(0)";
-            string "#define EQUAL(type) eq_ ## type";
-            string "#define UNDEFINED(type) undefined_ ## type";
-            string "static inline bool eq_unit(void) { return true; }";
-            string "static inline bool eq_bool(bool lhs, bool rhs) { return lhs == rhs; }";
-            string "static inline bool eq_fbits(uint64_t lhs, uint64_t rhs) { return lhs == rhs; }";
-            string "static inline void undefined_unit(void) {}";
-            string "static inline bool undefined_bool(void) { return false; }";
-            string "static inline uint64_t undefined_fbits(void) { return UINT64_C(0); }";
-            string
-              "static inline uint64_t safe_rshift(uint64_t value, uint64_t amount) { return amount >= UINT64_C(64) ? \
-               UINT64_C(0) : value >> amount; }";
-            string
-              "_Noreturn static inline void sail_match_failure(const char *function) { const int write_status = \
-               fprintf(stderr, \"Sail match failure in %s\\n\", function); (void)write_status; abort(); }";
-          ]
+          ((* Threaded functions declared before the anchor module take a
+              pointer to the register file; the parameter type must name one
+              file-scope struct rather than a fresh prototype-scoped one. *)
+           (if Config.register_file_thread then [ksprintf string "struct %s;" register_file_variable] else [])
+          @ [
+              string "#include <stdbool.h>";
+              string "#include <stddef.h>";
+              string "#include <stdint.h>";
+              string "#include <stdio.h>";
+              string "#include <stdlib.h>";
+              string "#include <string.h>";
+              string "typedef uint64_t unit;";
+              string "#define UNIT UINT64_C(0)";
+              string "#define EQUAL(type) eq_ ## type";
+              string "#define UNDEFINED(type) undefined_ ## type";
+              string "static inline bool eq_unit(void) { return true; }";
+              string "static inline bool eq_bool(bool lhs, bool rhs) { return lhs == rhs; }";
+              string "static inline bool eq_fbits(uint64_t lhs, uint64_t rhs) { return lhs == rhs; }";
+              string "static inline void undefined_unit(void) {}";
+              string "static inline bool undefined_bool(void) { return false; }";
+              string "static inline uint64_t undefined_fbits(void) { return UINT64_C(0); }";
+              string
+                "static inline uint64_t safe_rshift(uint64_t value, uint64_t amount) { return amount >= UINT64_C(64) ? \
+                 UINT64_C(0) : value >> amount; }";
+              string
+                "_Noreturn static inline void sail_match_failure(const char *function) { const int write_status = \
+                 fprintf(stderr, \"Sail match failure in %s\\n\", function); (void)write_status; abort(); }";
+            ]
+          )
       in
       let preamble in_header =
         let configured_headers =

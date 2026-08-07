@@ -73,7 +73,9 @@ let opt_specialization_obligations_lean = ref None
 let opt_specialization_obligations_coq = ref None
 let opt_optimized_model = ref false
 let opt_register_file = ref false
+let opt_register_file_thread = ref false
 let opt_register_file_excluded_modules : string list ref = ref []
+let opt_preserved_functions = ref IdSet.empty
 let opt_c_optimized_source_root = ref None
 let opt_c_optimized_include_dir = ref None
 let opt_c_external_types : string Bindings.t ref = ref Bindings.empty
@@ -352,6 +354,12 @@ let c_options =
       "emit model registers as members of one 'struct model_registers' so accesses share a single base address \
        (requires --c-optimized-model; generated headers keep per-register compatibility macros for hand-written FFI)"
     );
+    ( Flag.create ~prefix:["c"] "register_file_thread",
+      Arg.Set opt_register_file_thread,
+      "thread a pointer to the model register file through generated functions that access member registers instead of \
+       addressing the struct by symbol in every function (requires --c-register-file; entry points called by \
+       hand-written FFI keep their signatures)"
+    );
     ( Flag.create ~prefix:["c"] ~arg:"module" "register_file_exclude",
       Arg.String
         (fun stem ->
@@ -466,7 +474,11 @@ let c_options =
       "output root used by --c-optimized-model"
     );
     ( Flag.create ~prefix:["c"] "preserve",
-      Arg.String (fun str -> Specialize.add_initial_calls (IdSet.singleton (mk_id str))),
+      Arg.String
+        (fun str ->
+          opt_preserved_functions := IdSet.add (mk_id str) !opt_preserved_functions;
+          Specialize.add_initial_calls (IdSet.singleton (mk_id str))
+        ),
       "make sure the provided function identifier is preserved in C/C++ output"
     );
     (Flag.create ~prefix:["c"] "assert_to_exception", Arg.Set opt_assert_to_exception, "turn assertions into exceptions");
@@ -843,6 +855,8 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     raise (Reporting.err_general Parse_ast.Unknown "--c-register-file requires --c-optimized-model");
   if (not (Util.list_empty !opt_register_file_excluded_modules)) && not !opt_register_file then
     raise (Reporting.err_general Parse_ast.Unknown "--c-register-file-exclude requires --c-register-file");
+  if !opt_register_file_thread && not !opt_register_file then
+    raise (Reporting.err_general Parse_ast.Unknown "--c-register-file-thread requires --c-register-file");
   let ( reserveds,
         overrides,
         c_repr_unsigned,
@@ -995,7 +1009,10 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let no_lib = !opt_no_lib
     let no_rts = !opt_no_rts
     let no_mangle = !opt_no_mangle
-    let reserved_words = reserveds
+
+    (* The threaded register-file pointer is a fixed parameter name in
+       generated signatures; keep name generation from ever claiming it. *)
+    let reserved_words = if !opt_register_file_thread then Util.StringSet.add "regs" reserveds else reserveds
     let overrides = overrides
     let branch_coverage = !opt_branch_coverage
     let assert_to_exception = !opt_assert_to_exception
@@ -1017,7 +1034,9 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let specialization_obligations_coq = !opt_specialization_obligations_coq
     let optimized_model = !opt_optimized_model
     let register_file = !opt_register_file
+    let register_file_thread = !opt_register_file_thread
     let register_file_excluded_modules = !opt_register_file_excluded_modules
+    let preserved_functions = !opt_preserved_functions
     let external_types = !opt_c_external_types
     let external_type_names = c_repr_external_names
     let byte_pointer_fields = !opt_c_byte_pointer_fields

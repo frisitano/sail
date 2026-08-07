@@ -171,10 +171,21 @@ module type CODEGEN_CONFIG = sig
       compatibility aliases for hand-written FFI translation units. *)
   val register_file : bool
 
+  (** Thread a pointer to the register file through generated functions instead of addressing the struct by symbol.
+      Exactly the functions whose own body accesses a member register gain a leading
+      [struct model_registers *const regs] parameter and spell accesses [regs->NAME]; call sites forward their own
+      [regs] or pass [&model_registers]. Entry points reached from hand-written FFI (zmain, --c-preserve functions,
+      initialize_registers, __InitConfig) keep their existing signatures. Requires [register_file]. *)
+  val register_file_thread : bool
+
   (** Generated-module file stems (for example ["host/debug_enabled"]) whose registers stay plain C globals when
       [register_file] is enabled. Hand-written platform code may declare its own [extern] for such registers without
       including the generated headers, so their symbols must survive. *)
   val register_file_excluded_modules : string list
+
+  (** Function identifiers pinned by [--c-preserve]: callable from hand-written FFI, so [register_file_thread] must not
+      change their signatures. *)
+  val preserved_functions : Ast_compare.IdSet.t
 
   (** Nominal Sail types whose final C declaration is supplied by an external header in an optimized-model build. *)
   val external_types : string Ast_compare.Bindings.t
