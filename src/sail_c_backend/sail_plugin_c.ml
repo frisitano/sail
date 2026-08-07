@@ -66,6 +66,7 @@ let opt_no_rts = ref false
 let opt_preserve_types = ref IdSet.empty
 let opt_specialize_c = ref false
 let opt_require_bounded_int = ref false
+let opt_const_match_tables = ref false
 let opt_specialization_plan_json = ref None
 let opt_specialization_plan_human = ref None
 let opt_specialization_obligations_lean = ref None
@@ -315,6 +316,10 @@ let c_options =
     ( Flag.create ~prefix:["c"] "require_bounded_int",
       Arg.Set opt_require_bounded_int,
       "reject arbitrary-precision integers that need a finite semantic Sail bound"
+    );
+    ( Flag.create ~prefix:["c"] "const_match_tables",
+      Arg.Set opt_const_match_tables,
+      "lower recovered constant-armed switches into static const table lookups"
     );
     ( Flag.create ~prefix:["c"] ~arg:"filename" "specialization_plan",
       Arg.String (fun path -> opt_specialization_plan_json := Some path),
@@ -978,6 +983,7 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let c_static_evaluators = c_static_evaluators
     let specialize_c = !opt_specialize_c
     let require_bounded_int = !opt_require_bounded_int
+    let const_match_tables = !opt_const_match_tables
     let specialization_plan_json = !opt_specialization_plan_json
     let specialization_plan_human = !opt_specialization_plan_human
     let specialization_obligations_lean = !opt_specialization_obligations_lean

@@ -145,6 +145,11 @@ module type CODEGEN_CONFIG = sig
   (** Reject generated C that still requires arbitrary-precision integers. *)
   val require_bounded_int : bool
 
+  (** Lower recovered closed-family switches whose arms produce compile-time constants into [static const] tables
+      indexed by the dense selector tag, and additionally recognize literal-selector ladders over small fixed unsigned
+      integers as switch families. *)
+  val const_match_tables : bool
+
   (** Optional backend-neutral representation-specialization plan outputs. *)
   val specialization_plan_json : string option
 

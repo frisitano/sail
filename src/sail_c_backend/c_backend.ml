@@ -5080,6 +5080,7 @@ module type CODEGEN_CONFIG = sig
   val c_static_evaluators : string Bindings.t
   val specialize_c : bool
   val require_bounded_int : bool
+  val const_match_tables : bool
   val specialization_plan_json : string option
   val specialization_plan_human : string option
   val specialization_obligations_lean : string option
@@ -6737,6 +6738,18 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       )
     | CT_enum id ->
         Option.map (fun members -> IdSet.elements members |> List.map sgen_id) (Bindings.find_opt id ctx.enums)
+    (* Literal ladders over a byte-bounded unsigned selector form a closed
+       family of at most 256 dense tags.  This recognition exists to feed the
+       constant-arm table lowering, so it stays behind the same flag. *)
+    | CT_fuint width when Config.const_match_tables && width <= 8 -> Some (List.init (1 lsl width) string_of_int)
+    | _ -> None
+
+  let literal_switch_label selector literal =
+    match cval_ctyp selector with
+    | CT_fuint width
+      when Config.const_match_tables && width <= 8 && Big_int.less_equal Big_int.zero literal
+           && Big_int.less literal (Big_int.pow_int_positive 2 width) ->
+        Some (Big_int.to_string literal)
     | _ -> None
 
   let rec switch_failure_cases ctx = function
@@ -6748,6 +6761,13 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         Option.map (fun family -> (sgen_cval selector, family, [sgen_id member])) (switch_family_labels ctx selector)
     | V_call (Neq, [selector; V_member (member, _)]) ->
         Option.map (fun family -> (sgen_cval selector, family, [sgen_id member])) (switch_family_labels ctx selector)
+    | V_call (Neq, [V_lit (VL_int literal, _); (V_id _ as selector)])
+    | V_call (Neq, [(V_id _ as selector); V_lit (VL_int literal, _)]) -> (
+        match literal_switch_label selector literal with
+        | Some label ->
+            Option.map (fun family -> (sgen_cval selector, family, [label])) (switch_family_labels ctx selector)
+        | None -> None
+      )
     | V_call (Band, [left; right]) -> (
         match (switch_failure_cases ctx left, switch_failure_cases ctx right) with
         | Some (left_selector, left_family, left_cases), Some (right_selector, right_family, right_cases)
@@ -6858,6 +6878,206 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       | _ -> None
     )
     else None
+
+  (* --c-const-match-tables: a recovered switch arm is "constant" when its
+     body is exactly one return (or one copy) of a value composed entirely of
+     literals and enum members.  Enough such arms lower to a [static const]
+     table indexed by the dense selector tag; payload-reading arms stay in a
+     residual switch whose default reads the table.  Classification runs on
+     the collected arms BEFORE identical-body merging, and the exact-shape
+     requirement rejects any arm carrying additional instructions (including
+     coverage instrumentation calls). *)
+
+  type constant_arm_exit = Constant_arm_return | Constant_arm_copy of Parse_ast.l * clexp * string option
+
+  type constant_switch_table = {
+    table_declaration : document;
+    (* Statement lines for the table read; [in_switch] selects the trailing
+       break when the residual switch survives around them. *)
+    table_read : in_switch:bool -> string list;
+    table_read_declares : bool;
+    residual_cases : (string list * instr list) list;
+  }
+
+  let constant_arm_exits_agree first second =
+    match (first, second) with
+    | Constant_arm_return, Constant_arm_return -> true
+    | Constant_arm_copy (_, first_destination, first_label), Constant_arm_copy (_, second_destination, second_label) ->
+        Stdlib.compare first_destination second_destination = 0 && first_label = second_label
+    | _ -> false
+
+  let rec constant_table_value = function
+    | V_lit ((VL_int _ | VL_bool _ | VL_bits _ | VL_enum _), _) -> true
+    | V_member _ -> true
+    (* Proved representation conversions of literals render as literal
+       constants ([integer_literal_value] recurses only through them). *)
+    | V_call ((Unsigned _ | Zero_extend _), [_]) as conversion -> Option.is_some (integer_literal_value conversion)
+    | V_struct (fields, _) -> List.for_all (fun (_, field_value) -> constant_table_value field_value) fields
+    | V_tuple members -> List.for_all constant_table_value members
+    | _ -> false
+
+  let classify_constant_arm body =
+    match List.filter (function I_aux (I_comment _, _) -> false | _ -> true) body with
+    | [I_aux (I_return value, _)] when constant_table_value value -> Some (Constant_arm_return, value)
+    | [I_aux (I_copy (destination, value), (_, l))] when constant_table_value value ->
+        Some (Constant_arm_copy (l, destination, None), value)
+    | [I_aux (I_copy (destination, value), (_, l)); I_aux (I_goto label, _)] when constant_table_value value ->
+        Some (Constant_arm_copy (l, destination, Some label), value)
+    | _ -> None
+
+  let constant_table_members = function
+    | V_struct (fields, _) -> Some (List.map (fun (field, field_value) -> (sgen_id field, field_value)) fields)
+    | V_tuple members -> Some (List.mapi (fun index member -> (sgen_tuple_id index, member)) members)
+    | _ -> None
+
+  (* Aggregates of nonnegative fixed unsigned literals pack into one integer
+     per table entry, first member in the most significant lanes at its native
+     storage width.  Everything else keeps its aggregate initializer. *)
+  let packed_constant_layout values =
+    let layout_of value =
+      match constant_table_members value with
+      | Some members ->
+          List.fold_right
+            (fun (member_name, member_value) layout ->
+              match (layout, cval_ctyp member_value, integer_literal_value member_value) with
+              | Some fields, CT_fuint width, Some literal when width <= 64 && Big_int.less_equal Big_int.zero literal ->
+                  Some ((member_name, native_c_integer_width width, CT_fuint width) :: fields)
+              | _ -> None
+            )
+            members (Some [])
+      | None -> None
+    in
+    match values with
+    | [] -> None
+    | first :: rest -> (
+        match layout_of first with
+        | Some (_ :: _ as layout) when List.fold_left (fun total (_, width, _) -> total + width) 0 layout <= 64 ->
+            let same_layout value =
+              match layout_of value with
+              | Some other ->
+                  List.length other = List.length layout
+                  && List.for_all2
+                       (fun (name, width, _) (other_name, other_width, _) ->
+                         String.equal name other_name && width = other_width
+                       )
+                       layout other
+              | None -> false
+            in
+            if List.for_all same_layout rest then Some layout else None
+        | _ -> None
+      )
+
+  let packed_constant_entry layout value =
+    let members = Option.get (constant_table_members value) in
+    List.fold_left
+      (fun entry (member_name, width, _) ->
+        let literal = Option.get (integer_literal_value (List.assoc member_name members)) in
+        Big_int.add (Big_int.mul entry (Big_int.pow_int_positive 2 width)) literal
+      )
+      Big_int.zero layout
+
+  let packed_constant_unpack result_ctyp layout entry_expression =
+    let _, members =
+      List.fold_right
+        (fun (member_name, width, member_ctyp) (offset, rendered) ->
+          let shifted = if offset = 0 then entry_expression else sprintf "(%s >> %d)" entry_expression offset in
+          (offset + width, sprintf ".%s = (%s)%s" member_name (sgen_ctyp member_ctyp) shifted :: rendered)
+        )
+        layout (0, [])
+    in
+    sprintf "((%s){%s})" (sgen_ctyp result_ctyp) (String.concat ", " members)
+
+  let rec sgen_constant_table_initializer value =
+    match constant_table_members value with
+    | Some members ->
+        sprintf "{%s}"
+          (Util.string_of_list ", "
+             (fun (member_name, member_value) ->
+               sprintf ".%s = %s" member_name (sgen_constant_table_initializer member_value)
+             )
+             members
+          )
+    | None -> sgen_cval_in_value_context value
+
+  let constant_table_counter = ref 0
+
+  let collected_switch_constant_table ctx selector cases =
+    if (not Config.const_match_tables) || Config.cpp || Option.is_some Config.branch_coverage then None
+    else (
+      let classified = List.map (fun (labels, body) -> (labels, body, classify_constant_arm body)) cases in
+      let constant_arms =
+        List.filter_map (function labels, _, Some (exit, value) -> Some (labels, exit, value) | _ -> None) classified
+      in
+      let residual_cases =
+        List.filter_map (function labels, body, None -> Some (labels, body) | _ -> None) classified
+      in
+      match constant_arms with
+      | (_, first_exit, first_value) :: rest when List.length constant_arms >= 8 ->
+          let result_ctyp = cval_ctyp first_value in
+          if
+            List.for_all
+              (fun (_, exit, value) ->
+                constant_arm_exits_agree first_exit exit && ctyp_equal (cval_ctyp value) result_ctyp
+              )
+              rest
+            && is_stack_ctyp ctx result_ctyp
+            && not (ctyp_equal result_ctyp CT_unit)
+          then (
+            let table = sprintf "sail_const_arms_%d" !constant_table_counter in
+            incr constant_table_counter;
+            let values = List.map (fun (_, _, value) -> value) constant_arms in
+            let element_type, entry_of, read_statements, read_declares =
+              match packed_constant_layout values with
+              | Some layout ->
+                  let total_width =
+                    native_c_integer_width (List.fold_left (fun total (_, width, _) -> total + width) 0 layout)
+                  in
+                  let element_type = sprintf "uint%d_t" total_width in
+                  let entry_of value =
+                    sprintf "UINT%d_C(%s)" total_width (Big_int.to_string (packed_constant_entry layout value))
+                  in
+                  let read exit_of =
+                    sprintf "const %s entry = %s[%s];" element_type table selector
+                    :: exit_of (packed_constant_unpack result_ctyp layout "entry")
+                  in
+                  (element_type, entry_of, read, true)
+              | None ->
+                  let read exit_of = exit_of (sprintf "%s[%s]" table selector) in
+                  (sgen_ctyp result_ctyp, sgen_constant_table_initializer, read, false)
+            in
+            let table_read ~in_switch =
+              let exit_of expression =
+                match first_exit with
+                | Constant_arm_return -> [sprintf "return %s;" expression]
+                | Constant_arm_copy (l, destination, label) ->
+                    sprintf "%s = %s;" (sgen_clexp_pure l destination) expression
+                    ::
+                    ( match label with
+                    | Some target -> [sprintf "goto %s;" target]
+                    | None -> if in_switch then ["break;"] else []
+                    )
+              in
+              read_statements exit_of
+            in
+            let entries =
+              List.concat_map (fun (labels, _, value) -> List.map (fun label -> (label, value)) labels) constant_arms
+            in
+            let table_declaration =
+              string (sprintf "  static const %s %s[] = {" element_type table)
+              ^^ nest 2
+                   (List.fold_left
+                      (fun doc (label, value) ->
+                        doc ^^ hardline ^^ string (sprintf "  [%s] = %s," label (entry_of value))
+                      )
+                      empty entries
+                   )
+              ^^ hardline ^^ string "  };"
+            in
+            Some { table_declaration; table_read; table_read_declares = read_declares; residual_cases }
+          )
+          else None
+      | _ -> None
+    )
 
   let rec codegen_instr fid ctx (I_aux (instr, (_, l))) =
     match instr with
@@ -7321,35 +7541,55 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     in
     let remaining = List.filter (fun label -> not (Util.StringSet.mem label covered)) family in
     let cases = if remaining = [] then cases else cases @ [(remaining, default_body)] in
-    let rendered_cases =
-      List.map
-        (fun (labels, body) ->
-          let body_doc = codegen_case_body body in
-          (labels, body_doc, Document.to_string body_doc)
-        )
-        cases
+    let render_case_labels cases =
+      let rendered_cases =
+        List.map
+          (fun (labels, body) ->
+            let body_doc = codegen_case_body body in
+            (labels, body_doc, Document.to_string body_doc)
+          )
+          cases
+      in
+      let merged_cases =
+        List.fold_left
+          (fun merged (labels, body_doc, key) ->
+            let rec merge reversed = function
+              | [] -> List.rev_append reversed [(labels, body_doc, key)]
+              | (prior_labels, prior_doc, prior_key) :: rest when String.equal key prior_key ->
+                  List.rev_append reversed ((prior_labels @ labels, prior_doc, prior_key) :: rest)
+              | prior :: rest -> merge (prior :: reversed) rest
+            in
+            merge [] merged
+          )
+          [] rendered_cases
+      in
+      let codegen_case (labels, body, _) =
+        separate_map hardline (fun label -> string "  case" ^^ space ^^ string label ^^ colon) labels ^^ body
+      in
+      separate_map hardline codegen_case merged_cases
     in
-    let merged_cases =
-      List.fold_left
-        (fun merged (labels, body_doc, key) ->
-          let rec merge reversed = function
-            | [] -> List.rev_append reversed [(labels, body_doc, key)]
-            | (prior_labels, prior_doc, prior_key) :: rest when String.equal key prior_key ->
-                List.rev_append reversed ((prior_labels @ labels, prior_doc, prior_key) :: rest)
-            | prior :: rest -> merge (prior :: reversed) rest
-          in
-          merge [] merged
-        )
-        [] rendered_cases
-    in
-    let codegen_case (labels, body, _) =
-      separate_map hardline (fun label -> string "  case" ^^ space ^^ string label ^^ colon) labels ^^ body
-    in
-    string "  switch" ^^ space
-    ^^ parens (string selector)
-    ^^ space ^^ lbrace ^^ hardline
-    ^^ separate_map hardline codegen_case merged_cases
-    ^^ hardline ^^ string "  }"
+    match collected_switch_constant_table ctx selector cases with
+    | Some lowering ->
+        let read_doc in_switch =
+          let statements = separate_map hardline (fun line -> string ("  " ^ line)) (lowering.table_read ~in_switch) in
+          if not in_switch then statements
+          else if lowering.table_read_declares then
+            hardline ^^ string "  {" ^^ nest 2 (hardline ^^ statements) ^^ hardline ^^ string "  }"
+          else nest 2 (hardline ^^ statements)
+        in
+        lowering.table_declaration ^^ hardline
+        ^^
+        if lowering.residual_cases = [] then read_doc false
+        else
+          string "  switch" ^^ space
+          ^^ parens (string selector)
+          ^^ space ^^ lbrace ^^ hardline
+          ^^ render_case_labels lowering.residual_cases
+          ^^ hardline ^^ string "  default:" ^^ read_doc true ^^ hardline ^^ string "  }"
+    | None ->
+        string "  switch" ^^ space
+        ^^ parens (string selector)
+        ^^ space ^^ lbrace ^^ hardline ^^ render_case_labels cases ^^ hardline ^^ string "  }"
 
   and codegen_instrs ?(function_tail = false) fid ctx instrs =
     let split_simple_loop loop_label end_label instrs =
@@ -12231,8 +12471,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       let managed_model_cdefs =
         List.filter
           (function
-            | CDEF_aux (CDEF_type ctyp_def, _) ->
-                not (Bindings.mem (ctype_def_id ctyp_def) Config.external_type_names)
+            | CDEF_aux (CDEF_type ctyp_def, _) -> not (Bindings.mem (ctype_def_id ctyp_def) Config.external_type_names)
             | _ -> true
             )
           cdefs
@@ -12243,7 +12482,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         cdefs_contain ctx (function CT_json | CT_json_key -> true | _ -> false) managed_model_cdefs
       in
       let is_managed_ctyp = function
-        | CT_lint | CT_lbits | CT_real | CT_string | CT_list _ | CT_vector _ | CT_memory_writes | CT_json | CT_json_key ->
+        | CT_lint | CT_lbits | CT_real | CT_string | CT_list _ | CT_vector _ | CT_memory_writes | CT_json | CT_json_key
+          ->
             true
         | _ -> false
       in
