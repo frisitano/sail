@@ -7020,6 +7020,11 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | _ -> None
 
   let rec switch_failure_cases ctx = function
+    (* Branch-inversion cleanups leave failure conditions as [Bnot (Eq ...)];
+       codegen renders that as [!=], so recognize it as the same exclusion.
+       Kept behind the table flag so builds without it stay byte-identical. *)
+    | V_call (Bnot, [V_call (Eq, [left; right])]) when Config.const_match_tables ->
+        switch_failure_cases ctx (V_call (Neq, [left; right]))
     | V_ctor_kind (selector, ctor) ->
         Option.map
           (fun family -> (sgen_cval selector ^ ".kind", family, ["Kind_" ^ sgen_uid ctor]))
@@ -7028,9 +7033,19 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         Option.map (fun family -> (sgen_cval selector, family, [sgen_id member])) (switch_family_labels ctx selector)
     | V_call (Neq, [selector; V_member (member, _)]) ->
         Option.map (fun family -> (sgen_cval selector, family, [sgen_id member])) (switch_family_labels ctx selector)
-    | V_call (Neq, [V_lit (VL_int literal, _); (V_id _ as selector)])
-    | V_call (Neq, [(V_id _ as selector); V_lit (VL_int literal, _)]) -> (
-        match literal_switch_label selector literal with
+    (* Specialization rewrites the match literal into its proved narrow
+       representation, so the comparison operand is frequently a converted
+       literal ([Unsigned]/[Zero_extend] of an integer literal) rather than a
+       bare [V_lit].  [integer_literal_value] recovers the same constant from
+       both forms. *)
+    | V_call (Neq, [literal; (V_id _ as selector)]) when Option.is_some (integer_literal_value literal) -> (
+        match literal_switch_label selector (Option.get (integer_literal_value literal)) with
+        | Some label ->
+            Option.map (fun family -> (sgen_cval selector, family, [label])) (switch_family_labels ctx selector)
+        | None -> None
+      )
+    | V_call (Neq, [(V_id _ as selector); literal]) when Option.is_some (integer_literal_value literal) -> (
+        match literal_switch_label selector (Option.get (integer_literal_value literal)) with
         | Some label ->
             Option.map (fun family -> (sgen_cval selector, family, [label])) (switch_family_labels ctx selector)
         | None -> None
@@ -7183,13 +7198,43 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | V_tuple members -> List.for_all constant_table_value members
     | _ -> false
 
-  let classify_constant_arm body =
+  (* A table arm produces either a pure constant value or, for a nullary
+     union-constructor application, a constant kind tag.  Under the optimized
+     model a nullary constructor lowers to a by-value struct whose only
+     meaningful content is [.kind], so a family of such arms is exactly a
+     table of kind values. *)
+  type constant_arm_table_value = Constant_table_cval of cval | Constant_table_kind of string * ctyp
+
+  let nullary_constructor_kind ctx destination callee args =
+    match clexp_ctyp destination with
+    | CT_variant _ as variant_ctyp
+      when is_variant_constructor ctx (fst callee)
+           && List.for_all (fun arg -> ctyp_equal (cval_ctyp arg) CT_unit) args ->
+        Some ("Kind_" ^ sgen_uid callee, variant_ctyp)
+    | _ -> None
+
+  let classify_constant_arm ctx body =
     match List.filter (function I_aux (I_comment _, _) -> false | _ -> true) body with
-    | [I_aux (I_return value, _)] when constant_table_value value -> Some (Constant_arm_return, value)
+    | [I_aux (I_return value, _)] when constant_table_value value ->
+        Some (Constant_arm_return, Constant_table_cval value)
     | [I_aux (I_copy (destination, value), (_, l))] when constant_table_value value ->
-        Some (Constant_arm_copy (l, destination, None), value)
+        Some (Constant_arm_copy (l, destination, None), Constant_table_cval value)
     | [I_aux (I_copy (destination, value), (_, l)); I_aux (I_goto label, _)] when constant_table_value value ->
-        Some (Constant_arm_copy (l, destination, Some label), value)
+        Some (Constant_arm_copy (l, destination, Some label), Constant_table_cval value)
+    | [I_aux (I_funcall (CR_one destination, Call _, callee, args), (_, l))] -> (
+        match (nullary_constructor_kind ctx destination callee args, destination) with
+        | Some (kind, variant_ctyp), CL_id (Return _, _) ->
+            Some (Constant_arm_return, Constant_table_kind (kind, variant_ctyp))
+        | Some (kind, variant_ctyp), _ ->
+            Some (Constant_arm_copy (l, destination, None), Constant_table_kind (kind, variant_ctyp))
+        | None, _ -> None
+      )
+    | [I_aux (I_funcall (CR_one destination, Call _, callee, args), (_, l)); I_aux (I_goto label, _)] -> (
+        match nullary_constructor_kind ctx destination callee args with
+        | Some (kind, variant_ctyp) ->
+            Some (Constant_arm_copy (l, destination, Some label), Constant_table_kind (kind, variant_ctyp))
+        | None -> None
+      )
     | _ -> None
 
   let constant_table_members = function
@@ -7271,20 +7316,40 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let collected_switch_constant_table ctx selector cases =
     if (not Config.const_match_tables) || Config.cpp || Option.is_some Config.branch_coverage then None
     else (
-      let classified = List.map (fun (labels, body) -> (labels, body, classify_constant_arm body)) cases in
+      let classified = List.map (fun (labels, body) -> (labels, body, classify_constant_arm ctx body)) cases in
+      let kind_arm_present =
+        List.exists (function _, _, Some (_, Constant_table_kind _) -> true | _ -> false) classified
+      in
+      let cval_arm_present =
+        List.exists (function _, _, Some (_, Constant_table_cval _) -> true | _ -> false) classified
+      in
+      (* Kind and value arms never share one table element type.  On a mixed
+         match the kind arms return to the residual switch, exactly as before
+         they became classifiable, and the value arms keep their table. *)
+      let classified =
+        if kind_arm_present && cval_arm_present then
+          List.map
+            (function labels, body, Some (_, Constant_table_kind _) -> (labels, body, None) | arm -> arm)
+            classified
+        else classified
+      in
       let constant_arms =
         List.filter_map (function labels, _, Some (exit, value) -> Some (labels, exit, value) | _ -> None) classified
       in
       let residual_cases =
         List.filter_map (function labels, body, None -> Some (labels, body) | _ -> None) classified
       in
+      let table_value_ctyp = function
+        | Constant_table_cval value -> cval_ctyp value
+        | Constant_table_kind (_, variant_ctyp) -> variant_ctyp
+      in
       match constant_arms with
       | (_, first_exit, first_value) :: rest when List.length constant_arms >= 8 ->
-          let result_ctyp = cval_ctyp first_value in
+          let result_ctyp = table_value_ctyp first_value in
           if
             List.for_all
               (fun (_, exit, value) ->
-                constant_arm_exits_agree first_exit exit && ctyp_equal (cval_ctyp value) result_ctyp
+                constant_arm_exits_agree first_exit exit && ctyp_equal (table_value_ctyp value) result_ctyp
               )
               rest
             && is_stack_ctyp ctx result_ctyp
@@ -7292,55 +7357,108 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           then (
             let table = sprintf "sail_const_arms_%d" !constant_table_counter in
             incr constant_table_counter;
-            let values = List.map (fun (_, _, value) -> value) constant_arms in
-            let element_type, entry_of, read_statements, read_declares =
-              match packed_constant_layout values with
-              | Some layout ->
-                  let total_width =
-                    native_c_integer_width (List.fold_left (fun total (_, width, _) -> total + width) 0 layout)
-                  in
-                  let element_type = sprintf "uint%d_t" total_width in
-                  let entry_of value =
-                    sprintf "UINT%d_C(%s)" total_width (Big_int.to_string (packed_constant_entry layout value))
-                  in
-                  let read exit_of =
-                    sprintf "const %s entry = %s[%s];" element_type table selector
-                    :: exit_of (packed_constant_unpack result_ctyp layout "entry")
-                  in
-                  (element_type, entry_of, read, true)
-              | None ->
-                  let read exit_of = exit_of (sprintf "%s[%s]" table selector) in
-                  (sgen_ctyp result_ctyp, sgen_constant_table_initializer, read, false)
-            in
-            let table_read ~in_switch =
-              let exit_of expression =
-                match first_exit with
-                | Constant_arm_return -> [sprintf "return %s;" expression]
-                | Constant_arm_copy (l, destination, label) ->
-                    sprintf "%s = %s;" (sgen_clexp_pure l destination) expression
-                    ::
-                    ( match label with
-                    | Some target -> [sprintf "goto %s;" target]
-                    | None -> if in_switch then ["break;"] else []
-                    )
-              in
-              read_statements exit_of
-            in
-            let entries =
-              List.concat_map (fun (labels, _, value) -> List.map (fun label -> (label, value)) labels) constant_arms
-            in
-            let table_declaration =
-              string (sprintf "  static const %s %s[] = {" element_type table)
-              ^^ nest 2
-                   (List.fold_left
-                      (fun doc (label, value) ->
-                        doc ^^ hardline ^^ string (sprintf "  [%s] = %s," label (entry_of value))
+            match first_value with
+            | Constant_table_kind _ ->
+                (* Nullary constructors carry no payload, so the table stores
+                   only the kind enum and the read writes only [.kind]: the
+                   union bytes stay exactly as indeterminate as an ordinary
+                   nullary-constructor call leaves its unused members. *)
+                let variant_id =
+                  match result_ctyp with
+                  | CT_variant (id, _) -> id
+                  | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "constant kind table over non-variant type"
+                in
+                let element_type = sprintf "enum kind_%s" (sgen_id variant_id) in
+                let table_read ~in_switch =
+                  match first_exit with
+                  | Constant_arm_return -> [sprintf "return ((%s){.kind = %s[%s]});" (sgen_ctyp result_ctyp) table selector]
+                  | Constant_arm_copy (l, destination, label) ->
+                      sprintf "%s.kind = %s[%s];" (sgen_clexp_pure l destination) table selector
+                      ::
+                      ( match label with
+                      | Some target -> [sprintf "goto %s;" target]
+                      | None -> if in_switch then ["break;"] else []
                       )
-                      empty entries
-                   )
-              ^^ hardline ^^ string "  };"
-            in
-            Some { table_declaration; table_read; table_read_declares = read_declares; residual_cases }
+                in
+                let entries =
+                  List.concat_map
+                    (fun (labels, _, value) ->
+                      match value with
+                      | Constant_table_kind (kind, _) -> List.map (fun label -> (label, kind)) labels
+                      | Constant_table_cval _ -> []
+                    )
+                    constant_arms
+                in
+                let table_declaration =
+                  string (sprintf "  static const %s %s[] = {" element_type table)
+                  ^^ nest 2
+                       (List.fold_left
+                          (fun doc (label, kind) -> doc ^^ hardline ^^ string (sprintf "  [%s] = %s," label kind))
+                          empty entries
+                       )
+                  ^^ hardline ^^ string "  };"
+                in
+                Some { table_declaration; table_read; table_read_declares = false; residual_cases }
+            | Constant_table_cval _ ->
+                let values =
+                  List.filter_map
+                    (function _, _, Constant_table_cval value -> Some value | _ -> None)
+                    constant_arms
+                in
+                let element_type, entry_of, read_statements, read_declares =
+                  match packed_constant_layout values with
+                  | Some layout ->
+                      let total_width =
+                        native_c_integer_width (List.fold_left (fun total (_, width, _) -> total + width) 0 layout)
+                      in
+                      let element_type = sprintf "uint%d_t" total_width in
+                      let entry_of value =
+                        sprintf "UINT%d_C(%s)" total_width (Big_int.to_string (packed_constant_entry layout value))
+                      in
+                      let read exit_of =
+                        sprintf "const %s entry = %s[%s];" element_type table selector
+                        :: exit_of (packed_constant_unpack result_ctyp layout "entry")
+                      in
+                      (element_type, entry_of, read, true)
+                  | None ->
+                      let read exit_of = exit_of (sprintf "%s[%s]" table selector) in
+                      (sgen_ctyp result_ctyp, sgen_constant_table_initializer, read, false)
+                in
+                let table_read ~in_switch =
+                  let exit_of expression =
+                    match first_exit with
+                    | Constant_arm_return -> [sprintf "return %s;" expression]
+                    | Constant_arm_copy (l, destination, label) ->
+                        sprintf "%s = %s;" (sgen_clexp_pure l destination) expression
+                        ::
+                        ( match label with
+                        | Some target -> [sprintf "goto %s;" target]
+                        | None -> if in_switch then ["break;"] else []
+                        )
+                  in
+                  read_statements exit_of
+                in
+                let entries =
+                  List.concat_map
+                    (fun (labels, _, value) ->
+                      match value with
+                      | Constant_table_cval value -> List.map (fun label -> (label, value)) labels
+                      | Constant_table_kind _ -> []
+                    )
+                    constant_arms
+                in
+                let table_declaration =
+                  string (sprintf "  static const %s %s[] = {" element_type table)
+                  ^^ nest 2
+                       (List.fold_left
+                          (fun doc (label, value) ->
+                            doc ^^ hardline ^^ string (sprintf "  [%s] = %s," label (entry_of value))
+                          )
+                          empty entries
+                       )
+                  ^^ hardline ^^ string "  };"
+                in
+                Some { table_declaration; table_read; table_read_declares = read_declares; residual_cases }
           )
           else None
       | _ -> None
