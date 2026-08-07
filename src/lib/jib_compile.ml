@@ -6769,9 +6769,21 @@ module Make (C : CONFIG) = struct
                   | Some _ | None -> result_lifetime
                 in
                 let result_lifetime =
+                  (* A subtrahend-not-above-minuend ordering proof implies the
+                     exact difference is nonnegative.  Callers prove the
+                     ordering on their own argument types, while the direct
+                     result proof is attempted on the callee's freshened
+                     signature return type (e.g. int('n - 'm)), whose
+                     variables are never instantiated in the caller
+                     environment; treat the ordering proof as result evidence
+                     so guarded subtractions keep their nonnegative lower
+                     bound. *)
                   match result_lifetime with
                   | Lifetime_range (lower, upper)
-                    when primitive = `Sub && Jib_semantics.has_result_nonnegative semantic_proofs ->
+                    when primitive = `Sub
+                         && (Jib_semantics.has_result_nonnegative semantic_proofs
+                            || Jib_semantics.has_argument_le ~left:1 ~right:0 semantic_proofs
+                            ) ->
                       Lifetime_range (Big_int.max Big_int.zero lower, upper)
                   | result -> result
                 in
