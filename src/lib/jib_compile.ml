@@ -5617,7 +5617,11 @@ module Make (C : CONFIG) = struct
         (function
           | CDEF_aux (CDEF_fundef (id, heap_return, params, _), fundef_annot) as cdef -> (
               match Bindings.find_opt id valspecs with
-              | Some ([], param_ctyps, ret_ctyp, None, _) -> (
+              (* A spliced override is an explicit refinement of the canonical
+                 function; it must win over the backend's built-in support
+                 routine for the same name and ABI. *)
+              | Some ([], param_ctyps, ret_ctyp, None, _)
+                when Option.is_none (get_def_attribute "spliced" fundef_annot) -> (
                   match C.specialized_function_external id param_ctyps ret_ctyp with
                   | Some external_id ->
                       if List.compare_lengths params param_ctyps <> 0 then
@@ -7267,7 +7271,13 @@ module Make (C : CONFIG) = struct
           in
           let visitor = new specialize_parameter_representations replacements ret_ctyp actual_ret_ctyp in
           let body =
-            match C.specialized_function_external id actual_ctyps actual_ret_ctyp with
+            (* Spliced overrides also win in representation clones; see the
+               original-body selection above. *)
+            match
+              (if Option.is_some (get_def_attribute "spliced" fundef_annot) then None
+               else C.specialized_function_external id actual_ctyps actual_ret_ctyp
+              )
+            with
             | Some external_id ->
                 let l = id_loc id in
                 let args = List.map2 (fun param ctyp -> V_id (param, ctyp)) params actual_ctyps in
