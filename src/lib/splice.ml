@@ -55,10 +55,10 @@ open Ast_defs
 open Ast_util
 
 let scan_ast { defs; _ } =
-  let scan (ids, specs, type_defs) (DEF_aux (aux, _) as def) =
+  let scan (ids, specs, type_defs) (DEF_aux (aux, def_annot) as def) =
     match aux with
     | DEF_fundef fd -> (IdSet.add (id_of_fundef fd) ids, specs, type_defs)
-    | DEF_val (VS_aux (VS_val_spec (_, id, _), _) as vs) -> (ids, Bindings.add id vs specs, type_defs)
+    | DEF_val (VS_aux (VS_val_spec (_, id, _), _) as vs) -> (ids, Bindings.add id (vs, def_annot) specs, type_defs)
     | DEF_type td -> (ids, specs, Bindings.add (id_of_type_def td) def type_defs)
     | DEF_pragma (("file_start" | "file_end"), _) -> (ids, specs, type_defs)
     | _ ->
@@ -80,7 +80,14 @@ let filter_old_ast repl_ids repl_specs repl_types { defs; _ } =
         else (def :: rdefs, specs_found, types_found)
     | DEF_val (VS_aux (VS_val_spec (_, id, _), _)) -> (
         match Bindings.find_opt id repl_specs with
-        | Some vs -> (DEF_aux (DEF_val vs, def_annot) :: rdefs, IdSet.add id specs_found, types_found)
+        (* Keep the replacement's def_annot so attribute-only val splices
+           (e.g. $[c_inline] on a spec-defined function) survive, mirroring
+           how replacement type definitions already retain their attributes. *)
+        | Some (vs, repl_annot) ->
+            ( DEF_aux (DEF_val vs, { repl_annot with loc = def_annot.loc }) :: rdefs,
+              IdSet.add id specs_found,
+              types_found
+            )
         | None -> (def :: rdefs, specs_found, types_found)
       )
     | DEF_type td -> (

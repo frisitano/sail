@@ -323,6 +323,10 @@ let c_options =
       Arg.Set opt_const_match_tables,
       "lower recovered constant-armed switches into static const table lookups"
     );
+    ( Flag.create ~prefix:["c"] "inline_attr",
+      Arg.Set C_backend.optimize_inline_attr,
+      "inline calls to $[c_inline]-annotated Sail functions in generated C"
+    );
     ( Flag.create ~prefix:["c"] ~arg:"filename" "specialization_plan",
       Arg.String (fun path -> opt_specialization_plan_json := Some path),
       "write a deterministic backend-neutral specialization plan as JSON"

@@ -79,6 +79,7 @@ let optimize_fixed_int = ref false
 let optimize_fixed_bits = ref false
 let optimize_stack_aggregates = ref false
 let optimize_unit_results = ref false
+let optimize_inline_attr = ref false
 
 let ngensym = symbol_generator ()
 
@@ -2199,6 +2200,175 @@ let rec insert_heap_returns ctx ret_ctyps = function
       Reporting.unreachable (id_loc id) __POS__ "Found function with return already re-written in insert_heap_returns"
   | cdef :: cdefs -> cdef :: insert_heap_returns ctx ret_ctyps cdefs
   | [] -> []
+
+(* == --c-inline-attr ======================================================
+   Calls to functions carrying the $[c_inline] attribute are inlined into
+   their callers with the generic JIB inliner.  This MUST run before
+   [insert_heap_returns]: the inliner substitutes the canonical JIB return
+   protocol (writes to the [return] name followed by [I_end]/[I_undefined]),
+   which insert_heap_returns rewrites into [I_return]/heap-return pointers
+   that [Jib_optimize.inline] does not understand.  Exception control flow
+   is already lowered by this point (jib_compile's fix_exception), so an
+   inlined body's exception exits fall through to the caller's existing
+   have_exception check after its call site.
+
+   The attribute is read from the CDEF_fundef def_annot, so specialized
+   clones (which share the annotated definition's def_annot) inline exactly
+   like their source function.  Marked functions are still emitted as
+   ordinary definitions; only their call sites change.
+
+   The inliner freshens labels but not declared locals, so a caller and an
+   inlined body may declare the same source-named local.  The later custom
+   copy/alias passes assume declaration names are unique per function body,
+   so [uniquify_inlined_declarations] re-runs the compile-time uniquing over
+   the merged body. *)
+let c_inline_attribute = "c_inline"
+
+let has_c_inline_attribute def_annot = Option.is_some (get_def_attribute c_inline_attribute def_annot)
+
+(* Copy $[c_inline] from val specs onto their function definitions: the
+   optimized model attaches the attribute through attribute-only val splices,
+   and jib_compile builds each CDEF_fundef def_annot from the DEF_fundef. *)
+let propagate_inline_attributes ast =
+  let open Ast_defs in
+  let annotated_specs =
+    List.fold_left
+      (fun ids (DEF_aux (def, def_annot)) ->
+        match def with
+        | DEF_val (VS_aux (VS_val_spec (_, id, _), _)) when has_c_inline_attribute def_annot -> IdSet.add id ids
+        | _ -> ids
+      )
+      IdSet.empty ast.defs
+  in
+  if IdSet.is_empty annotated_specs then ast
+  else
+    {
+      ast with
+      defs =
+        List.map
+          (fun (DEF_aux (def, def_annot) as full_def) ->
+            match def with
+            | DEF_fundef fd when IdSet.mem (id_of_fundef fd) annotated_specs && not (has_c_inline_attribute def_annot)
+              ->
+                DEF_aux (def, add_def_attribute (gen_loc def_annot.loc) c_inline_attribute None def_annot)
+            | _ -> full_def
+          )
+          ast.defs;
+    }
+
+let uniquify_inlined_declarations instrs =
+  let unique_id ctyp = function
+    | Name (id, _) -> ngensym ~source_name:(string_of_id id) ~source_type:(string_of_ctyp ctyp) ()
+    | Gen (_, _, _, source_name, source_type) -> ngensym ?source_name ?source_type ()
+    | _ -> ngensym ~source_name:"value" ~source_type:(string_of_ctyp ctyp) ()
+  in
+  let rec go seen = function
+    | I_aux (I_decl (ctyp, id), aux) :: instrs when NameSet.mem id seen ->
+        let id' = unique_id ctyp id in
+        let instrs', seen = go seen instrs in
+        (I_aux (I_decl (ctyp, id'), aux) :: instrs_rename id id' instrs', seen)
+    | I_aux (I_decl (ctyp, id), aux) :: instrs ->
+        let instrs', seen = go (NameSet.add id seen) instrs in
+        (I_aux (I_decl (ctyp, id), aux) :: instrs', seen)
+    | I_aux (I_init (ctyp, id, init), aux) :: instrs when NameSet.mem id seen ->
+        let id' = unique_id ctyp id in
+        let instrs', seen = go seen instrs in
+        (I_aux (I_init (ctyp, id', init), aux) :: instrs_rename id id' instrs', seen)
+    | I_aux (I_init (ctyp, id, init), aux) :: instrs ->
+        let instrs', seen = go (NameSet.add id seen) instrs in
+        (I_aux (I_init (ctyp, id, init), aux) :: instrs', seen)
+    | I_aux (I_block block, aux) :: instrs ->
+        let block', seen = go seen block in
+        let instrs', seen = go seen instrs in
+        (I_aux (I_block block', aux) :: instrs', seen)
+    | I_aux (I_try_block block, aux) :: instrs ->
+        let block', seen = go seen block in
+        let instrs', seen = go seen instrs in
+        (I_aux (I_try_block block', aux) :: instrs', seen)
+    | I_aux (I_if (cval, then_instrs, else_instrs), aux) :: instrs ->
+        let then_instrs', seen = go seen then_instrs in
+        let else_instrs', seen = go seen else_instrs in
+        let instrs', seen = go seen instrs in
+        (I_aux (I_if (cval, then_instrs', else_instrs'), aux) :: instrs', seen)
+    | instr :: instrs ->
+        let instrs', seen = go seen instrs in
+        (instr :: instrs', seen)
+    | [] -> ([], seen)
+  in
+  fst (go NameSet.empty instrs)
+
+let inline_marked_functions cdefs =
+  let marked =
+    List.fold_left
+      (fun marked -> function
+        | CDEF_aux (CDEF_fundef (id, Return_plain, _, _), def_annot) when has_c_inline_attribute def_annot ->
+            IdSet.add id marked
+        | _ -> marked
+        )
+      IdSet.empty cdefs
+  in
+  if IdSet.is_empty marked then cdefs
+  else (
+    let direct_marked_calls body =
+      List.fold_left
+        (fun calls instr ->
+          let found = ref calls in
+          iter_instr
+            (function
+              | I_aux (I_funcall (_, Call _, (fid, _), _), _) when IdSet.mem fid marked ->
+                  found := IdSet.add fid !found
+              | _ -> ()
+              )
+            instr;
+          !found
+        )
+        IdSet.empty body
+    in
+    let marked_edges =
+      List.fold_left
+        (fun edges -> function
+          | CDEF_aux (CDEF_fundef (id, Return_plain, _, body), _) when IdSet.mem id marked ->
+              Bindings.add id (direct_marked_calls body) edges
+          | _ -> edges
+          )
+        Bindings.empty cdefs
+    in
+    (* Reject marked cycles up front: the fixpoint inliner would re-expand a
+       recursive marked call forever. *)
+    let rec closure acc frontier =
+      if IdSet.is_empty frontier then acc
+      else (
+        let next =
+          IdSet.fold
+            (fun id next ->
+              match Bindings.find_opt id marked_edges with
+              | Some callees -> IdSet.union callees next
+              | None -> next
+            )
+            frontier IdSet.empty
+        in
+        let fresh = IdSet.diff next acc in
+        closure (IdSet.union acc fresh) fresh
+      )
+    in
+    IdSet.iter
+      (fun id ->
+        let callees = Option.value ~default:IdSet.empty (Bindings.find_opt id marked_edges) in
+        if IdSet.mem id (closure callees callees) then
+          c_error ~loc:(id_loc id) ("$[c_inline] function " ^ string_of_id id ^ " is (mutually) recursive")
+      )
+      marked;
+    List.map
+      (function
+        | CDEF_aux (CDEF_fundef (id, heap_return, args, body), def_annot)
+          when (not (IdSet.mem id marked)) && not (IdSet.is_empty (direct_marked_calls body)) ->
+            let body = Jib_optimize.inline cdefs (fun call -> IdSet.mem call marked) body in
+            let body = uniquify_inlined_declarations body in
+            CDEF_aux (CDEF_fundef (id, heap_return, args, body), def_annot)
+        | cdef -> cdef
+        )
+      cdefs
+  )
 
 (**************************************************************************)
 (* 5. Optimizations                                                       *)
@@ -12530,9 +12700,13 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           format
       in
       let self_dependent_assignments = self_dependent_assignments ast in
+      let ast = if !optimize_inline_attr then propagate_inline_attributes ast else ast in
       log_phase "lowering Sail AST to JIB";
       let cdefs, ctx = jib_of_ast env effect_info ast in
       log_phase "lowered JIB definitions=%d" (List.length cdefs);
+      (* --c-inline-attr must run before insert_heap_returns rewrites the
+         canonical JIB return protocol the generic inliner substitutes. *)
+      let cdefs = if !optimize_inline_attr then inline_marked_functions cdefs else cdefs in
       (* let cdefs', _ = Jib_optimize.remove_tuples cdefs ctx in *)
       let cdefs = insert_heap_returns ctx Bindings.empty cdefs in
       let cdefs, fixed_bitvector_fusions =
