@@ -641,6 +641,32 @@ let dependent_types_equivalent ctx left right =
       (expand_synonyms_for_dependent_type ctx right)
   with Type_internal.Type_error _ -> false
 
+(* Sail's flow typing refines type indices inside a branch, so a value whose
+   own type mentions concrete indices can be accepted where the branch result
+   type mentions the tested variable. Lean learns nothing from the Bool test,
+   so the two record applications stay distinct types there and the value has
+   to be cast under the branch hypothesis. Only record applications whose
+   arguments are all indices qualify: their Lean parameters carry no data, and
+   any genuine type argument would need a coercion of its own. *)
+let index_refined_record_typ ctx expected actual =
+  let expected = expand_synonyms_for_dependent_type ctx expected in
+  let actual = expand_synonyms_for_dependent_type ctx actual in
+  let all_index_args args = List.for_all (function A_aux (A_nexp _, _) -> true | _ -> false) args in
+  match (expected, actual) with
+  | Typ_aux (Typ_app (expected_id, expected_args), _), Typ_aux (Typ_app (actual_id, actual_args), _) ->
+      Id.compare expected_id actual_id = 0
+      && Bindings.mem expected_id ctx.global.semantic_types.record_fields
+      && expected_args <> []
+      && all_index_args expected_args
+      && all_index_args actual_args
+      && not (dependent_types_equivalent ctx expected actual)
+  | _ -> false
+
+(* The equality between the two record applications follows from the branch
+   hypothesis, which Lean has in scope as a Bool equation. *)
+let doc_index_refinement_cast value =
+  parens (string "cast (by first | rfl | simp_all) " ^^ parens value)
+
 let prop_dependent_alias_id_for_typ ctx typ =
   match typ with
   | Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, _), _) when prop_dependent_alias id -> Some id
@@ -3850,6 +3876,7 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
           log_dependent_representation typ e represented representation_typ
             needs_repack
       in
+      let refines_index = (not target_dependent) && index_refined_record_typ ctx typ (typ_of e) in
       if target_dependent && expression_never_returns e then
         doc_exp as_monadic
           { expression_ctx with expected_dependent = None }
@@ -3875,9 +3902,24 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
               )
           in
           if as_monadic then computation else parens (leftarrow ^^ space ^^ computation)
+        else if refines_index then (
+          let computation =
+            parens
+              (prefix 2 1 (string "do")
+                 (separate hardline
+                    [
+                      string "let indexRefinedResult " ^^ leftarrow ^^ space ^^ doc_exp true expression_ctx e;
+                      string "pure " ^^ doc_index_refinement_cast (string "indexRefinedResult");
+                    ]
+                 )
+              )
+          in
+          if as_monadic then computation else parens (leftarrow ^^ space ^^ computation)
+        )
         else doc_exp as_monadic expression_ctx e
       else
         let value = doc_exp false expression_ctx e in
+        let value = if refines_index then doc_index_refinement_cast value else value in
         let value =
           if should_pack then
             pack_expected value
@@ -4376,14 +4418,20 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
         | _ -> failwith ("assign " ^ string_of_lexp le ^ "not implemented yet")
         )
   | E_if (i, t, e) ->
+      let index_refined branch = index_refined_record_typ ctx (typ_of full_exp) (typ_of branch) in
+      let refines_index = index_refined t || index_refined e in
       let t, e =
         if has_dependent_type ctx (typ_of full_exp) then
           (annotate_dependent_tail (typ_of full_exp) t, annotate_dependent_tail (typ_of full_exp) e)
+        else if refines_index then
+          ( (if index_refined t then annotate_dependent_tail (typ_of full_exp) t else t),
+            if index_refined e then annotate_dependent_tail (typ_of full_exp) e else e
+          )
         else (t, e)
       in
       let statements_monadic = as_monadic || has_effect t || has_effect e in
       let condition =
-        if has_dependent_type ctx (typ_of full_exp) then
+        if has_dependent_type ctx (typ_of full_exp) || refines_index then
           string "if " ^^ name_if_hypothesis ctx ^^ string " : ("
           ^^ nest 1 (d_of_arg ctx i)
           ^^ string " : Bool) = true"
