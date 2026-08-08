@@ -24,6 +24,16 @@ let opt_prop_dependent_types : (string * string) list ref = ref []
 
 let opt_infer_prop_dependent_types : bool ref = ref false
 
+(* Whether Sail's constraints are carried into Lean as proof obligations: a
+   proof field on every constrained struct and a hypothesis on every function
+   signature, both discharged by tactic.  This states in Lean what the Sail
+   types actually say, but it only elaborates where the surrounding Lean types
+   still carry the facts the obligation needs -- which erased `range` types,
+   union payloads and dependent result bounds currently do not.  Off by
+   default so the ordinary extraction stays buildable; see the Lean backend
+   notes for what has to be restored first. *)
+let opt_constraint_obligations : bool ref = ref false
+
 let inferred_prop_dependent_records : string list ref = ref []
 
 let prop_dependent_mode_active () =
@@ -5015,7 +5025,44 @@ let doc_funcl_init global (FCL_aux (FCL_funcl (id, pexp), annot)) =
         )
         tq
       |> List.filter_map Fun.id
-    else []
+    else if not !opt_constraint_obligations then []
+    else
+      (* Sail discharges a function's constraints at every call site, so its
+         body may rely on them.  Lean has to be told: without them a validity
+         obligation raised inside the body -- constructing a constrained
+         record, refining an index -- has no facts to work from.  They are
+         autoParams, so an ordinary call site still passes nothing and the
+         caller's own hypotheses discharge them.
+
+         Only constraints whose variables the rendered signature actually
+         binds can be stated; one over a variable Lean never sees would
+         auto-bind a fresh implicit that no call site could determine. *)
+      let env = try Env.add_typquant Unknown tq ctx.env with Type_internal.Type_error _ -> ctx.env in
+      let constraint_var_available kid =
+        KidSet.mem kid ctx.function_bound_nvars
+        || (match KBindings.find_opt kid ctx.kid_id_renames with Some (Some _) -> true | _ -> false)
+      in
+      List.mapi
+        (fun index (QI_aux (item, _)) ->
+          match item with
+          | QI_constraint nc when KidSet.for_all constraint_var_available (tyvars_of_constraint nc) ->
+              let nc = try Env.expand_constraint_synonyms env nc with Type_internal.Type_error _ -> nc in
+              Some
+                (parens
+                   (flow (break 1)
+                      [
+                        string (Printf.sprintf "_sailConstraint%i" index);
+                        colon;
+                        doc_nconstraint ctx nc;
+                        coloneq;
+                        doc_discharge_by;
+                      ]
+                   )
+                )
+          | _ -> None
+        )
+        tq
+      |> List.filter_map Fun.id
   in
   (* Use auto-implicits for type quanitifiers for now and see if this works *)
   let doc_ret_typ_orig =
@@ -5546,6 +5593,34 @@ let doc_record_index_projections ctx id tq fields =
     )
     fields
 
+(* Sail attaches a constraint to a struct declaration, and it is that
+   constraint -- not the field types -- that rules out the index combinations
+   the specification forbids.  Dropping it makes the Lean type strictly weaker
+   than the Sail one, so it becomes a proof field over the index parameters.
+   The obligation is stated expanded, because the Bool type synonyms it is
+   written with are opaque to the arithmetic tactics. *)
+let record_validity_constraint ctx tq =
+  let constraints = List.filter_map (function QI_aux (QI_constraint nc, _) -> Some nc | _ -> None) tq in
+  match constraints with
+  | [] -> None
+  | first :: rest ->
+      let nc = List.fold_left nc_and first rest in
+      let env = try Env.add_typquant Unknown tq ctx.env with Type_internal.Type_error _ -> ctx.env in
+      Some (try Env.expand_constraint_synonyms env nc with Type_internal.Type_error _ -> nc)
+
+let record_validity_field_name = "sailValid"
+
+let doc_record_validity_field ctx tq =
+  if not !opt_constraint_obligations then None
+  else
+  match record_validity_constraint ctx tq with
+  | None -> None
+  | Some nc ->
+      Some
+        (flow (break 1)
+           [string record_validity_field_name; colon; doc_nconstraint ctx nc; coloneq; doc_discharge_by]
+        )
+
 let record_stored_fields ctx id tq fields =
   List.filter (fun ((_, typ), _) -> Option.is_none (record_index_projection_nexp ctx id tq typ)) fields
 
@@ -5556,6 +5631,79 @@ let doc_structure_fields fields_doc = if fields_doc = [] then empty else hardlin
 
 let doc_appended_projections projections =
   if projections = [] then empty else hardline ^^ hardline ^^ separate hardline projections
+
+(* A record carrying a validity proof cannot derive [BEq], [Repr] or
+   [Inhabited]: the proof field is a [Prop].  Equality and printing ignore it,
+   which proof irrelevance justifies.  Inhabitation is only available where the
+   constraint actually holds, so the instance is stated at the index defaults
+   rather than for every index -- an index combination the specification
+   forbids must not be inhabited, which is the point of carrying the proof. *)
+let doc_record_validity_instances ctx id tq stored derive_inhabited =
+  let implicit_binders = doc_typ_quant_relevant ctx tq |> List.map braces in
+  let applied =
+    match doc_typ_quant_only_vars ctx tq with
+    | [] -> doc_id_ctor id
+    | args -> parens (flow space (doc_id_ctor id :: args))
+  in
+  (* A field whose type is one of the record's type parameters needs that
+     parameter's own instance, exactly as `deriving` would have required. *)
+  let type_param_instances klass =
+    List.filter_map
+      (function
+        | QI_aux (QI_id (KOpt_aux (KOpt_kind (K_aux (K_type, _), kid), _)), _) ->
+            Some (brackets (flow space [string klass; doc_kid ctx kid]))
+        | _ -> None
+        )
+      tq
+  in
+  let instance_head binders klass typ =
+    flow (break 1) ([string "instance"] @ binders @ [colon; string klass; typ; coloneq])
+  in
+  let field_names = List.map (fun ((field, _), _) -> doc_id_ctor field) stored in
+  let beq_body =
+    match field_names with
+    | [] -> string "⟨fun _ _ => true⟩"
+    | names ->
+        string "⟨fun x y => "
+        ^^ separate (string " && ")
+             (List.map (fun n -> string "x." ^^ n ^^ string " == y." ^^ n) names)
+        ^^ string "⟩"
+  in
+  let all_int_indices =
+    List.for_all
+      (function QI_aux (QI_id (KOpt_aux (KOpt_kind (K_aux (K_int, _), _), _)), _) | QI_aux (QI_constraint _, _) -> true | _ -> false)
+      tq
+  in
+  let zero_indices = List.map (fun _ -> string "0") (doc_typ_quant_only_vars ctx tq) in
+  let default_applied =
+    match zero_indices with [] -> doc_id_ctor id | args -> parens (flow space (doc_id_ctor id :: args))
+  in
+  let default_literal =
+    match field_names with
+    | [] -> string "{ }"
+    | names ->
+        braces (space ^^ separate comma_sp (List.map (fun n -> n ^^ string " := default") names) ^^ space)
+  in
+  let instances =
+    [
+      nest 2
+        (instance_head (implicit_binders @ type_param_instances "BEq") "BEq" applied ^^ hardline ^^ beq_body);
+      nest 2
+        (instance_head implicit_binders "Repr" applied
+        ^^ hardline
+        ^^ string "⟨fun _ _ => Std.Format.text \""
+        ^^ doc_id_ctor id ^^ string "\"⟩"
+        );
+    ]
+    @
+    if derive_inhabited && all_int_indices then
+      [
+        nest 2
+          (instance_head [] "Inhabited" default_applied ^^ hardline ^^ string "⟨" ^^ default_literal ^^ string "⟩");
+      ]
+    else []
+  in
+  hardline ^^ hardline ^^ separate hardline instances
 
 let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
   let ctx =
@@ -5740,6 +5888,7 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
   | TD_record (id, tq, fields, _) ->
       let stored = record_stored_fields ctx id tq fields in
       let projections = doc_record_index_projections ctx id tq fields in
+      let validity = doc_record_validity_field ctx tq in
       let derive_inhabited =
         not
           (List.exists
@@ -5748,7 +5897,7 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
              )
              stored)
       in
-      let fields_doc = doc_structure_fields (List.map (doc_typ_id ctx) stored) in
+      let fields_doc = doc_structure_fields (List.map (doc_typ_id ctx) stored @ Option.to_list validity) in
       let rectyp = doc_typ_quant_relevant ctx tq in
       let rectyp = List.map (fun d -> parens d) rectyp |> separate space in
       let derivers =
@@ -5756,11 +5905,21 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
         else [string "Repr"]
       in
       let derivers = if IdSet.mem id !non_beq_types then derivers else string "BEq" :: derivers in
+      let deriving_doc =
+        if Option.is_some validity then empty
+        else hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers
+      in
+      (* A structure whose only field is the validity proof would land in
+         [Prop]; the model needs it to carry data-free runtime values, so the
+         sort is stated. *)
+      let sort_doc = if Option.is_some validity then string ": Type" else empty in
       doc_typ_quant_in_comment ctx tq
       ^^ nest 2
-           (flow (break 1) (remove_empties [string "structure"; doc_id_ctor id; rectyp; string "where"])
-           ^^ fields_doc ^^ hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers
+           (flow (break 1)
+              (remove_empties [string "structure"; doc_id_ctor id; rectyp; sort_doc; string "where"])
+           ^^ fields_doc ^^ deriving_doc
            )
+      ^^ (if Option.is_some validity then doc_record_validity_instances ctx id tq stored derive_inhabited else empty)
       ^^ doc_appended_projections projections
   | TD_abbrev
       ( id,

@@ -201,6 +201,10 @@ let lean_options =
         ),
       "lower one recoverably indexed record and existential alias to a runtime carrier plus erased Prop refinement"
     );
+    ( Flag.create ~prefix:["lean"] "constraint_obligations",
+      Arg.Unit (fun () -> Pretty_print_lean.opt_constraint_obligations := true),
+      "carry Sail's struct and function constraints into Lean as tactic-discharged proof obligations"
+    );
     ( Flag.create ~prefix:["lean"] ~arg:"func-name" "non_beq_type",
       Arg.String Pretty_print_lean.(fun fn -> non_beq_types := IdSet.add (mk_id fn) !non_beq_types),
       "disable deriving a BEq instance for this type"
