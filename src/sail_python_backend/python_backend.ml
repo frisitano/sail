@@ -249,6 +249,43 @@ let safe_value_name id =
   )
   else name
 
+(* Every name a generated module binds at its top level: type and constructor
+   names, module-level values and registers, imported names, and the runtime
+   primitives. Set once per emitted module, before any of its function bodies
+   are rendered. *)
+let current_module_names : StringSet.t ref = ref StringSet.empty
+
+(* Only function bodies introduce locals, so the dodge set is armed there and
+   nowhere else: module-level definitions must keep the very names this set
+   records. *)
+let module_level_names : StringSet.t ref = ref StringSet.empty
+
+let with_module_level_names names render =
+  let previous = !module_level_names in
+  module_level_names := names;
+  match render () with
+  | result ->
+      module_level_names := previous;
+      result
+  | exception exn ->
+      module_level_names := previous;
+      raise exn
+
+let in_function_body render = with_module_level_names !current_module_names render
+
+(* A Python function has one flat local scope: binding a name anywhere in the
+   body makes every read of that name in the body local, including reads the
+   backend emits before the binding and reads in the parameter annotations.  A
+   local that reused a module-level name therefore hid the module-level
+   binding -- for a Sail type alias whose representation constructor the body
+   still has to call, that turned into `name(name)` on an ordinary value.
+   Locals take a suffixed name instead; module-level references keep theirs. *)
+let safe_local_name id =
+  let rec dodge candidate =
+    if StringSet.mem candidate !module_level_names then dodge (candidate ^ "_") else candidate
+  in
+  dodge (safe_value_name id)
+
 let add_indent line = if String.equal line "" then line else "    " ^ line
 let indent lines = List.map add_indent lines
 let block header lines = header :: indent (if lines = [] then ["pass"] else lines)
@@ -1578,7 +1615,7 @@ let rec python_pat ctx (P_aux (pat_aux, (l, _)) as pat) =
       match Env.lookup_id id (env_of_pat pat) with
       | Enum _ -> { pattern = value_name ctx id; guards = []; irrefutable = false }
       | Register _ -> backend_error ~loc:l ("cannot bind register " ^ id_string id ^ " in a Python pattern")
-      | Local _ | Unbound _ -> { pattern = safe_value_name id; guards = []; irrefutable = true }
+      | Local _ | Unbound _ -> { pattern = safe_local_name id; guards = []; irrefutable = true }
     )
   | P_lit (L_aux (((L_bin _ | L_hex _) as lit_aux), lit_l)) ->
       let binding = fresh ctx "bits_pattern" in
@@ -1597,7 +1634,7 @@ let rec python_pat ctx (P_aux (pat_aux, (l, _)) as pat) =
   | P_wild -> { pattern = "_"; guards = []; irrefutable = true }
   | P_as (pat, id) ->
       let pat = python_pat ctx pat in
-      { pat with pattern = "(" ^ pat.pattern ^ " as " ^ safe_value_name id ^ ")" }
+      { pat with pattern = "(" ^ pat.pattern ^ " as " ^ safe_local_name id ^ ")" }
   | P_app (id, pats) -> (
       match (native_option_constructor (env_of_pat pat) id, pats) with
       | Some `None, _ -> { pattern = "None"; guards = []; irrefutable = false }
@@ -1666,7 +1703,7 @@ let guard_clause guards = match guards with [] -> "" | _ -> " if " ^ String.conc
 let rec assignment_pattern ctx (P_aux (pat_aux, _) as pat) =
   match pat_aux with
   | P_id id -> (
-      match Env.lookup_id id (env_of_pat pat) with Local _ | Unbound _ -> Some (safe_value_name id) | _ -> None
+      match Env.lookup_id id (env_of_pat pat) with Local _ | Unbound _ -> Some (safe_local_name id) | _ -> None
     )
   | P_wild -> Some "_"
   | P_typ (_, pat) | P_var (pat, _) -> assignment_pattern ctx pat
@@ -1719,7 +1756,7 @@ let rec lexp ctx (LE_aux (lexp_aux, ((l, _) as annot))) =
   match lexp_aux with
   | LE_id id | LE_typ (_, id) -> (
       match Env.lookup_id id (env_of_annot annot) with
-      | Local _ | Unbound _ -> safe_value_name id
+      | Local _ | Unbound _ -> safe_local_name id
       | Register _ | Enum _ -> source_value_name ctx id
     )
   | LE_tuple items -> "(" ^ String.concat ", " (List.map (lexp ctx) items) ^ ")"
@@ -1887,7 +1924,7 @@ and lower_app ctx (E_aux (_, (l, _)) as exp) id args =
 
 and lower_value ctx (E_aux (exp_aux, (l, _)) as exp) =
   match exp_aux with
-  | E_id id -> ([], if IdSet.mem id ctx.local_ids then safe_value_name id else source_value_name ctx id)
+  | E_id id -> ([], if IdSet.mem id ctx.local_ids then safe_local_name id else source_value_name ctx id)
   | E_lit lit -> ([], python_lit lit)
   | E_typ (_, exp) | E_internal_assume (_, exp) -> lower_value ctx exp
   | E_app (id, args) -> lower_app ctx exp id args
@@ -2219,7 +2256,7 @@ and emit_structural_stmt ctx (E_aux (exp_aux, _) as exp) =
       let increasing = match order with Ord_inc -> "True" | Ord_dec -> "False" in
       before_start @ before_finish @ before_step
       @ block
-          ("for " ^ safe_value_name id ^ " in sail_range(" ^ start ^ ", " ^ finish ^ ", " ^ step ^ ", " ^ increasing
+          ("for " ^ safe_local_name id ^ " in sail_range(" ^ start ^ ", " ^ finish ^ ", " ^ step ^ ", " ^ increasing
          ^ "):"
           )
           (with_local_ids ctx [id] (fun () -> emit_structural_stmt ctx body))
@@ -2305,7 +2342,7 @@ and emit_into ctx target (E_aux (exp_aux, annot) as exp) =
       let increasing = match order with Ord_inc -> "True" | Ord_dec -> "False" in
       before_start @ before_finish @ before_step
       @ block
-          ("for " ^ safe_value_name id ^ " in sail_range(" ^ start ^ ", " ^ finish ^ ", " ^ step ^ ", " ^ increasing
+          ("for " ^ safe_local_name id ^ " in sail_range(" ^ start ^ ", " ^ finish ^ ", " ^ step ^ ", " ^ increasing
          ^ "):"
           )
           (with_local_ids ctx [id] (fun () -> emit_stmt ctx body))
@@ -2577,8 +2614,8 @@ let split_argument_patterns count pat =
   | count, _ -> List.init count (fun _ -> pat)
 
 let simple_parameter = function
-  | P_aux (P_id id, _) -> Some (safe_value_name id)
-  | P_aux (P_typ (_, P_aux (P_id id, _)), _) -> Some (safe_value_name id)
+  | P_aux (P_id id, _) -> Some (safe_local_name id)
+  | P_aux (P_typ (_, P_aux (P_id id, _)), _) -> Some (safe_local_name id)
   | _ -> None
 
 let add_numeric_value ?(already_integer = false) values kid expression =
@@ -2875,8 +2912,10 @@ let function_lines ~preserve_structure ctx (FD_aux (FD_function (_, _, clauses),
       lines
 
 let function_definition ~preserve_structure ctx = function
-  | DEF_aux (DEF_fundef function_definition, _) -> function_lines ~preserve_structure ctx function_definition
-  | DEF_aux (DEF_internal_mutrec definitions, _) -> concat_map (function_lines ~preserve_structure ctx) definitions
+  | DEF_aux (DEF_fundef function_definition, _) ->
+      in_function_body (fun () -> function_lines ~preserve_structure ctx function_definition)
+  | DEF_aux (DEF_internal_mutrec definitions, _) ->
+      in_function_body (fun () -> concat_map (function_lines ~preserve_structure ctx) definitions)
   | _ -> []
 
 let register_declarations ctx defs =
@@ -3574,7 +3613,42 @@ type source_module_render = {
   referenced_type_names : StringSet.t;
 }
 
+(* Type, constructor, and validity names are unique across the whole model and
+   are imported unrenamed, so any of them can be visible in any module. *)
+let program_type_level_names ctx =
+  let add _ name names = StringSet.add name names in
+  runtime_names |> Bindings.fold add ctx.type_names |> Bindings.fold add ctx.constructor_names
+  |> Bindings.fold add ctx.record_validity_names
+
+(* Values a module actually binds at its top level. [bound_value_names] is not
+   usable here: it deliberately also collects function-local binders, so every
+   local would collide with itself. *)
+let module_value_names ctx definitions =
+  let register_ids =
+    List.filter_map
+      (function DEF_aux (DEF_register (DEC_aux (DEC_reg (_, id, _), _)), _) -> Some id | _ -> None)
+      definitions
+  in
+  List.fold_left
+    (fun names id -> StringSet.add (value_name ctx id) names)
+    StringSet.empty
+    (emitted_value_ids ctx definitions @ register_ids)
+
+let source_module_level_names ctx components definitions =
+  let names = StringSet.union (program_type_level_names ctx) (module_value_names ctx definitions) in
+  let names =
+    match StringMap.find_opt (module_key components) ctx.value_import_names with
+    | Some bindings -> Bindings.fold (fun _ name names -> StringSet.add name names) bindings names
+    | None -> names
+  in
+  match StringMap.find_opt (module_key components) ctx.module_import_names with
+  | Some aliases -> StringMap.fold (fun _ name names -> StringSet.add name names) aliases names
+  | None -> names
+
 let render_source_module ~preserve_structure ctx components definitions =
+  let previous_module_names = !current_module_names in
+  current_module_names := source_module_level_names ctx components definitions;
+  Fun.protect ~finally:(fun () -> current_module_names := previous_module_names) @@ fun () ->
   let module_ctx = { ctx with current_module = Some components } in
   let delayed_aliases = delayed_alias_names module_ctx definitions in
   let rendered, late_values, late_modules =
@@ -4009,6 +4083,8 @@ let generate ?runtime_module ?extern_module ?(preserve_structure = false) ?(sour
   let ctx =
     make_context ~source_val_specs ~pydantic ~ethereum_fixed_bytes ~enum_conversions ?extern_module env ast
   in
+  (* Single-file output: the whole program shares one module scope. *)
+  current_module_names := StringSet.union (program_type_level_names ctx) (module_value_names ctx ast.defs);
   let runtime = runtime_source ctx runtime_module in
   let type_lines =
     concat_map (function DEF_aux (DEF_type definition, _) -> type_definition ctx definition | _ -> []) ast.defs
