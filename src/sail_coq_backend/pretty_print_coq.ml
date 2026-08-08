@@ -2027,18 +2027,45 @@ let doc_exp, doc_let =
             in
             let varstuple_retyped = check_exp env (strip_exp varstuple) (general_typ_of full_exp) in
             let varstuple_pp, lambda = make_loop_vars [] varstuple_retyped (general_typ_of full_exp) in
-            let msuffix, measure_pp =
-              match measure with None -> ("", []) | Some exp -> ("T", [parens (prefix 2 1 (group lambda) (expN exp))])
+            (* whileMT/untilMT take a pure measure and apply it to the initial
+               loop variables exactly once, to obtain the recursion limit.  An
+               effectful measure therefore cannot be passed through as a
+               function, but it can be evaluated in the monad before the loop
+               starts and supplied as a constant limit, which computes the
+               same value in the same place. *)
+            let measure_limit_pp = string "_loop_measure" in
+            let msuffix, measure_pp, measure_prelude =
+              match measure with
+              | None -> ("", [], None)
+              | Some exp when effectful (effect_of exp) && csuffix = "M" ->
+                  let measure_fn = parens (prefix 2 1 (group lambda) (expN exp)) in
+                  ( "T",
+                    [parens (separate space [string "fun"; underscore; bigarrow; measure_limit_pp])],
+                    Some (parens (prefix 2 1 measure_fn varstuple_pp))
+                  )
+              | Some exp -> ("T", [parens (prefix 2 1 (group lambda) (expN exp))], None)
             in
-            parens
-              ((prefix 2 1)
-                 (string (combinator ^ csuffix ^ msuffix))
-                 (separate (break 1)
-                    ((varstuple_pp :: measure_pp)
-                    @ [parens (prefix 2 1 (group lambda) (expN cond)); parens (prefix 2 1 (group lambda) body_pp)]
+            let loop_pp =
+              parens
+                ((prefix 2 1)
+                   (string (combinator ^ csuffix ^ msuffix))
+                   (separate (break 1)
+                      ((varstuple_pp :: measure_pp)
+                      @ [parens (prefix 2 1 (group lambda) (expN cond)); parens (prefix 2 1 (group lambda) body_pp)]
+                      )
+                   )
+                )
+            in
+            begin
+              match measure_prelude with
+              | None -> loop_pp
+              | Some measure_app ->
+                  parens
+                    (infix 0 1
+                       (separate space [string ">>= fun"; measure_limit_pp; bigarrow])
+                       measure_app loop_pp
                     )
-                 )
-              )
+            end
         | Id_aux (Id "early_return", _) -> (
             match args with
             | [exp] ->
