@@ -2930,7 +2930,7 @@ let doc_exp, doc_let =
                       separate space
                         [
                           string ">>= fun";
-                          squote ^^ parens (pat_pp ^/^ colon ^^ space ^^ doc_typ ctxt outer_env typ);
+                          squote ^^ parens (pat_pp ^/^ colon ^^ space ^^ doc_internal_typ ctxt outer_env typ);
                           bigarrow;
                         ]
                   | None, _ ->
