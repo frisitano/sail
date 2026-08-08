@@ -667,6 +667,12 @@ let index_refined_record_typ ctx expected actual =
 let doc_index_refinement_cast value =
   parens (string "cast (by first | rfl | simp_all) " ^^ parens value)
 
+(* An ascribed expression is always emitted at the ascribed type, packing its
+   carrier on the way if that is what the ascription demands. A caller holding
+   the same target must therefore not pack the result a second time. *)
+let exp_is_ascribed_at ctx typ (E_aux (exp, _)) =
+  match exp with E_typ (ascribed, _) -> dependent_types_equivalent ctx ascribed typ | _ -> false
+
 let prop_dependent_alias_id_for_typ ctx typ =
   match typ with
   | Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, _), _) when prop_dependent_alias id -> Some id
@@ -3342,7 +3348,8 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
         match (ctx.dependent_result, ctx.dependent_return) with
         | Some result, _ ->
             doc_prop_dependent_result_pack ctx result arg value
-        | None, Some typ when has_dependent_type ctx typ ->
+        | None, Some typ
+          when has_dependent_type ctx typ && not (exp_is_ascribed_at ctx typ arg) ->
             doc_dependent_pack ctx typ value
         | _ -> value
       in
@@ -3693,9 +3700,13 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
                         (fun value ->
                           doc_dependent_repack ctx ret public_typ value
                         )
+                  (* Unpacking and repacking is the identity when the call
+                     already returns the expected shape, and Lean cannot
+                     elaborate the destructuring lambdas that spell it out. *)
                   | true, true
                     when arg_bindings <> []
-                         && not named_result_matches_public ->
+                         && (not named_result_matches_public)
+                         && not (dependent_types_equivalent ctx ret public_typ) ->
                       Some (fun value -> pack_public (doc_dependent_unpack ctx ret value))
                   | _ -> None
                 in
@@ -3877,6 +3888,31 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
             needs_repack
       in
       let refines_index = (not target_dependent) && index_refined_record_typ ctx typ (typ_of e) in
+      (* A tuple literal is not a single carrier: each component chooses its
+         own representation, and only some of them may still need packing.
+         Distribute the expected type over the components so that each one is
+         packed, unpacked or left alone on its own terms. *)
+      let component_annotated_tuple =
+        if target_dependent && Option.is_none active_result then (
+          match (e, expand_synonyms_for_dependent_type ctx typ) with
+          | E_aux (E_tuple components, tuple_annot), Typ_aux (Typ_tuple component_typs, _)
+            when List.length components = List.length component_typs ->
+              Some
+                (E_aux
+                   ( E_tuple
+                       (List.map2
+                          (fun component_typ (E_aux (_, component_annot) as component) ->
+                            E_aux (E_typ (component_typ, component), component_annot)
+                          )
+                          component_typs components
+                       ),
+                     tuple_annot
+                   )
+                )
+          | _ -> None
+        )
+        else None
+      in
       if target_dependent && expression_never_returns e then
         doc_exp as_monadic
           { expression_ctx with expected_dependent = None }
@@ -3887,6 +3923,8 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
          | E_aux ((E_if _ | E_match _ | E_let _ | E_internal_plet _ | E_block _), _) -> true
          | _ -> false
       then doc_exp as_monadic ctx (annotate_dependent_tail typ e)
+      else if Option.is_some component_annotated_tuple then
+        doc_exp as_monadic { ctx with expected_dependent = None } (Option.get component_annotated_tuple)
       else if has_effect e then
         if should_pack then
           let computation =
@@ -3934,7 +3972,11 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
               else doc_raw_typ ctx (env_of full_exp) typ
         in
         wrap_with_pure as_monadic (parens (separate space [value; colon; expected_typ]))
-  | E_tuple es -> wrap_with_pure as_monadic (parens (separate_map (comma ^^ space) (d_of_arg ctx) es))
+  | E_tuple es ->
+      (* An expected tuple type belongs to the tuple, never to a component:
+         a component that inherited it would pack itself as the whole tuple. *)
+      let component_ctx = { ctx with expected_dependent = None } in
+      wrap_with_pure as_monadic (parens (separate_map (comma ^^ space) (d_of_arg component_ctx) es))
   (* Sail's flow typing carries the negated condition past a guard such as
        if invalid then throw;
      Keep the continuation in the corresponding Lean branch so that the
