@@ -662,10 +662,49 @@ let index_refined_record_typ ctx expected actual =
       && not (dependent_types_equivalent ctx expected actual)
   | _ -> false
 
+(* One ladder discharges every obligation this backend introduces: the equality
+   between two record applications whose indices a branch refined, and the
+   validity constraint carried by a constrained record or function signature.
+   Both are linear arithmetic over the indices once the index projections and
+   the branch hypotheses have been unfolded, which is what [simp_all] does. *)
+let lean_discharge_tactic =
+  "first | rfl | omega | (congr 1 <;> simp_all) | (congr 1 <;> omega) | (simp_all <;> omega) | (simp_all <;> rfl) \
+   | simp_all"
+
+let doc_discharge_by = string ("by " ^ lean_discharge_tactic)
+
 (* The equality between the two record applications follows from the branch
    hypothesis, which Lean has in scope as a Bool equation. *)
-let doc_index_refinement_cast value =
-  parens (string "cast (by first | rfl | simp_all) " ^^ parens value)
+let doc_index_refinement_cast value = parens (string "cast (" ^^ doc_discharge_by ^^ string ") " ^^ parens value)
+
+(* Packing a value into an existential only needs a cast when the expected
+   carrier fixes an index that the value's own type spells differently.  Index
+   positions filled by the existential's own witnesses are solved by
+   unification and must not be compared. *)
+let existential_pack_refines_index ctx expected actual =
+  match expand_synonyms_for_dependent_type ctx expected with
+  | Typ_aux (Typ_exist (kopts, _, inner), _) -> (
+      let bound = KidSet.of_list (List.map kopt_kid kopts) in
+      match
+        (expand_synonyms_for_dependent_type ctx inner, expand_synonyms_for_dependent_type ctx actual)
+      with
+      | Typ_aux (Typ_app (expected_id, expected_args), _), Typ_aux (Typ_app (actual_id, actual_args), _)
+        when Id.compare expected_id actual_id = 0
+             && Bindings.mem expected_id ctx.global.semantic_types.record_fields
+             && List.length expected_args = List.length actual_args ->
+          List.exists2
+            (fun expected_arg actual_arg ->
+              match (expected_arg, actual_arg) with
+              | A_aux (A_nexp (Nexp_aux (Nexp_var kid, _)), _), _ when KidSet.mem kid bound -> false
+              | A_aux (A_nexp expected_nexp, _), A_aux (A_nexp actual_nexp, _) ->
+                  not (nexp_identical expected_nexp actual_nexp)
+              | A_aux (A_nexp _, _), _ -> true
+              | _ -> false
+            )
+            expected_args actual_args
+      | _ -> false
+    )
+  | _ -> false
 
 (* An ascribed expression is always emitted at the ascribed type, packing its
    carrier on the way if that is what the ascription demands. A caller holding
@@ -2199,6 +2238,56 @@ let semantic_record_field ctx record_id field =
 let semantic_record_field_of_exp ctx exp field =
   match record_id_of_typ (typ_of exp) with Some id -> semantic_record_field ctx id field | None -> None
 
+(* A record field whose Sail type is a singleton integer over the record's own
+   index parameters carries no information the record type does not already
+   fix.  Storing it would leave the index parameter phantom and make
+   [value.field = index] -- the entire content of the singleton type --
+   unrecoverable in Lean.  Such a field is therefore not stored at all: it is
+   emitted as a projection returning the index, so the equation holds by [rfl].
+
+   The guard on the rendered kinds keeps the projection well typed.  A field
+   rendered as [Nat] must be built from index parameters that are themselves
+   rendered as [Nat]; the reverse direction is covered by Lean's coercion. *)
+let record_index_projection_nexp ctx id tq typ =
+  if List.mem (string_of_id id) !opt_extern_types then
+    (* The Lean declaration of an extern type is written by hand outside this
+       backend, so its fields are whatever that declaration stores. *)
+    None
+  else
+  let env = try Env.add_typquant Unknown tq ctx.env with Type_internal.Type_error _ -> ctx.env in
+  let field_ctx = context_init env ctx.global in
+  let expanded = try Env.expand_synonyms env typ with Type_internal.Type_error _ -> typ in
+  match expanded with
+  | Typ_aux (Typ_app (Id_aux (Id ("atom" | "implicit"), _), [A_aux (A_nexp nexp, _)]), _) ->
+      let quantified = KidSet.of_list (quantified_int_kids tq) in
+      let vars = tyvars_of_nexp nexp in
+      let renders_nat = provably_nneg field_ctx nexp in
+      let var_renders_nat kid = provably_nneg field_ctx (Nexp_aux (Nexp_var kid, Unknown)) in
+      if KidSet.subset vars quantified && ((not renders_nat) || KidSet.for_all var_renders_nat vars) then Some nexp
+      else None
+  | _ -> None
+
+let record_index_projection_field ctx record_id field =
+  match
+    (Bindings.find_opt record_id ctx.global.semantic_types.record_quants, semantic_record_field ctx record_id field)
+  with
+  | Some tq, Some typ -> record_index_projection_nexp ctx record_id tq typ
+  | _ -> None
+
+(* Whether the field of [record_id] is projected from an index rather than
+   stored.  Every emitter that names a field -- structure declaration, literal
+   construction, functional update, and pattern -- has to agree on this. *)
+let record_field_is_projected ctx record_id field =
+  Option.is_some (record_index_projection_field ctx record_id field)
+
+let projected_fields_removed ctx record_id fexps =
+  match record_id with
+  | Some record_id ->
+      List.filter
+        (fun (FE_aux (FE_fexp (field, _), _)) -> not (record_field_is_projected ctx record_id field))
+        fexps
+  | None -> fexps
+
 (* Lean erases Sail singleton integer refinements to Nat/Int.  A projection
    whose inferred Sail type is atom(n) nevertheless has the unique value n;
    render that index directly so it remains definitionally equal to indices in
@@ -2459,7 +2548,30 @@ let rec doc_pat ?(need_parens = false) ?(in_vector = false) ctx in_match_bv (P_a
         )
   | P_var (p, _) -> doc_pat ctx in_match_bv p
   | P_as (pat, id) -> doc_pat ctx in_match_bv pat
-  | P_struct (_, pats, _) ->
+  | P_struct (struct_name, pats, _) ->
+      (* A field projected from an index is not stored, so it cannot appear in
+         a structure pattern.  Nothing is lost as long as the sub-pattern binds
+         no names; a binder would have to be recovered from the index instead,
+         which a pattern cannot express. *)
+      let record_id =
+        match struct_name with SN_id id -> Some id | SN_anon -> record_id_of_typ (typ_of_pat pat)
+      in
+      let projected field =
+        match record_id with Some record_id -> record_field_is_projected ctx record_id field | None -> false
+      in
+      let pats =
+        List.filter
+          (fun (field, sub) ->
+            if not (projected field) then true
+            else if IdSet.is_empty (pat_ids sub) then false
+            else
+              failwith
+                ("Lean backend cannot bind " ^ string_of_id field
+               ^ " in a structure pattern: the field is projected from a type index"
+                )
+          )
+          pats
+      in
       let pats =
         List.map (fun (id, pat) -> separate space [doc_id_ctor id; coloneq; doc_pat ctx in_match_bv pat]) pats
       in
@@ -3856,6 +3968,12 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
         | None -> target_dependent && ((not represented) || needs_repack)
       in
       let pack_expected value =
+        (* Sail's flow typing refined the carrier's indices under a branch
+           test; Lean only has that test as a Bool equation, so the carrier is
+           cast under it before the witnesses are packed around it. *)
+        let value =
+          if existential_pack_refines_index ctx typ (typ_of e) then doc_index_refinement_cast value else value
+        in
         let packed =
           match active_result with
           | Some result ->
@@ -4308,6 +4426,10 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
   | E_internal_return e -> doc_exp false ctx e (* ??? *)
   | E_struct (struct_name, fexps) ->
       let record_id = match struct_name with SN_id id -> Some id | SN_anon -> record_id_of_typ (typ_of full_exp) in
+      (* Fields projected from the record's indices are not stored, so the
+         literal must not mention them.  Their Sail value is the index the
+         result type already carries. *)
+      let fexps = projected_fields_removed ctx record_id fexps in
       let args =
         List.map
           (fun (FE_aux (FE_fexp (field, _), _) as fexp) ->
@@ -4396,20 +4518,28 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
       wrap_with_pure as_monadic field
   | E_struct_update (exp, fexps) ->
       let record_id = record_id_of_typ (typ_of exp) in
+      let updated = projected_fields_removed ctx record_id fexps in
       let args =
         List.map
           (fun (FE_aux (FE_fexp (field, e), _) as fexp) ->
             let field_typ = Option.bind record_id (fun record_id -> semantic_record_field ctx record_id field) in
             doc_fexp ?field_typ (has_effect e) ctx fexp
           )
-          fexps
+          updated
       in
       let record = doc_exp false ctx exp in
       let record =
         if has_top_level_dependent_type ctx (typ_of exp) then doc_dependent_unpack ctx (typ_of exp) record else record
       in
-      wrap_with_pure as_monadic
-        (braces (space ^^ record ^^ string " with " ^^ separate (comma ^^ space) args ^^ space))
+      (* An update that only rewrites projected fields changes the record's
+         indices and nothing else, so the whole update is the original value
+         re-indexed. *)
+      if args = [] then
+        wrap_with_pure as_monadic
+          (if List.length updated = List.length fexps then record else doc_index_refinement_cast record)
+      else
+        wrap_with_pure as_monadic
+          (braces (space ^^ record ^^ string " with " ^^ separate (comma ^^ space) args ^^ space))
   | E_match (discr, brs) ->
       let brs =
         if has_dependent_type ctx (typ_of full_exp) then
@@ -5385,6 +5515,48 @@ let rec typ_blocks_derived_inhabited ctx seen (Typ_aux (typ, _) as full_typ) =
       List.exists (typ_blocks_derived_inhabited ctx seen) (ret :: args)
   | Typ_id _ | Typ_app _ | Typ_var _ | Typ_bidir _ | Typ_internal_unknown -> false
 
+(* Fields the Lean structure does not store, emitted instead as projections of
+   the record's own index parameters.  [value.field] then reduces to the index,
+   so anything Sail knows about the field -- a branch test, a call argument, an
+   existential witness -- is directly a fact about the type.  They are simp
+   lemmas so the tactics that discharge index refinements and validity
+   obligations can see through them. *)
+let doc_record_index_projections ctx id tq fields =
+  let implicit_binders = doc_typ_quant_relevant ctx tq |> List.map braces in
+  let applied =
+    match doc_typ_quant_only_vars ctx tq with
+    | [] -> doc_id_ctor id
+    | args -> parens (flow space (doc_id_ctor id :: args))
+  in
+  List.filter_map
+    (fun ((field, typ), _) ->
+      match record_index_projection_nexp ctx id tq typ with
+      | None -> None
+      | Some nexp ->
+          Some
+            (nest 2
+               (flow (break 1)
+                  ([string "@[simp] def"; doc_id_ctor id ^^ dot ^^ doc_id_ctor field]
+                  @ implicit_binders
+                  @ [parens (separate space [underscore; colon; applied]); colon; doc_typ ctx typ; coloneq]
+                  )
+               ^^ hardline ^^ doc_nexp ctx nexp
+               )
+            )
+    )
+    fields
+
+let record_stored_fields ctx id tq fields =
+  List.filter (fun ((_, typ), _) -> Option.is_none (record_index_projection_nexp ctx id tq typ)) fields
+
+(* [structure C where] followed directly by [deriving] is how Lean spells a
+   structure with no stored fields, which is what a record whose fields are all
+   singleton indices becomes. *)
+let doc_structure_fields fields_doc = if fields_doc = [] then empty else hardline ^^ separate hardline fields_doc
+
+let doc_appended_projections projections =
+  if projections = [] then empty else hardline ^^ hardline ^^ separate hardline projections
+
 let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
   let ctx =
     match td with
@@ -5419,7 +5591,8 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
       let indexed_equalities =
         prop_dependent_record_index_equalities ctx id tq
       in
-      let fields_doc = separate hardline (List.map (doc_typ_id ctx) fields) in
+      let fields_doc = doc_structure_fields (List.map (doc_typ_id ctx) (record_stored_fields ctx id tq fields)) in
+      let projections = doc_record_index_projections ctx id tq fields in
       let derivers = [string "Inhabited"; string "Repr"] in
       let derivers = if IdSet.mem id !non_beq_types then derivers else string "BEq" :: derivers in
       let id_doc = doc_id_ctor id in
@@ -5427,8 +5600,9 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
         doc_typ_quant_in_comment ctx tq
         ^^ nest 2
              (flow (break 1) [string "structure"; id_doc; string "where"]
-             ^^ hardline ^^ fields_doc ^^ hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers
+             ^^ fields_doc ^^ hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers
              )
+        ^^ doc_appended_projections projections
       in
       let valid_doc =
         separate hardline
@@ -5564,16 +5738,17 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
       in
       structure_doc ^^ hardline ^^ hardline ^^ valid_doc
   | TD_record (id, tq, fields, _) ->
+      let stored = record_stored_fields ctx id tq fields in
+      let projections = doc_record_index_projections ctx id tq fields in
       let derive_inhabited =
         not
           (List.exists
              (fun ((_, typ), _) ->
                typ_blocks_derived_inhabited ctx IdSet.empty typ
              )
-             fields)
+             stored)
       in
-      let fields = List.map (doc_typ_id ctx) fields in
-      let fields_doc = separate hardline fields in
+      let fields_doc = doc_structure_fields (List.map (doc_typ_id ctx) stored) in
       let rectyp = doc_typ_quant_relevant ctx tq in
       let rectyp = List.map (fun d -> parens d) rectyp |> separate space in
       let derivers =
@@ -5584,8 +5759,9 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
       doc_typ_quant_in_comment ctx tq
       ^^ nest 2
            (flow (break 1) (remove_empties [string "structure"; doc_id_ctor id; rectyp; string "where"])
-           ^^ hardline ^^ fields_doc ^^ hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers
+           ^^ fields_doc ^^ hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers
            )
+      ^^ doc_appended_projections projections
   | TD_abbrev
       ( id,
         [],
@@ -5819,7 +5995,27 @@ let doc_val ctx pat exp =
     | Some typ -> doc_dependent_pack ctx typ base_pp
     | None -> base_pp
   in
-  (global, nest 2 (group (string "def" ^^ space ^^ idpp ^^ typpp ^^ space ^^ coloneq ^/^ base_pp)))
+  (* A constant whose Sail type is a singleton integer *is* that integer: the
+     type already fixes it, exactly as for a singleton record field.  A
+     reducible abbreviation of the literal keeps that definitional in Lean, so
+     a test against the constant refines an index the same way a test against
+     the literal does. *)
+  let singleton_constant =
+    let typ = match pat_typ with Some typ -> Some typ | None -> (try Some (typ_of exp) with _ -> None) in
+    match Option.map (fun typ -> try Env.expand_synonyms ctx.env typ with Type_internal.Type_error _ -> typ) typ with
+    | Some
+        (Typ_aux
+          (Typ_app (Id_aux (Id ("atom" | "implicit"), _), [A_aux (A_nexp (Nexp_aux (Nexp_constant c, _)), _)]), _)
+          ) ->
+        Some c
+    | _ -> None
+  in
+  let keyword, base_pp =
+    match singleton_constant with
+    | Some c when Option.is_none semantic_typ && Option.is_none dependent_typ -> ("abbrev", doc_big_int c)
+    | _ -> ("def", base_pp)
+  in
+  (global, nest 2 (group (string keyword ^^ space ^^ idpp ^^ typpp ^^ space ^^ coloneq ^/^ base_pp)))
 
 (* Sail doc comments (/*! ... */) become Lean docstrings, and a file's
    leading /*md ... */ block becomes a Lean module docstring, so extracted
