@@ -5259,6 +5259,7 @@ module type CODEGEN_CONFIG = sig
   val register_file : bool
   val register_file_thread : bool
   val register_file_excluded_modules : string list
+  val register_pins : (string * string) list
   val preserved_functions : IdSet.t
   val external_types : string Bindings.t
   val external_type_names : string Bindings.t
@@ -5469,6 +5470,15 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let current_function_threaded = ref false
 
   let register_file_threaded_function id = Config.register_file_thread && IdSet.mem id !register_file_threaded_functions
+
+  (* --c-register-pin NAME=REG: the named model registers are emitted as
+     global register variables permanently bound to the given callee-saved
+     machine registers. The declaration binds the name in every translation
+     unit with no storage, so there is no definition, no extern, and no
+     register-file membership; generated code and hand-written FFI both use
+     the plain register name and compile to direct machine-register access. *)
+  let register_pinned name =
+    match name with Name (id, _) -> List.assoc_opt (string_of_id id) Config.register_pins | _ -> None
 
   let register_file_member = function
     | Name (id, _) -> Config.register_file && IdSet.mem id !register_file_member_ids
@@ -7059,6 +7069,38 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       )
     | _ -> None
 
+  (* The dual of [switch_failure_cases]: positive selector tests guarding an
+     exiting arm body.  Statement-armed matches reach codegen as sequential
+     guards ([if (sel == A) { ...; return; }]), so their conditions carry the
+     arm's own labels rather than an exclusion. *)
+  let rec switch_success_cases ctx = function
+    | V_call (Bnot, [V_call (Neq, [left; right])]) when Config.const_match_tables ->
+        switch_success_cases ctx (V_call (Eq, [left; right]))
+    | V_call (Eq, [V_member (member, _); selector]) ->
+        Option.map (fun family -> (sgen_cval selector, family, [sgen_id member])) (switch_family_labels ctx selector)
+    | V_call (Eq, [selector; V_member (member, _)]) ->
+        Option.map (fun family -> (sgen_cval selector, family, [sgen_id member])) (switch_family_labels ctx selector)
+    | V_call (Eq, [literal; (V_id _ as selector)]) when Option.is_some (integer_literal_value literal) -> (
+        match literal_switch_label selector (Option.get (integer_literal_value literal)) with
+        | Some label ->
+            Option.map (fun family -> (sgen_cval selector, family, [label])) (switch_family_labels ctx selector)
+        | None -> None
+      )
+    | V_call (Eq, [(V_id _ as selector); literal]) when Option.is_some (integer_literal_value literal) -> (
+        match literal_switch_label selector (Option.get (integer_literal_value literal)) with
+        | Some label ->
+            Option.map (fun family -> (sgen_cval selector, family, [label])) (switch_family_labels ctx selector)
+        | None -> None
+      )
+    | V_call (Bor, [left; right]) -> (
+        match (switch_success_cases ctx left, switch_success_cases ctx right) with
+        | Some (left_selector, left_family, left_cases), Some (right_selector, right_family, right_cases)
+          when String.equal left_selector right_selector && left_family = right_family ->
+            Some (left_selector, left_family, left_cases @ right_cases)
+        | _ -> None
+      )
+    | _ -> None
+
   let rec collect_switch_cases ctx expected_selector expected_family cases instr =
     match instr with
     | I_if (condition, then_instrs, (_ :: _ as case_body)) -> (
@@ -7118,6 +7160,29 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       )
     | [I_aux (I_block instrs, _)] ->
         collect_terminal_switch_cases ctx allow_fallthrough_case expected_selector expected_family cases instrs
+    | _ -> None
+
+  (* The dual ladder: sequential positive guards whose then-branch exits,
+       if (sel == A) { ...; return; }
+       if (sel == B) { ...; return; }
+       ...default...
+     Each recognized guard contributes one case; whatever follows the last
+     recognized guard is the default body.  The exit requirement means control
+     can never fall from a case into the default, so consuming the tail is
+     semantics-preserving. *)
+  let rec collect_guard_switch_cases ctx expected_selector expected_family cases = function
+    | I_aux (I_if (condition, then_instrs, []), _) :: rest when switch_branch_exits ctx then_instrs -> (
+        match switch_success_cases ctx condition with
+        | Some (selector, family, labels)
+          when Option.fold ~none:true ~some:(String.equal selector) expected_selector
+               && Option.fold ~none:true ~some:(( = ) family) expected_family -> (
+            let cases = cases @ [(labels, then_instrs)] in
+            match collect_guard_switch_cases ctx (Some selector) (Some family) cases rest with
+            | Some result -> Some result
+            | None -> Some (selector, family, cases, rest)
+          )
+        | _ -> None
+      )
     | _ -> None
 
   (* Return a C conditional expression only for the exact JIB shape produced
@@ -8038,9 +8103,16 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           match collect_terminal_switch_cases ctx function_tail None None [] terminal_ladder with
           | Some (selector, family, (_ :: _ as cases), default_body) ->
               [codegen_collected_switch ~function_tail fid ctx selector family cases default_body]
-          | _ ->
-              let first = List.hd terminal_ladder in
-              codegen_instr fid ctx first :: docs (List.tl terminal_ladder)
+          | _ -> (
+              (* The guard-form dual only pays as a real switch; below the
+                 table threshold the sequential compares are left alone. *)
+              match collect_guard_switch_cases ctx None None [] terminal_ladder with
+              | Some (selector, family, (_ :: _ as cases), default_body) when List.length cases >= 8 ->
+                  [codegen_collected_switch ~function_tail fid ctx selector family cases default_body]
+              | _ ->
+                  let first = List.hd terminal_ladder in
+                  codegen_instr fid ctx first :: docs (List.tl terminal_ladder)
+            )
         )
       (* A Sail [foreach] reaches JIB as a label followed by an exit jump,
          a body, and a private back edge.  Recover that region as a C loop.
@@ -11714,6 +11786,18 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
            [codegen_register_file_docs]); its storage is the single
            [struct model_registers model_registers] definition. *)
         []
+    | CDEF_register (id, ctyp, _) when Option.is_some (register_pinned id) ->
+        let machine_register = Option.get (register_pinned id) in
+        (* A pinned register is a reserved machine register in every
+           translation unit; the header declaration is the whole binding. *)
+        [
+          VariableDeclaration
+            (string (Printf.sprintf "// register %s (pinned to %s)" (string_of_name id) machine_register)
+            ^^ hardline
+            ^^ string
+                 (Printf.sprintf "register %s %s __asm__(\"%s\");" (sgen_ctyp ctyp) (sgen_name id) machine_register)
+            );
+        ]
     | CDEF_register (id, ctyp, _) ->
         let definition =
           VariableDefinition
@@ -12173,7 +12257,10 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           match annotated with
           | CDEF_aux (CDEF_register (reg, ctyp, _), _) ->
               let index = module_index annotated in
-              if List.mem modules.(index).file_stem Config.register_file_excluded_modules then (members, anchor)
+              if
+                List.mem modules.(index).file_stem Config.register_file_excluded_modules
+                || Option.is_some (register_pinned reg)
+              then (members, anchor)
               else ((reg, ctyp) :: members, max anchor index)
           | _ -> (members, anchor)
         )

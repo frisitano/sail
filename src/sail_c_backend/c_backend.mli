@@ -182,6 +182,7 @@ module type CODEGEN_CONFIG = sig
       [register_file] is enabled. Hand-written platform code may declare its own [extern] for such registers without
       including the generated headers, so their symbols must survive. *)
   val register_file_excluded_modules : string list
+  val register_pins : (string * string) list
 
   (** Function identifiers pinned by [--c-preserve]: callable from hand-written FFI, so [register_file_thread] must not
       change their signatures. *)

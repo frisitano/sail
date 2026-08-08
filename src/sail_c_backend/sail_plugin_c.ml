@@ -75,6 +75,7 @@ let opt_optimized_model = ref false
 let opt_register_file = ref false
 let opt_register_file_thread = ref false
 let opt_register_file_excluded_modules : string list ref = ref []
+let opt_register_pins : (string * string) list ref = ref []
 let opt_preserved_functions = ref IdSet.empty
 let opt_c_optimized_source_root = ref None
 let opt_c_optimized_include_dir = ref None
@@ -371,6 +372,24 @@ let c_options =
         ),
       "keep registers declared in this generated module (by file stem, for example host/debug_enabled) as plain C \
        globals when --c-register-file is enabled"
+    );
+    ( Flag.create ~prefix:["c"] ~arg:"name=reg[,name=reg]" "register_pin",
+      Arg.String
+        (fun spec ->
+          String.split_on_char ',' spec
+          |> List.iter (fun pair ->
+                 match String.split_on_char '=' (String.trim pair) with
+                 | [name; machine_register]
+                   when String.trim name <> "" && String.trim machine_register <> "" ->
+                     let name = String.trim name in
+                     if List.mem_assoc name !opt_register_pins then
+                       raise (Arg.Bad ("duplicate --c-register-pin register " ^ name))
+                     else opt_register_pins := (name, String.trim machine_register) :: !opt_register_pins
+                 | _ -> raise (Arg.Bad "--c-register-pin expects NAME=MACHINE_REGISTER pairs")
+             )
+        ),
+      "emit the named model registers as global register variables permanently bound to the given machine registers \
+       (scalar registers only; the binding is declared in every translation unit and excluded from the register file)"
     );
     ( Flag.create ~prefix:["c"] ~arg:"directory" "optimized_source_root",
       Arg.String (fun directory -> opt_c_optimized_source_root := Some directory),
@@ -1036,6 +1055,7 @@ let c_target (mode : c_backend_mode) out_file { ast; effect_info; env; default_s
     let register_file = !opt_register_file
     let register_file_thread = !opt_register_file_thread
     let register_file_excluded_modules = !opt_register_file_excluded_modules
+  let register_pins = !opt_register_pins
     let preserved_functions = !opt_preserved_functions
     let external_types = !opt_c_external_types
     let external_type_names = c_repr_external_names
