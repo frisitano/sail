@@ -4653,17 +4653,50 @@ let is_noreturn_call ctx = function
    rewritten independently; a terminating call in only one arm therefore
    cannot discard the other arm's continuation. *)
 let prune_after_noreturn_call ctx (CDEF_aux (aux, def_annot)) =
-  let rec rewrite = function
-    | [] -> []
-    | instr :: _ when is_noreturn_call ctx instr -> [instr]
-    | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rest ->
-        I_aux (I_if (condition, rewrite then_instrs, rewrite else_instrs), if_aux) :: rewrite rest
-    | I_aux (I_block instrs, block_aux) :: rest -> I_aux (I_block (rewrite instrs), block_aux) :: rewrite rest
-    | I_aux (I_try_block instrs, block_aux) :: rest -> I_aux (I_try_block (rewrite instrs), block_aux) :: rewrite rest
-    | instr :: rest -> instr :: rewrite rest
+  let collect_targeted_labels body =
+    let targets = ref Util.StringSet.empty in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               ( match aux with
+               | I_goto target | I_jump (_, target) -> targets := Util.StringSet.add target !targets
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    !targets
   in
   match aux with
-  | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite body), def_annot)
+  | CDEF_fundef (id, ret, args, body) ->
+      let targeted_labels = collect_targeted_labels body in
+      (* The tail is unreachable by fall-through, but it is not inert: a label
+         in it may still be the target of a [goto] from an earlier arm, and the
+         function epilogue must survive or the generated C falls off the end of
+         a value-returning function.  Retain those two structural forms and
+         discard only the dead computation between them. *)
+      let rec keep_structural = function
+        | [] -> []
+        | (I_aux (I_label label, _) as instr) :: rest when Util.StringSet.mem label targeted_labels ->
+            instr :: keep_structural rest
+        | (I_aux ((I_end _ | I_undefined _), _) as instr) :: rest -> instr :: keep_structural rest
+        | _ :: rest -> keep_structural rest
+      in
+      let rec rewrite = function
+        | [] -> []
+        | instr :: rest when is_noreturn_call ctx instr -> instr :: keep_structural rest
+        | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rest ->
+            I_aux (I_if (condition, rewrite then_instrs, rewrite else_instrs), if_aux) :: rewrite rest
+        | I_aux (I_block instrs, block_aux) :: rest -> I_aux (I_block (rewrite instrs), block_aux) :: rewrite rest
+        | I_aux (I_try_block instrs, block_aux) :: rest -> I_aux (I_try_block (rewrite instrs), block_aux) :: rewrite rest
+        | instr :: rest -> instr :: rewrite rest
+      in
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
 let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
@@ -6325,7 +6358,11 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | _ -> sprintf "(%s / %s)" (sgen_cval v1) (sgen_cval v2)
       )
     | Imod, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) && match cval_ctyp v2 with CT_fuint _ -> true | _ -> false ->
-        sprintf "u320_mod_u64(%s, %s)" (sgen_cval v1) (sgen_cval v2)
+        (* The remainder of a u320 by a u64 divisor is itself u64-valued, and
+           [u320_mod_u64] returns it as such, but the destination slot carries
+           the dividend's u320 representation -- unlike the [Idiv] sibling,
+           whose quotient is genuinely u320-wide.  Widen at the boundary. *)
+        sprintf "u320_of_u64(u320_mod_u64(%s, %s))" (sgen_cval v1) (sgen_cval v2)
     | Imod, [v1; v2] when is_c_repr_u320 (cval_ctyp v1) -> sprintf "u320_mod(%s, %s)" (sgen_cval v1) (u320_of v2)
     | Imod, [v1; v2] when is_c_repr_u256 (cval_ctyp v1) && is_c_repr_u128 (cval_ctyp v2) ->
         sprintf "u256_mod_u128(%s, %s)" (sgen_cval v1) (sgen_cval v2)
