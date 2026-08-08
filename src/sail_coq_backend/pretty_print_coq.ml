@@ -4158,11 +4158,28 @@ let rec untuple_args_pat typs (P_aux (paux, ((l, _) as annot)) as pat) =
   | _, [typ] -> ([(pat, typ)], identity)
   | _, _ -> unreachable l __POS__ "Unexpected pattern/type combination"
 
+(* catch_early_return and pure_early_return require one shared type for the
+   early-return channel and the fall-through result.  Early returns are already
+   packed to the named semantic return type, so the fall-through result has to
+   be packed inside the handler rather than around it. *)
+let doc_semantic_early_return ctxt is_monadic exp_pp =
+  match ctxt.semantic_return with
+  | None -> exp_pp
+  | Some typ ->
+      let packed_pp = doc_semantic_pack ctxt typ (string "semanticResult") in
+      let bind_pp, inject_pp =
+        if is_monadic then (string ">>= fun semanticResult =>", string "returnR " ^^ parens ctxt.ret_typ_pp ^^ space)
+        else (string ">>$= fun semanticResult =>", string "inr ")
+      in
+      group (parens exp_pp ^^ space ^^ bind_pp ^/^ inject_pp ^^ packed_pp)
+
 let doc_fun_body ctxt is_monadic exp =
   let exp_pp = doc_exp ctxt false true exp in
-  if Option.is_some ctxt.early_ret then
+  if Option.is_some ctxt.early_ret then (
+    let exp_pp = doc_semantic_early_return ctxt is_monadic exp_pp in
     if is_monadic then align (string "catch_early_return" ^//^ parens exp_pp)
     else align (string "pure_early_return" ^//^ parens exp_pp)
+  )
   else exp_pp
 
 (* Coq doesn't support "as" patterns well in Definition binders, so we push
@@ -4553,6 +4570,9 @@ let doc_funcl_body ctxt (exp, is_monadic, fixupspp) =
   let bodypp = doc_fun_body ctxt is_monadic exp in
   let bodypp =
     match ctxt.semantic_return with
+    (* doc_fun_body already packed the fall-through result inside the
+       early-return handler, so the handler output is fully semantic. *)
+    | Some _ when Option.is_some ctxt.early_ret -> bodypp
     | Some typ when is_monadic ->
         group
           (parens bodypp ^^ space ^^ string ">>= fun semanticResult =>" ^/^ string "returnM "
