@@ -207,11 +207,84 @@ let implicit_parens x = enclose (string "{") (string "}") x
 let leftarrow = string "←"
 let leftarrowdo = string "← do"
 
+(* Lean tokens that cannot appear as an identifier. A Sail name that collides
+   with one of these is suffixed with a prime, which Lean accepts as an
+   ordinary identifier character. Names Sail itself reserves are listed too so
+   that the set can be read against Lean's grammar rather than against Sail's
+   lexer. *)
+let lean_reserved_names =
+  Util.StringSet.of_list
+    [
+      (* declaration and command keywords *)
+      "abbrev";
+      "alias";
+      "attribute";
+      "axiom";
+      "class";
+      "def";
+      "deriving";
+      "example";
+      "extends";
+      "inductive";
+      "instance";
+      "local";
+      "macro";
+      "macro_rules";
+      "mutual";
+      "namespace";
+      "noncomputable";
+      "notation";
+      "opaque";
+      "open";
+      "partial";
+      "private";
+      "protected";
+      "scoped";
+      "section";
+      "set_option";
+      "structure";
+      "syntax";
+      "theorem";
+      "universe";
+      "unsafe";
+      "variable";
+      (* fixity keywords *)
+      "infix";
+      "infixl";
+      "infixr";
+      "postfix";
+      "prefix";
+      (* term and tactic keywords *)
+      "at";
+      "block";
+      "break";
+      "calc";
+      "catch";
+      "continue";
+      "finally";
+      "from";
+      "fun";
+      "have";
+      "matches";
+      "meta";
+      "nofun";
+      "nomatch";
+      "rec";
+      "show";
+      "sorry";
+      "suffices";
+      "this";
+      "unless";
+      "using";
+      "where";
+      "with";
+    ]
+
 let rec fix_id name =
   match name with
   (* Lean keywords to avoid, to expand as needed *)
   | "_lean_wildcard" -> "_"
-  | "rec" | "def" | "at" | "alias" | "break" | "meta" | "class" | "have" | "block" | "prefix" -> name ^ "'"
+  | _ when Util.StringSet.mem name lean_reserved_names -> name ^ "'"
   | "main" ->
       the_main_function_has_been_seen := true;
       "sail_main"
