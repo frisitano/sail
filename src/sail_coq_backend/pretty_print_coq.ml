@@ -3075,7 +3075,7 @@ let doc_exp, doc_let =
           else None
       | A_aux (A_typ _, _) -> None
     in
-    let witness_docs =
+    let witness_docs, payload_typ =
       match Env.expand_synonyms env public_typ with
       | Typ_aux (Typ_exist (kopts, _nc, inner), _) ->
           let relevant_kopts, _ = relevant_existential_vars ctxt env kopts inner in
@@ -3083,10 +3083,22 @@ let doc_exp, doc_let =
           let actual_typ = Env.expand_synonyms (env_of exp) (typ_of exp) in
           (try
              let unifiers = Type_check.unify (typ_loc public_typ) env goals inner actual_typ in
-             List.map
-               (fun kopt -> witness_arg_doc (KBindings.find (kopt_kid kopt) unifiers))
-               relevant_kopts
-             |> Util.option_all
+             let witnesses =
+               List.map
+                 (fun kopt -> witness_arg_doc (KBindings.find (kopt_kid kopt) unifiers))
+                 relevant_kopts
+               |> Util.option_all
+             in
+             (* The payload's own type pins down which index each [existT]
+                abstracts.  Without it Coq elaborates [@existT _ _ w payload]
+                left to right and solves the sigma predicate by higher-order
+                unification against the payload's type, which picks the last
+                type argument rather than the quantified one. *)
+             let instantiated = Type_check.subst_unifiers unifiers inner in
+             let payload =
+               if KidSet.is_empty (KidSet.inter goals (tyvars_of_typ instantiated)) then Some instantiated else None
+             in
+             (witnesses, payload)
            with ex ->
              debug ctxt
                (lazy
@@ -3094,9 +3106,9 @@ let doc_exp, doc_let =
                 ^ Printexc.to_string ex
                  )
                );
-             None
+             (None, None)
           )
-      | _ -> None
+      | _ -> (None, None)
     in
     debug ctxt
       ( lazy
@@ -3188,6 +3200,15 @@ let doc_exp, doc_let =
     let pp =
       match witness_docs with
       | Some witnesses when List.length witnesses = List.length kids_to_print ->
+          let inner =
+            match payload_typ with
+            | Some payload when kids_to_print <> [] -> (
+                match doc_typ ctxt env payload with
+                | typ_pp -> parens (separate space [inner; colon; typ_pp])
+                | exception _ -> inner
+              )
+            | _ -> inner
+          in
           List.fold_left
             (fun pp witness -> separate space [string "@existT _ _"; witness; parens pp])
             inner witnesses
