@@ -1782,8 +1782,27 @@ let rec expression_is_unit_value = function
       expression_is_unit_value exp
   | _ -> false
 
+(* A global binding whose declared type packs existential indices is emitted
+   already unpacked whenever the use site instantiated those indices, so the
+   value that reaches the surrounding expression is the fields carrier rather
+   than the packed Sigma. Both the emission in [doc_exp]'s [E_id] case and the
+   representation predicates below must agree on that, otherwise the value is
+   projected twice. *)
+let global_dependent_binding_unpacked_at_use ctx id use_typ =
+  match Bindings.find_opt id ctx.global.semantic_types.bindings with
+  | Some typ ->
+      has_top_level_dependent_type ctx typ
+      && (not (has_top_level_dependent_type ctx use_typ))
+      && not
+           (match ctx.expected_dependent with
+           | Some expected -> dependent_types_equivalent ctx typ expected
+           | None -> false
+           )
+  | None -> false
+
 let dependent_representation_type ctx (E_aux (exp, _) as full_exp) =
   match exp with
+  | E_id id when global_dependent_binding_unpacked_at_use ctx id (typ_of full_exp) -> typ_of full_exp
   | E_id id -> (
       match Bindings.find_opt id ctx.packed_dependent_types with
       | Some typ -> typ
@@ -3113,25 +3132,13 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
           else value
       else (
         let value = doc_id_ctor id in
-        let preserve_expected_dependent =
-          match
-            ( ctx.expected_dependent,
-              Bindings.find_opt id ctx.global.semantic_types.bindings
-            )
-          with
-          | Some expected, Some typ ->
-              dependent_types_equivalent ctx typ expected
-          | _ -> false
-        in
         let value =
-          if preserve_expected_dependent then value
-          else
+          if global_dependent_binding_unpacked_at_use ctx id (typ_of full_exp) then (
             match Bindings.find_opt id ctx.global.semantic_types.bindings with
-            | Some typ
-              when has_top_level_dependent_type ctx typ
-                   && not (has_top_level_dependent_type ctx (typ_of full_exp)) ->
-                doc_dependent_unpack ctx typ value
-            | _ -> value
+            | Some typ -> doc_dependent_unpack ctx typ value
+            | None -> value
+          )
+          else value
         in
         let value =
           match Bindings.find_opt id ctx.global.semantic_types.bindings with
