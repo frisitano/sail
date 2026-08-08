@@ -5911,7 +5911,24 @@ let rec doc_defs_rec ctx defs types (former_funcs : document list) (docdefs : do
       in
       doc_defs_rec ctx defs' types former_funcs pp_f pending
   | DEF_aux (DEF_internal_mutrec fdefs, dannot) :: defs' ->
-      let funs = separate_map hardline (fun fdef -> doc_fundef ctx fdef) fdefs in
+      (* The explicit-measure rewrite renames each measured member of the group
+         to a #rec# helper and appends the original name as a wrapper right
+         after the group. Members that carry no measure still call those
+         wrappers, so the wrappers have to join the same mutual block: Lean
+         resolves names across a mutual block and splits it into cliques before
+         checking termination, whereas a definition placed after the block is
+         simply not in scope inside it. *)
+      let group_ids = List.fold_left (fun ids fdef -> IdSet.add (id_of_fundef fdef) ids) IdSet.empty fdefs in
+      let is_group_measure_wrapper fdef =
+        IdSet.mem (mk_id ("#rec#" ^ string_of_id (id_of_fundef fdef))) group_ids
+      in
+      let rec split_measure_wrappers wrappers = function
+        | DEF_aux (DEF_fundef fdef, _) :: rest when is_group_measure_wrapper fdef ->
+            split_measure_wrappers (wrappers @ [fdef]) rest
+        | rest -> (wrappers, rest)
+      in
+      let wrappers, defs' = split_measure_wrappers [] defs' in
+      let funs = separate_map hardline (fun fdef -> doc_fundef ctx fdef) (fdefs @ wrappers) in
       let res = string "mutual" ^^ hardline ^^ funs ^^ hardline ^^ string "end" ^^ hardline in
       doc_defs_rec ctx defs' types former_funcs (docdefs ^^ pending ^^ hardline ^^ res ^^ hardline) empty
   | DEF_aux (DEF_type tdef, _) :: defs' when List.mem (string_of_id (id_of_type_def tdef)) !opt_extern_types ->
