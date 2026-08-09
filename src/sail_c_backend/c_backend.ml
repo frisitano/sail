@@ -6556,10 +6556,28 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             if len = 64 then extracted else sprintf "(%s & %s)" (sgen_mask len) extracted
         | _ -> assert false
       )
-    | Proven_slice (len, 64), [vec; start] ->
+    | Proven_slice (len, proven_width), [vec; start] ->
+        let raw () = sprintf "(%s >> %s)" (sgen_cval vec) (sgen_cval start) in
         let extracted =
           match cval_ctyp vec with
-          | CT_fbits _ | CT_fuint _ -> sprintf "(%s >> %s)" (sgen_cval vec) (sgen_cval start)
+          (* A fixed bitvector is stored in a full machine word whatever its
+             logical width, so the proven shift stays in range. *)
+          | CT_fbits _ -> raw ()
+          | CT_fuint width when proven_width <= width -> raw ()
+          | CT_fuint width -> (
+              (* The shift was proven in range against a wider earlier
+                 representation of this operand, and a later narrowing has
+                 since reduced it.  C leaves a shift at or beyond the
+                 operand's width undefined, so re-establish the extraction
+                 against the representation actually in hand rather than
+                 trusting a proof about a representation that no longer
+                 exists.  A non-negative bounded integer has no set bits at
+                 or above its width, so those slices are zero. *)
+              match start with
+              | V_lit (VL_int amount, _) when Big_int.less_equal (Big_int.of_int width) amount -> "UINT64_C(0)"
+              | V_lit (VL_int amount, _) when Big_int.less amount (Big_int.of_int width) -> raw ()
+              | _ -> sprintf "safe_rshift(%s, %s)" (sgen_cval vec) (sgen_cval start)
+            )
           | CT_sbits _ -> sprintf "(%s.bits >> %s)" (sgen_cval vec) (sgen_cval start)
           | _ -> assert false
         in
