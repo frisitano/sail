@@ -1,0 +1,93 @@
+# Focused CI for the evm-sail compiler branch.
+#
+# The upstream matrix workflows build across four operating systems and two
+# OCaml versions, which is the right check for upstream Sail but slow feedback
+# for a downstream compiler branch. This job answers the two questions that
+# matter here: does the custom compiler still build, and do the Coq backend
+# regression cases under test/coq/ still behave as documented?
+#
+# Those cases are otherwise unexercised -- there is no Coq test harness in the
+# repository -- so without this they only ever run by hand.
+name: evm-sail Coq backend
+
+on:
+  push:
+    branches: [evm-sail]
+  pull_request:
+    branches: [evm-sail]
+  workflow_dispatch:
+
+env:
+  OPAMVERBOSE: 1
+
+jobs:
+  coq-backend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        run: sudo apt-get install -y build-essential libgmp-dev
+
+      - name: Setup Z3
+        uses: cda-tum/setup-z3@v1
+        with:
+          version: 4.15.3
+
+      - name: Set-up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.2.1
+
+      - name: Build the compiler
+        run: |
+          opam pin --yes --no-action add .
+          opam install sail --yes
+
+      # A mutual recursion group where only some members declare a
+      # termination_measure used to emit Coq that cannot compile. The backend
+      # must now reject it, naming the members that need a measure.
+      - name: Mixed measured/unmeasured mutual group is rejected
+        run: |
+          set +e
+          out=$(opam exec -- sail --coq --coq-output-dir /tmp/mixed -o m \
+                  test/coq/mutrec_mixed_measure.sail 2>&1)
+          status=$?
+          set -e
+          echo "$out"
+          if [ $status -eq 0 ]; then
+            echo "::error::expected Sail to reject the mixed group, but it succeeded"
+            exit 1
+          fi
+          echo "$out" | grep -q "termination_measure" || {
+            echo "::error::rejected, but not with the expected diagnostic"; exit 1; }
+
+      # The same group with measures on every member must generate.
+      - name: Uniformly measured mutual group generates
+        run: |
+          opam exec -- sail --coq --coq-output-dir /tmp/allmeasured -o m \
+            test/coq/mutrec_all_measured.sail
+          test -s /tmp/allmeasured/m.v
+
+      # Constraints are dropped into a comment by default and carried as
+      # hypotheses under the flag; both spellings must generate.
+      - name: Constraint obligations, off and on
+        run: |
+          opam exec -- sail --coq --coq-output-dir /tmp/c_off -o c \
+            test/coq/constraint_obligations.sail
+          grep -q '(\*.*<=?.*\*)' /tmp/c_off/c.v || {
+            echo "::error::default output no longer carries the constraint comment"; exit 1; }
+
+          opam exec -- sail --coq --coq-constraint-obligations \
+            --coq-output-dir /tmp/c_on -o c test/coq/constraint_obligations.sail
+          grep -q '_sailConstraint0' /tmp/c_on/c.v || {
+            echo "::error::--coq-constraint-obligations did not emit an obligation"; exit 1; }
+          grep -q 'ltac:(sail_constraint)' /tmp/c_on/c.v || {
+            echo "::error::call site does not discharge the obligation"; exit 1; }
+
+      # Turning the flag on must not change anything when it is off.
+      - name: Flag off leaves output unchanged
+        run: |
+          opam exec -- sail --coq --coq-output-dir /tmp/c_again -o c \
+            test/coq/constraint_obligations.sail
+          diff /tmp/c_off/c.v /tmp/c_again/c.v
