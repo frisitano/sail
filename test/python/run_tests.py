@@ -138,6 +138,13 @@ def oracle_values(module: Any) -> list[str]:
     return [sail_format(module, value) for value in values]
 
 
+# Set by --update-goldens (or SAIL_UPDATE_GOLDENS=1): rewrite the checked-in
+# golden files from the current generator output instead of asserting against
+# them. Regenerating by hand is error-prone because the goldens must come from
+# the same binary and plugin the harness itself uses.
+UPDATE_GOLDENS = os.environ.get("SAIL_UPDATE_GOLDENS") == "1"
+
+
 def assert_lines(label: str, actual: list[str], expected: list[str]) -> None:
     if actual == expected:
         return
@@ -458,9 +465,14 @@ def source_checks(path: Path, golden_name: str = "source.expect") -> None:
     assert "match pair:" in source
     for erased_form in ("_SAIL_PROGRAM", "_MODEL.call_public", "class SailModel", "class SailStruct", "class SailVariant"):
         assert erased_form not in source
+    projected = source_projection(source)
+    if UPDATE_GOLDENS:
+        (HERE / golden_name).write_text(projected + "\n")
+        print(f"updated golden {golden_name}")
+        return
     assert_lines(
         "generated source golden",
-        source_projection(source).splitlines(),
+        projected.splitlines(),
         (HERE / golden_name).read_text().splitlines(),
     )
 
@@ -633,7 +645,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sail", default=os.environ.get("SAIL", str(DEFAULT_SAIL if DEFAULT_SAIL.exists() else "sail")))
     parser.add_argument("--plugin", default=str(DEFAULT_PLUGIN) if DEFAULT_PLUGIN.exists() else None)
+    parser.add_argument(
+        "--update-goldens",
+        action="store_true",
+        help="rewrite the checked-in .expect goldens from this run's output",
+    )
     args = parser.parse_args()
+    if args.update_goldens:
+        global UPDATE_GOLDENS
+        UPDATE_GOLDENS = True
 
     sail_path = Path(args.sail)
     sail = [str(sail_path.resolve()) if sail_path.exists() else args.sail]
