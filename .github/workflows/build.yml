@@ -15,6 +15,9 @@ env:
 jobs:
   build:
     strategy:
+      # Without this one failing leg cancels the others, so a single flaky
+      # runner hides whether the rest of the matrix is healthy.
+      fail-fast: false
       matrix:
         ocaml_version: [4.14.3, 5.2.1]
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26, windows-2025]
@@ -42,8 +45,15 @@ jobs:
       if: runner.os == 'Windows'
       run: vcpkg install gmp
 
+    # The download this action performs hangs consistently on linux/arm64,
+    # so use the distribution package there and the pinned release elsewhere.
+    - name: Setup Z3 (apt, linux/arm64)
+      if: matrix.os == 'ubuntu-24.04-arm'
+      run: sudo apt-get install -y z3
+
     - name: Setup Z3
       id: z3
+      if: matrix.os != 'ubuntu-24.04-arm'
       uses: cda-tum/setup-z3@v1
       with:
         version: 4.15.3
