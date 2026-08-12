@@ -45,11 +45,31 @@ jobs:
       if: runner.os == 'Windows'
       run: vcpkg install gmp
 
-    # The download this action performs hangs consistently on linux/arm64,
-    # so use the distribution package there and the pinned release elsewhere.
-    - name: Setup Z3 (apt, linux/arm64)
+    # cda-tum/setup-z3 fails on linux/arm64 with 'socket hang up' while
+    # fetching the release -- reproduced on consecutive runs, same leg, same
+    # step. The asset itself is published (z3-<ver>-arm64-glibc-2.34.zip), so
+    # fetch it directly with retries rather than falling back to the
+    # distribution package: apt on noble carries 4.8.x, and solving with a
+    # different Z3 than the other legs would make this leg's typechecking
+    # results incomparable.
+    - name: Setup Z3 (pinned release, linux/arm64)
       if: matrix.os == 'ubuntu-24.04-arm'
-      run: sudo apt-get install -y z3
+      run: |
+        set -euo pipefail
+        ver=4.15.3
+        dir="z3-${ver}-arm64-glibc-2.34"
+        url="https://github.com/Z3Prover/z3/releases/download/z3-${ver}/${dir}.zip"
+        for attempt in 1 2 3; do
+          if curl -fL --retry 5 --retry-all-errors --connect-timeout 20 \
+               -o /tmp/z3.zip "$url"; then
+            break
+          fi
+          echo "attempt ${attempt} failed, retrying"
+          sleep $((attempt * 5))
+        done
+        unzip -q /tmp/z3.zip -d /tmp/z3
+        echo "/tmp/z3/${dir}/bin" >> "$GITHUB_PATH"
+        /tmp/z3/${dir}/bin/z3 --version
 
     - name: Setup Z3
       id: z3
