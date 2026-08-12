@@ -435,10 +435,7 @@ let without_function_definitions functions ast =
 let without_generated_undefined_definitions ast =
   without_function_definitions (generated_undefined_function_ids ast.defs) ast
 
-type runtime_numeric_value = {
-  expression : string;
-  already_integer : bool;
-}
+type runtime_numeric_value = { expression : string; already_integer : bool }
 
 type context = {
   env : Env.t;
@@ -451,7 +448,7 @@ type context = {
   enums : IdSet.t;
   type_names : string Bindings.t;
   record_quants : typquant Bindings.t;
-  record_fields : ((id * typ) list) Bindings.t;
+  record_fields : (id * typ) list Bindings.t;
   record_validity_names : string Bindings.t;
   function_quants : typquant Bindings.t;
   type_aliases : (id * typ) list;
@@ -755,10 +752,7 @@ let make_context ?(qualify_globals = false) ?(value_modules = Bindings.empty) ?(
     Bindings.fold
       (fun _ enum_id enums -> IdSet.add enum_id enums)
       enum_conversions.to_enum_functions
-      (Bindings.fold
-         (fun _ enum_id enums -> IdSet.add enum_id enums)
-         enum_conversions.from_enum_functions IdSet.empty
-      )
+      (Bindings.fold (fun _ enum_id enums -> IdSet.add enum_id enums) enum_conversions.from_enum_functions IdSet.empty)
   in
   let used =
     ref
@@ -785,15 +779,15 @@ let make_context ?(qualify_globals = false) ?(value_modules = Bindings.empty) ?(
             set := IdSet.add id !set
           in
           match type_definition with
-          | TD_record (id, typq, _, _) ->
+          | TD_record (id, typq, _, _) -> (
               add_type id records;
               record_quants := Bindings.add id typq !record_quants;
-              ( match type_definition with
+              match type_definition with
               | TD_record (_, _, fields, _) ->
                   record_fields :=
                     Bindings.add id (List.map (fun ((field, typ), _) -> (field, typ)) fields) !record_fields
               | _ -> ()
-              )
+            )
           | TD_variant (id, _, _, _) -> add_type id variants
           | TD_enum (id, _, _) -> add_type id enums
           | TD_abbrev (id, _, _) | TD_abstract (id, _, _) | TD_bitfield (id, _, _) ->
@@ -926,12 +920,11 @@ let public_uint_width lower upper =
 
 let range_annotation _ctx lower upper =
   match (big_int_of_nexp lower, big_int_of_nexp upper) with
-  | Some lower_value, Some upper_value when Big_int.less_equal Big_int.zero lower_value ->
-      ( match public_uint_width lower_value upper_value with
+  | Some lower_value, Some upper_value when Big_int.less_equal Big_int.zero lower_value -> (
+      match public_uint_width lower_value upper_value with
       | Some width -> "U" ^ string_of_int width
-      | None ->
-          Printf.sprintf "BoundedUint[%s, %s]" (Big_int.to_string lower_value) (Big_int.to_string upper_value)
-      )
+      | None -> Printf.sprintf "BoundedUint[%s, %s]" (Big_int.to_string lower_value) (Big_int.to_string upper_value)
+    )
   | Some lower_value, None when Big_int.less_equal Big_int.zero lower_value -> "Uint"
   | _ -> "int"
 
@@ -960,7 +953,7 @@ let aliases_for_typ ctx typ =
 let named_alias ctx typ = List.fold_left (fun alias id -> Some id) None (aliases_for_typ ctx typ)
 
 let syntactic_named_alias ctx = function
-  | Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, []), _)
+  | (Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, []), _))
     when List.exists (fun (alias, _) -> Id.compare alias id = 0) ctx.type_aliases ->
       Some id
   | _ -> None
@@ -970,67 +963,69 @@ let rec python_typ ctx (Typ_aux (typ_aux, _) as typ) =
   | Some id -> type_name ctx id
   | None -> (
       match named_alias ctx typ with
-  | Some id -> type_name ctx id
-  | None -> (
-      match fixed_bytes_type ctx typ with
-      | Some python_type -> python_type
+      | Some id -> type_name ctx id
       | None -> (
-          match typ_aux with
-          | Typ_id id -> (
-              match id_string id with
-              | "unit" -> "None"
-              | "bool" -> "bool"
-              | "int" -> "int"
-              | "nat" -> "Uint"
-              | "string" | "string_literal" -> "str"
-              | "real" -> "float"
-              | "bit" -> "Annotated[Bits, BitWidth(1)]"
-              | _ -> type_name ctx id
+          match fixed_bytes_type ctx typ with
+          | Some python_type -> python_type
+          | None -> (
+              match typ_aux with
+              | Typ_id id -> (
+                  match id_string id with
+                  | "unit" -> "None"
+                  | "bool" -> "bool"
+                  | "int" -> "int"
+                  | "nat" -> "Uint"
+                  | "string" | "string_literal" -> "str"
+                  | "real" -> "float"
+                  | "bit" -> "Annotated[Bits, BitWidth(1)]"
+                  | _ -> type_name ctx id
+                )
+              | Typ_var _ -> "Any"
+              | Typ_fn (args, result) ->
+                  "Callable[["
+                  ^ String.concat ", " (List.map (python_typ ctx) args)
+                  ^ "], " ^ python_typ ctx result ^ "]"
+              | Typ_bidir (left, right) -> "tuple[" ^ python_typ ctx left ^ ", " ^ python_typ ctx right ^ "]"
+              | Typ_tuple items -> (
+                  match items with
+                  | [] -> "tuple[()]"
+                  | [item] -> "tuple[" ^ python_typ ctx item ^ ",]"
+                  | _ -> "tuple[" ^ String.concat ", " (List.map (python_typ ctx) items) ^ "]"
+                )
+              | Typ_app (id, [A_aux (A_nexp lower, _); A_aux (A_nexp upper, _)]) when id_string id = "range" ->
+                  range_annotation ctx lower upper
+              | Typ_app (id, [A_aux (A_nexp value, _)]) when id_string id = "atom" || id_string id = "implicit" -> (
+                  match big_int_of_nexp value with
+                  | Some _ -> "Annotated[int, IntegerRange(" ^ python_nexp value ^ ", " ^ python_nexp value ^ ")]"
+                  | None -> "int"
+                )
+              | Typ_app (id, [A_aux (A_nexp width, _)]) when id_string id = "bitvector" || id_string id = "bits" -> (
+                  match big_int_of_nexp width with
+                  | Some _ -> "Annotated[Bits, BitWidth(" ^ python_nexp width ^ ")]"
+                  | None -> "Bits"
+                )
+              | Typ_app (id, _) when id_string id = "atom_bool" -> "bool"
+              | Typ_app (id, [A_aux (A_nexp value, _)]) when id_string id = "itself" -> (
+                  match big_int_of_nexp value with
+                  | Some _ -> "Annotated[int, IntegerRange(" ^ python_nexp value ^ ", " ^ python_nexp value ^ ")]"
+                  | None -> "int"
+                )
+              | Typ_app (id, [A_aux (A_nexp length, _); A_aux (A_typ item, _)]) when id_string id = "vector" -> (
+                  let items = "list[" ^ python_typ ctx item ^ "]" in
+                  match big_int_of_nexp length with
+                  | Some _ -> "Annotated[" ^ items ^ ", VectorLength(" ^ python_nexp length ^ ")]"
+                  | None -> items
+                )
+              | Typ_app (id, [A_aux (A_typ item, _)]) when id_string id = "list" -> "list[" ^ python_typ ctx item ^ "]"
+              | Typ_app (id, [A_aux (A_typ item, _)]) when id_string id = "option" -> python_typ ctx item ^ " | None"
+              | Typ_app (id, [A_aux (A_typ item, _)]) when id_string id = "register" ->
+                  "SailRef[" ^ python_typ ctx item ^ "]"
+              | Typ_app (id, []) -> python_typ ctx (Typ_aux (Typ_id id, typ_loc typ))
+              | Typ_app (id, _) -> type_name ctx id
+              | Typ_exist (_, _, body) -> python_typ ctx body
+              | Typ_internal_unknown -> "Any"
             )
-          | Typ_var _ -> "Any"
-          | Typ_fn (args, result) ->
-              "Callable[[" ^ String.concat ", " (List.map (python_typ ctx) args) ^ "], " ^ python_typ ctx result ^ "]"
-          | Typ_bidir (left, right) -> "tuple[" ^ python_typ ctx left ^ ", " ^ python_typ ctx right ^ "]"
-          | Typ_tuple items -> (
-              match items with
-              | [] -> "tuple[()]"
-              | [item] -> "tuple[" ^ python_typ ctx item ^ ",]"
-              | _ -> "tuple[" ^ String.concat ", " (List.map (python_typ ctx) items) ^ "]"
-            )
-          | Typ_app (id, [A_aux (A_nexp lower, _); A_aux (A_nexp upper, _)]) when id_string id = "range" ->
-              range_annotation ctx lower upper
-          | Typ_app (id, [A_aux (A_nexp value, _)]) when id_string id = "atom" || id_string id = "implicit" -> (
-              match big_int_of_nexp value with
-              | Some _ -> "Annotated[int, IntegerRange(" ^ python_nexp value ^ ", " ^ python_nexp value ^ ")]"
-              | None -> "int"
-            )
-          | Typ_app (id, [A_aux (A_nexp width, _)]) when id_string id = "bitvector" || id_string id = "bits" -> (
-              match big_int_of_nexp width with
-              | Some _ -> "Annotated[Bits, BitWidth(" ^ python_nexp width ^ ")]"
-              | None -> "Bits"
-            )
-          | Typ_app (id, _) when id_string id = "atom_bool" -> "bool"
-          | Typ_app (id, [A_aux (A_nexp value, _)]) when id_string id = "itself" -> (
-              match big_int_of_nexp value with
-              | Some _ -> "Annotated[int, IntegerRange(" ^ python_nexp value ^ ", " ^ python_nexp value ^ ")]"
-              | None -> "int"
-            )
-          | Typ_app (id, [A_aux (A_nexp length, _); A_aux (A_typ item, _)]) when id_string id = "vector" -> (
-              let items = "list[" ^ python_typ ctx item ^ "]" in
-              match big_int_of_nexp length with
-              | Some _ -> "Annotated[" ^ items ^ ", VectorLength(" ^ python_nexp length ^ ")]"
-              | None -> items
-            )
-          | Typ_app (id, [A_aux (A_typ item, _)]) when id_string id = "list" -> "list[" ^ python_typ ctx item ^ "]"
-          | Typ_app (id, [A_aux (A_typ item, _)]) when id_string id = "option" -> python_typ ctx item ^ " | None"
-          | Typ_app (id, [A_aux (A_typ item, _)]) when id_string id = "register" ->
-              "SailRef[" ^ python_typ ctx item ^ "]"
-          | Typ_app (id, []) -> python_typ ctx (Typ_aux (Typ_id id, typ_loc typ))
-          | Typ_app (id, _) -> type_name ctx id
-          | Typ_exist (_, _, body) -> python_typ ctx body
-          | Typ_internal_unknown -> "Any"
         )
-    )
     )
 
 (* A polymorphic Sail type abbreviation may mention numeric parameters that do
@@ -1064,9 +1059,8 @@ let rec python_alias_typ ctx (Typ_aux (typ_aux, _) as typ) =
           | [item] -> "tuple[" ^ python_alias_typ ctx item ^ ",]"
           | _ -> "tuple[" ^ String.concat ", " (List.map (python_alias_typ ctx) items) ^ "]"
         )
-      | Typ_app (id, [A_aux (A_nexp lower, _); A_aux (A_nexp upper, _)]) when id_string id = "range" -> (
+      | Typ_app (id, [A_aux (A_nexp lower, _); A_aux (A_nexp upper, _)]) when id_string id = "range" ->
           range_annotation ctx lower upper
-        )
       | Typ_app (id, [A_aux (A_nexp _, _)])
         when id_string id = "atom" || id_string id = "implicit" || id_string id = "itself" ->
           "int"
@@ -1254,8 +1248,7 @@ let representation_class ctx env typ =
       let expanded = Env.expand_synonyms env typ in
       let syntactic_alias = syntactic_named_alias ctx typ in
       match expanded with
-      | Typ_aux (Typ_app (id, [A_aux (A_nexp lower, _); A_aux (A_nexp upper, _)]), _)
-        when id_string id = "range" -> (
+      | Typ_aux (Typ_app (id, [A_aux (A_nexp lower, _); A_aux (A_nexp upper, _)]), _) when id_string id = "range" -> (
           match big_int_of_nexp lower with
           | Some lower when Big_int.less_equal Big_int.zero lower -> (
               match syntactic_alias with
@@ -1270,8 +1263,7 @@ let representation_class ctx env typ =
                           | Some width -> Some ("U" ^ string_of_int width)
                           | None ->
                               Some
-                                (Printf.sprintf "BoundedUint[%s, %s]" (Big_int.to_string lower)
-                                   (Big_int.to_string upper)
+                                (Printf.sprintf "BoundedUint[%s, %s]" (Big_int.to_string lower) (Big_int.to_string upper)
                                 )
                         )
                       | None -> Some "Uint"
@@ -1281,9 +1273,7 @@ let representation_class ctx env typ =
           | _ -> None
         )
       | _ -> (
-          match expanded with
-          | Typ_aux (Typ_id id, _) when id_string id = "nat" -> Some "Uint"
-          | _ -> None
+          match expanded with Typ_aux (Typ_id id, _) when id_string id = "nat" -> Some "Uint" | _ -> None
         )
     )
 
@@ -1724,8 +1714,7 @@ let add_pattern_numeric_values ctx values pat =
     | P_var (inner, TP_aux (TP_var kid, _)) ->
         let values =
           match assignment_pattern ctx inner with
-          | Some target when not (String.equal target "_") ->
-              KBindings.add kid (runtime_numeric_value target) values
+          | Some target when not (String.equal target "_") -> KBindings.add kid (runtime_numeric_value target) values
           | _ -> values
         in
         collect values inner
@@ -2190,7 +2179,8 @@ and emit_assignment ctx target_lexp value =
   | E_aux
       ( ( E_block _ | E_let _ | E_internal_plet _ | E_var _ | E_if _ | E_match _ | E_try _ | E_assign _ | E_assert _
         | E_for _ | E_loop _ | E_return _ | E_internal_return _ | E_throw _ | E_exit _ ),
-        _ ) ->
+        _
+      ) ->
       let temporary = fresh ctx "assigned_value" in
       emit_into ctx temporary value @ [assign temporary]
   | _ ->
@@ -2383,8 +2373,7 @@ let record_field_has_validation ctx env typ =
   | None -> (
       match typ with
       | Typ_aux (Typ_id id, _) when id_string id = "nat" -> false
-      | Typ_aux (Typ_app (id, [A_aux (A_nexp lower, _); A_aux (A_nexp upper, _)]), _)
-        when id_string id = "range" -> (
+      | Typ_aux (Typ_app (id, [A_aux (A_nexp lower, _); A_aux (A_nexp upper, _)]), _) when id_string id = "range" -> (
           match (big_int_of_nexp lower, big_int_of_nexp upper) with
           | Some lower, Some _ when Big_int.less_equal Big_int.zero lower -> false
           | _ -> true
@@ -2401,14 +2390,14 @@ let record_field_validation ctx env value typ =
   let required_bound description nexp = required_runtime_nexp ~loc:(typ_loc typ) ctx description nexp in
   match typ with
   | Typ_aux (Typ_id id, _) when id_string id = "nat" -> None
-  | Typ_aux (Typ_app (id, [A_aux (A_nexp lower, _); A_aux (A_nexp upper, _)]), _) when id_string id = "range" ->
-      ( match (big_int_of_nexp lower, big_int_of_nexp upper) with
+  | Typ_aux (Typ_app (id, [A_aux (A_nexp lower, _); A_aux (A_nexp upper, _)]), _) when id_string id = "range" -> (
+      match (big_int_of_nexp lower, big_int_of_nexp upper) with
       | Some lower, Some _ when Big_int.less_equal Big_int.zero lower -> None
       | _ ->
           let lower = required_bound "record range lower bound" lower in
           let upper = required_bound "record range upper bound" upper in
           Some ("(" ^ lower ^ " <= int(" ^ value ^ ") <= " ^ upper ^ ")", string_of_typ typ)
-      )
+    )
   | Typ_aux (Typ_app (id, [A_aux (A_nexp expected, _)]), _)
     when id_string id = "atom" || id_string id = "implicit" || id_string id = "itself" ->
       let expected = required_bound "record singleton value" expected in
@@ -2518,9 +2507,7 @@ let pydantic_record_definition ctx l id typq fields =
   in
   let body =
     (if has_validity then ["validity: " ^ validity_type_name ctx id] else [])
-    @ List.map
-        (fun ((field, typ), _) -> py_id field ^ ": " ^ record_field_type ctx owner field_names typ)
-        fields
+    @ List.map (fun ((field, typ), _) -> py_id field ^ ": " ^ record_field_type ctx owner field_names typ) fields
     @ pydantic_validator field_checks
   in
   validity_lines
@@ -2546,9 +2533,7 @@ let type_definition ctx (TD_aux (definition, (l, _))) =
         let field_names = record_field_names fields in
         let body =
           typquant_comment typq
-          @ List.map
-              (fun ((field, typ), _) -> py_id field ^ ": " ^ record_field_type ctx owner field_names typ)
-              fields
+          @ List.map (fun ((field, typ), _) -> py_id field ^ ": " ^ record_field_type ctx owner field_names typ) fields
         in
         record_field_type_aliases ctx owner fields
         @ ("@dataclass(slots=True)" :: block ("class " ^ owner ^ ":") body)
@@ -2583,8 +2568,8 @@ let type_definition ctx (TD_aux (definition, (l, _))) =
       block ("class " ^ type_name ctx id ^ "(" ^ (if numeric then "UintEnum" else "Enum") ^ "):") body @ [""]
   | TD_abbrev (id, _, A_aux (A_typ typ, _)) -> (
       match range_bounds ctx.env typ with
-      | Some (lower, upper)
-        when Big_int.less_equal Big_int.zero lower && Option.is_none (public_uint_width lower upper) ->
+      | Some (lower, upper) when Big_int.less_equal Big_int.zero lower && Option.is_none (public_uint_width lower upper)
+        ->
           let body =
             [
               "LOWER = " ^ Big_int.to_string lower;
@@ -3158,8 +3143,7 @@ let fixed_bytes_python_types ctx =
   IntMap.bindings ctx.fixed_bytes_types |> List.map snd |> List.sort_uniq String.compare
 
 let ethereum_types_runtime_names ctx =
-  ["U8"; "U16"; "U32"; "U64"; "U256"; "Uint"; "UintEnum"; "Unsigned"]
-  @ fixed_bytes_python_types ctx
+  ["U8"; "U16"; "U32"; "U64"; "U256"; "Uint"; "UintEnum"; "Unsigned"] @ fixed_bytes_python_types ctx
   |> StringSet.of_list
 
 let profile_runtime_import_names ctx names =
@@ -3230,10 +3214,7 @@ let runtime_source ctx runtime_module =
         String.concat "\n"
           (List.filter
              (fun source -> not (String.equal source ""))
-             [
-               imports;
-               String.concat "\n" (explicit_import ~reexport:true module_name external_runtime_imports);
-             ]
+             [imports; String.concat "\n" (explicit_import ~reexport:true module_name external_runtime_imports)]
           )
         ^ "\n"
   in
@@ -4080,9 +4061,7 @@ let generate ?runtime_module ?extern_module ?(preserve_structure = false) ?(sour
   let enum_conversions = generated_enum_conversions ast.defs in
   let ast = without_generated_undefined_definitions ast in
   let ast = without_function_definitions enum_conversions.function_ids ast in
-  let ctx =
-    make_context ~source_val_specs ~pydantic ~ethereum_fixed_bytes ~enum_conversions ?extern_module env ast
-  in
+  let ctx = make_context ~source_val_specs ~pydantic ~ethereum_fixed_bytes ~enum_conversions ?extern_module env ast in
   (* Single-file output: the whole program shares one module scope. *)
   current_module_names := StringSet.union (program_type_level_names ctx) (module_value_names ctx ast.defs);
   let runtime = runtime_source ctx runtime_module in

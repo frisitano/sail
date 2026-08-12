@@ -96,9 +96,8 @@ let the_target = ref None
 
 let register ~name ?flag ?description:desc ?(options = []) ?(pre_parse_hook = fun () -> ())
     ?(pre_initial_check_hook = fun _ -> ()) ?(post_initial_check_hook = fun _ -> ())
-    ?(pre_rewrites_hook = fun _ _ _ -> ()) ?(skip_initial_rewrite = false)
-    ?(rewrites = []) ?(asserts_termination = false) ?(supports_abstract_types = false)
-    ?(supports_runtime_config = false) action =
+    ?(pre_rewrites_hook = fun _ _ _ -> ()) ?(skip_initial_rewrite = false) ?(rewrites = [])
+    ?(asserts_termination = false) ?(supports_abstract_types = false) ?(supports_runtime_config = false) action =
   let set_target () =
     match !the_target with
     | None -> the_target := Some name

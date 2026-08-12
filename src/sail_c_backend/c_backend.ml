@@ -2322,8 +2322,7 @@ let inline_marked_functions cdefs =
           let found = ref calls in
           iter_instr
             (function
-              | I_aux (I_funcall (_, Call _, (fid, _), _), _) when IdSet.mem fid marked ->
-                  found := IdSet.add fid !found
+              | I_aux (I_funcall (_, Call _, (fid, _), _), _) when IdSet.mem fid marked -> found := IdSet.add fid !found
               | _ -> ()
               )
             instr;
@@ -2348,9 +2347,7 @@ let inline_marked_functions cdefs =
         let next =
           IdSet.fold
             (fun id next ->
-              match Bindings.find_opt id marked_edges with
-              | Some callees -> IdSet.union callees next
-              | None -> next
+              match Bindings.find_opt id marked_edges with Some callees -> IdSet.union callees next | None -> next
             )
             frontier IdSet.empty
         in
@@ -4693,7 +4690,8 @@ let prune_after_noreturn_call ctx (CDEF_aux (aux, def_annot)) =
         | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rest ->
             I_aux (I_if (condition, rewrite then_instrs, rewrite else_instrs), if_aux) :: rewrite rest
         | I_aux (I_block instrs, block_aux) :: rest -> I_aux (I_block (rewrite instrs), block_aux) :: rewrite rest
-        | I_aux (I_try_block instrs, block_aux) :: rest -> I_aux (I_try_block (rewrite instrs), block_aux) :: rewrite rest
+        | I_aux (I_try_block instrs, block_aux) :: rest ->
+            I_aux (I_try_block (rewrite instrs), block_aux) :: rewrite rest
         | instr :: rest -> instr :: rewrite rest
       in
       CDEF_aux (CDEF_fundef (id, ret, args, rewrite body), def_annot)
@@ -6002,58 +6000,58 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         if Config.narrowing_policy = Narrowing_checked then checked else unchecked
       in
       let low_u64 () =
-        if is_c_repr_u320 source then
-          sprintf "%s(%s)" (checked_helper "u320_to_u64" "u320_to_u64_unchecked") rendered
+        if is_c_repr_u320 source then sprintf "%s(%s)" (checked_helper "u320_to_u64" "u320_to_u64_unchecked") rendered
         else if is_c_repr_u256 source then
           sprintf "%s(%s)" (checked_helper "u256_to_u64" "u256_to_u64_unchecked") rendered
         else if is_c_repr_u128 source then
           sprintf "%s(%s)" (checked_helper "u128_to_u64" "u128_to_u64_unchecked") rendered
-        else
+        else (
           match source with
           (* Only a source wider than the projection needs an explicit
              truncation; a native source already converts implicitly wherever
              this projection is consumed. *)
-          | CT_fint width | CT_fuint width when width > 64 -> sprintf "((uint64_t)(%s))" rendered
+          | (CT_fint width | CT_fuint width) when width > 64 -> sprintf "((uint64_t)(%s))" rendered
           | CT_fint _ | CT_fuint _ | CT_constant _ -> rendered
           | _ -> c_error (sprintf "Cannot project proved integer representation %s" (string_of_ctyp source))
+        )
       in
       let as_u128 () =
-        if is_c_repr_u320 source then
-          sprintf "%s(%s)" (checked_helper "u128_of_u320" "u128_of_u320_unchecked") rendered
+        if is_c_repr_u320 source then sprintf "%s(%s)" (checked_helper "u128_of_u320" "u128_of_u320_unchecked") rendered
         else if is_c_repr_u256 source then
           sprintf "%s(%s)" (checked_helper "u128_of_u256" "u128_of_u256_unchecked") rendered
         else if is_c_repr_u128 source then rendered
-        else
+        else (
           match source with
-          | CT_fint width | CT_fuint width when width > 64 ->
+          | (CT_fint width | CT_fuint width) when width > 64 ->
               sprintf "((u128){{(uint64_t)(%s), (uint64_t)(((unsigned __int128)(%s)) >> 64)}})" rendered rendered
           | CT_fint _ | CT_fuint _ | CT_constant _ -> sprintf "u128_of_u64(%s)" (low_u64 ())
           | _ -> c_error (sprintf "Cannot narrow %s to u128" (string_of_ctyp source))
+        )
       in
       let as_u256 () =
-        if is_c_repr_u320 source then
-          sprintf "%s(%s)" (checked_helper "u256_of_u320" "u256_of_u320_unchecked") rendered
+        if is_c_repr_u320 source then sprintf "%s(%s)" (checked_helper "u256_of_u320" "u256_of_u320_unchecked") rendered
         else if is_c_repr_u256 source then rendered
         else if is_c_repr_u128 source then sprintf "u256_of_u128(%s)" rendered
-        else
+        else (
           match source with
-          | CT_fint width | CT_fuint width when width > 64 -> sprintf "u256_of_u128(%s)" (as_u128 ())
+          | (CT_fint width | CT_fuint width) when width > 64 -> sprintf "u256_of_u128(%s)" (as_u128 ())
           | CT_fint _ | CT_fuint _ | CT_constant _ -> sprintf "u256_of_fbits(%s)" (low_u64 ())
           | _ -> c_error (sprintf "Cannot narrow %s to u256" (string_of_ctyp source))
+        )
       in
-      if is_c_repr_u320 target then (
+      if is_c_repr_u320 target then
         if is_c_repr_u320 source then rendered
         else if is_c_repr_u256 source then sprintf "u320_of_u256(%s)" rendered
         else if is_c_repr_u128 source then sprintf "u320_of_u128(%s)" rendered
-        else
+        else (
           match source with
-          | CT_fint width | CT_fuint width when width > 64 -> sprintf "u320_of_u128(%s)" (as_u128 ())
+          | (CT_fint width | CT_fuint width) when width > 64 -> sprintf "u320_of_u128(%s)" (as_u128 ())
           | CT_fint _ | CT_fuint _ | CT_constant _ -> sprintf "u320_of_u64(%s)" (low_u64 ())
           | _ -> c_error (sprintf "Cannot narrow %s to u320" (string_of_ctyp source))
-      )
+        )
       else if is_c_repr_u256 target then as_u256 ()
       else if is_c_repr_u128 target then as_u128 ()
-      else
+      else (
         match target with
         (* Only a wide carrier needs an explicit low-limb projection. A native
            source keeps the ordinary represented-cast renderer, which
@@ -6073,6 +6071,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             | _ -> sgen_cval_as target value
           )
         | _ -> c_error (sprintf "Invalid proved integer narrowing target %s" (string_of_ctyp target))
+      )
     in
     match (op, cvals) with
     | Bnot, [V_lit (VL_bool value, _)] -> if value then "false" else "true"
@@ -6748,46 +6747,49 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     let fits_unsigned width = integer_cval_fits Big_int.zero (max_uint width) cval in
     let fits_signed width = integer_cval_fits (min_int width) (max_int width) cval in
     if Config.narrowing_policy = Narrowing_all then assignment
-    else
-    match (ctyp_to, ctyp_from) with
-    | CT_fuint to_width, CT_fuint from_width ->
-        let to_width = storage_width to_width in
-        let from_width = storage_width from_width in
-        if from_width <= to_width || fits_unsigned to_width then assignment
-        else
-          checked (sprintf "%s > %s" (sgen_cval cval) (upper_unsigned_bound ctyp_to to_width)) (outside_target_domain ())
-          ^^ assignment
-    | CT_fint to_width, CT_fint from_width ->
-        let to_width = storage_width to_width in
-        let from_width = storage_width from_width in
-        if from_width <= to_width || fits_signed to_width then assignment
-        else
-          checked
-            (sprintf "%s < %s || %s > %s" (sgen_cval cval) (lower_bound ctyp_to to_width) (sgen_cval cval)
-               (upper_signed_bound ctyp_to to_width)
-            )
-            (outside_target_domain ())
-          ^^ assignment
-    | CT_fuint to_width, CT_fint from_width ->
-        let to_width = storage_width to_width in
-        let from_width = storage_width from_width in
-        let negative = checked (sprintf "%s < 0" (sgen_cval cval)) (negative_target ()) in
-        if fits_unsigned to_width then assignment
-        else if from_width <= to_width then negative ^^ assignment
-        else
-          negative
-          ^^ checked
-               (sprintf "%s > %s" (sgen_cval cval) (upper_unsigned_bound ctyp_to to_width))
-               (outside_target_domain ())
-          ^^ assignment
-    | CT_fint to_width, CT_fuint from_width ->
-        let to_width = storage_width to_width in
-        let from_width = storage_width from_width in
-        if from_width < to_width || fits_signed to_width then assignment
-        else
-          checked (sprintf "%s > %s" (sgen_cval cval) (upper_signed_bound ctyp_to to_width)) (outside_target_domain ())
-          ^^ assignment
-    | _ -> assert false
+    else (
+      match (ctyp_to, ctyp_from) with
+      | CT_fuint to_width, CT_fuint from_width ->
+          let to_width = storage_width to_width in
+          let from_width = storage_width from_width in
+          if from_width <= to_width || fits_unsigned to_width then assignment
+          else
+            checked
+              (sprintf "%s > %s" (sgen_cval cval) (upper_unsigned_bound ctyp_to to_width))
+              (outside_target_domain ())
+            ^^ assignment
+      | CT_fint to_width, CT_fint from_width ->
+          let to_width = storage_width to_width in
+          let from_width = storage_width from_width in
+          if from_width <= to_width || fits_signed to_width then assignment
+          else
+            checked
+              (sprintf "%s < %s || %s > %s" (sgen_cval cval) (lower_bound ctyp_to to_width) (sgen_cval cval)
+                 (upper_signed_bound ctyp_to to_width)
+              )
+              (outside_target_domain ())
+            ^^ assignment
+      | CT_fuint to_width, CT_fint from_width ->
+          let to_width = storage_width to_width in
+          let from_width = storage_width from_width in
+          let negative = checked (sprintf "%s < 0" (sgen_cval cval)) (negative_target ()) in
+          if fits_unsigned to_width then assignment
+          else if from_width <= to_width then negative ^^ assignment
+          else
+            negative
+            ^^ checked
+                 (sprintf "%s > %s" (sgen_cval cval) (upper_unsigned_bound ctyp_to to_width))
+                 (outside_target_domain ())
+            ^^ assignment
+      | CT_fint to_width, CT_fuint from_width ->
+          let to_width = storage_width to_width in
+          let from_width = storage_width from_width in
+          if from_width < to_width || fits_signed to_width then assignment
+          else
+            checked (sprintf "%s > %s" (sgen_cval cval) (upper_signed_bound ctyp_to to_width)) (outside_target_domain ())
+            ^^ assignment
+      | _ -> assert false
+    )
 
   (* Return the expression for conversions that can be written directly in a
      stack-local initializer.  Checked native-integer conversions deliberately
@@ -6943,10 +6945,12 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         assign_u64_call (unchecked "u320_to_u64" "u320_to_u64_unchecked")
     | to_typ, from_typ when is_c_repr_u256 to_typ && is_c_repr_u320 from_typ ->
         ksprintf string "  %s = %s(%s);" (sgen_clexp_pure l clexp)
-          (unchecked "u256_of_u320" "u256_of_u320_unchecked") (sgen_cval cval)
+          (unchecked "u256_of_u320" "u256_of_u320_unchecked")
+          (sgen_cval cval)
     | to_typ, from_typ when is_c_repr_u128 to_typ && is_c_repr_u320 from_typ ->
         ksprintf string "  %s = %s(%s);" (sgen_clexp_pure l clexp)
-          (unchecked "u128_of_u320" "u128_of_u320_unchecked") (sgen_cval cval)
+          (unchecked "u128_of_u320" "u128_of_u320_unchecked")
+          (sgen_cval cval)
     | to_typ, CT_lbits when is_c_repr_u256 to_typ ->
         ksprintf string "  %s = u256_of_lbits(%s);" (sgen_clexp_pure l clexp) (sgen_cval cval)
     | CT_lbits, from_typ when is_c_repr_u256 from_typ ->
@@ -6986,7 +6990,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         assign_u64_call (unchecked "u128_to_u64" "u128_to_u64_unchecked")
     | to_typ, from_typ when is_c_repr_u128 to_typ && is_c_repr_u256 from_typ ->
         ksprintf string "  %s = %s(%s);" (sgen_clexp_pure l clexp)
-          (unchecked "u128_of_u256" "u128_of_u256_unchecked") (sgen_cval cval)
+          (unchecked "u128_of_u256" "u128_of_u256_unchecked")
+          (sgen_cval cval)
     | to_typ, (CT_vector (CT_fbits 8 | CT_fuint 8) | CT_fvector (_, (CT_fbits 8 | CT_fuint 8)))
       when is_c_repr_fixed_bytes to_typ ->
         codegen_fixed_bytes_vector_conversion l clexp cval to_typ ~initialize:true
@@ -7454,8 +7459,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   let nullary_constructor_kind ctx destination callee args =
     match clexp_ctyp destination with
     | CT_variant _ as variant_ctyp
-      when is_variant_constructor ctx (fst callee)
-           && List.for_all (fun arg -> ctyp_equal (cval_ctyp arg) CT_unit) args ->
+      when is_variant_constructor ctx (fst callee) && List.for_all (fun arg -> ctyp_equal (cval_ctyp arg) CT_unit) args
+      ->
         Some ("Kind_" ^ sgen_uid callee, variant_ctyp)
     | _ -> None
 
@@ -7617,7 +7622,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                 let element_type = sprintf "enum kind_%s" (sgen_id variant_id) in
                 let table_read ~in_switch =
                   match first_exit with
-                  | Constant_arm_return -> [sprintf "return ((%s){.kind = %s[%s]});" (sgen_ctyp result_ctyp) table selector]
+                  | Constant_arm_return ->
+                      [sprintf "return ((%s){.kind = %s[%s]});" (sgen_ctyp result_ctyp) table selector]
                   | Constant_arm_copy (l, destination, label) ->
                       sprintf "%s.kind = %s[%s];" (sgen_clexp_pure l destination) table selector
                       ::
@@ -7647,9 +7653,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                 Some { table_declaration; table_read; table_read_declares = false; residual_cases }
             | Constant_table_cval _ ->
                 let values =
-                  List.filter_map
-                    (function _, _, Constant_table_cval value -> Some value | _ -> None)
-                    constant_arms
+                  List.filter_map (function _, _, Constant_table_cval value -> Some value | _ -> None) constant_arms
                 in
                 let element_type, entry_of, read_statements, read_declares =
                   match packed_constant_layout values with
@@ -11999,8 +12003,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           VariableDeclaration
             (string (Printf.sprintf "// register %s (pinned to %s)" (string_of_name id) machine_register)
             ^^ hardline
-            ^^ string
-                 (Printf.sprintf "register %s %s __asm__(\"%s\");" (sgen_ctyp ctyp) (sgen_name id) machine_register)
+            ^^ string (Printf.sprintf "register %s %s __asm__(\"%s\");" (sgen_ctyp ctyp) (sgen_name id) machine_register)
             );
         ]
     | CDEF_register (id, ctyp, _) ->
@@ -13550,7 +13553,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           in
           Some
             (Specialization_plan.create ~compiler_name:"Sail" ~compiler_version:"0.20.2" ~compiler_revision:None
-               ~configuration ~narrowing_policy:(string_of_narrowing_policy Config.narrowing_policy)
+               ~configuration
+               ~narrowing_policy:(string_of_narrowing_policy Config.narrowing_policy)
                ~input_locations:(List.map (fun (DEF_aux (_, annot)) -> annot.loc) ast.defs)
                !Jib_compile.representation_specializations
             )

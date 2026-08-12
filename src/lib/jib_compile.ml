@@ -5619,8 +5619,8 @@ module Make (C : CONFIG) = struct
               (* A spliced override is an explicit refinement of the canonical
                  function; it must win over the backend's built-in support
                  routine for the same name and ABI. *)
-              | Some ([], param_ctyps, ret_ctyp, None, _)
-                when Option.is_none (get_def_attribute "spliced" fundef_annot) -> (
+              | Some ([], param_ctyps, ret_ctyp, None, _) when Option.is_none (get_def_attribute "spliced" fundef_annot)
+                -> (
                   match C.specialized_function_external id param_ctyps ret_ctyp with
                   | Some external_id ->
                       if List.compare_lengths params param_ctyps <> 0 then
@@ -6550,7 +6550,7 @@ module Make (C : CONFIG) = struct
       proven_fixed_integer_conversion represented (integer_lifetime_interval lifetime) value
     in
     let specialize_proven_integer_conversion lifetime_ranges = function
-      | I_aux (I_init (represented, name, Init_cval value), aux) as instr -> (
+      | I_aux (I_init (represented, name, Init_cval value), aux) as instr ->
           let source = cval_ctyp value in
           if ctyp_equal source represented then instr
           else (
@@ -6566,8 +6566,7 @@ module Make (C : CONFIG) = struct
               ~some:(fun value -> I_aux (I_init (represented, name, Init_cval value), aux))
               converted
           )
-        )
-      | I_aux (I_reinit (represented, name, value), aux) as instr -> (
+      | I_aux (I_reinit (represented, name, value), aux) as instr ->
           let source = cval_ctyp value in
           if ctyp_equal source represented then instr
           else (
@@ -6579,12 +6578,9 @@ module Make (C : CONFIG) = struct
                 (string_of_ctyp source) (string_of_ctyp represented)
                 (string_of_integer_interval (integer_lifetime_interval lifetime))
                 (Option.is_some converted);
-            Option.fold ~none:instr
-              ~some:(fun value -> I_aux (I_reinit (represented, name, value), aux))
-              converted
+            Option.fold ~none:instr ~some:(fun value -> I_aux (I_reinit (represented, name, value), aux)) converted
           )
-        )
-      | I_aux (I_copy (result, value), aux) as instr -> (
+      | I_aux (I_copy (result, value), aux) as instr ->
           let represented = clexp_ctyp result in
           let source = cval_ctyp value in
           if ctyp_equal source represented then instr
@@ -6592,13 +6588,13 @@ module Make (C : CONFIG) = struct
             let lifetime = cval_integer_lifetime lifetime_ranges value in
             let converted = proven_native_conversion represented lifetime value in
             if !opt_debug_function_representations then
-              Printf.eprintf "C representation specialization: conversion source=%s destination=%s interval=%s proof=%b\n%!"
+              Printf.eprintf
+                "C representation specialization: conversion source=%s destination=%s interval=%s proof=%b\n%!"
                 (string_of_ctyp source) (string_of_ctyp represented)
                 (string_of_integer_interval (integer_lifetime_interval lifetime))
                 (Option.is_some converted);
             Option.fold ~none:instr ~some:(fun value -> I_aux (I_copy (result, value), aux)) converted
           )
-        )
       | instr -> instr
     in
     let specialize_proven_bitvector_shift lifetime_ranges = function
@@ -6712,9 +6708,8 @@ module Make (C : CONFIG) = struct
               match represented_integer_lifetime ctx carrier_lifetime with
               | Some ((CT_fint _ | CT_fuint _) as carrier) when not (ctyp_equal (clexp_ctyp result) carrier) ->
                   let l = snd aux in
-                  log_progress
-                    "structural-primitive carrier=%s left=%s(%s) right=%s(%s)"
-                    (string_of_ctyp carrier) (string_of_ctyp (cval_ctyp left))
+                  log_progress "structural-primitive carrier=%s left=%s(%s) right=%s(%s)" (string_of_ctyp carrier)
+                    (string_of_ctyp (cval_ctyp left))
                     (string_of_integer_interval (integer_lifetime_interval left_lifetime))
                     (string_of_ctyp (cval_ctyp right))
                     (string_of_integer_interval (integer_lifetime_interval right_lifetime));
@@ -6919,8 +6914,7 @@ module Make (C : CONFIG) = struct
           let mixed_custom_comparison = mixed_custom_unsigned_representations left right in
           match (comparison, constant_comparison, comparison_carrier, mixed_custom_comparison) with
           | Some _, Some value, _, _ -> I_aux (I_copy (result, V_lit (VL_bool value, CT_bool)), aux)
-          | Some op, None, Some _, Some (left, right) ->
-              I_aux (I_copy (result, V_call (op, [left; right])), aux)
+          | Some op, None, Some _, Some (left, right) -> I_aux (I_copy (result, V_call (op, [left; right])), aux)
           | Some op, None, Some _, None when exact_mixed_fixed_comparison left right ->
               I_aux (I_copy (result, V_call (op, [left; right])), aux)
           | Some op, None, Some carrier, None ->
@@ -7044,10 +7038,8 @@ module Make (C : CONFIG) = struct
                     let preserve_native_operands =
                       Option.is_some power_of_two_operation || Option.is_some mixed_fixed_operation
                     in
-                    log_progress
-                      "primitive=%s carrier=%s result=%s left=%s(%s) right=%s(%s) preserve-mixed=%b"
-                      (string_of_id id)
-                      (string_of_ctyp carrier)
+                    log_progress "primitive=%s carrier=%s result=%s left=%s(%s) right=%s(%s) preserve-mixed=%b"
+                      (string_of_id id) (string_of_ctyp carrier)
                       (Option.fold ~none:"?" ~some:string_of_ctyp result_carrier)
                       (string_of_ctyp (cval_ctyp left))
                       (string_of_integer_interval (integer_lifetime_interval left_lifetime))
@@ -7332,9 +7324,8 @@ module Make (C : CONFIG) = struct
             (* Spliced overrides also win in representation clones; see the
                original-body selection above. *)
             match
-              (if Option.is_some (get_def_attribute "spliced" fundef_annot) then None
-               else C.specialized_function_external id actual_ctyps actual_ret_ctyp
-              )
+              if Option.is_some (get_def_attribute "spliced" fundef_annot) then None
+              else C.specialized_function_external id actual_ctyps actual_ret_ctyp
             with
             | Some external_id ->
                 let l = id_loc id in
@@ -7393,14 +7384,14 @@ module Make (C : CONFIG) = struct
           let calls = ref [] in
           let conversions = ref [] in
           let record_conversion source destination proven =
-            if not (ctyp_equal source destination) then
-              conversions := (source, destination, proven) :: !conversions
+            if not (ctyp_equal source destination) then conversions := (source, destination, proven) :: !conversions
           in
           let conversion_visitor =
             object
               inherit empty_jib_visitor
 
-              method! vcval = function
+              method! vcval =
+                function
                 | V_call (Proven_narrow destination, [source]) ->
                     record_conversion (cval_ctyp source) destination true;
                     DoChildren
@@ -7420,8 +7411,7 @@ module Make (C : CONFIG) = struct
                     :: !calls
               | I_aux (I_copy (destination, value), _) ->
                   record_conversion (cval_ctyp value) (clexp_ctyp destination) false
-              | I_aux (I_init (destination, _, Init_cval value), _)
-              | I_aux (I_reinit (destination, _, value), _) ->
+              | I_aux (I_init (destination, _, Init_cval value), _) | I_aux (I_reinit (destination, _, value), _) ->
                   record_conversion (cval_ctyp value) destination false
               | _ -> ()
               ))
@@ -8084,7 +8074,7 @@ module Make (C : CONFIG) = struct
                      inserting argument casts so that exact casts retain an
                      explicit [Proven_narrow] marker. *)
                   let refine_argument_le left right intervals =
-                    if Jib_semantics.has_argument_le ~left ~right semantic_proofs then
+                    if Jib_semantics.has_argument_le ~left ~right semantic_proofs then (
                       match (List.nth_opt intervals left, List.nth_opt intervals right) with
                       | Some (Some (left_lower, left_upper)), Some (Some (right_lower, right_upper)) ->
                           List.mapi
@@ -8095,11 +8085,10 @@ module Make (C : CONFIG) = struct
                             )
                             intervals
                       | _ -> intervals
+                    )
                     else intervals
                   in
-                  let argument_intervals =
-                    argument_intervals |> refine_argument_le 0 1 |> refine_argument_le 1 0
-                  in
+                  let argument_intervals = argument_intervals |> refine_argument_le 0 1 |> refine_argument_le 1 0 in
                   let casted_args =
                     List.mapi
                       (fun index (arg, param_ctyp) ->
@@ -8119,13 +8108,17 @@ module Make (C : CONFIG) = struct
                           | Some converted ->
                               if !opt_debug_function_representations then
                                 Printf.eprintf
-                                  "C representation specialization: precise-call function=%s argument=%d source=%s destination=%s proof=true\n%!"
+                                  "C representation specialization: precise-call function=%s argument=%d source=%s \
+                                   destination=%s proof=true\n\
+                                   %!"
                                   (string_of_id id) index (string_of_ctyp arg_ctyp) (string_of_ctyp param_ctyp);
                               ([], converted, [])
                           | None ->
                               if !opt_debug_function_representations then
                                 Printf.eprintf
-                                  "C representation specialization: precise-call function=%s argument=%d source=%s destination=%s proof=false\n%!"
+                                  "C representation specialization: precise-call function=%s argument=%d source=%s \
+                                   destination=%s proof=false\n\
+                                   %!"
                                   (string_of_id id) index (string_of_ctyp arg_ctyp) (string_of_ctyp param_ctyp);
                               let gs = ngensym () in
                               let cast = [idecl l param_ctyp gs; icopy l (CL_id (gs, param_ctyp)) arg] in

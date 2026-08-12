@@ -94,10 +94,7 @@ let filter_old_ast repl_ids repl_specs repl_types { defs; _ } =
         let id = id_of_type_def td in
         match Bindings.find_opt id repl_types with
         | Some (DEF_aux (repl_aux, repl_annot)) ->
-            ( DEF_aux (repl_aux, { repl_annot with loc = def_annot.loc }) :: rdefs,
-              specs_found,
-              IdSet.add id types_found
-            )
+            (DEF_aux (repl_aux, { repl_annot with loc = def_annot.loc }) :: rdefs, specs_found, IdSet.add id types_found)
         | None -> (def :: rdefs, specs_found, types_found)
       )
     | _ -> (def :: rdefs, specs_found, types_found)
@@ -123,9 +120,7 @@ let move_replacement_fundefs ast =
         let replacement, other_defs = List.partition is_replacement defs in
         let replacement =
           List.map
-            (function
-              | DEF_aux (repl_aux, repl_annot) -> DEF_aux (repl_aux, { repl_annot with loc = original_loc })
-            )
+            (function DEF_aux (repl_aux, repl_annot) -> DEF_aux (repl_aux, { repl_annot with loc = original_loc }))
             replacement
         in
         aux (replacement @ acc) other_defs

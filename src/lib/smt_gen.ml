@@ -336,12 +336,13 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
     | (Power_of_two_idiv exponent | Power_of_two_imod exponent), [arg] ->
         let width =
           match arg_ctyps with
-          | [CT_fint width | CT_fuint width] -> width
+          | [(CT_fint width | CT_fuint width)] -> width
           | _ -> failwith "power-of-two arithmetic requires a fixed integer"
         in
         let divisor = bvint width (Big_int.pow_int_positive 2 exponent) in
         Fn ((match op with Power_of_two_idiv _ -> "bvudiv" | _ -> "bvurem"), [arg; divisor])
-    | (Mixed_proven_idiv (operation_ctyp, result_ctyp) | Mixed_proven_imod (operation_ctyp, result_ctyp)), [left; right] ->
+    | (Mixed_proven_idiv (operation_ctyp, result_ctyp) | Mixed_proven_imod (operation_ctyp, result_ctyp)), [left; right]
+      ->
         let signed, operation_width =
           match operation_ctyp with
           | CT_fint width -> (true, width)
@@ -361,7 +362,10 @@ module Make (Config : CONFIG) (Primop_gen : PRIMOP_GEN) = struct
         in
         let operation =
           Fn
-            ( (match op with Mixed_proven_idiv _ -> if signed then "bvsdiv" else "bvudiv" | _ -> if signed then "bvsrem" else "bvurem"),
+            ( ( match op with
+              | Mixed_proven_idiv _ -> if signed then "bvsdiv" else "bvudiv"
+              | _ -> if signed then "bvsrem" else "bvurem"
+              ),
               [extend (List.nth arg_ctyps 0) left; extend (List.nth arg_ctyps 1) right]
             )
         in

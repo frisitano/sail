@@ -173,7 +173,7 @@ let lean_options =
           Pretty_print_lean.opt_semantic_range_types := true;
           opt_explicit_measures := true;
           Type_check.opt_expand_valspec := false
-      ),
+        ),
       "preserve explicit range aliases as nominal executable types with separate validity predicates"
     );
     ( Flag.create ~prefix:["lean"] "prop_dependent_types",

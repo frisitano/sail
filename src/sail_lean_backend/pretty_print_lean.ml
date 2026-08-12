@@ -37,9 +37,7 @@ let opt_constraint_obligations : bool ref = ref false
 let inferred_prop_dependent_records : string list ref = ref []
 
 let prop_dependent_mode_active () =
-  !opt_semantic_range_types
-  || !opt_infer_prop_dependent_types
-  || !opt_prop_dependent_types <> []
+  !opt_semantic_range_types || !opt_infer_prop_dependent_types || !opt_prop_dependent_types <> []
   || !inferred_prop_dependent_records <> []
 
 type semantic_range = { low : nexp; high : nexp }
@@ -124,44 +122,34 @@ type context = {
   dependent_return : typ option;
       (** The public existential return type of the current function, when its body uses the unpacked indexed value. *)
   dependent_result : prop_dependent_result option;
-      (** A function-specific Prop-backed rendering of an eligible existential
-          result.  Unlike a generic Sail existential, this has an erased
-          validity predicate rather than runtime Sigma witnesses. *)
+      (** A function-specific Prop-backed rendering of an eligible existential result. Unlike a generic Sail
+          existential, this has an erased validity predicate rather than runtime Sigma witnesses. *)
   expected_dependent : typ option;
-      (** The proof-refined result type expected for the current expression.
-          This is consumed by the expression itself and is not propagated to
-          its children. *)
+      (** The proof-refined result type expected for the current expression. This is consumed by the expression itself
+          and is not propagated to its children. *)
   lean_bound_nvars : KidSet.t;
-      (** Numeric kind variables that occur in the generated Lean signature
-          and are therefore available as explicit or auto-implicit binders. *)
+      (** Numeric kind variables that occur in the generated Lean signature and are therefore available as explicit or
+          auto-implicit binders. *)
   function_bound_nvars : KidSet.t;
-      (** Numeric kind variables bound by the function signature itself.
-          Unlike [lean_bound_nvars], this excludes witnesses introduced while
-          rendering local dependent expressions. *)
+      (** Numeric kind variables bound by the function signature itself. Unlike [lean_bound_nvars], this excludes
+          witnesses introduced while rendering local dependent expressions. *)
   unpacked_dependent_ids : IdSet.t;
-      (** Local binders whose Sail type is existential, but whose generated
-          Lean representation is the existential payload after a Sigma
-          pattern or function-entry unpack. *)
+      (** Local binders whose Sail type is existential, but whose generated Lean representation is the existential
+          payload after a Sigma pattern or function-entry unpack. *)
   packed_dependent_types : typ Bindings.t;
-      (** Local binders whose refined AST type is an existential payload, but
-          whose generated Lean representation remains the public Sigma type
-          because it is stored in a typed local or loop-carried aggregate. *)
+      (** Local binders whose refined AST type is an existential payload, but whose generated Lean representation
+          remains the public Sigma type because it is stored in a typed local or loop-carried aggregate. *)
   packed_dependent_results : prop_dependent_result Bindings.t;
-      (** Local binders that retain a function-specific Prop-backed result
-          wrapper rather than only its carrier. *)
+      (** Local binders that retain a function-specific Prop-backed result wrapper rather than only its carrier. *)
   kid_docs : document KBindings.t;
-      (** Local renderings for numeric kind variables recovered from fields of
-          a proof-refined runtime carrier. *)
+      (** Local renderings for numeric kind variables recovered from fields of a proof-refined runtime carrier. *)
   dependent_pattern_kid_docs : document KBindings.t Bindings.t;
-      (** Existential witness renderings associated with each value binder in
-          a destructuring pattern.  The same Sail kind names can be reused by
-          successive existential results, so field projections must recover
-          the witnesses belonging to their record rather than whichever
-          witness was bound most recently. *)
+      (** Existential witness renderings associated with each value binder in a destructuring pattern. The same Sail
+          kind names can be reused by successive existential results, so field projections must recover the witnesses
+          belonging to their record rather than whichever witness was bound most recently. *)
   local_let_ids : IdSet.t;
-      (** Value binders introduced by local lets, used to distinguish an
-          unpacked existential carrier with anonymous witnesses from an
-          indexed function argument whose type variables are in scope. *)
+      (** Value binders introduced by local lets, used to distinguish an unpacked existential carrier with anonymous
+          witnesses from an indexed function argument whose type variables are in scope. *)
 }
 
 let context_init env global =
@@ -311,23 +299,24 @@ let doc_id_ctor (Id_aux (i, _)) =
 let doc_kid ctx (Kid_aux (Var x, _) as ki) =
   match KBindings.find_opt ki ctx.kid_docs with
   | Some doc -> doc
-  | None ->
-  let ki =
-    if
-      KidSet.mem ki ctx.lean_bound_nvars
-      ||
-      match KBindings.find_opt ki ctx.kid_id_renames with Some (Some _) -> true | _ -> false
-    then ki
-    else
-      let equal_bound =
-        KidSet.inter (Spec_analysis.equal_kids ctx.env ki) ctx.lean_bound_nvars |> KidSet.elements
+  | None -> (
+      let ki =
+        if
+          KidSet.mem ki ctx.lean_bound_nvars
+          || match KBindings.find_opt ki ctx.kid_id_renames with Some (Some _) -> true | _ -> false
+        then ki
+        else (
+          let equal_bound =
+            KidSet.inter (Spec_analysis.equal_kids ctx.env ki) ctx.lean_bound_nvars |> KidSet.elements
+          in
+          match equal_bound with equal_kid :: _ -> equal_kid | [] -> ki
+        )
       in
-      (match equal_bound with equal_kid :: _ -> equal_kid | [] -> ki)
-  in
-  let Kid_aux (Var x, _) = ki in
-  match KBindings.find_opt ki ctx.kid_id_renames with
-  | Some (Some i) -> doc_id_ctor i
-  | _ -> "k_" ^ String.sub x 1 (String.length x - 1) |> fix_id |> string
+      let (Kid_aux (Var x, _)) = ki in
+      match KBindings.find_opt ki ctx.kid_id_renames with
+      | Some (Some i) -> doc_id_ctor i
+      | _ -> "k_" ^ String.sub x 1 (String.length x - 1) |> fix_id |> string
+    )
 
 let id_has_name name id = String.equal name (string_of_id id)
 
@@ -335,8 +324,7 @@ let prop_dependent_record id =
   List.exists (fun (record, _) -> id_has_name record id) !opt_prop_dependent_types
   || List.exists (fun record -> id_has_name record id) !inferred_prop_dependent_records
 
-let prop_dependent_alias id =
-  List.exists (fun (_, alias) -> id_has_name alias id) !opt_prop_dependent_types
+let prop_dependent_alias id = List.exists (fun (_, alias) -> id_has_name alias id) !opt_prop_dependent_types
 
 let prop_dependent_record_for_alias id =
   List.find_map
@@ -352,15 +340,11 @@ let prop_dependent_record_typ = function
   | _ -> false
 
 let prop_dependent_record_id_for_typ = function
-  | Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, _), _)
-    when prop_dependent_record id ->
-      Some id
+  | (Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, _), _)) when prop_dependent_record id -> Some id
   | _ -> None
 
 let prop_dependent_record_application = function
-  | Typ_aux (Typ_app (id, args), _)
-    when prop_dependent_record id && args <> [] ->
-      Some (id, args)
+  | Typ_aux (Typ_app (id, args), _) when prop_dependent_record id && args <> [] -> Some (id, args)
   | _ -> None
 
 (* TODO do a proper renaming and keep track of it *)
@@ -466,26 +450,13 @@ let rec lean_nvars_of_typ (Typ_aux (typ, _)) =
   | Typ_id _ -> KidSet.empty
   | Typ_var kid -> KidSet.singleton kid
   | Typ_fn (args, ret) ->
-      List.fold_left
-        (fun kids typ -> KidSet.union kids (lean_nvars_of_typ typ))
-        (lean_nvars_of_typ ret) args
-  | Typ_tuple typs ->
-      List.fold_left
-        (fun kids typ -> KidSet.union kids (lean_nvars_of_typ typ))
-        KidSet.empty typs
-  | Typ_app
-      ( Id_aux (Id ("implicit" | "range" | "atom" | "atom_bool"), _),
-        _
-      ) ->
-      KidSet.empty
+      List.fold_left (fun kids typ -> KidSet.union kids (lean_nvars_of_typ typ)) (lean_nvars_of_typ ret) args
+  | Typ_tuple typs -> List.fold_left (fun kids typ -> KidSet.union kids (lean_nvars_of_typ typ)) KidSet.empty typs
+  | Typ_app (Id_aux (Id ("implicit" | "range" | "atom" | "atom_bool"), _), _) -> KidSet.empty
   | Typ_app (_, args) ->
-      List.fold_left
-        (fun kids arg -> KidSet.union kids (lean_nvars_of_typ_arg arg))
-        KidSet.empty args
+      List.fold_left (fun kids arg -> KidSet.union kids (lean_nvars_of_typ_arg arg)) KidSet.empty args
   | Typ_exist (kopts, _, inner) ->
-      List.fold_left
-        (fun kids kopt -> KidSet.remove (kopt_kid kopt) kids)
-        (lean_nvars_of_typ inner) kopts
+      List.fold_left (fun kids kopt -> KidSet.remove (kopt_kid kopt) kids) (lean_nvars_of_typ inner) kopts
   | Typ_bidir _ | Typ_internal_unknown -> KidSet.empty
 
 and lean_nvars_of_typ_arg (A_aux (arg, _)) =
@@ -666,9 +637,7 @@ let index_refined_record_typ ctx expected actual =
   | Typ_aux (Typ_app (expected_id, expected_args), _), Typ_aux (Typ_app (actual_id, actual_args), _) ->
       Id.compare expected_id actual_id = 0
       && Bindings.mem expected_id ctx.global.semantic_types.record_fields
-      && expected_args <> []
-      && all_index_args expected_args
-      && all_index_args actual_args
+      && expected_args <> [] && all_index_args expected_args && all_index_args actual_args
       && not (dependent_types_equivalent ctx expected actual)
   | _ -> false
 
@@ -678,8 +647,8 @@ let index_refined_record_typ ctx expected actual =
    Both are linear arithmetic over the indices once the index projections and
    the branch hypotheses have been unfolded, which is what [simp_all] does. *)
 let lean_discharge_tactic =
-  "first | rfl | omega | (congr 1 <;> simp_all) | (congr 1 <;> omega) | (simp_all <;> omega) | (simp_all <;> rfl) \
-   | simp_all"
+  "first | rfl | omega | (congr 1 <;> simp_all) | (congr 1 <;> omega) | (simp_all <;> omega) | (simp_all <;> rfl) | \
+   simp_all"
 
 let doc_discharge_by = string ("by " ^ lean_discharge_tactic)
 
@@ -695,9 +664,7 @@ let existential_pack_refines_index ctx expected actual =
   match expand_synonyms_for_dependent_type ctx expected with
   | Typ_aux (Typ_exist (kopts, _, inner), _) -> (
       let bound = KidSet.of_list (List.map kopt_kid kopts) in
-      match
-        (expand_synonyms_for_dependent_type ctx inner, expand_synonyms_for_dependent_type ctx actual)
-      with
+      match (expand_synonyms_for_dependent_type ctx inner, expand_synonyms_for_dependent_type ctx actual) with
       | Typ_aux (Typ_app (expected_id, expected_args), _), Typ_aux (Typ_app (actual_id, actual_args), _)
         when Id.compare expected_id actual_id = 0
              && Bindings.mem expected_id ctx.global.semantic_types.record_fields
@@ -724,7 +691,7 @@ let exp_is_ascribed_at ctx typ (E_aux (exp, _)) =
 
 let prop_dependent_alias_id_for_typ ctx typ =
   match typ with
-  | Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, _), _) when prop_dependent_alias id -> Some id
+  | (Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, _), _)) when prop_dependent_alias id -> Some id
   | _ ->
       let expanded = expand_synonyms_for_dependent_type ctx typ in
       List.find_map
@@ -733,10 +700,8 @@ let prop_dependent_alias_id_for_typ ctx typ =
           match Bindings.find_opt alias ctx.global.semantic_types.aliases with
           | Some alias_typ -> (
               try
-                if
-                  Type_check.alpha_equivalent ctx.env expanded
-                    (expand_synonyms_for_dependent_type ctx alias_typ)
-                then Some alias
+                if Type_check.alpha_equivalent ctx.env expanded (expand_synonyms_for_dependent_type ctx alias_typ) then
+                  Some alias
                 else None
               with Type_internal.Type_error _ -> None
             )
@@ -748,207 +713,170 @@ let prop_dependent_alias_for_typ ctx typ = Option.is_some (prop_dependent_alias_
 
 let rec has_dependent_type ctx typ =
   if prop_dependent_record_typ typ then true
-  else
-  let typ = expand_synonyms_for_dependent_type ctx typ in
-  if prop_dependent_record_typ typ then true
-  else match typ with
-  | Typ_aux (Typ_exist (kopts, _, inner), _) ->
-      relevant_existential_kopts kopts inner <> [] || has_dependent_type ctx inner
-  | Typ_aux (Typ_app (_, args), _) ->
-      List.exists (function A_aux (A_typ inner, _) -> has_dependent_type ctx inner | _ -> false) args
-  | Typ_aux (Typ_tuple typs, _) -> List.exists (has_dependent_type ctx) typs
-  | _ -> false
+  else (
+    let typ = expand_synonyms_for_dependent_type ctx typ in
+    if prop_dependent_record_typ typ then true
+    else (
+      match typ with
+      | Typ_aux (Typ_exist (kopts, _, inner), _) ->
+          relevant_existential_kopts kopts inner <> [] || has_dependent_type ctx inner
+      | Typ_aux (Typ_app (_, args), _) ->
+          List.exists (function A_aux (A_typ inner, _) -> has_dependent_type ctx inner | _ -> false) args
+      | Typ_aux (Typ_tuple typs, _) -> List.exists (has_dependent_type ctx) typs
+      | _ -> false
+    )
+  )
 
 let has_top_level_dependent_type ctx typ =
   if prop_dependent_record_typ typ then true
-  else
+  else (
     let typ = expand_synonyms_for_dependent_type ctx typ in
     if prop_dependent_record_typ typ then true
-    else
+    else (
       match typ with
       | Typ_aux (Typ_exist (kopts, _, inner), _) -> relevant_existential_kopts kopts inner <> []
       | _ -> false
+    )
+  )
 
 let dependent_lambda binder body = parens (string "fun " ^^ binder ^^ string " => " ^^ body)
 
 let dependent_type_nvar_available ctx kid =
   KidSet.mem kid ctx.lean_bound_nvars
-  ||
-  match KBindings.find_opt kid ctx.kid_id_renames with Some (Some _) -> true | _ -> false
+  || match KBindings.find_opt kid ctx.kid_id_renames with Some (Some _) -> true | _ -> false
 
 let rec contains_prop_dependent_alias ctx typ =
   if prop_dependent_alias_for_typ ctx typ || prop_dependent_record_typ typ then true
-  else
+  else (
     let typ = expand_synonyms_for_dependent_type ctx typ in
     if prop_dependent_record_typ typ then true
-    else match typ with
-    | Typ_aux (Typ_exist (_, _, inner), _) -> contains_prop_dependent_alias ctx inner
-    | Typ_aux (Typ_app (_, args), _) ->
-        List.exists
-          (function
-            | A_aux (A_typ inner, _) -> contains_prop_dependent_alias ctx inner
-            | _ -> false
-          )
-          args
-    | Typ_aux (Typ_tuple typs, _) -> List.exists (contains_prop_dependent_alias ctx) typs
-    | _ -> false
+    else (
+      match typ with
+      | Typ_aux (Typ_exist (_, _, inner), _) -> contains_prop_dependent_alias ctx inner
+      | Typ_aux (Typ_app (_, args), _) ->
+          List.exists (function A_aux (A_typ inner, _) -> contains_prop_dependent_alias ctx inner | _ -> false) args
+      | Typ_aux (Typ_tuple typs, _) -> List.exists (contains_prop_dependent_alias ctx) typs
+      | _ -> false
+    )
+  )
 
-let inferred_prop_dependent_alias_args ctx alias
-    (Typ_aux (_, location) as typ) =
+let inferred_prop_dependent_alias_args ctx alias (Typ_aux (_, location) as typ) =
   match
     ( Bindings.find_opt alias ctx.global.semantic_types.aliases,
       Bindings.find_opt alias ctx.global.semantic_types.alias_quants
     )
   with
-  | Some alias_body, Some quant ->
+  | Some alias_body, Some quant -> (
       let kopts = quant_kopts quant in
       let goals = KidSet.of_list (List.map kopt_kid kopts) in
       let env =
         List.fold_left
-          (fun env kopt ->
-            try Env.add_typ_var location kopt env
-            with Type_internal.Type_error _ -> env
-          )
+          (fun env kopt -> try Env.add_typ_var location kopt env with Type_internal.Type_error _ -> env)
           ctx.env kopts
       in
-      (try
-         let unifiers =
-           Type_check.unify location env goals alias_body typ
-         in
-         Some
-           (List.map
-              (fun kopt -> KBindings.find (kopt_kid kopt) unifiers)
-              kopts
-           )
-       with _ -> None)
+      try
+        let unifiers = Type_check.unify location env goals alias_body typ in
+        Some (List.map (fun kopt -> KBindings.find (kopt_kid kopt) unifiers) kopts)
+      with _ -> None
+    )
   | _ -> None
 
 let rec doc_dependent_shape ctx typ =
   match prop_dependent_alias_id_for_typ ctx typ with
   | Some alias -> (
       match typ with
-      | Typ_aux (Typ_app (id, args), _)
-        when Id.compare id alias = 0 && args <> [] ->
-          parens
-            (flow space
-               (doc_id_ctor alias
-               :: List.map (doc_typ_arg ctx `All) args
-               )
-            )
+      | Typ_aux (Typ_app (id, args), _) when Id.compare id alias = 0 && args <> [] ->
+          parens (flow space (doc_id_ctor alias :: List.map (doc_typ_arg ctx `All) args))
       | _ -> (
           match inferred_prop_dependent_alias_args ctx alias typ with
-          | Some args when args <> [] ->
-              parens
-                (flow space
-                   (doc_id_ctor alias
-                   :: List.map (doc_typ_arg ctx `All) args
-                   )
-                )
+          | Some args when args <> [] -> parens (flow space (doc_id_ctor alias :: List.map (doc_typ_arg ctx `All) args))
           | _ ->
               if
-                match Sys.getenv_opt "SAIL_LEAN_DEPENDENT_DEBUG" with
-                | Some ("1" | "true" | "yes") -> true
-                | _ -> false
+                match Sys.getenv_opt "SAIL_LEAN_DEPENDENT_DEBUG" with Some ("1" | "true" | "yes") -> true | _ -> false
               then
-                Printf.eprintf
-                  "lean-dependent-alias: could not recover arguments for %s from %s\n%!"
+                Printf.eprintf "lean-dependent-alias: could not recover arguments for %s from %s\n%!"
                   (string_of_id alias) (string_of_typ typ);
               doc_id_ctor alias
         )
     )
-  | None ->
-    match prop_dependent_record_application typ with
-    | Some (record, args) ->
-        parens
-          (flow space
-             ((doc_id_ctor record ^^ string ".Indexed")
-             :: List.map (doc_typ_arg ctx `All) args
-             )
-          )
-    | None ->
-    match prop_dependent_record_id_for_typ typ with
-    | Some record -> doc_id_ctor record ^^ string ".Refined"
-    | None ->
-    let typ = expand_synonyms_for_dependent_type ctx typ in
-    match prop_dependent_record_application typ with
-    | Some (record, args) ->
-        parens
-          (flow space
-             ((doc_id_ctor record ^^ string ".Indexed")
-             :: List.map (doc_typ_arg ctx `All) args
-             )
-          )
-    | None ->
-    match prop_dependent_record_id_for_typ typ with
-    | Some record -> doc_id_ctor record ^^ string ".Refined"
-    | None ->
-    match typ with
-    | Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _)
-      when has_dependent_type ctx inner ->
-        parens (string "Option " ^^ doc_dependent_shape ctx inner)
-    | Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _)
-      when has_dependent_type ctx inner ->
-        parens (string "List " ^^ doc_dependent_shape ctx inner)
-    | Typ_aux
-        ( Typ_app
-            ( Id_aux (Id "vector", _),
-              [A_aux (A_nexp length, _); A_aux (A_typ inner, _)]
-            ),
-          _
+  | None -> (
+      match prop_dependent_record_application typ with
+      | Some (record, args) ->
+          parens (flow space ((doc_id_ctor record ^^ string ".Indexed") :: List.map (doc_typ_arg ctx `All) args))
+      | None -> (
+          match prop_dependent_record_id_for_typ typ with
+          | Some record -> doc_id_ctor record ^^ string ".Refined"
+          | None -> (
+              let typ = expand_synonyms_for_dependent_type ctx typ in
+              match prop_dependent_record_application typ with
+              | Some (record, args) ->
+                  parens (flow space ((doc_id_ctor record ^^ string ".Indexed") :: List.map (doc_typ_arg ctx `All) args))
+              | None -> (
+                  match prop_dependent_record_id_for_typ typ with
+                  | Some record -> doc_id_ctor record ^^ string ".Refined"
+                  | None -> (
+                      match typ with
+                      | Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _)
+                        when has_dependent_type ctx inner ->
+                          parens (string "Option " ^^ doc_dependent_shape ctx inner)
+                      | Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _)
+                        when has_dependent_type ctx inner ->
+                          parens (string "List " ^^ doc_dependent_shape ctx inner)
+                      | Typ_aux
+                          (Typ_app (Id_aux (Id "vector", _), [A_aux (A_nexp length, _); A_aux (A_typ inner, _)]), _)
+                        when has_dependent_type ctx inner ->
+                          nest 2
+                            (parens (flow space [string "Vector"; doc_dependent_shape ctx inner; doc_nexp ctx length]))
+                      | Typ_aux (Typ_tuple typs, _) when List.exists (has_dependent_type ctx) typs ->
+                          parens (separate_map (space ^^ string "×" ^^ space) (doc_dependent_shape ctx) typs)
+                      | Typ_aux (Typ_exist (kopts, nc, inner), l) ->
+                          let env = List.fold_left (fun env kopt -> Env.add_typ_var l kopt env) ctx.env kopts in
+                          let env = try Env.add_constraint nc env with Type_internal.Type_error _ -> env in
+                          let ctx = context_with_env ctx env in
+                          let relevant_kopts = relevant_existential_kopts kopts inner in
+                          let ctx =
+                            {
+                              ctx with
+                              lean_bound_nvars =
+                                List.fold_left
+                                  (fun bound kopt -> KidSet.add (kopt_kid kopt) bound)
+                                  ctx.lean_bound_nvars relevant_kopts;
+                            }
+                          in
+                          List.fold_right
+                            (fun (KOpt_aux (KOpt_kind (kind, kid), _)) body ->
+                              parens
+                                (flow (break 1)
+                                   [
+                                     string "Sigma";
+                                     string "fun";
+                                     parens (separate space [doc_kid ctx kid; colon; doc_existential_kind ctx kid kind]);
+                                     string "=>";
+                                     body;
+                                   ]
+                                )
+                            )
+                            relevant_kopts (doc_typ ctx inner)
+                      | _ -> doc_typ ctx typ
+                    )
+                )
+            )
         )
-      when has_dependent_type ctx inner ->
-        nest 2 (parens (flow space [string "Vector"; doc_dependent_shape ctx inner; doc_nexp ctx length]))
-    | Typ_aux (Typ_tuple typs, _) when List.exists (has_dependent_type ctx) typs ->
-        parens (separate_map (space ^^ string "×" ^^ space) (doc_dependent_shape ctx) typs)
-    | Typ_aux (Typ_exist (kopts, nc, inner), l) ->
-        let env = List.fold_left (fun env kopt -> Env.add_typ_var l kopt env) ctx.env kopts in
-        let env =
-          try Env.add_constraint nc env
-          with Type_internal.Type_error _ -> env
-        in
-        let ctx = context_with_env ctx env in
-        let relevant_kopts = relevant_existential_kopts kopts inner in
-        let ctx =
-          {
-            ctx with
-            lean_bound_nvars =
-              List.fold_left
-                (fun bound kopt -> KidSet.add (kopt_kid kopt) bound)
-                ctx.lean_bound_nvars relevant_kopts;
-          }
-        in
-        List.fold_right
-          (fun (KOpt_aux (KOpt_kind (kind, kid), _)) body ->
-            parens
-              (flow (break 1)
-                 [
-                   string "Sigma";
-                   string "fun";
-                   parens
-                     (separate space
-                        [doc_kid ctx kid; colon; doc_existential_kind ctx kid kind]
-                     );
-                   string "=>";
-                   body;
-                 ]
-              )
-          )
-          relevant_kopts (doc_typ ctx inner)
-    | _ -> doc_typ ctx typ
+    )
 
 let doc_dependent_pattern ?(proof = string "_sailValidity") ctx typ pattern =
-  if prop_dependent_alias_for_typ ctx typ then
-    string "⟨" ^^ pattern ^^ comma_sp ^^ proof ^^ string "⟩"
-  else if prop_dependent_record_typ typ then
-    string "⟨" ^^ pattern ^^ comma_sp ^^ proof ^^ string "⟩"
-  else
+  if prop_dependent_alias_for_typ ctx typ then string "⟨" ^^ pattern ^^ comma_sp ^^ proof ^^ string "⟩"
+  else if prop_dependent_record_typ typ then string "⟨" ^^ pattern ^^ comma_sp ^^ proof ^^ string "⟩"
+  else (
     let typ = expand_synonyms_for_dependent_type ctx typ in
     match typ with
     | Typ_aux (Typ_exist (kopts, _, inner), _) ->
         List.fold_right
           (fun _ pattern -> string "⟨_, " ^^ pattern ^^ string "⟩")
-          (relevant_existential_kopts kopts inner) pattern
-  | _ -> pattern
+          (relevant_existential_kopts kopts inner)
+          pattern
+    | _ -> pattern
+  )
 
 let rec constraint_application_ids (NC_aux (nc, _)) =
   match nc with
@@ -960,113 +888,79 @@ let rec constraint_application_ids (NC_aux (nc, _)) =
 let typquant_constraint_application_ids tq =
   List.fold_left
     (fun ids (QI_aux (item, _)) ->
-      match item with
-      | QI_constraint constraint_ ->
-          IdSet.union ids (constraint_application_ids constraint_)
-      | _ -> ids
+      match item with QI_constraint constraint_ -> IdSet.union ids (constraint_application_ids constraint_) | _ -> ids
     )
     IdSet.empty tq
 
 let instantiate_constraint instantiation nc =
-  KBindings.fold
-    (fun kid arg nc -> Ast_util.constraint_subst kid arg nc)
-    instantiation nc
+  KBindings.fold (fun kid arg nc -> Ast_util.constraint_subst kid arg nc) instantiation nc
 
 let rec prop_dependent_carrier_record_ids ctx typ =
   match prop_dependent_record_id_for_typ typ with
   | Some record -> IdSet.singleton record
   | None ->
       let expanded = expand_synonyms_for_dependent_type ctx typ in
-      if Typ.compare expanded typ <> 0 then
-        prop_dependent_carrier_record_ids ctx expanded
+      if Typ.compare expanded typ <> 0 then prop_dependent_carrier_record_ids ctx expanded
       else (
-      match expanded with
-      | Typ_aux (Typ_tuple typs, _) ->
-          List.fold_left
-            (fun records typ ->
-              IdSet.union records
-                (prop_dependent_carrier_record_ids ctx typ)
-            )
-            IdSet.empty typs
-      | _ -> IdSet.empty
-    )
+        match expanded with
+        | Typ_aux (Typ_tuple typs, _) ->
+            List.fold_left
+              (fun records typ -> IdSet.union records (prop_dependent_carrier_record_ids ctx typ))
+              IdSet.empty typs
+        | _ -> IdSet.empty
+      )
 
 let rec prop_dependent_carrier_properties ctx root typ =
   match prop_dependent_record_id_for_typ typ with
   | Some _ -> [parens root ^^ string ".property"]
   | None ->
       let expanded = expand_synonyms_for_dependent_type ctx typ in
-      if Typ.compare expanded typ <> 0 then
-        prop_dependent_carrier_properties ctx root expanded
+      if Typ.compare expanded typ <> 0 then prop_dependent_carrier_properties ctx root expanded
       else (
-      match expanded with
-      | Typ_aux (Typ_tuple typs, _) ->
-          let rec collect root = function
-            | [] -> []
-            | [typ] -> prop_dependent_carrier_properties ctx root typ
-            | typ :: rest ->
-                prop_dependent_carrier_properties ctx
-                  (parens root ^^ string ".1") typ
-                @ collect (parens root ^^ string ".2") rest
-          in
-          collect root typs
-      | _ -> []
-    )
+        match expanded with
+        | Typ_aux (Typ_tuple typs, _) ->
+            let rec collect root = function
+              | [] -> []
+              | [typ] -> prop_dependent_carrier_properties ctx root typ
+              | typ :: rest ->
+                  prop_dependent_carrier_properties ctx (parens root ^^ string ".1") typ
+                  @ collect (parens root ^^ string ".2") rest
+            in
+            collect root typs
+        | _ -> []
+      )
 
 let prop_dependent_result_proof ctx result =
   let unfold =
     string (result.result_name ^ ".Valid")
     :: List.concat_map
-         (fun record ->
-           [
-             doc_id_ctor record ^^ string ".Indexed.Valid";
-             doc_id_ctor record ^^ string ".Valid";
-           ]
-         )
-         (IdSet.elements
-            (prop_dependent_carrier_record_ids ctx result.result_carrier)
-         )
-    @ List.map doc_id_ctor
-        (IdSet.elements
-           (constraint_application_ids result.result_constraint)
-        )
+         (fun record -> [doc_id_ctor record ^^ string ".Indexed.Valid"; doc_id_ctor record ^^ string ".Valid"])
+         (IdSet.elements (prop_dependent_carrier_record_ids ctx result.result_carrier))
+    @ List.map doc_id_ctor (IdSet.elements (constraint_application_ids result.result_constraint))
   in
   let properties =
     List.mapi
-      (fun index property ->
-        string (Printf.sprintf "have resultValidity%i := " index)
-        ^^ property
-      )
-      (prop_dependent_carrier_properties ctx
-         (string "resultCarrier") result.result_carrier
-      )
+      (fun index property -> string (Printf.sprintf "have resultValidity%i := " index) ^^ property)
+      (prop_dependent_carrier_properties ctx (string "resultCarrier") result.result_carrier)
   in
   let source_properties =
     List.mapi
-      (fun index property ->
-        string (Printf.sprintf "have sourceValidity%i := " index)
-        ^^ property
-      )
-      (prop_dependent_carrier_properties ctx
-         (string "dependentResult") result.result_carrier
-      )
+      (fun index property -> string (Printf.sprintf "have sourceValidity%i := " index) ^^ property)
+      (prop_dependent_carrier_properties ctx (string "dependentResult") result.result_carrier)
   in
   string "by"
   ^^ nest 2
        (hardline
        ^^ separate hardline
-          (source_properties @ properties
-          @ [
-              string "simp_all [" ^^ separate comma_sp unfold
-              ^^ string "] <;> first | omega | grind";
-            ]
-          )
+            (source_properties @ properties
+            @ [string "simp_all [" ^^ separate comma_sp unfold ^^ string "] <;> first | omega | grind"]
+            )
        )
 
 let prop_dependent_alias_parts ctx alias =
   match Bindings.find_opt alias ctx.global.semantic_types.aliases with
-  | Some (Typ_aux (Typ_exist (_, nc, (Typ_aux (Typ_app (record, _), _) as inner)), _))
-    when prop_dependent_record record ->
+  | Some (Typ_aux (Typ_exist (_, nc, (Typ_aux (Typ_app (record, _), _) as inner)), _)) when prop_dependent_record record
+    ->
       Some (record, nc, inner)
   | _ -> None
 
@@ -1077,11 +971,11 @@ let context_dependent_validity ctx =
         match prop_dependent_alias_parts ctx alias with
         | Some (record, _, _) ->
             ( (string ("have dependentValidity_" ^ fix_id (string_of_id id) ^ " := ")
-              ^^ parens (doc_id_ctor id) ^^ string ".property")
+              ^^ parens (doc_id_ctor id)
+              ^^ string ".property"
+              )
               :: facts,
-              (doc_id_ctor alias ^^ string ".Valid")
-              :: (doc_id_ctor record ^^ string ".Valid")
-              :: unfold
+              (doc_id_ctor alias ^^ string ".Valid") :: (doc_id_ctor record ^^ string ".Valid") :: unfold
             )
         | None -> (facts, unfold)
       )
@@ -1089,47 +983,40 @@ let context_dependent_validity ctx =
         match prop_dependent_record_id_for_typ typ with
         | Some record ->
             ( (string ("have dependentValidity_" ^ fix_id (string_of_id id) ^ " := ")
-              ^^ parens (doc_id_ctor id) ^^ string ".property")
-              :: facts,
-              (match prop_dependent_record_application typ with
-              | Some _ ->
-                  (doc_id_ctor record ^^ string ".Indexed.Valid")
-                  :: (doc_id_ctor record ^^ string ".Valid") :: unfold
-              | None ->
-                  (doc_id_ctor record ^^ string ".Valid") :: unfold
+              ^^ parens (doc_id_ctor id)
+              ^^ string ".property"
               )
+              :: facts,
+              match prop_dependent_record_application typ with
+              | Some _ ->
+                  (doc_id_ctor record ^^ string ".Indexed.Valid") :: (doc_id_ctor record ^^ string ".Valid") :: unfold
+              | None -> (doc_id_ctor record ^^ string ".Valid") :: unfold
             )
         | None -> (facts, unfold)
       )
   in
-  let facts, unfold =
-    Bindings.fold add_packed ctx.packed_dependent_types ([], [])
-  in
+  let facts, unfold = Bindings.fold add_packed ctx.packed_dependent_types ([], []) in
   Bindings.fold
     (fun id result (facts, unfold) ->
       let root = parens (doc_id_ctor id) ^^ string ".val" in
       let result_facts =
         List.mapi
           (fun index property ->
-            string
-              (Printf.sprintf "have dependentResultValidity_%s_%i := "
-                 (fix_id (string_of_id id)) index
-              )
+            string (Printf.sprintf "have dependentResultValidity_%s_%i := " (fix_id (string_of_id id)) index)
             ^^ property
           )
           (prop_dependent_carrier_properties ctx root result.result_carrier)
       in
       ( (string ("have dependentResultValidity_" ^ fix_id (string_of_id id) ^ " := ")
-        ^^ parens (doc_id_ctor id) ^^ string ".property")
-        :: result_facts @ facts,
+        ^^ parens (doc_id_ctor id)
+        ^^ string ".property"
+        )
+        :: result_facts
+        @ facts,
         string (result.result_name ^ ".Valid")
         :: List.map
              (fun record -> doc_id_ctor record ^^ string ".Valid")
-             (IdSet.elements
-                (prop_dependent_carrier_record_ids ctx
-                   result.result_carrier
-                )
-             )
+             (IdSet.elements (prop_dependent_carrier_record_ids ctx result.result_carrier))
         @ unfold
       )
     )
@@ -1139,22 +1026,14 @@ let doc_constraint_proof ?(facts = []) ?(extra_unfold = []) ctx nc =
   let context_facts, dependent_unfold = context_dependent_validity ctx in
   let facts = context_facts @ facts in
   let unfold =
-    List.map doc_id_ctor
-      (IdSet.elements (constraint_application_ids nc))
-    @ extra_unfold @ dependent_unfold
+    List.map doc_id_ctor (IdSet.elements (constraint_application_ids nc)) @ extra_unfold @ dependent_unfold
   in
   let tactic =
     match unfold with
     | [] -> string "first | omega | grind"
-    | _ ->
-        string "simp_all ["
-        ^^ separate comma_sp unfold
-        ^^ string "] <;> first | omega | grind"
+    | _ -> string "simp_all [" ^^ separate comma_sp unfold ^^ string "] <;> first | omega | grind"
   in
-  if facts = [] then string "by " ^^ tactic
-  else
-    string "by"
-    ^^ nest 2 (hardline ^^ separate hardline (facts @ [tactic]))
+  if facts = [] then string "by " ^^ tactic else string "by" ^^ nest 2 (hardline ^^ separate hardline (facts @ [tactic]))
 
 let prop_dependent_proof ?(facts = []) ctx typ =
   let context_facts, context_unfold = context_dependent_validity ctx in
@@ -1164,18 +1043,16 @@ let prop_dependent_proof ?(facts = []) ctx typ =
       match prop_dependent_alias_parts ctx alias with
       | Some (record, nc, _) ->
           let unfold =
-            IdSet.union
-              (constraint_application_ids nc)
-              (match Bindings.find_opt record ctx.global.semantic_types.record_quants with
-               | Some quant ->
-                   List.fold_left
-                     (fun ids (QI_aux (item, _)) ->
-                       match item with
-                       | QI_constraint nc -> IdSet.union ids (constraint_application_ids nc)
-                       | _ -> ids
-                     )
-                     IdSet.empty quant
-               | None -> IdSet.empty)
+            IdSet.union (constraint_application_ids nc)
+              ( match Bindings.find_opt record ctx.global.semantic_types.record_quants with
+              | Some quant ->
+                  List.fold_left
+                    (fun ids (QI_aux (item, _)) ->
+                      match item with QI_constraint nc -> IdSet.union ids (constraint_application_ids nc) | _ -> ids
+                    )
+                    IdSet.empty quant
+              | None -> IdSet.empty
+              )
           in
           let unfold =
             (doc_id_ctor alias ^^ string ".Valid")
@@ -1183,14 +1060,9 @@ let prop_dependent_proof ?(facts = []) ctx typ =
             :: List.map doc_id_ctor (IdSet.elements unfold)
             @ context_unfold
           in
-          let tactic =
-            string "simp_all [" ^^ separate comma_sp unfold
-            ^^ string "] <;> first | omega | grind"
-          in
+          let tactic = string "simp_all [" ^^ separate comma_sp unfold ^^ string "] <;> first | omega | grind" in
           if facts = [] then string "by " ^^ tactic
-          else
-            string "by"
-            ^^ nest 2 (hardline ^^ separate hardline (facts @ [tactic]))
+          else string "by" ^^ nest 2 (hardline ^^ separate hardline (facts @ [tactic]))
       | None -> failwith ("No proof-refined carrier configured for " ^ string_of_id alias)
     )
   | None -> failwith ("Expected a named proof-refined alias, got " ^ string_of_typ typ)
@@ -1199,9 +1071,7 @@ let prop_dependent_record_proof ?(facts = []) ?(extra_unfold = []) ctx typ =
   let record =
     match prop_dependent_record_id_for_typ typ with
     | Some record -> record
-    | None ->
-        failwith
-          ("Expected a proof-refined record, got " ^ string_of_typ typ)
+    | None -> failwith ("Expected a proof-refined record, got " ^ string_of_typ typ)
   in
   let context_facts, context_unfold = context_dependent_validity ctx in
   let facts = context_facts @ facts in
@@ -1210,46 +1080,26 @@ let prop_dependent_record_proof ?(facts = []) ?(extra_unfold = []) ctx typ =
     | Some quant ->
         List.fold_left
           (fun ids (QI_aux (item, _)) ->
-            match item with
-            | QI_constraint nc ->
-                IdSet.union ids (constraint_application_ids nc)
-            | _ -> ids
+            match item with QI_constraint nc -> IdSet.union ids (constraint_application_ids nc) | _ -> ids
           )
           IdSet.empty quant
     | None -> IdSet.empty
   in
   let unfold =
-    (match prop_dependent_record_application typ with
-    | Some _ ->
-        [
-          doc_id_ctor record ^^ string ".Indexed.Valid";
-          doc_id_ctor record ^^ string ".Valid";
-        ]
-    | None -> [doc_id_ctor record ^^ string ".Valid"])
+    ( match prop_dependent_record_application typ with
+      | Some _ -> [doc_id_ctor record ^^ string ".Indexed.Valid"; doc_id_ctor record ^^ string ".Valid"]
+      | None -> [doc_id_ctor record ^^ string ".Valid"]
+      )
     @ List.map doc_id_ctor (IdSet.elements unfold)
   in
-  let unfold =
-    unfold @ extra_unfold @ context_unfold
-  in
-  let tactic =
-    string "simp_all [" ^^ separate comma_sp unfold
-    ^^ string "] <;> first | omega | grind"
-  in
-  if facts = [] then string "by " ^^ tactic
-  else
-    string "by"
-    ^^ nest 2 (hardline ^^ separate hardline (facts @ [tactic]))
+  let unfold = unfold @ extra_unfold @ context_unfold in
+  let tactic = string "simp_all [" ^^ separate comma_sp unfold ^^ string "] <;> first | omega | grind" in
+  if facts = [] then string "by " ^^ tactic else string "by" ^^ nest 2 (hardline ^^ separate hardline (facts @ [tactic]))
 
 let singleton_kid_of_field env typ =
   try
     match Env.expand_synonyms env typ with
-    | Typ_aux
-        ( Typ_app
-            ( Id_aux (Id ("atom" | "implicit"), _),
-              [A_aux (A_nexp (Nexp_aux (Nexp_var kid, _)), _)]
-            ),
-          _
-        ) ->
+    | Typ_aux (Typ_app (Id_aux (Id ("atom" | "implicit"), _), [A_aux (A_nexp (Nexp_aux (Nexp_var kid, _)), _)]), _) ->
         Some kid
     | _ -> None
   with Type_internal.Type_error _ -> None
@@ -1257,18 +1107,15 @@ let singleton_kid_of_field env typ =
 let quantified_int_kids tq =
   List.filter_map
     (fun (QI_aux (item, _)) ->
-      match item with
-      | QI_id (KOpt_aux (KOpt_kind (K_aux (K_int, _), kid), _)) -> Some kid
-      | _ -> None
+      match item with QI_id (KOpt_aux (KOpt_kind (K_aux (K_int, _), kid), _)) -> Some kid | _ -> None
     )
     tq
 
-let doc_field_path root path =
-  List.fold_left (fun doc field -> doc ^^ dot ^^ doc_id_ctor field) root path
+let doc_field_path root path = List.fold_left (fun doc field -> doc ^^ dot ^^ doc_id_ctor field) root path
 
 let rec prop_dependent_record_declaration_witness_paths ctx seen record =
   if IdSet.mem record seen then KBindings.empty
-  else
+  else (
     match
       ( Bindings.find_opt record ctx.global.semantic_types.record_quants,
         Bindings.find_opt record ctx.global.semantic_types.record_fields
@@ -1282,23 +1129,14 @@ let rec prop_dependent_record_declaration_witness_paths ctx seen record =
             match singleton_kid_of_field field_env typ with
             | Some kid -> KBindings.add kid [field] witnesses
             | None -> (
-                let typ =
-                  try Env.expand_synonyms field_env typ
-                  with Type_internal.Type_error _ -> typ
-                in
+                let typ = try Env.expand_synonyms field_env typ with Type_internal.Type_error _ -> typ in
                 match typ with
-                | Typ_aux (Typ_app (nested_record, args), _)
-                  when prop_dependent_record nested_record -> (
+                | Typ_aux (Typ_app (nested_record, args), _) when prop_dependent_record nested_record -> (
                     match Bindings.find_opt nested_record ctx.global.semantic_types.record_quants with
                     | Some nested_quant ->
                         let nested_kids = quantified_int_kids nested_quant in
-                        let nested_paths =
-                          prop_dependent_record_declaration_witness_paths ctx seen nested_record
-                        in
-                        let actuals =
-                          try List.combine nested_kids args
-                          with Invalid_argument _ -> []
-                        in
+                        let nested_paths = prop_dependent_record_declaration_witness_paths ctx seen nested_record in
+                        let actuals = try List.combine nested_kids args with Invalid_argument _ -> [] in
                         List.fold_left
                           (fun witnesses (nested_kid, A_aux (arg, _)) ->
                             match (KBindings.find_opt nested_kid nested_paths, arg) with
@@ -1314,6 +1152,7 @@ let rec prop_dependent_record_declaration_witness_paths ctx seen record =
           )
           fields KBindings.empty
     | _ -> KBindings.empty
+  )
 
 let rec prop_dependent_record_witness_paths ctx inner =
   match inner with
@@ -1323,19 +1162,12 @@ let rec prop_dependent_record_witness_paths ctx inner =
           let quantified =
             List.filter_map
               (fun (QI_aux (item, _)) ->
-                match item with
-                | QI_id (KOpt_aux (KOpt_kind (kind, kid), _)) -> Some (kind, kid)
-                | _ -> None
+                match item with QI_id (KOpt_aux (KOpt_kind (kind, kid), _)) -> Some (kind, kid) | _ -> None
               )
               quant
           in
-          let actuals =
-            try List.combine quantified args
-            with Invalid_argument _ -> []
-          in
-          let declaration_paths =
-            prop_dependent_record_declaration_witness_paths ctx IdSet.empty record
-          in
+          let actuals = try List.combine quantified args with Invalid_argument _ -> [] in
+          let declaration_paths = prop_dependent_record_declaration_witness_paths ctx IdSet.empty record in
           List.fold_left
             (fun witnesses ((kind, declaration_kid), A_aux (arg, _)) ->
               match (kind, arg, KBindings.find_opt declaration_kid declaration_paths) with
@@ -1348,71 +1180,54 @@ let rec prop_dependent_record_witness_paths ctx inner =
     )
   | _ ->
       let expanded = expand_synonyms_for_dependent_type ctx inner in
-      if Typ.compare expanded inner <> 0 then
-        prop_dependent_record_witness_paths ctx expanded
-      else
+      if Typ.compare expanded inner <> 0 then prop_dependent_record_witness_paths ctx expanded
+      else (
         match expanded with
-        | Typ_aux (Typ_exist (_, _, carrier), _) ->
-            prop_dependent_record_witness_paths ctx carrier
+        | Typ_aux (Typ_exist (_, _, carrier), _) -> prop_dependent_record_witness_paths ctx carrier
         | _ -> KBindings.empty
+      )
 
-let merge_kbindings left right =
-  KBindings.fold KBindings.add right left
+let merge_kbindings left right = KBindings.fold KBindings.add right left
 
 let rec prop_dependent_carrier_witness_docs ctx root typ =
   match prop_dependent_record_id_for_typ typ with
-  | Some _ ->
-      KBindings.map
-        (doc_field_path (parens root ^^ string ".val"))
-        (prop_dependent_record_witness_paths ctx typ)
+  | Some _ -> KBindings.map (doc_field_path (parens root ^^ string ".val")) (prop_dependent_record_witness_paths ctx typ)
   | None ->
       let expanded = expand_synonyms_for_dependent_type ctx typ in
-      if Typ.compare expanded typ <> 0 then
-        prop_dependent_carrier_witness_docs ctx root expanded
+      if Typ.compare expanded typ <> 0 then prop_dependent_carrier_witness_docs ctx root expanded
       else (
-      match expanded with
-      | Typ_aux (Typ_tuple typs, _) ->
-          let rec collect root = function
-            | [] -> KBindings.empty
-            | [typ] ->
-                prop_dependent_carrier_witness_docs ctx root typ
-            | typ :: rest ->
-                merge_kbindings
-                  (prop_dependent_carrier_witness_docs ctx
-                     (parens root ^^ string ".1") typ
-                  )
-                  (collect (parens root ^^ string ".2") rest)
-          in
-          collect root typs
-      | _ -> KBindings.empty
-    )
+        match expanded with
+        | Typ_aux (Typ_tuple typs, _) ->
+            let rec collect root = function
+              | [] -> KBindings.empty
+              | [typ] -> prop_dependent_carrier_witness_docs ctx root typ
+              | typ :: rest ->
+                  merge_kbindings
+                    (prop_dependent_carrier_witness_docs ctx (parens root ^^ string ".1") typ)
+                    (collect (parens root ^^ string ".2") rest)
+            in
+            collect root typs
+        | _ -> KBindings.empty
+      )
 
 let rec prop_dependent_result_carrier_eligible ctx typ =
   match prop_dependent_record_id_for_typ typ with
   | Some _ -> true
   | None ->
       let expanded = expand_synonyms_for_dependent_type ctx typ in
-      if Typ.compare expanded typ <> 0 then
-        prop_dependent_result_carrier_eligible ctx expanded
+      if Typ.compare expanded typ <> 0 then prop_dependent_result_carrier_eligible ctx expanded
       else (
-      match expanded with
-      | Typ_aux (Typ_tuple typs, _) ->
-          typs <> []
-          && List.for_all (prop_dependent_result_carrier_eligible ctx) typs
-      | _ -> false
-    )
+        match expanded with
+        | Typ_aux (Typ_tuple typs, _) -> typs <> [] && List.for_all (prop_dependent_result_carrier_eligible ctx) typs
+        | _ -> false
+      )
 
 let infer_prop_dependent_result ctx id tq typ =
   match typ with
-  | Typ_aux (Typ_exist (kopts, nc, carrier), _)
-    when prop_dependent_result_carrier_eligible ctx carrier ->
+  | Typ_aux (Typ_exist (kopts, nc, carrier), _) when prop_dependent_result_carrier_eligible ctx carrier ->
       let relevant_kopts = relevant_existential_kopts kopts carrier in
-      let witness_docs =
-        prop_dependent_carrier_witness_docs ctx (string "value") carrier
-      in
-      let existential_kids =
-        KidSet.of_list (List.map kopt_kid kopts)
-      in
+      let witness_docs = prop_dependent_carrier_witness_docs ctx (string "value") carrier in
+      let existential_kids = KidSet.of_list (List.map kopt_kid kopts) in
       let unrecoverable_existential_kids =
         KidSet.filter
           (fun kid -> not (KBindings.mem kid witness_docs))
@@ -1420,31 +1235,19 @@ let infer_prop_dependent_result ctx id tq typ =
       in
       let parameter_kids =
         KidSet.filter
-          (fun kid ->
-            not (KidSet.mem kid existential_kids)
-            && not (KBindings.mem kid witness_docs)
-          )
+          (fun kid -> (not (KidSet.mem kid existential_kids)) && not (KBindings.mem kid witness_docs))
           (tyvars_of_constraint nc)
       in
-      let result_params =
-        List.filter
-          (fun kopt -> KidSet.mem (kopt_kid kopt) parameter_kids)
-          (quant_kopts tq)
-      in
+      let result_params = List.filter (fun kopt -> KidSet.mem (kopt_kid kopt) parameter_kids) (quant_kopts tq) in
       if
         relevant_kopts <> []
         && KidSet.is_empty unrecoverable_existential_kids
-        && List.for_all
-             (fun (KOpt_aux (KOpt_kind (_, kid), _)) ->
-               KBindings.mem kid witness_docs
-             )
-             relevant_kopts
+        && List.for_all (fun (KOpt_aux (KOpt_kind (_, kid), _)) -> KBindings.mem kid witness_docs) relevant_kopts
         && List.length result_params = KidSet.cardinal parameter_kids
       then
         Some
           {
-            result_name =
-              Util.to_upper_camel_case (fix_id (string_of_id id)) ^ "Result";
+            result_name = Util.to_upper_camel_case (fix_id (string_of_id id)) ^ "Result";
             result_quant = tq;
             result_kopts = relevant_kopts;
             result_params;
@@ -1455,8 +1258,7 @@ let infer_prop_dependent_result ctx id tq typ =
       else None
   | _ -> None
 
-let prop_dependent_result_for_id ctx id =
-  Bindings.find_opt id ctx.global.prop_dependent_results
+let prop_dependent_result_for_id ctx id = Bindings.find_opt id ctx.global.prop_dependent_results
 
 let doc_prop_dependent_result_type ctx result =
   match result.result_params with
@@ -1464,9 +1266,7 @@ let doc_prop_dependent_result_type ctx result =
   | params ->
       parens
         (string result.result_name ^^ space
-        ^^ separate_map space
-             (fun (KOpt_aux (KOpt_kind (_, kid), _)) -> doc_kid ctx kid)
-             params
+        ^^ separate_map space (fun (KOpt_aux (KOpt_kind (_, kid), _)) -> doc_kid ctx kid) params
         )
 
 (* A result-specific [Valid] predicate already retains the relationships among
@@ -1478,19 +1278,13 @@ let rec doc_prop_dependent_result_carrier_shape ctx typ =
   | Some record -> doc_id_ctor record ^^ string ".Refined"
   | None ->
       let expanded = expand_synonyms_for_dependent_type ctx typ in
-      if Typ.compare expanded typ <> 0 then
-        doc_prop_dependent_result_carrier_shape ctx expanded
+      if Typ.compare expanded typ <> 0 then doc_prop_dependent_result_carrier_shape ctx expanded
       else (
-      match expanded with
-      | Typ_aux (Typ_tuple typs, _) ->
-          parens
-            (separate_map
-               (space ^^ string "×" ^^ space)
-               (doc_prop_dependent_result_carrier_shape ctx)
-               typs
-            )
-      | _ -> doc_dependent_shape ctx typ
-    )
+        match expanded with
+        | Typ_aux (Typ_tuple typs, _) ->
+            parens (separate_map (space ^^ string "×" ^^ space) (doc_prop_dependent_result_carrier_shape ctx) typs)
+        | _ -> doc_dependent_shape ctx typ
+      )
 
 (* A result carrier deliberately erases each component's indices to the
    record's [Refined] form.  Reconstruct those indices in the aggregate
@@ -1503,245 +1297,199 @@ let rec doc_prop_dependent_result_carrier_validities ctx root typ =
       [
         parens
           (flow space
-             ((doc_id_ctor record ^^ string ".Indexed.Valid")
-             :: List.map (doc_typ_arg ctx `All) args
+             (((doc_id_ctor record ^^ string ".Indexed.Valid") :: List.map (doc_typ_arg ctx `All) args)
              @ [parens root ^^ string ".val"]
              )
           );
       ]
   | None -> (
       match prop_dependent_record_id_for_typ typ with
-      | Some record ->
-          [
-            parens
-              (flow space
-                 [
-                   doc_id_ctor record ^^ string ".Valid";
-                   parens root ^^ string ".val";
-                 ]
-              );
-          ]
+      | Some record -> [parens (flow space [doc_id_ctor record ^^ string ".Valid"; parens root ^^ string ".val"])]
       | None ->
           let expanded = expand_synonyms_for_dependent_type ctx typ in
-          if Typ.compare expanded typ <> 0 then
-            doc_prop_dependent_result_carrier_validities ctx root expanded
-          else
+          if Typ.compare expanded typ <> 0 then doc_prop_dependent_result_carrier_validities ctx root expanded
+          else (
             match expanded with
             | Typ_aux (Typ_tuple typs, _) ->
                 let rec collect root = function
                   | [] -> []
-                  | [typ] ->
-                      doc_prop_dependent_result_carrier_validities ctx root typ
+                  | [typ] -> doc_prop_dependent_result_carrier_validities ctx root typ
                   | typ :: rest ->
-                      doc_prop_dependent_result_carrier_validities ctx
-                        (parens root ^^ string ".1") typ
+                      doc_prop_dependent_result_carrier_validities ctx (parens root ^^ string ".1") typ
                       @ collect (parens root ^^ string ".2") rest
                 in
                 collect root typs
             | _ -> []
+          )
     )
 
 let add_prop_dependent_record_binder_kid_docs ctx binder typ =
   let witness_paths = prop_dependent_record_witness_paths ctx typ in
   let kid_docs =
-    KBindings.fold
-      (fun kid path docs -> KBindings.add kid (doc_field_path binder path) docs)
-      witness_paths ctx.kid_docs
+    KBindings.fold (fun kid path docs -> KBindings.add kid (doc_field_path binder path) docs) witness_paths ctx.kid_docs
   in
   { ctx with kid_docs }
 
 let prop_dependent_repack_target ctx binder target_typ =
   let carrier = parens binder ^^ string ".val" in
-  let target_ctx =
-    add_prop_dependent_record_binder_kid_docs ctx carrier target_typ
-  in
+  let target_ctx = add_prop_dependent_record_binder_kid_docs ctx carrier target_typ in
   (target_ctx, doc_dependent_shape target_ctx target_typ)
 
 let rec doc_dependent_pack ctx typ value =
   match prop_dependent_alias_id_for_typ ctx typ with
-  | Some alias ->
-      string "⟨" ^^ value ^^ comma_sp
-      ^^ prop_dependent_proof ctx typ
-      ^^ string "⟩"
-  | None ->
-  match prop_dependent_record_id_for_typ typ with
-  | Some _ ->
-      string "⟨" ^^ value ^^ comma_sp
-      ^^ prop_dependent_record_proof ctx typ
-      ^^ string "⟩"
-  | None ->
-  let typ = expand_synonyms_for_dependent_type ctx typ in
-  if prop_dependent_record_typ typ then
-    string "⟨" ^^ value ^^ comma_sp
-    ^^ prop_dependent_record_proof ctx typ
-    ^^ string "⟩"
-  else
-  match typ with
-  | Typ_aux (Typ_exist (kopts, _, inner), _) ->
-      let relevant_kopts = relevant_existential_kopts kopts inner in
-      let witness_paths = prop_dependent_record_witness_paths ctx inner in
-      if
-        relevant_kopts <> []
-        && List.for_all
-             (fun (KOpt_aux (KOpt_kind (_, kid), _)) -> KBindings.mem kid witness_paths)
-             relevant_kopts
-      then
-        let binder = string "dependentValue" in
-        let packed =
-          List.fold_right
-            (fun (KOpt_aux (KOpt_kind (_, kid), _)) packed ->
-              let path = KBindings.find kid witness_paths in
-              string "⟨" ^^ doc_field_path binder path ^^ comma_sp ^^ packed ^^ string "⟩"
-            )
-            relevant_kopts (doc_dependent_pack ctx inner binder)
-        in
-        parens (dependent_lambda binder packed ^^ space ^^ parens value)
-      else
-        let value = doc_dependent_pack ctx inner value in
-        List.fold_right (fun _ value -> string "⟨_, " ^^ value ^^ string "⟩") relevant_kopts value
-  | Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _)
-    when has_dependent_type ctx inner ->
-      parens
-        (string "Option.map "
-        ^^ dependent_lambda (string "dependentValue") (doc_dependent_pack ctx inner (string "dependentValue"))
-        ^^ space ^^ parens value
-        )
-  | Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _) when has_dependent_type ctx inner ->
-      parens
-        (string "List.map "
-        ^^ dependent_lambda (string "dependentValue") (doc_dependent_pack ctx inner (string "dependentValue"))
-        ^^ space ^^ parens value
-        )
-  | Typ_aux (Typ_app (Id_aux (Id "vector", _), [A_aux (A_nexp _, _); A_aux (A_typ inner, _)]), _)
-    when has_dependent_type ctx inner ->
-      parens
-        (string "Vector.map "
-        ^^ dependent_lambda (string "dependentValue") (doc_dependent_pack ctx inner (string "dependentValue"))
-        ^^ space ^^ parens value
-        )
-  | Typ_aux (Typ_tuple typs, _) when List.exists (has_dependent_type ctx) typs ->
-      let names = List.mapi (fun i _ -> Printf.sprintf "dependentValue%i" i) typs in
-      let pat = parens (separate comma_sp (List.map string names)) in
-      let body =
-        parens (separate comma_sp (List.map2 (fun typ name -> doc_dependent_pack ctx typ (string name)) typs names))
-      in
-      parens (dependent_lambda pat body ^^ space ^^ parens value)
-  | _ -> value
+  | Some alias -> string "⟨" ^^ value ^^ comma_sp ^^ prop_dependent_proof ctx typ ^^ string "⟩"
+  | None -> (
+      match prop_dependent_record_id_for_typ typ with
+      | Some _ -> string "⟨" ^^ value ^^ comma_sp ^^ prop_dependent_record_proof ctx typ ^^ string "⟩"
+      | None ->
+          let typ = expand_synonyms_for_dependent_type ctx typ in
+          if prop_dependent_record_typ typ then
+            string "⟨" ^^ value ^^ comma_sp ^^ prop_dependent_record_proof ctx typ ^^ string "⟩"
+          else (
+            match typ with
+            | Typ_aux (Typ_exist (kopts, _, inner), _) ->
+                let relevant_kopts = relevant_existential_kopts kopts inner in
+                let witness_paths = prop_dependent_record_witness_paths ctx inner in
+                if
+                  relevant_kopts <> []
+                  && List.for_all
+                       (fun (KOpt_aux (KOpt_kind (_, kid), _)) -> KBindings.mem kid witness_paths)
+                       relevant_kopts
+                then (
+                  let binder = string "dependentValue" in
+                  let packed =
+                    List.fold_right
+                      (fun (KOpt_aux (KOpt_kind (_, kid), _)) packed ->
+                        let path = KBindings.find kid witness_paths in
+                        string "⟨" ^^ doc_field_path binder path ^^ comma_sp ^^ packed ^^ string "⟩"
+                      )
+                      relevant_kopts (doc_dependent_pack ctx inner binder)
+                  in
+                  parens (dependent_lambda binder packed ^^ space ^^ parens value)
+                )
+                else (
+                  let value = doc_dependent_pack ctx inner value in
+                  List.fold_right (fun _ value -> string "⟨_, " ^^ value ^^ string "⟩") relevant_kopts value
+                )
+            | Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _) when has_dependent_type ctx inner
+              ->
+                parens
+                  (string "Option.map "
+                  ^^ dependent_lambda (string "dependentValue") (doc_dependent_pack ctx inner (string "dependentValue"))
+                  ^^ space ^^ parens value
+                  )
+            | Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _) when has_dependent_type ctx inner
+              ->
+                parens
+                  (string "List.map "
+                  ^^ dependent_lambda (string "dependentValue") (doc_dependent_pack ctx inner (string "dependentValue"))
+                  ^^ space ^^ parens value
+                  )
+            | Typ_aux (Typ_app (Id_aux (Id "vector", _), [A_aux (A_nexp _, _); A_aux (A_typ inner, _)]), _)
+              when has_dependent_type ctx inner ->
+                parens
+                  (string "Vector.map "
+                  ^^ dependent_lambda (string "dependentValue") (doc_dependent_pack ctx inner (string "dependentValue"))
+                  ^^ space ^^ parens value
+                  )
+            | Typ_aux (Typ_tuple typs, _) when List.exists (has_dependent_type ctx) typs ->
+                let names = List.mapi (fun i _ -> Printf.sprintf "dependentValue%i" i) typs in
+                let pat = parens (separate comma_sp (List.map string names)) in
+                let body =
+                  parens
+                    (separate comma_sp (List.map2 (fun typ name -> doc_dependent_pack ctx typ (string name)) typs names))
+                in
+                parens (dependent_lambda pat body ^^ space ^^ parens value)
+            | _ -> value
+          )
+    )
 
 let rec doc_dependent_unpack ctx typ value =
   if prop_dependent_alias_for_typ ctx typ then parens value ^^ string ".val"
   else if prop_dependent_record_typ typ then parens value ^^ string ".val"
-  else
-  let typ = expand_synonyms_for_dependent_type ctx typ in
-  if prop_dependent_record_typ typ then parens value ^^ string ".val"
-  else
-  match typ with
-  | Typ_aux (Typ_exist (kopts, _, inner), _) ->
-      let value =
-        List.fold_left
-          (fun value _ -> parens value ^^ string ".2")
-          value (relevant_existential_kopts kopts inner)
-      in
-      doc_dependent_unpack ctx inner value
-  | Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _)
-    when has_dependent_type ctx inner ->
-      parens
-        (string "Option.map "
-        ^^ dependent_lambda (string "dependentValue") (doc_dependent_unpack ctx inner (string "dependentValue"))
-        ^^ space ^^ parens value
-        )
-  | Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _) when has_dependent_type ctx inner ->
-      parens
-        (string "List.map "
-        ^^ dependent_lambda (string "dependentValue") (doc_dependent_unpack ctx inner (string "dependentValue"))
-        ^^ space ^^ parens value
-        )
-  | Typ_aux (Typ_app (Id_aux (Id "vector", _), [A_aux (A_nexp _, _); A_aux (A_typ inner, _)]), _)
-    when has_dependent_type ctx inner ->
-      parens
-        (string "Vector.map "
-        ^^ dependent_lambda (string "dependentValue") (doc_dependent_unpack ctx inner (string "dependentValue"))
-        ^^ space ^^ parens value
-        )
-  | Typ_aux (Typ_tuple typs, _) when List.exists (has_dependent_type ctx) typs ->
-      let names = List.mapi (fun i _ -> Printf.sprintf "dependentValue%i" i) typs in
-      let pat = parens (separate comma_sp (List.map string names)) in
-      let body =
-        parens
-          (separate comma_sp (List.map2 (fun typ name -> doc_dependent_unpack ctx typ (string name)) typs names))
-      in
-      parens (dependent_lambda pat body ^^ space ^^ parens value)
-  | _ -> value
+  else (
+    let typ = expand_synonyms_for_dependent_type ctx typ in
+    if prop_dependent_record_typ typ then parens value ^^ string ".val"
+    else (
+      match typ with
+      | Typ_aux (Typ_exist (kopts, _, inner), _) ->
+          let value =
+            List.fold_left (fun value _ -> parens value ^^ string ".2") value (relevant_existential_kopts kopts inner)
+          in
+          doc_dependent_unpack ctx inner value
+      | Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _) when has_dependent_type ctx inner ->
+          parens
+            (string "Option.map "
+            ^^ dependent_lambda (string "dependentValue") (doc_dependent_unpack ctx inner (string "dependentValue"))
+            ^^ space ^^ parens value
+            )
+      | Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _) when has_dependent_type ctx inner ->
+          parens
+            (string "List.map "
+            ^^ dependent_lambda (string "dependentValue") (doc_dependent_unpack ctx inner (string "dependentValue"))
+            ^^ space ^^ parens value
+            )
+      | Typ_aux (Typ_app (Id_aux (Id "vector", _), [A_aux (A_nexp _, _); A_aux (A_typ inner, _)]), _)
+        when has_dependent_type ctx inner ->
+          parens
+            (string "Vector.map "
+            ^^ dependent_lambda (string "dependentValue") (doc_dependent_unpack ctx inner (string "dependentValue"))
+            ^^ space ^^ parens value
+            )
+      | Typ_aux (Typ_tuple typs, _) when List.exists (has_dependent_type ctx) typs ->
+          let names = List.mapi (fun i _ -> Printf.sprintf "dependentValue%i" i) typs in
+          let pat = parens (separate comma_sp (List.map string names)) in
+          let body =
+            parens
+              (separate comma_sp (List.map2 (fun typ name -> doc_dependent_unpack ctx typ (string name)) typs names))
+          in
+          parens (dependent_lambda pat body ^^ space ^^ parens value)
+      | _ -> value
+    )
+  )
 
 let doc_dependent_repack ctx source_typ target_typ value =
-  match
-    ( prop_dependent_record_id_for_typ source_typ,
-      prop_dependent_alias_id_for_typ ctx target_typ )
-  with
+  match (prop_dependent_record_id_for_typ source_typ, prop_dependent_alias_id_for_typ ctx target_typ) with
   | Some source_record, Some target_alias -> (
       match prop_dependent_alias_parts ctx target_alias with
-      | Some (target_record, _, _)
-        when Id.compare source_record target_record = 0 ->
+      | Some (target_record, _, _) when Id.compare source_record target_record = 0 ->
           let binder = string "dependentValue" in
-          let target_ctx, target_shape =
-            prop_dependent_repack_target ctx binder target_typ
-          in
+          let target_ctx, target_shape = prop_dependent_repack_target ctx binder target_typ in
           let proof =
-            string "by"
-            ^^ hardline ^^ string "   constructor"
-            ^^ hardline ^^ string "   · exact "
-            ^^ (match prop_dependent_record_application source_typ with
-               | Some _ -> string "dependentValue.property.1"
-               | None -> string "dependentValue.property")
+            string "by" ^^ hardline ^^ string "   constructor" ^^ hardline ^^ string "   · exact "
+            ^^ ( match prop_dependent_record_application source_typ with
+              | Some _ -> string "dependentValue.property.1"
+              | None -> string "dependentValue.property"
+              )
             ^^ hardline ^^ string "   · exact "
             ^^ parens
                  (prop_dependent_proof
-                    ~facts:
-                      [
-                        string
-                          "have dependentValidity := dependentValue.property";
-                      ]
+                    ~facts:[string "have dependentValidity := dependentValue.property"]
                     target_ctx target_typ
                  )
           in
           parens
-            (string "let " ^^ binder ^^ string " := " ^^ parens value
-            ^^ hardline
+            (string "let " ^^ binder ^^ string " := " ^^ parens value ^^ hardline
             ^^ parens
                  (separate space
-                    [
-                      string "⟨" ^^ binder ^^ string ".val" ^^ comma_sp
-                      ^^ proof ^^ string "⟩";
-                      colon;
-                      target_shape;
-                    ]
+                    [string "⟨" ^^ binder ^^ string ".val" ^^ comma_sp ^^ proof ^^ string "⟩"; colon; target_shape]
                  )
             )
-      | _ ->
-          doc_dependent_pack ctx target_typ
-            (doc_dependent_unpack ctx source_typ value)
+      | _ -> doc_dependent_pack ctx target_typ (doc_dependent_unpack ctx source_typ value)
     )
   | Some source_record, None -> (
       match prop_dependent_record_id_for_typ target_typ with
-      | Some target_record
-        when Id.compare source_record target_record = 0 ->
+      | Some target_record when Id.compare source_record target_record = 0 ->
           let binder = string "dependentValue" in
-          let target_ctx, target_shape =
-            prop_dependent_repack_target ctx binder target_typ
-          in
+          let target_ctx, target_shape = prop_dependent_repack_target ctx binder target_typ in
           parens
-            (string "let " ^^ binder ^^ string " := " ^^ parens value
-            ^^ hardline
+            (string "let " ^^ binder ^^ string " := " ^^ parens value ^^ hardline
             ^^ parens
                  (separate space
                     [
                       string "⟨" ^^ binder ^^ string ".val" ^^ comma_sp
                       ^^ prop_dependent_record_proof
-                           ~facts:
-                             [
-                               string
-                                 "have dependentValidity := dependentValue.property";
-                             ]
+                           ~facts:[string "have dependentValidity := dependentValue.property"]
                            target_ctx target_typ
                       ^^ string "⟩";
                       colon;
@@ -1749,36 +1497,23 @@ let doc_dependent_repack ctx source_typ target_typ value =
                     ]
                  )
             )
-      | _ ->
-          doc_dependent_pack ctx target_typ
-            (doc_dependent_unpack ctx source_typ value)
+      | _ -> doc_dependent_pack ctx target_typ (doc_dependent_unpack ctx source_typ value)
     )
   | None, None -> (
-      match
-        ( prop_dependent_alias_id_for_typ ctx source_typ,
-          prop_dependent_record_id_for_typ target_typ )
-      with
+      match (prop_dependent_alias_id_for_typ ctx source_typ, prop_dependent_record_id_for_typ target_typ) with
       | Some source_alias, Some target_record -> (
           match prop_dependent_alias_parts ctx source_alias with
-          | Some (source_record, _, _)
-            when Id.compare source_record target_record = 0 ->
+          | Some (source_record, _, _) when Id.compare source_record target_record = 0 ->
               let binder = string "dependentValue" in
-              let target_ctx, target_shape =
-                prop_dependent_repack_target ctx binder target_typ
-              in
+              let target_ctx, target_shape = prop_dependent_repack_target ctx binder target_typ in
               parens
-                (string "let " ^^ binder ^^ string " := " ^^ parens value
-                ^^ hardline
+                (string "let " ^^ binder ^^ string " := " ^^ parens value ^^ hardline
                 ^^ parens
                      (separate space
                         [
                           string "⟨" ^^ binder ^^ string ".val" ^^ comma_sp
                           ^^ prop_dependent_record_proof
-                               ~facts:
-                                 [
-                                   string
-                                     "have dependentValidity := dependentValue.property";
-                                 ]
+                               ~facts:[string "have dependentValidity := dependentValue.property"]
                                target_ctx target_typ
                           ^^ string "⟩";
                           colon;
@@ -1786,17 +1521,11 @@ let doc_dependent_repack ctx source_typ target_typ value =
                         ]
                      )
                 )
-          | _ ->
-              doc_dependent_pack ctx target_typ
-                (doc_dependent_unpack ctx source_typ value)
+          | _ -> doc_dependent_pack ctx target_typ (doc_dependent_unpack ctx source_typ value)
         )
-      | _ ->
-          doc_dependent_pack ctx target_typ
-            (doc_dependent_unpack ctx source_typ value)
+      | _ -> doc_dependent_pack ctx target_typ (doc_dependent_unpack ctx source_typ value)
     )
-  | _ ->
-      doc_dependent_pack ctx target_typ
-        (doc_dependent_unpack ctx source_typ value)
+  | _ -> doc_dependent_pack ctx target_typ (doc_dependent_unpack ctx source_typ value)
 
 let semantic_range_id ctx typ =
   let rec resolve seen = function
@@ -1905,35 +1634,27 @@ let semantic_function_type ctx id =
 let rec app_returns_prop_dependent_record ctx = function
   | E_aux (E_app (id, _), _) -> (
       match semantic_function_type ctx id with
-      | Some (_, ret) ->
-          prop_dependent_record_typ ret
-          || prop_dependent_alias_for_typ ctx ret
+      | Some (_, ret) -> prop_dependent_record_typ ret || prop_dependent_alias_for_typ ctx ret
       | None -> false
     )
-  | E_aux (E_typ (_, expression), _)
-  | E_aux (E_block [expression], _) ->
+  | E_aux (E_typ (_, expression), _) | E_aux (E_block [expression], _) ->
       app_returns_prop_dependent_record ctx expression
   | _ -> false
 
 let rec prop_dependent_result_of_exp ctx = function
-  | E_aux (E_app (id, _), _) ->
-      prop_dependent_result_for_id ctx id
-  | E_aux (E_id id, _) ->
-      Bindings.find_opt id ctx.packed_dependent_results
-  | E_aux (E_typ (_, exp), _) | E_aux (E_block [exp], _) ->
-      prop_dependent_result_of_exp ctx exp
+  | E_aux (E_app (id, _), _) -> prop_dependent_result_for_id ctx id
+  | E_aux (E_id id, _) -> Bindings.find_opt id ctx.packed_dependent_results
+  | E_aux (E_typ (_, exp), _) | E_aux (E_block [exp], _) -> prop_dependent_result_of_exp ctx exp
   | _ -> None
 
 let rec expression_never_returns = function
   | E_aux ((E_exit _ | E_throw _), _) -> true
-  | E_aux (E_typ (_, exp), _) | E_aux (E_block [exp], _) ->
-      expression_never_returns exp
+  | E_aux (E_typ (_, exp), _) | E_aux (E_block [exp], _) -> expression_never_returns exp
   | _ -> false
 
 let rec expression_is_unit_value = function
   | E_aux (E_lit (L_aux (L_unit, _)), _) -> true
-  | E_aux (E_typ (_, exp), _) | E_aux (E_block [exp], _) ->
-      expression_is_unit_value exp
+  | E_aux (E_typ (_, exp), _) | E_aux (E_block [exp], _) -> expression_is_unit_value exp
   | _ -> false
 
 (* A global binding whose declared type packs existential indices is emitted
@@ -1948,7 +1669,7 @@ let global_dependent_binding_unpacked_at_use ctx id use_typ =
       has_top_level_dependent_type ctx typ
       && (not (has_top_level_dependent_type ctx use_typ))
       && not
-           (match ctx.expected_dependent with
+           ( match ctx.expected_dependent with
            | Some expected -> dependent_types_equivalent ctx typ expected
            | None -> false
            )
@@ -1978,7 +1699,7 @@ let dependent_representation_type ctx (E_aux (exp, _) as full_exp) =
 let rec exp_has_dependent_representation ctx (E_aux (exp, _) as full_exp) =
   let representation_typ = dependent_representation_type ctx full_exp in
   if not (has_dependent_type ctx representation_typ) then false
-  else
+  else (
     match exp with
     | E_id id -> not (IdSet.mem id ctx.unpacked_dependent_ids)
     | E_typ (_, exp) -> exp_has_dependent_representation ctx exp
@@ -1989,7 +1710,7 @@ let rec exp_has_dependent_representation ctx (E_aux (exp, _) as full_exp) =
         match expand_synonyms_for_dependent_type ctx representation_typ with
         | Typ_aux (Typ_tuple typs, _) when List.length typs = List.length exps ->
             List.for_all2
-              (fun typ exp -> not (has_dependent_type ctx typ) || exp_has_dependent_representation ctx exp)
+              (fun typ exp -> (not (has_dependent_type ctx typ)) || exp_has_dependent_representation ctx exp)
               typs exps
         | _ -> false
       )
@@ -1997,12 +1718,8 @@ let rec exp_has_dependent_representation ctx (E_aux (exp, _) as full_exp) =
     | E_field (record_exp, field) -> (
         let field_typ =
           match typ_of record_exp with
-          | Typ_aux (Typ_id record, _)
-          | Typ_aux (Typ_app (record, _), _) ->
-              Option.bind
-                (Bindings.find_opt record
-                   ctx.global.semantic_types.record_fields)
-                (Bindings.find_opt field)
+          | Typ_aux (Typ_id record, _) | Typ_aux (Typ_app (record, _), _) ->
+              Option.bind (Bindings.find_opt record ctx.global.semantic_types.record_fields) (Bindings.find_opt field)
           | _ -> None
         in
         match field_typ with
@@ -2020,120 +1737,81 @@ let rec exp_has_dependent_representation ctx (E_aux (exp, _) as full_exp) =
       )
     | E_app _ -> true
     | _ -> true
+  )
 
 let rec doc_prop_dependent_result_carrier ctx carrier source_exp value =
   match prop_dependent_record_id_for_typ carrier with
-  | Some record ->
+  | Some record -> (
       let result_carrier = mk_id_typ record in
-      (
       match prop_dependent_result_of_exp ctx source_exp with
-      | Some source_result
-        when
-          dependent_types_equivalent ctx source_result.result_carrier
-            carrier ->
+      | Some source_result when dependent_types_equivalent ctx source_result.result_carrier carrier ->
           parens value ^^ string ".val"
-      | _ when exp_has_dependent_representation ctx source_exp ->
+      | _ when exp_has_dependent_representation ctx source_exp -> (
           let source_typ = dependent_representation_type ctx source_exp in
-          let expanded_source_typ =
-            expand_synonyms_for_dependent_type ctx source_typ
-          in
-          (match prop_dependent_record_application expanded_source_typ with
-          | Some (source_record, _)
-            when Id.compare source_record record = 0 ->
-              parens
-                (doc_id_ctor source_record
-                ^^ string ".Indexed.toRefined "
-                ^^ parens value
-                )
-          | _ ->
-          match prop_dependent_record_id_for_typ source_typ with
-          | Some source_record when Id.compare source_record record = 0 ->
-              let base_validity =
-                match prop_dependent_record_application source_typ with
-                | Some _ -> parens value ^^ string ".property.1"
-                | None -> parens value ^^ string ".property"
-              in
-              string "⟨" ^^ parens value ^^ string ".val" ^^ comma_sp
-              ^^ base_validity ^^ string "⟩"
-          | _ ->
-              doc_dependent_repack ctx source_typ result_carrier value)
+          let expanded_source_typ = expand_synonyms_for_dependent_type ctx source_typ in
+          match prop_dependent_record_application expanded_source_typ with
+          | Some (source_record, _) when Id.compare source_record record = 0 ->
+              parens (doc_id_ctor source_record ^^ string ".Indexed.toRefined " ^^ parens value)
+          | _ -> (
+              match prop_dependent_record_id_for_typ source_typ with
+              | Some source_record when Id.compare source_record record = 0 ->
+                  let base_validity =
+                    match prop_dependent_record_application source_typ with
+                    | Some _ -> parens value ^^ string ".property.1"
+                    | None -> parens value ^^ string ".property"
+                  in
+                  string "⟨" ^^ parens value ^^ string ".val" ^^ comma_sp ^^ base_validity ^^ string "⟩"
+              | _ -> doc_dependent_repack ctx source_typ result_carrier value
+            )
+        )
       | _ -> doc_dependent_pack ctx result_carrier value
     )
   | None ->
       let expanded = expand_synonyms_for_dependent_type ctx carrier in
-      if Typ.compare expanded carrier <> 0 then
-        doc_prop_dependent_result_carrier ctx expanded source_exp value
+      if Typ.compare expanded carrier <> 0 then doc_prop_dependent_result_carrier ctx expanded source_exp value
       else (
-      match (expanded, source_exp) with
-      | Typ_aux (Typ_tuple typs, _), E_aux (E_tuple exps, _)
-        when List.length typs = List.length exps ->
-          let already_refined =
-            List.for_all2
-              (fun typ exp ->
-                (not (has_dependent_type ctx typ))
-                ||
-                ( exp_has_dependent_representation ctx exp
-                  && dependent_types_equivalent ctx
-                       (dependent_representation_type ctx exp) typ
+        match (expanded, source_exp) with
+        | Typ_aux (Typ_tuple typs, _), E_aux (E_tuple exps, _) when List.length typs = List.length exps ->
+            let already_refined =
+              List.for_all2
+                (fun typ exp ->
+                  (not (has_dependent_type ctx typ))
+                  || exp_has_dependent_representation ctx exp
+                     && dependent_types_equivalent ctx (dependent_representation_type ctx exp) typ
                 )
-              )
-              typs exps
-          in
-          if already_refined then value
-          else
-            let names =
-              List.mapi
-                (fun index _ ->
-                  Printf.sprintf "dependentResultValue%i" index
-                )
-                typs
+                typs exps
             in
-            let pattern =
-              parens (separate comma_sp (List.map string names))
-            in
-            let converted =
-              parens
-                (separate comma_sp
-                   (List.map2
-                      (fun (typ, exp) name ->
-                        doc_prop_dependent_result_carrier ctx typ exp
-                          (string name)
-                      )
-                      (List.combine typs exps) names
-                   )
-                )
-            in
-            parens
-              (dependent_lambda pattern converted ^^ space ^^ parens value)
-      | carrier, _ -> (
-          match prop_dependent_result_of_exp ctx source_exp with
-          | Some source_result
-            when
-              dependent_types_equivalent ctx source_result.result_carrier
-                carrier ->
-              parens value ^^ string ".val"
-          | _ -> doc_dependent_pack ctx carrier value
-        )
-    )
+            if already_refined then value
+            else (
+              let names = List.mapi (fun index _ -> Printf.sprintf "dependentResultValue%i" index) typs in
+              let pattern = parens (separate comma_sp (List.map string names)) in
+              let converted =
+                parens
+                  (separate comma_sp
+                     (List.map2
+                        (fun (typ, exp) name -> doc_prop_dependent_result_carrier ctx typ exp (string name))
+                        (List.combine typs exps) names
+                     )
+                  )
+              in
+              parens (dependent_lambda pattern converted ^^ space ^^ parens value)
+            )
+        | carrier, _ -> (
+            match prop_dependent_result_of_exp ctx source_exp with
+            | Some source_result when dependent_types_equivalent ctx source_result.result_carrier carrier ->
+                parens value ^^ string ".val"
+            | _ -> doc_dependent_pack ctx carrier value
+          )
+      )
 
 let doc_prop_dependent_result_pack ctx result source_exp value =
   let binder = string "dependentResult" in
-  let carrier =
-    doc_prop_dependent_result_carrier ctx result.result_carrier source_exp
-      binder
-  in
+  let carrier = doc_prop_dependent_result_carrier ctx result.result_carrier source_exp binder in
   let body =
-    string "let resultCarrier := " ^^ carrier
-    ^^ hardline
-    ^^ string "⟨resultCarrier, "
-    ^^ prop_dependent_result_proof ctx result
-    ^^ string "⟩"
+    string "let resultCarrier := " ^^ carrier ^^ hardline ^^ string "⟨resultCarrier, "
+    ^^ prop_dependent_result_proof ctx result ^^ string "⟩"
   in
-  parens
-    (string "let " ^^ binder ^^ string " := " ^^ parens value
-    ^^ hardline
-    ^^ body
-    )
+  parens (string "let " ^^ binder ^^ string " := " ^^ parens value ^^ hardline ^^ body)
 
 (* Follow only the result-producing tails of control flow.  A function needs
    explicit constraint proofs precisely when at least one such tail still
@@ -2141,22 +1819,17 @@ let doc_prop_dependent_result_pack ctx result source_exp value =
 let rec dependent_tail_has_representation ctx (E_aux (exp, _) as full_exp) =
   match exp with
   | E_if (_, then_exp, else_exp) ->
-      dependent_tail_has_representation ctx then_exp
-      && dependent_tail_has_representation ctx else_exp
+      dependent_tail_has_representation ctx then_exp && dependent_tail_has_representation ctx else_exp
   | E_match (_, clauses) ->
       List.for_all
         (fun (Pat_aux (clause, _)) ->
           match clause with
-          | Pat_exp (_, branch) | Pat_when (_, _, branch) ->
-              dependent_tail_has_representation ctx branch
+          | Pat_exp (_, branch) | Pat_when (_, _, branch) -> dependent_tail_has_representation ctx branch
         )
         clauses
-  | E_let (_, _, body) | E_internal_plet (_, _, body) ->
-      dependent_tail_has_representation ctx body
+  | E_let (_, _, body) | E_internal_plet (_, _, body) -> dependent_tail_has_representation ctx body
   | E_block exps -> (
-      match List.rev exps with
-      | [] -> false
-      | last :: _ -> dependent_tail_has_representation ctx last
+      match List.rev exps with [] -> false | last :: _ -> dependent_tail_has_representation ctx last
     )
   | E_typ (_, inner) -> dependent_tail_has_representation ctx inner
   | _ -> exp_has_dependent_representation ctx full_exp
@@ -2164,30 +1837,20 @@ let rec dependent_tail_has_representation ctx (E_aux (exp, _) as full_exp) =
 let rec dependent_tail_carrier_kids ctx (E_aux (exp, _) as full_exp) =
   match exp with
   | E_if (_, then_exp, else_exp) ->
-      KidSet.union
-        (dependent_tail_carrier_kids ctx then_exp)
-        (dependent_tail_carrier_kids ctx else_exp)
+      KidSet.union (dependent_tail_carrier_kids ctx then_exp) (dependent_tail_carrier_kids ctx else_exp)
   | E_match (_, clauses) ->
       List.fold_left
         (fun kids (Pat_aux (clause, _)) ->
-          let branch =
-            match clause with
-            | Pat_exp (_, branch) | Pat_when (_, _, branch) -> branch
-          in
+          let branch = match clause with Pat_exp (_, branch) | Pat_when (_, _, branch) -> branch in
           KidSet.union kids (dependent_tail_carrier_kids ctx branch)
         )
         KidSet.empty clauses
-  | E_let (_, _, body) | E_internal_plet (_, _, body) ->
-      dependent_tail_carrier_kids ctx body
+  | E_let (_, _, body) | E_internal_plet (_, _, body) -> dependent_tail_carrier_kids ctx body
   | E_block exps -> (
-      match List.rev exps with
-      | [] -> KidSet.empty
-      | last :: _ -> dependent_tail_carrier_kids ctx last
+      match List.rev exps with [] -> KidSet.empty | last :: _ -> dependent_tail_carrier_kids ctx last
     )
   | E_typ (_, inner) -> dependent_tail_carrier_kids ctx inner
-  | _ ->
-      if exp_has_dependent_representation ctx full_exp then KidSet.empty
-      else lean_nvars_of_typ (typ_of full_exp)
+  | _ -> if exp_has_dependent_representation ctx full_exp then KidSet.empty else lean_nvars_of_typ (typ_of full_exp)
 
 (* A refined value may also be constructed before the result-producing tail,
    for example in a let binding.  Such a construction needs the enclosing
@@ -2198,8 +1861,7 @@ let dependent_record_construction_kids ctx exp =
     let kids, exp = recurse kids exp in
     let kids =
       match aux with
-      | E_struct _ | E_struct_update _
-        when prop_dependent_record_typ (typ_of exp) ->
+      | (E_struct _ | E_struct_update _) when prop_dependent_record_typ (typ_of exp) ->
           KidSet.union kids (lean_nvars_of_typ (typ_of exp))
       | _ -> kids
     in
@@ -2207,8 +1869,7 @@ let dependent_record_construction_kids ctx exp =
   in
   fst (foldin_exp collect KidSet.empty exp)
 
-let constraint_relevant_to kids nc =
-  not (KidSet.is_empty (KidSet.inter kids (tyvars_of_constraint nc)))
+let constraint_relevant_to kids nc = not (KidSet.is_empty (KidSet.inter kids (tyvars_of_constraint nc)))
 
 let close_constraint_kids quant seeds =
   let rec close kids =
@@ -2216,8 +1877,7 @@ let close_constraint_kids quant seeds =
       List.fold_left
         (fun expanded (QI_aux (item, _)) ->
           match item with
-          | QI_constraint nc when constraint_relevant_to kids nc ->
-              KidSet.union expanded (tyvars_of_constraint nc)
+          | QI_constraint nc when constraint_relevant_to kids nc -> KidSet.union expanded (tyvars_of_constraint nc)
           | _ -> expanded
         )
         kids quant
@@ -2229,14 +1889,12 @@ let close_constraint_kids quant seeds =
 let debug_dependent_representation =
   match Sys.getenv_opt "SAIL_LEAN_DEPENDENT_DEBUG" with Some ("1" | "true" | "yes") -> true | _ -> false
 
-let log_dependent_representation expected exp represented representation_typ
-    needs_repack =
+let log_dependent_representation expected exp represented representation_typ needs_repack =
   if debug_dependent_representation then
-    Printf.eprintf
-      "lean-dependent: expected=%s expression=%s type=%s representation=%s represented=%b repack=%b\n%!"
+    Printf.eprintf "lean-dependent: expected=%s expression=%s type=%s representation=%s represented=%b repack=%b\n%!"
       (string_of_typ expected) (string_of_exp exp)
-      (string_of_typ (typ_of exp)) (string_of_typ representation_typ)
-      represented needs_repack
+      (string_of_typ (typ_of exp))
+      (string_of_typ representation_typ) represented needs_repack
 
 let record_id_of_typ = function Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, _), _) -> Some id | _ -> None
 
@@ -2263,19 +1921,20 @@ let record_index_projection_nexp ctx id tq typ =
     (* The Lean declaration of an extern type is written by hand outside this
        backend, so its fields are whatever that declaration stores. *)
     None
-  else
-  let env = try Env.add_typquant Unknown tq ctx.env with Type_internal.Type_error _ -> ctx.env in
-  let field_ctx = context_init env ctx.global in
-  let expanded = try Env.expand_synonyms env typ with Type_internal.Type_error _ -> typ in
-  match expanded with
-  | Typ_aux (Typ_app (Id_aux (Id ("atom" | "implicit"), _), [A_aux (A_nexp nexp, _)]), _) ->
-      let quantified = KidSet.of_list (quantified_int_kids tq) in
-      let vars = tyvars_of_nexp nexp in
-      let renders_nat = provably_nneg field_ctx nexp in
-      let var_renders_nat kid = provably_nneg field_ctx (Nexp_aux (Nexp_var kid, Unknown)) in
-      if KidSet.subset vars quantified && ((not renders_nat) || KidSet.for_all var_renders_nat vars) then Some nexp
-      else None
-  | _ -> None
+  else (
+    let env = try Env.add_typquant Unknown tq ctx.env with Type_internal.Type_error _ -> ctx.env in
+    let field_ctx = context_init env ctx.global in
+    let expanded = try Env.expand_synonyms env typ with Type_internal.Type_error _ -> typ in
+    match expanded with
+    | Typ_aux (Typ_app (Id_aux (Id ("atom" | "implicit"), _), [A_aux (A_nexp nexp, _)]), _) ->
+        let quantified = KidSet.of_list (quantified_int_kids tq) in
+        let vars = tyvars_of_nexp nexp in
+        let renders_nat = provably_nneg field_ctx nexp in
+        let var_renders_nat kid = provably_nneg field_ctx (Nexp_aux (Nexp_var kid, Unknown)) in
+        if KidSet.subset vars quantified && ((not renders_nat) || KidSet.for_all var_renders_nat vars) then Some nexp
+        else None
+    | _ -> None
+  )
 
 let record_index_projection_field ctx record_id field =
   match
@@ -2287,15 +1946,12 @@ let record_index_projection_field ctx record_id field =
 (* Whether the field of [record_id] is projected from an index rather than
    stored.  Every emitter that names a field -- structure declaration, literal
    construction, functional update, and pattern -- has to agree on this. *)
-let record_field_is_projected ctx record_id field =
-  Option.is_some (record_index_projection_field ctx record_id field)
+let record_field_is_projected ctx record_id field = Option.is_some (record_index_projection_field ctx record_id field)
 
 let projected_fields_removed ctx record_id fexps =
   match record_id with
   | Some record_id ->
-      List.filter
-        (fun (FE_aux (FE_fexp (field, _), _)) -> not (record_field_is_projected ctx record_id field))
-        fexps
+      List.filter (fun (FE_aux (FE_fexp (field, _), _)) -> not (record_field_is_projected ctx record_id field)) fexps
   | None -> fexps
 
 (* Lean erases Sail singleton integer refinements to Nat/Int.  A projection
@@ -2304,18 +1960,10 @@ let projected_fields_removed ctx record_id fexps =
    the surrounding dependent record type. *)
 let singleton_nexp_of_typ ctx typ =
   match Env.expand_synonyms ctx.env typ with
-  | Typ_aux
-      ( Typ_app
-          ( Id_aux (Id ("atom" | "implicit"), _),
-            [A_aux (A_nexp nexp, _)]
-          ),
-        _
-      ) ->
+  | Typ_aux (Typ_app (Id_aux (Id ("atom" | "implicit"), _), [A_aux (A_nexp nexp, _)]), _) ->
       let available kid =
-        KidSet.mem kid ctx.function_bound_nvars
-        || KBindings.mem kid ctx.kid_docs
-        ||
-        match KBindings.find_opt kid ctx.kid_id_renames with Some (Some _) -> true | _ -> false
+        KidSet.mem kid ctx.function_bound_nvars || KBindings.mem kid ctx.kid_docs
+        || match KBindings.find_opt kid ctx.kid_id_renames with Some (Some _) -> true | _ -> false
       in
       if KidSet.for_all available (tyvars_of_nexp nexp) then Some nexp else None
   | _ -> None
@@ -2544,18 +2192,11 @@ let rec doc_pat ?(need_parens = false) ?(in_vector = false) ctx in_match_bv (P_a
         doc_dependent_pattern ~proof ctx typ pattern
       in
       let constructor_pats =
-        try List.mapi (fun index (typ, pat) -> doc_constructor_pat index typ pat) (List.combine constructor_arg_typs pats)
-        with Invalid_argument _ ->
-          List.mapi
-            (fun index pat -> doc_constructor_pat index (typ_of_pat pat) pat)
-            pats
+        try
+          List.mapi (fun index (typ, pat) -> doc_constructor_pat index typ pat) (List.combine constructor_arg_typs pats)
+        with Invalid_argument _ -> List.mapi (fun index pat -> doc_constructor_pat index (typ_of_pat pat) pat) pats
       in
-      opt_parens
-        (string "."
-        ^^ doc_id_ctor (fixup_match_id cons)
-        ^^ space
-        ^^ separate (string ", ") constructor_pats
-        )
+      opt_parens (string "." ^^ doc_id_ctor (fixup_match_id cons) ^^ space ^^ separate (string ", ") constructor_pats)
   | P_var (p, _) -> doc_pat ctx in_match_bv p
   | P_as (pat, id) -> doc_pat ctx in_match_bv pat
   | P_struct (struct_name, pats, _) ->
@@ -2563,9 +2204,7 @@ let rec doc_pat ?(need_parens = false) ?(in_vector = false) ctx in_match_bv (P_a
          a structure pattern.  Nothing is lost as long as the sub-pattern binds
          no names; a binder would have to be recovered from the index instead,
          which a pattern cannot express. *)
-      let record_id =
-        match struct_name with SN_id id -> Some id | SN_anon -> record_id_of_typ (typ_of_pat pat)
-      in
+      let record_id = match struct_name with SN_id id -> Some id | SN_anon -> record_id_of_typ (typ_of_pat pat) in
       let projected field =
         match record_id with Some record_id -> record_field_is_projected ctx record_id field | None -> false
       in
@@ -2614,8 +2253,7 @@ and doc_vector_concat pats =
 let rec pattern_destructures_value (P_aux (pat, _)) =
   match pat with
   | P_typ (_, pat) | P_var (pat, _) -> pattern_destructures_value pat
-  | P_tuple _ | P_list _ | P_vector _ | P_vector_concat _ | P_string_append _ | P_cons _ | P_app _ | P_struct _ ->
-      true
+  | P_tuple _ | P_list _ | P_vector _ | P_vector_concat _ | P_string_append _ | P_cons _ | P_app _ | P_struct _ -> true
   | P_lit _ | P_wild | P_or _ | P_not _ | P_as _ | P_id _ | P_vector_subrange _ -> false
 
 let rec nested_dependent_pattern_bindings ctx typ (P_aux (pat, _)) =
@@ -2623,9 +2261,7 @@ let rec nested_dependent_pattern_bindings ctx typ (P_aux (pat, _)) =
   let recurse_many typs pats =
     try
       List.fold_left2
-        (fun bindings typ pat ->
-          Bindings.fold Bindings.add (recurse typ pat) bindings
-        )
+        (fun bindings typ pat -> Bindings.fold Bindings.add (recurse typ pat) bindings)
         Bindings.empty typs pats
     with Invalid_argument _ -> Bindings.empty
   in
@@ -2635,12 +2271,10 @@ let rec nested_dependent_pattern_bindings ctx typ (P_aux (pat, _)) =
   | P_as (pat, id) ->
       let bindings = recurse typ pat in
       if has_top_level_dependent_type ctx typ then Bindings.add id typ bindings else bindings
-  | P_id id ->
-      if has_top_level_dependent_type ctx typ then Bindings.singleton id typ else Bindings.empty
+  | P_id id -> if has_top_level_dependent_type ctx typ then Bindings.singleton id typ else Bindings.empty
   | P_tuple pats -> (
       match expand_synonyms_for_dependent_type ctx typ with
-      | Typ_aux (Typ_tuple typs, _) ->
-          recurse_many typs pats
+      | Typ_aux (Typ_tuple typs, _) -> recurse_many typs pats
       | _ -> Bindings.empty
     )
   | P_app (constructor, pats) ->
@@ -2650,9 +2284,7 @@ let rec nested_dependent_pattern_bindings ctx typ (P_aux (pat, _)) =
         | None -> (
             try
               let _, typ = Env.get_val_spec constructor ctx.env in
-              match typ with
-              | Typ_aux (Typ_fn (arg_typs, _), _) -> arg_typs
-              | _ -> []
+              match typ with Typ_aux (Typ_fn (arg_typs, _), _) -> arg_typs | _ -> []
             with _ -> []
           )
       in
@@ -2667,107 +2299,69 @@ let doc_pat_for_type ctx in_match_bv typ pat =
         (fun (KOpt_aux (KOpt_kind (_, kid), _)) pattern ->
           string "⟨" ^^ doc_kid ctx kid ^^ string ", " ^^ pattern ^^ string "⟩"
         )
-        (relevant_existential_kopts kopts inner) (doc_pat ctx in_match_bv pat)
+        (relevant_existential_kopts kopts inner)
+        (doc_pat ctx in_match_bv pat)
   | _ -> doc_pat ctx in_match_bv pat
 
 let rec first_pattern_binder (P_aux (pat, _)) =
   let first pats = List.find_map first_pattern_binder pats in
   match pat with
   | P_id id -> Some id
-  | P_typ (_, pat) | P_var (pat, _) | P_as (pat, _) ->
-      first_pattern_binder pat
-  | P_tuple pats | P_list pats | P_vector pats | P_vector_concat pats ->
-      first pats
+  | P_typ (_, pat) | P_var (pat, _) | P_as (pat, _) -> first_pattern_binder pat
+  | P_tuple pats | P_list pats | P_vector pats | P_vector_concat pats -> first pats
   | P_app (_, pats) | P_string_append pats -> first pats
   | P_cons (head, tail) -> (
-      match first_pattern_binder head with
-      | Some _ as binder -> binder
-      | None -> first_pattern_binder tail
+      match first_pattern_binder head with Some _ as binder -> binder | None -> first_pattern_binder tail
     )
-  | P_struct (_, fields, _) ->
-      List.find_map
-        (fun (_, pat) -> first_pattern_binder pat)
-        fields
+  | P_struct (_, fields, _) -> List.find_map (fun (_, pat) -> first_pattern_binder pat) fields
   | P_lit _ | P_wild | P_or _ | P_not _ | P_vector_subrange _ -> None
 
 let existential_pattern_kid_docs ctx typ pat =
   let typ = expand_synonyms_for_dependent_type ctx typ in
   match (typ, first_pattern_binder pat) with
-  | Typ_aux (Typ_exist (kopts, _, inner), _), Some binder
-    when pattern_destructures_value pat ->
+  | Typ_aux (Typ_exist (kopts, _, inner), _), Some binder when pattern_destructures_value pat ->
       List.fold_left
         (fun docs (KOpt_aux (KOpt_kind (_, kid), _)) ->
-          let Kid_aux (Var raw_name, _) = kid in
-          let kind_name =
-            String.sub raw_name 1 (String.length raw_name - 1)
-          in
-          let witness =
-            fix_id (string_of_id binder ^ "_" ^ kind_name)
-          in
+          let (Kid_aux (Var raw_name, _)) = kid in
+          let kind_name = String.sub raw_name 1 (String.length raw_name - 1) in
+          let witness = fix_id (string_of_id binder ^ "_" ^ kind_name) in
           KBindings.add kid (string witness) docs
         )
-        KBindings.empty (relevant_existential_kopts kopts inner)
+        KBindings.empty
+        (relevant_existential_kopts kopts inner)
   | _ -> KBindings.empty
 
-let context_with_pattern_kid_docs ctx docs =
-  {
-    ctx with
-    kid_docs =
-      KBindings.fold KBindings.add docs ctx.kid_docs;
-  }
+let context_with_pattern_kid_docs ctx docs = { ctx with kid_docs = KBindings.fold KBindings.add docs ctx.kid_docs }
 
 (* Relate the fresh index variables in a typed expression or pattern back to
    the witnesses carried by its public nested-Sigma type.  Ordinary Lean
    extraction erases Sail constraints, but it must retain these equalities in
    the generated names/paths so later dependent type annotations remain
    well-scoped. *)
-let add_existential_carrier_witness_docs ctx public_typ candidate_typs
-    witness_doc =
+let add_existential_carrier_witness_docs ctx public_typ candidate_typs witness_doc =
   let rec existential_carrier ctx kopts typ =
     let typ = expand_synonyms_for_dependent_type ctx typ in
     match typ with
     | Typ_aux (Typ_exist (outer_kopts, nc, inner), l) ->
-        let env =
-          List.fold_left
-            (fun env kopt -> Env.add_typ_var l kopt env)
-            ctx.env outer_kopts
-        in
-        let env =
-          try Env.add_constraint nc env
-          with Type_internal.Type_error _ -> env
-        in
-        existential_carrier (context_with_env ctx env)
-          (kopts @ relevant_existential_kopts outer_kopts inner) inner
+        let env = List.fold_left (fun env kopt -> Env.add_typ_var l kopt env) ctx.env outer_kopts in
+        let env = try Env.add_constraint nc env with Type_internal.Type_error _ -> env in
+        existential_carrier (context_with_env ctx env) (kopts @ relevant_existential_kopts outer_kopts inner) inner
     | _ -> (ctx, kopts, typ)
   in
-  let carrier_ctx, witness_kopts, carrier_typ =
-    existential_carrier ctx [] public_typ
-  in
+  let carrier_ctx, witness_kopts, carrier_typ = existential_carrier ctx [] public_typ in
   let add_candidate ctx candidate_typ =
     try
-      let goals =
-        KidSet.of_list (List.map kopt_kid witness_kopts)
-      in
-      let unifiers =
-        Type_check.unify (typ_loc candidate_typ) carrier_ctx.env goals
-          carrier_typ candidate_typ
-      in
+      let goals = KidSet.of_list (List.map kopt_kid witness_kopts) in
+      let unifiers = Type_check.unify (typ_loc candidate_typ) carrier_ctx.env goals carrier_typ candidate_typ in
       List.mapi (fun index kopt -> (index, kopt_kid kopt)) witness_kopts
       |> List.fold_left
-        (fun ctx (index, witness) ->
-          match KBindings.find_opt witness unifiers with
-          | Some
-              (A_aux
-                (A_nexp (Nexp_aux (Nexp_var raw_kid, _)), _)) ->
-              {
-                ctx with
-                kid_docs =
-                  KBindings.add raw_kid (witness_doc index witness)
-                    ctx.kid_docs;
-              }
-          | _ -> ctx
-        )
-        ctx
+           (fun ctx (index, witness) ->
+             match KBindings.find_opt witness unifiers with
+             | Some (A_aux (A_nexp (Nexp_aux (Nexp_var raw_kid, _)), _)) ->
+                 { ctx with kid_docs = KBindings.add raw_kid (witness_doc index witness) ctx.kid_docs }
+             | _ -> ctx
+           )
+           ctx
     with _ -> ctx
   in
   List.fold_left add_candidate ctx candidate_typs
@@ -2824,10 +2418,7 @@ let semantic_pattern_unpacks ctx pat = semantic_pattern_unpacks_with_typ ctx Non
 let rec dependent_pattern_unpacked_ids ctx typ (P_aux (pat, _)) =
   let recurse typ pat = dependent_pattern_unpacked_ids ctx typ pat in
   let recurse_many typs pats =
-    try
-      List.fold_left2
-        (fun ids typ pat -> IdSet.union ids (recurse typ pat))
-        IdSet.empty typs pats
+    try List.fold_left2 (fun ids typ pat -> IdSet.union ids (recurse typ pat)) IdSet.empty typs pats
     with Invalid_argument _ -> IdSet.empty
   in
   match pat with
@@ -2835,19 +2426,16 @@ let rec dependent_pattern_unpacked_ids ctx typ (P_aux (pat, _)) =
   | P_var (pat, _) | P_as (pat, _) -> recurse typ pat
   | P_app (constructor, pats) -> (
       match semantic_function_type ctx constructor with
-      | Some (arg_typs, _) ->
-          (try
-             List.fold_left2
-               (fun ids arg_typ pat ->
-                 let ids =
-                   if has_top_level_dependent_type ctx arg_typ then
-                     IdSet.union ids (pat_ids pat)
-                   else ids
-                 in
-                 IdSet.union ids (recurse arg_typ pat)
-               )
-               IdSet.empty arg_typs pats
-           with Invalid_argument _ -> IdSet.empty)
+      | Some (arg_typs, _) -> (
+          try
+            List.fold_left2
+              (fun ids arg_typ pat ->
+                let ids = if has_top_level_dependent_type ctx arg_typ then IdSet.union ids (pat_ids pat) else ids in
+                IdSet.union ids (recurse arg_typ pat)
+              )
+              IdSet.empty arg_typs pats
+          with Invalid_argument _ -> IdSet.empty
+        )
       | None -> IdSet.empty
     )
   | P_tuple pats -> (
@@ -2858,9 +2446,7 @@ let rec dependent_pattern_unpacked_ids ctx typ (P_aux (pat, _)) =
   | P_list pats -> (
       match expand_synonyms_for_dependent_type ctx typ with
       | Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _) ->
-          List.fold_left
-            (fun ids pat -> IdSet.union ids (recurse inner pat))
-            IdSet.empty pats
+          List.fold_left (fun ids pat -> IdSet.union ids (recurse inner pat)) IdSet.empty pats
       | _ -> IdSet.empty
     )
   | P_cons (head, tail) -> (
@@ -2872,35 +2458,23 @@ let rec dependent_pattern_unpacked_ids ctx typ (P_aux (pat, _)) =
   | _ -> IdSet.empty
 
 let context_with_dependent_pattern_unpacks ctx pat =
-  let unpacked =
-    dependent_pattern_unpacked_ids ctx (typ_of_pat pat) pat
-  in
-  let packed =
-    nested_dependent_pattern_bindings ctx (typ_of_pat pat) pat
-  in
-  let packed =
-    IdSet.fold (fun id bindings -> Bindings.remove id bindings)
-      unpacked packed
-  in
+  let unpacked = dependent_pattern_unpacked_ids ctx (typ_of_pat pat) pat in
+  let packed = nested_dependent_pattern_bindings ctx (typ_of_pat pat) pat in
+  let packed = IdSet.fold (fun id bindings -> Bindings.remove id bindings) unpacked packed in
   let ctx =
     {
       ctx with
-      unpacked_dependent_ids =
-        IdSet.union ctx.unpacked_dependent_ids unpacked;
+      unpacked_dependent_ids = IdSet.union ctx.unpacked_dependent_ids unpacked;
       packed_dependent_types =
-        IdSet.fold
-          (fun id bindings -> Bindings.remove id bindings)
-          unpacked ctx.packed_dependent_types;
+        IdSet.fold (fun id bindings -> Bindings.remove id bindings) unpacked ctx.packed_dependent_types;
     }
   in
   Bindings.fold
     (fun id typ ctx ->
       {
         ctx with
-        unpacked_dependent_ids =
-          IdSet.remove id ctx.unpacked_dependent_ids;
-        packed_dependent_types =
-          Bindings.add id typ ctx.packed_dependent_types;
+        unpacked_dependent_ids = IdSet.remove id ctx.unpacked_dependent_ids;
+        packed_dependent_types = Bindings.add id typ ctx.packed_dependent_types;
       }
     )
     packed ctx
@@ -2909,8 +2483,8 @@ let doc_pat_typ_ascription ctx (P_aux (p, (l, annot)) as pat) =
   match p with
   | P_typ (ptyp, _) ->
       Some
-        (if contains_prop_dependent_alias ctx ptyp then doc_dependent_shape ctx ptyp
-         else doc_raw_typ ctx (env_of_pat pat) ptyp
+        ( if contains_prop_dependent_alias ctx ptyp then doc_dependent_shape ctx ptyp
+          else doc_raw_typ ctx (env_of_pat pat) ptyp
         )
   | _ -> None
 
@@ -2988,13 +2562,8 @@ let doc_instantiated_nvars ctx quantified f_typ instantiation =
         let visible, captured, inferable =
           List.fold_left
             (fun (visible, captured, inferable) typ ->
-              let visible =
-                KidSet.union visible (KidSet.diff (lean_nvars_of_typ typ) captured)
-              in
-              let inferable =
-                KidSet.union inferable
-                  (lean_nvars_of_typ (expand_synonyms_for_dependent_type ctx typ))
-              in
+              let visible = KidSet.union visible (KidSet.diff (lean_nvars_of_typ typ) captured) in
+              let inferable = KidSet.union inferable (lean_nvars_of_typ (expand_synonyms_for_dependent_type ctx typ)) in
               let captured =
                 match captured_typ_var (mk_id "_", typ) with
                 | Some (_, kid) -> KidSet.add kid captured
@@ -3002,27 +2571,23 @@ let doc_instantiated_nvars ctx quantified f_typ instantiation =
               in
               (visible, captured, inferable)
             )
-            (KidSet.empty, KidSet.empty, KidSet.empty) args
+            (KidSet.empty, KidSet.empty, KidSet.empty)
+            args
         in
-        ( KidSet.union visible (KidSet.diff (lean_nvars_of_typ ret) captured),
-          inferable
-        )
+        (KidSet.union visible (KidSet.diff (lean_nvars_of_typ ret) captured), inferable)
     | _ -> (KidSet.empty, KidSet.empty)
   in
-  let declared =
-    KidSet.of_list (List.map kopt_kid (quant_kopts quantified))
-  in
+  let declared = KidSet.of_list (List.map kopt_kid (quant_kopts quantified)) in
   KBindings.bindings instantiation
   |> List.filter_map (fun (kid, arg) ->
-         match arg with
-         | A_aux (A_nexp nexp, _)
-           when KidSet.mem kid declared
-                && KidSet.mem kid visible
-                && not (KidSet.mem kid inferable)
-                && KidSet.for_all (dependent_type_nvar_available ctx) (tyvars_of_nexp nexp) ->
-             Some (parens (doc_kid ctx kid ^^ space ^^ coloneq ^^ space ^^ doc_typ_arg ctx `All arg))
-         | _ -> None
-     )
+      match arg with
+      | A_aux (A_nexp nexp, _)
+        when KidSet.mem kid declared && KidSet.mem kid visible
+             && (not (KidSet.mem kid inferable))
+             && KidSet.for_all (dependent_type_nvar_available ctx) (tyvars_of_nexp nexp) ->
+          Some (parens (doc_kid ctx kid ^^ space ^^ coloneq ^^ space ^^ doc_typ_arg ctx `All arg))
+      | _ -> None
+  )
 
 let op_of_id id =
   match id with
@@ -3127,8 +2692,7 @@ let match_or_match_bv (is_match_bv : bool) brs = if is_match_bv then "match_bv "
 let rec annotate_dependent_tail public_typ (E_aux (exp, annot) as full_exp) =
   let recurse = annotate_dependent_tail public_typ in
   match exp with
-  | E_if (condition, then_exp, else_exp) ->
-      E_aux (E_if (condition, recurse then_exp, recurse else_exp), annot)
+  | E_if (condition, then_exp, else_exp) -> E_aux (E_if (condition, recurse then_exp, recurse else_exp), annot)
   | E_match (discriminant, clauses) ->
       let rewrite_clause (Pat_aux (clause, clause_annot)) =
         match clause with
@@ -3150,11 +2714,7 @@ let rec doc_match_clause (is_bv : bool) (as_monadic : bool) ctx (Pat_aux (cl, l)
   match cl with
   | Pat_exp (pat, branch) ->
       let branch_ctx = context_with_dependent_pattern_unpacks ctx pat in
-      let branch =
-        separate hardline
-          (semantic_pattern_unpacks ctx pat
-          @ [wrap_exp as_monadic branch_ctx branch])
-      in
+      let branch = separate hardline (semantic_pattern_unpacks ctx pat @ [wrap_exp as_monadic branch_ctx branch]) in
       group
         (nest 2
            (string "| " ^^ doc_pat ctx is_bv pat ^^ string " =>"
@@ -3166,8 +2726,7 @@ let rec doc_match_clause (is_bv : bool) (as_monadic : bool) ctx (Pat_aux (cl, l)
       let branch_ctx = context_with_dependent_pattern_unpacks ctx pat in
       group
         (nest 2
-           (string "| " ^^ doc_pat ctx is_bv pat ^^ string " if "
-           ^^ doc_exp false branch_ctx when_ ^^ string " =>"
+           (string "| " ^^ doc_pat ctx is_bv pat ^^ string " if " ^^ doc_exp false branch_ctx when_ ^^ string " =>"
            ^^ string (if is_bv && as_monadic then " do" else "")
            ^^ break 1 ^^ wrap_exp as_monadic branch_ctx branch
            )
@@ -3223,37 +2782,27 @@ and doc_loop l as_monadic ctx loop_kind args =
   let cond_effects = has_effect cond in
   let vartuple_pp, base_lambda = make_loop_vars [] varstuple in
   let loop_ctx =
-    let variables =
-      match varstuple with
-      | E_aux (E_tuple variables, _) -> variables
-      | variable -> [variable]
-    in
+    let variables = match varstuple with E_aux (E_tuple variables, _) -> variables | variable -> [variable] in
     List.fold_left
       (fun ctx (E_aux (expression, _) as variable) ->
         match expression with
         | E_id id ->
             let public_typ = dependent_representation_type ctx variable in
-            if has_top_level_dependent_type ctx public_typ then
+            if has_top_level_dependent_type ctx public_typ then (
               let ctx =
                 {
                   ctx with
-                  unpacked_dependent_ids =
-                    IdSet.remove id ctx.unpacked_dependent_ids;
-                  packed_dependent_types =
-                    Bindings.add id public_typ ctx.packed_dependent_types;
+                  unpacked_dependent_ids = IdSet.remove id ctx.unpacked_dependent_ids;
+                  packed_dependent_types = Bindings.add id public_typ ctx.packed_dependent_types;
                 }
               in
               let rec witness_path value index =
-                if index = 0 then parens value ^^ string ".1"
-                else
-                  witness_path (parens value ^^ string ".2")
-                    (index - 1)
+                if index = 0 then parens value ^^ string ".1" else witness_path (parens value ^^ string ".2") (index - 1)
               in
               add_existential_carrier_witness_docs ctx public_typ
                 [typ_of variable]
-                (fun index _ ->
-                  witness_path (doc_id_ctor id) index
-                )
+                (fun index _ -> witness_path (doc_id_ctor id) index)
+            )
             else ctx
         | _ -> ctx
       )
@@ -3316,47 +2865,36 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
   in
   let d_of_field (FE_aux (FE_fexp (field, e), _) as fexp) = doc_fexp (has_effect e) ctx fexp in
   let doc_short_circuit lhs when_true when_false =
-    let condition =
-      string "if (" ^^ nest 1 (d_of_arg ctx lhs) ^^ string " : Bool)"
-    in
+    let condition = string "if (" ^^ nest 1 (d_of_arg ctx lhs) ^^ string " : Bool)" in
     let branch exp =
       let rendered = doc_exp true ctx exp in
       if has_effect exp then wrap_with_do false true rendered else rendered
     in
-    (nest 2 condition
-     ^^ hardline
-     ^^ prefix 2 1 (string "then") (branch when_true)
-     ^^ hardline
-     ^^ prefix 2 1 (string "else") (branch when_false))
+    nest 2 condition ^^ hardline
+    ^^ prefix 2 1 (string "then") (branch when_true)
+    ^^ hardline
+    ^^ prefix 2 1 (string "else") (branch when_false)
     |> wrap_with_left_arrow (not as_monadic)
   in
   match e with
   | E_id id ->
-      if Env.is_register id env then
+      if Env.is_register id env then (
         let register_typ = Env.get_register id env in
         if as_monadic then
           if has_semantic_range ctx register_typ then
             prefix 2 1 (string "do")
               (separate hardline
                  [
-                   string "let registerValue " ^^ leftarrow ^^ space
-                   ^^ string "readReg " ^^ doc_id_ctor id;
-                   string "pure "
-                   ^^ parens
-                        (doc_semantic_unpack ctx register_typ
-                           (string "registerValue")
-                        );
+                   string "let registerValue " ^^ leftarrow ^^ space ^^ string "readReg " ^^ doc_id_ctor id;
+                   string "pure " ^^ parens (doc_semantic_unpack ctx register_typ (string "registerValue"));
                  ]
               )
           else string "readReg " ^^ doc_id_ctor id
-        else
-          let value =
-            parens
-              (leftarrow ^^ space ^^ string "readReg " ^^ doc_id_ctor id)
-          in
-          if has_semantic_range ctx register_typ then
-            doc_semantic_unpack ctx register_typ value
-          else value
+        else (
+          let value = parens (leftarrow ^^ space ^^ string "readReg " ^^ doc_id_ctor id) in
+          if has_semantic_range ctx register_typ then doc_semantic_unpack ctx register_typ value else value
+        )
+      )
       else (
         let value = doc_id_ctor id in
         let value =
@@ -3387,14 +2925,12 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
   | E_app (Id_aux (Id "while#t", _), args) -> doc_loop l as_monadic ctx `WhileFuel args
   | E_app (Id_aux (Id "until#", _), args) -> doc_loop l as_monadic ctx `Until args
   | E_app (Id_aux (Id "until#t", _), args) -> doc_loop l as_monadic ctx `UntilFuel args
-  | E_app (f, [lhs; rhs])
-    when has_effect rhs && Env.is_extern f env "lean"
-         && Env.get_extern f env "lean" = "_lean_and" ->
+  | E_app (f, [lhs; rhs]) when has_effect rhs && Env.is_extern f env "lean" && Env.get_extern f env "lean" = "_lean_and"
+    ->
       let false_exp = check_exp env (mk_lit_exp ~loc:l L_false) bool_typ in
       doc_short_circuit lhs rhs false_exp
-  | E_app (f, [lhs; rhs])
-    when has_effect rhs && Env.is_extern f env "lean"
-         && Env.get_extern f env "lean" = "_lean_or" ->
+  | E_app (f, [lhs; rhs]) when has_effect rhs && Env.is_extern f env "lean" && Env.get_extern f env "lean" = "_lean_or"
+    ->
       let true_exp = check_exp env (mk_lit_exp ~loc:l L_true) bool_typ in
       doc_short_circuit lhs true_exp rhs
   | E_app (Id_aux (Id "foreach#", _), args) -> (
@@ -3468,10 +3004,8 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
       in
       let value =
         match (ctx.dependent_result, ctx.dependent_return) with
-        | Some result, _ ->
-            doc_prop_dependent_result_pack ctx result arg value
-        | None, Some typ
-          when has_dependent_type ctx typ && not (exp_is_ascribed_at ctx typ arg) ->
+        | Some result, _ -> doc_prop_dependent_result_pack ctx result arg value
+        | None, Some typ when has_dependent_type ctx typ && not (exp_is_ascribed_at ctx typ arg) ->
             doc_dependent_pack ctx typ value
         | _ -> value
       in
@@ -3490,222 +3024,141 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
       let semantic_signature = semantic_function_type ctx f in
       let semantic_args, semantic_ret =
         match semantic_signature with
-        | Some (args, ret) ->
-            ( List.map (subst_unifiers instantiation) args,
-              Some (subst_unifiers instantiation ret)
-            )
+        | Some (args, ret) -> (List.map (subst_unifiers instantiation) args, Some (subst_unifiers instantiation ret))
         | None -> ([], None)
       in
-      let arg_bindings, arg_validity_facts, arg_validity_unfold,
-          packed_args =
+      let arg_bindings, arg_validity_facts, arg_validity_unfold, packed_args =
         try
           let rendered_args =
             List.mapi
-               (fun index (typ, (arg_exp, arg)) ->
-                 let formal_dependent = has_dependent_type ctx typ in
-                 let formal_prop_dependent_record =
-                   prop_dependent_record_typ typ
-                 in
-                 let argument_handles_expected =
-                   (formal_dependent || formal_prop_dependent_record)
-                   &&
-                   ( app_returns_prop_dependent_record ctx arg_exp
-                     || exp_has_dependent_representation ctx arg_exp )
-                 in
-                 let arg =
-                   if argument_handles_expected then
-                     d_of_arg { ctx with expected_dependent = Some typ } arg_exp
-                   else arg
-                 in
-                 let named_argument_result =
-                   prop_dependent_result_of_exp ctx arg_exp
-                 in
-                 let actual_represented =
-                   argument_handles_expected
-                   || exp_has_dependent_representation ctx arg_exp
-                 in
-                 let representation_typ =
-                   if argument_handles_expected then typ
-                   else dependent_representation_type ctx arg_exp
-                 in
-                 let bindings, validity_facts, validity_unfold, arg =
-                   if actual_represented && has_effect arg_exp then
-                     let name = Printf.sprintf "dependentArg%i" index in
-                     let value = string name in
-                     let binding =
-                       string "let " ^^ value ^^ space ^^ coloneq ^^ space
-                       ^^ arg
-                     in
-                     let validity_facts, validity_unfold =
-                       match named_argument_result with
-                       | Some result ->
-                           let carrier_root =
-                             parens value ^^ string ".val"
-                           in
-                           let carrier_facts =
-                             List.mapi
-                               (fun fact_index property ->
-                                 string
-                                   (Printf.sprintf
-                                      "have dependentArgumentValidity%i_%i := "
-                                      index fact_index
-                                   )
-                                 ^^ property
-                               )
-                               (prop_dependent_carrier_properties ctx
-                                  carrier_root result.result_carrier
-                               )
-                           in
-                           ( (string
-                                (Printf.sprintf
-                                   "have dependentArgumentResultValidity%i := "
-                                   index
-                                )
-                             ^^ parens value ^^ string ".property")
-                             :: carrier_facts,
-                             string (result.result_name ^ ".Valid")
-                             :: List.map
-                                  (fun record ->
-                                    doc_id_ctor record ^^ string ".Valid"
+              (fun index (typ, (arg_exp, arg)) ->
+                let formal_dependent = has_dependent_type ctx typ in
+                let formal_prop_dependent_record = prop_dependent_record_typ typ in
+                let argument_handles_expected =
+                  (formal_dependent || formal_prop_dependent_record)
+                  && (app_returns_prop_dependent_record ctx arg_exp || exp_has_dependent_representation ctx arg_exp)
+                in
+                let arg =
+                  if argument_handles_expected then d_of_arg { ctx with expected_dependent = Some typ } arg_exp else arg
+                in
+                let named_argument_result = prop_dependent_result_of_exp ctx arg_exp in
+                let actual_represented = argument_handles_expected || exp_has_dependent_representation ctx arg_exp in
+                let representation_typ =
+                  if argument_handles_expected then typ else dependent_representation_type ctx arg_exp
+                in
+                let bindings, validity_facts, validity_unfold, arg =
+                  if actual_represented && has_effect arg_exp then (
+                    let name = Printf.sprintf "dependentArg%i" index in
+                    let value = string name in
+                    let binding = string "let " ^^ value ^^ space ^^ coloneq ^^ space ^^ arg in
+                    let validity_facts, validity_unfold =
+                      match named_argument_result with
+                      | Some result ->
+                          let carrier_root = parens value ^^ string ".val" in
+                          let carrier_facts =
+                            List.mapi
+                              (fun fact_index property ->
+                                string (Printf.sprintf "have dependentArgumentValidity%i_%i := " index fact_index)
+                                ^^ property
+                              )
+                              (prop_dependent_carrier_properties ctx carrier_root result.result_carrier)
+                          in
+                          ( (string (Printf.sprintf "have dependentArgumentResultValidity%i := " index)
+                            ^^ parens value ^^ string ".property"
+                            )
+                            :: carrier_facts,
+                            string (result.result_name ^ ".Valid")
+                            :: List.map
+                                 (fun record -> doc_id_ctor record ^^ string ".Valid")
+                                 (IdSet.elements (prop_dependent_carrier_record_ids ctx result.result_carrier))
+                          )
+                      | None -> (
+                          match prop_dependent_alias_id_for_typ ctx representation_typ with
+                          | Some alias -> (
+                              match prop_dependent_alias_parts ctx alias with
+                              | Some (record, _, _) ->
+                                  ( [
+                                      string (Printf.sprintf "have dependentArgumentValidity%i := " index)
+                                      ^^ parens value ^^ string ".property";
+                                    ],
+                                    [doc_id_ctor alias ^^ string ".Valid"; doc_id_ctor record ^^ string ".Valid"]
                                   )
-                                  (IdSet.elements
-                                     (prop_dependent_carrier_record_ids ctx
-                                        result.result_carrier
-                                     )
+                              | None -> ([], [])
+                            )
+                          | None -> (
+                              match prop_dependent_record_id_for_typ representation_typ with
+                              | Some record ->
+                                  ( [
+                                      string (Printf.sprintf "have dependentArgumentValidity%i := " index)
+                                      ^^ parens value ^^ string ".property";
+                                    ],
+                                    [doc_id_ctor record ^^ string ".Valid"]
                                   )
-                           )
-                       | None -> (
-                           match
-                             prop_dependent_alias_id_for_typ ctx
-                               representation_typ
-                           with
-                           | Some alias -> (
-                               match prop_dependent_alias_parts ctx alias with
-                               | Some (record, _, _) ->
-                                   ( [
-                                       string
-                                         (Printf.sprintf
-                                            "have dependentArgumentValidity%i := "
-                                            index
-                                         )
-                                       ^^ parens value ^^ string ".property";
-                                     ],
-                                     [
-                                       doc_id_ctor alias ^^ string ".Valid";
-                                       doc_id_ctor record ^^ string ".Valid";
-                                     ]
-                                   )
-                               | None -> ([], [])
-                             )
-                           | None -> (
-                               match
-                                 prop_dependent_record_id_for_typ
-                                   representation_typ
-                               with
-                               | Some record ->
-                                   ( [
-                                       string
-                                         (Printf.sprintf
-                                            "have dependentArgumentValidity%i := "
-                                            index
-                                         )
-                                       ^^ parens value ^^ string ".property";
-                                     ],
-                                     [
-                                       doc_id_ctor record ^^ string ".Valid";
-                                     ]
-                                   )
-                               | None -> ([], [])
-                             )
-                         )
-                     in
-                     ([binding], validity_facts, validity_unfold, value)
-                   else ([], [], [], arg)
-                 in
-                 let arg =
-                       if formal_dependent then
-                         if actual_represented then
-                           (match named_argument_result with
-                           | Some result ->
-                               let carrier_value =
-                                 parens arg ^^ string ".val"
-                               in
-                               if
-                                 dependent_types_equivalent ctx
-                                   result.result_carrier typ
-                               then carrier_value
-                               else
-                                 doc_dependent_repack ctx
-                                   result.result_carrier typ carrier_value
-                           | None ->
-                               if
-                                 not
-                                   (dependent_types_equivalent ctx
-                                      representation_typ typ
-                                   )
-                               then
-                                 let repacked =
-                                   doc_dependent_repack ctx
-                                     representation_typ typ arg
-                                 in
-                                 if
-                                   Option.is_some
-                                     (prop_dependent_record_id_for_typ typ)
-                                 then repacked
-                                 else
-                                   let ascription =
-                                     if contains_prop_dependent_alias ctx typ then
-                                       doc_dependent_shape ctx typ
-                                     else doc_raw_typ ctx env typ
-                                   in
-                                   parens
-                                     (separate space
-                                        [repacked; colon; ascription]
-                                     )
-                               else arg)
-                         else doc_dependent_pack ctx typ arg
-                       else if actual_represented then
-                         (match named_argument_result with
-                         | Some result ->
-                             doc_dependent_unpack ctx result.result_carrier
-                               (parens arg ^^ string ".val")
-                         | None ->
-                             doc_dependent_unpack ctx
-                               representation_typ arg)
-                       else arg
-                 in
-                 let arg = if has_semantic_range ctx typ then doc_semantic_pack ctx typ arg else arg in
-                 (bindings, validity_facts, validity_unfold, arg)
-               )
-               (List.combine semantic_args (List.combine args raw_args))
+                              | None -> ([], [])
+                            )
+                        )
+                    in
+                    ([binding], validity_facts, validity_unfold, value)
+                  )
+                  else ([], [], [], arg)
+                in
+                let arg =
+                  if formal_dependent then
+                    if actual_represented then (
+                      match named_argument_result with
+                      | Some result ->
+                          let carrier_value = parens arg ^^ string ".val" in
+                          if dependent_types_equivalent ctx result.result_carrier typ then carrier_value
+                          else doc_dependent_repack ctx result.result_carrier typ carrier_value
+                      | None ->
+                          if not (dependent_types_equivalent ctx representation_typ typ) then (
+                            let repacked = doc_dependent_repack ctx representation_typ typ arg in
+                            if Option.is_some (prop_dependent_record_id_for_typ typ) then repacked
+                            else (
+                              let ascription =
+                                if contains_prop_dependent_alias ctx typ then doc_dependent_shape ctx typ
+                                else doc_raw_typ ctx env typ
+                              in
+                              parens (separate space [repacked; colon; ascription])
+                            )
+                          )
+                          else arg
+                    )
+                    else doc_dependent_pack ctx typ arg
+                  else if actual_represented then (
+                    match named_argument_result with
+                    | Some result -> doc_dependent_unpack ctx result.result_carrier (parens arg ^^ string ".val")
+                    | None -> doc_dependent_unpack ctx representation_typ arg
+                  )
+                  else arg
+                in
+                let arg = if has_semantic_range ctx typ then doc_semantic_pack ctx typ arg else arg in
+                (bindings, validity_facts, validity_unfold, arg)
+              )
+              (List.combine semantic_args (List.combine args raw_args))
           in
-          ( List.concat_map
-              (fun (bindings, _, _, _) -> bindings)
-              rendered_args,
-            List.concat_map
-              (fun (_, facts, _, _) -> facts)
-              rendered_args,
-            List.concat_map
-              (fun (_, _, unfold, _) -> unfold)
-              rendered_args,
+          ( List.concat_map (fun (bindings, _, _, _) -> bindings) rendered_args,
+            List.concat_map (fun (_, facts, _, _) -> facts) rendered_args,
+            List.concat_map (fun (_, _, unfold, _) -> unfold) rendered_args,
             List.map (fun (_, _, _, arg) -> arg) rendered_args
           )
         with Invalid_argument _ -> ([], [], [], raw_args)
       in
       let d_imargs =
-        (match extern_id with
-        | Some _ -> []
-        | None when Env.is_extern f env "c" -> []
-        | None -> (
-            match
-              ( Bindings.find_opt f ctx.global.semantic_types.valspec_quants,
-                Bindings.find_opt f ctx.global.semantic_types.valspecs
-              )
-            with
-            | Some semantic_quantified, Some semantic_typ ->
-                doc_instantiated_nvars ctx semantic_quantified semantic_typ instantiation
-            | _ -> []
-          ))
+        ( match extern_id with
+          | Some _ -> []
+          | None when Env.is_extern f env "c" -> []
+          | None -> (
+              match
+                ( Bindings.find_opt f ctx.global.semantic_types.valspec_quants,
+                  Bindings.find_opt f ctx.global.semantic_types.valspecs
+                )
+              with
+              | Some semantic_quantified, Some semantic_typ ->
+                  doc_instantiated_nvars ctx semantic_quantified semantic_typ instantiation
+              | _ -> []
+            )
+          )
         @ doc_implicit_args arg_names implicits packed_args
       in
       let d_args = List.map snd (List.filter (fun x -> not (fst x)) (List.combine implicits packed_args)) in
@@ -3722,9 +3175,7 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
                 | QI_constraint nc when constraint_relevant_to relevant_kids nc ->
                     Some
                       (parens
-                         (doc_constraint_proof
-                            ~facts:arg_validity_facts
-                            ~extra_unfold:arg_validity_unfold ctx
+                         (doc_constraint_proof ~facts:arg_validity_facts ~extra_unfold:arg_validity_unfold ctx
                             (instantiate_constraint instantiation nc)
                          )
                       )
@@ -3740,17 +3191,15 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
         match op_of_id extern_id with
         | `NotOp
           when extern_id = Some "Int.ediv"
-               && List.for_all
-                    (fun arg -> typ_is_lean_nat env (typ_of arg))
-                    args
+               && List.for_all (fun arg -> typ_is_lean_nat env (typ_of arg)) args
                && typ_is_lean_nat env (typ_of full_exp) ->
             `Binop "/"
         | `Binop "+i"
           when string_of_id f = "add_atom" && List.for_all (fun arg -> typ_is_lean_nat env (typ_of arg)) args ->
             `Binop "+"
         | `Binop "-i"
-          when List.for_all (fun arg -> typ_is_lean_nat env (typ_of arg)) args
-               && typ_is_lean_nat env (typ_of full_exp) ->
+          when List.for_all (fun arg -> typ_is_lean_nat env (typ_of arg)) args && typ_is_lean_nat env (typ_of full_exp)
+          ->
             `Binop "-"
         | op -> op
       in
@@ -3769,65 +3218,48 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
           let result_transform =
             match semantic_ret with
             | Some ret ->
-                let public_typ =
-                  Option.value ~default:(typ_of full_exp) expected_dependent
-                in
+                let public_typ = Option.value ~default:(typ_of full_exp) expected_dependent in
                 let public_dependent = has_dependent_type ctx public_typ in
                 let ret_dependent = has_dependent_type ctx ret in
                 let named_result_matches_public =
                   match prop_dependent_result_for_id ctx f with
                   | Some _ when Option.is_none expected_dependent -> true
-                  | Some result ->
-                      (try
-                         Type_check.alpha_equivalent ctx.env
-                           result.result_typ public_typ
-                       with Type_internal.Type_error _ -> false)
+                  | Some result -> (
+                      try Type_check.alpha_equivalent ctx.env result.result_typ public_typ
+                      with Type_internal.Type_error _ -> false
+                    )
                   | None -> false
                 in
                 let () =
                   if debug_dependent_representation && (public_dependent || ret_dependent) then
                     Printf.eprintf
                       "lean-dependent-call: function=%s expression=%s return=%s public=%s argument-bindings=%d \
-                       bound={%s} constraints={%s}\n%!"
-                      (string_of_id f) (string_of_exp full_exp) (string_of_typ ret)
-                      (string_of_typ public_typ) (List.length arg_bindings)
+                       bound={%s} constraints={%s}\n\
+                       %!"
+                      (string_of_id f) (string_of_exp full_exp) (string_of_typ ret) (string_of_typ public_typ)
+                      (List.length arg_bindings)
                       (String.concat "," (List.map string_of_kid (KidSet.elements ctx.lean_bound_nvars)))
                       (String.concat "," (List.map string_of_n_constraint (Env.get_constraints ctx.env)))
                 in
                 let pack_public value =
                   let public_ascription =
-                    if public_dependent then
-                      doc_dependent_shape ctx public_typ
-                    else doc_raw_typ ctx env public_typ
+                    if public_dependent then doc_dependent_shape ctx public_typ else doc_raw_typ ctx env public_typ
                   in
-                  parens
-                    (separate space
-                       [
-                         doc_dependent_pack ctx public_typ value;
-                         colon;
-                         public_ascription;
-                       ]
-                    )
+                  parens (separate space [doc_dependent_pack ctx public_typ value; colon; public_ascription])
                 in
                 let dependent_transform =
                   match (ret_dependent, public_dependent) with
                   | true, false -> Some (fun value -> doc_dependent_unpack ctx ret value)
                   | false, true -> Some pack_public
                   | true, true
-                    when prop_dependent_mode_active ()
-                         && not named_result_matches_public
-                         && not
-                              (dependent_types_equivalent ctx ret public_typ) ->
-                      Some
-                        (fun value ->
-                          doc_dependent_repack ctx ret public_typ value
-                        )
+                    when prop_dependent_mode_active () && (not named_result_matches_public)
+                         && not (dependent_types_equivalent ctx ret public_typ) ->
+                      Some (fun value -> doc_dependent_repack ctx ret public_typ value)
                   (* Unpacking and repacking is the identity when the call
                      already returns the expected shape, and Lean cannot
                      elaborate the destructuring lambdas that spell it out. *)
                   | true, true
-                    when arg_bindings <> []
-                         && (not named_result_matches_public)
+                    when arg_bindings <> [] && (not named_result_matches_public)
                          && not (dependent_types_equivalent ctx ret public_typ) ->
                       Some (fun value -> pack_public (doc_dependent_unpack ctx ret value))
                   | _ -> None
@@ -3836,14 +3268,16 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
                 if Option.is_some dependent_transform || semantic then
                   Some
                     (fun value ->
-                      let value = Option.fold ~none:value ~some:(fun transform -> transform value) dependent_transform in
+                      let value =
+                        Option.fold ~none:value ~some:(fun transform -> transform value) dependent_transform
+                      in
                       if semantic then doc_semantic_unpack ctx ret value else value
                     )
                 else None
             | None -> None
           in
           let call =
-            if arg_bindings <> [] then
+            if arg_bindings <> [] then (
               let result =
                 match (fn_monadic, result_transform) with
                 | true, Some transform ->
@@ -3856,7 +3290,8 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
                 | false, None -> [string "pure " ^^ parens call]
               in
               wrap_with_do (not as_monadic) true (separate hardline (arg_bindings @ result))
-            else
+            )
+            else (
               match result_transform with
               | Some transform ->
                   if fn_monadic then
@@ -3875,6 +3310,7 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
               | _ ->
                   wrap_with_left_arrow ((not as_monadic) && fn_monadic)
                     (wrap_with_pure (as_monadic && not fn_monadic) call)
+            )
           in
           nest 2 call
     )
@@ -3890,28 +3326,21 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
   | E_typ (typ, e) ->
       let typ =
         let same_prop_dependent_alias candidate =
-          match
-            ( prop_dependent_alias_id_for_typ ctx typ,
-              prop_dependent_alias_id_for_typ ctx candidate
+          match (prop_dependent_alias_id_for_typ ctx typ, prop_dependent_alias_id_for_typ ctx candidate) with
+          | Some actual, Some expected when Id.compare actual expected = 0 -> (
+              try
+                Type_check.alpha_equivalent ctx.env
+                  (expand_synonyms_for_dependent_type ctx typ)
+                  (expand_synonyms_for_dependent_type ctx candidate)
+              with Type_internal.Type_error _ -> false
             )
-          with
-          | Some actual, Some expected
-            when Id.compare actual expected = 0 ->
-              (try
-                 Type_check.alpha_equivalent ctx.env
-                   (expand_synonyms_for_dependent_type ctx typ)
-                   (expand_synonyms_for_dependent_type ctx candidate)
-               with Type_internal.Type_error _ -> false)
           | _ -> false
         in
         match ctx.expected_dependent with
         | Some expected when same_prop_dependent_alias expected -> expected
         | Some expected
-          when
-            has_dependent_type ctx expected
-            && app_returns_prop_dependent_record ctx e
-            && dependent_types_equivalent ctx expected
-                 (dependent_representation_type ctx e) ->
+          when has_dependent_type ctx expected && app_returns_prop_dependent_record ctx e
+               && dependent_types_equivalent ctx expected (dependent_representation_type ctx e) ->
             expected
         | _ -> (
             match ctx.dependent_return with
@@ -3921,55 +3350,38 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
       in
       let active_result =
         match ctx.dependent_result with
-        | Some result
-          when Type_check.alpha_equivalent ctx.env typ result.result_typ ->
-            Some result
+        | Some result when Type_check.alpha_equivalent ctx.env typ result.result_typ -> Some result
         | _ -> None
       in
       let target_dependent = has_dependent_type ctx typ in
       let expression_handles_expected =
-        Option.is_none active_result
-        && target_dependent && app_returns_prop_dependent_record ctx e
+        Option.is_none active_result && target_dependent && app_returns_prop_dependent_record ctx e
       in
-      let expression_handles_result_carrier =
-        Option.is_some active_result
-        && app_returns_prop_dependent_record ctx e
-      in
-      let represented =
-        expression_handles_expected || exp_has_dependent_representation ctx e
-      in
-      let representation_typ =
-        if expression_handles_expected then typ
-        else dependent_representation_type ctx e
-      in
+      let expression_handles_result_carrier = Option.is_some active_result && app_returns_prop_dependent_record ctx e in
+      let represented = expression_handles_expected || exp_has_dependent_representation ctx e in
+      let representation_typ = if expression_handles_expected then typ else dependent_representation_type ctx e in
       let expression_ctx =
         {
           ctx with
           expected_dependent =
-            (if
-               expression_handles_expected
-               ||
-               ( target_dependent
-                 && represented
-                 && dependent_types_equivalent ctx representation_typ typ
-               )
-             then Some typ
-             else
-               match active_result with
-               | Some _ when expression_handles_result_carrier ->
-                   Some (dependent_representation_type ctx e)
-               | _ -> None);
+            ( if
+                expression_handles_expected
+                || (target_dependent && represented && dependent_types_equivalent ctx representation_typ typ)
+              then Some typ
+              else (
+                match active_result with
+                | Some _ when expression_handles_result_carrier -> Some (dependent_representation_type ctx e)
+                | _ -> None
+              )
+            );
         }
       in
       let needs_repack =
-        target_dependent
-        && represented
-        && not (dependent_types_equivalent ctx representation_typ typ)
+        target_dependent && represented && not (dependent_types_equivalent ctx representation_typ typ)
       in
       let already_named_result =
         match (active_result, prop_dependent_result_of_exp ctx e) with
-        | Some expected, Some actual ->
-            String.equal expected.result_name actual.result_name
+        | Some expected, Some actual -> String.equal expected.result_name actual.result_name
         | _ -> false
       in
       let should_pack =
@@ -3986,34 +3398,22 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
         in
         let packed =
           match active_result with
-          | Some result ->
-              doc_prop_dependent_result_pack ctx result e value
+          | Some result -> doc_prop_dependent_result_pack ctx result e value
           | None ->
-              if needs_repack then
-                doc_dependent_repack ctx representation_typ typ value
+              if needs_repack then doc_dependent_repack ctx representation_typ typ value
               else doc_dependent_pack ctx typ value
         in
         let expected_typ =
           match active_result with
           | Some result -> doc_prop_dependent_result_type ctx result
           | None ->
-              if contains_prop_dependent_alias ctx typ then
-                doc_dependent_shape ctx typ
+              if contains_prop_dependent_alias ctx typ then doc_dependent_shape ctx typ
               else doc_raw_typ ctx (env_of full_exp) typ
         in
-        parens
-          (separate space
-             [
-               packed;
-               colon;
-               expected_typ;
-             ]
-          )
+        parens (separate space [packed; colon; expected_typ])
       in
       let () =
-        if target_dependent then
-          log_dependent_representation typ e represented representation_typ
-            needs_repack
+        if target_dependent then log_dependent_representation typ e represented representation_typ needs_repack
       in
       let refines_index = (not target_dependent) && index_refined_record_typ ctx typ (typ_of e) in
       (* A tuple literal is not a single carrier: each component chooses its
@@ -4042,32 +3442,28 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
         else None
       in
       if target_dependent && expression_never_returns e then
-        doc_exp as_monadic
-          { expression_ctx with expected_dependent = None }
-          e
-      else if target_dependent
-         &&
-         match e with
-         | E_aux ((E_if _ | E_match _ | E_let _ | E_internal_plet _ | E_block _), _) -> true
-         | _ -> false
+        doc_exp as_monadic { expression_ctx with expected_dependent = None } e
+      else if
+        target_dependent
+        && match e with E_aux ((E_if _ | E_match _ | E_let _ | E_internal_plet _ | E_block _), _) -> true | _ -> false
       then doc_exp as_monadic ctx (annotate_dependent_tail typ e)
       else if Option.is_some component_annotated_tuple then
         doc_exp as_monadic { ctx with expected_dependent = None } (Option.get component_annotated_tuple)
       else if has_effect e then
-        if should_pack then
+        if should_pack then (
           let computation =
             parens
               (prefix 2 1 (string "do")
                  (separate hardline
                     [
-                      string "let dependentResult " ^^ leftarrow ^^ space
-                      ^^ doc_exp true expression_ctx e;
+                      string "let dependentResult " ^^ leftarrow ^^ space ^^ doc_exp true expression_ctx e;
                       string "pure " ^^ parens (pack_expected (string "dependentResult"));
                     ]
                  )
               )
           in
           if as_monadic then computation else parens (leftarrow ^^ space ^^ computation)
+        )
         else if refines_index then (
           let computation =
             parens
@@ -4083,23 +3479,19 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
           if as_monadic then computation else parens (leftarrow ^^ space ^^ computation)
         )
         else doc_exp as_monadic expression_ctx e
-      else
+      else (
         let value = doc_exp false expression_ctx e in
         let value = if refines_index then doc_index_refinement_cast value else value in
-        let value =
-          if should_pack then
-            pack_expected value
-          else value
-        in
+        let value = if should_pack then pack_expected value else value in
         let expected_typ =
           match active_result with
           | Some result -> doc_prop_dependent_result_type ctx result
           | None ->
-              if contains_prop_dependent_alias ctx typ then
-                doc_dependent_shape ctx typ
+              if contains_prop_dependent_alias ctx typ then doc_dependent_shape ctx typ
               else doc_raw_typ ctx (env_of full_exp) typ
         in
         wrap_with_pure as_monadic (parens (separate space [value; colon; expected_typ]))
+      )
   | E_tuple es ->
       (* An expected tuple type belongs to the tuple, never to a component:
          a component that inherited it would pack itself as the whole tuple. *)
@@ -4109,42 +3501,14 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
        if invalid then throw;
      Keep the continuation in the corresponding Lean branch so that the
      dependent-if hypothesis remains in scope for generated validity proofs. *)
-  | ( E_let
-        ( lpat,
-          E_aux (E_if (condition, then_exp, else_exp), _),
-          body
-        )
-    | E_internal_plet
-        ( lpat,
-          E_aux (E_if (condition, then_exp, else_exp), _),
-          body
-        ) )
-    when
-      is_anonymous_pat lpat
-      && expression_never_returns then_exp
-      && expression_is_unit_value else_exp ->
-      doc_exp as_monadic ctx
-        (E_aux
-           (E_if (condition, then_exp, body), (l, annot))
-        )
-  | ( E_let
-        ( lpat,
-          E_aux (E_if (condition, then_exp, else_exp), _),
-          body
-        )
-    | E_internal_plet
-        ( lpat,
-          E_aux (E_if (condition, then_exp, else_exp), _),
-          body
-        ) )
-    when
-      is_anonymous_pat lpat
-      && expression_is_unit_value then_exp
-      && expression_never_returns else_exp ->
-      doc_exp as_monadic ctx
-        (E_aux
-           (E_if (condition, body, else_exp), (l, annot))
-        )
+  | E_let (lpat, E_aux (E_if (condition, then_exp, else_exp), _), body)
+  | E_internal_plet (lpat, E_aux (E_if (condition, then_exp, else_exp), _), body)
+    when is_anonymous_pat lpat && expression_never_returns then_exp && expression_is_unit_value else_exp ->
+      doc_exp as_monadic ctx (E_aux (E_if (condition, then_exp, body), (l, annot)))
+  | E_let (lpat, E_aux (E_if (condition, then_exp, else_exp), _), body)
+  | E_internal_plet (lpat, E_aux (E_if (condition, then_exp, else_exp), _), body)
+    when is_anonymous_pat lpat && expression_is_unit_value then_exp && expression_never_returns else_exp ->
+      doc_exp as_monadic ctx (E_aux (E_if (condition, body, else_exp), (l, annot)))
   | E_let (lpat, lexp, e') | E_internal_plet (lpat, lexp, e') ->
       let has_loop = has_loop lexp in
       let is_arrow_do = match e with E_let _ when not has_loop -> false | _ -> true in
@@ -4153,94 +3517,68 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
       let binding_typ =
         match named_result with
         | Some result -> result.result_carrier
-        | None ->
-            if exp_has_dependent_representation ctx lexp then
-              dependent_representation_type ctx lexp
-            else lexp_typ
+        | None -> if exp_has_dependent_representation ctx lexp then dependent_representation_type ctx lexp else lexp_typ
       in
       let explicit_prop_target =
         match lpat with
         | P_aux (P_typ (target_typ, _), _)
-          when prop_dependent_alias_for_typ ctx target_typ
-               && not (pattern_destructures_value lpat) ->
+          when prop_dependent_alias_for_typ ctx target_typ && not (pattern_destructures_value lpat) ->
             Some target_typ
         | _ -> None
       in
       let binding_typ = Option.value ~default:binding_typ explicit_prop_target in
       let preserve_prop_dependent =
         Option.is_none named_result
-        && not (pattern_destructures_value lpat)
-        && ( prop_dependent_alias_for_typ ctx binding_typ
-             || prop_dependent_record_typ binding_typ )
+        && (not (pattern_destructures_value lpat))
+        && (prop_dependent_alias_for_typ ctx binding_typ || prop_dependent_record_typ binding_typ)
       in
-      let pattern_kid_docs =
-        existential_pattern_kid_docs ctx binding_typ lpat
-      in
-      let pattern_ctx =
-        context_with_pattern_kid_docs ctx pattern_kid_docs
-      in
+      let pattern_kid_docs = existential_pattern_kid_docs ctx binding_typ lpat in
+      let pattern_ctx = context_with_pattern_kid_docs ctx pattern_kid_docs in
       let pattern_projection_ctx =
         add_existential_carrier_witness_docs pattern_ctx binding_typ
           [lexp_typ; typ_of_pat lpat]
           (fun _ witness -> doc_kid pattern_ctx witness)
       in
-      let pattern_projection_kid_docs =
-        pattern_projection_ctx.kid_docs
-      in
+      let pattern_projection_kid_docs = pattern_projection_ctx.kid_docs in
       let id_typ =
-        let pattern =
-          doc_pat_for_type (context_with_env pattern_ctx (env_of lexp)) false
-            binding_typ lpat
-        in
+        let pattern = doc_pat_for_type (context_with_env pattern_ctx (env_of lexp)) false binding_typ lpat in
         match named_result with
-        | Some _ when pattern_destructures_value lpat ->
-            string "⟨" ^^ pattern ^^ comma_sp
-            ^^ string "_sailValidity⟩"
+        | Some _ when pattern_destructures_value lpat -> string "⟨" ^^ pattern ^^ comma_sp ^^ string "_sailValidity⟩"
         | Some _ -> pattern
         | None ->
-            if pattern_destructures_value lpat || preserve_prop_dependent
-            then pattern
+            if pattern_destructures_value lpat || preserve_prop_dependent then pattern
             else doc_dependent_pattern ctx binding_typ pattern
       in
       let typ_ascription =
         match doc_pat_typ_ascription ctx lpat with
         | Some _ as explicit -> explicit
         | None
-          when
-            prop_dependent_mode_active ()
-            && (has_effect lexp || has_loop)
-            && not (has_dependent_type ctx binding_typ)
-            &&
-            match lpat with
-            | P_aux (P_id id, _) -> not (is_enum (env_of_pat lpat) id)
-            | _ -> false -> (
+          when prop_dependent_mode_active ()
+               && (has_effect lexp || has_loop)
+               && (not (has_dependent_type ctx binding_typ))
+               && match lpat with P_aux (P_id id, _) -> not (is_enum (env_of_pat lpat) id) | _ -> false ->
             let indexed_named_type =
               match binding_typ with
               | Typ_aux (Typ_app (_, args), _) ->
                   List.exists
-                    (fun (A_aux (arg, _)) ->
-                      match arg with A_nexp _ | A_bool _ -> true | A_typ _ -> false
-                    )
+                    (fun (A_aux (arg, _)) -> match arg with A_nexp _ | A_bool _ -> true | A_typ _ -> false)
                     args
               | _ -> false
             in
             if not indexed_named_type then None
             else
               Some
-                (match named_result with
+                ( match named_result with
                 | Some result -> doc_prop_dependent_result_type ctx result
-                | None when contains_prop_dependent_alias ctx binding_typ ->
-                    doc_dependent_shape ctx binding_typ
-                | None ->
-                    doc_raw_typ ctx (env_of lexp) binding_typ
+                | None when contains_prop_dependent_alias ctx binding_typ -> doc_dependent_shape ctx binding_typ
+                | None -> doc_raw_typ ctx (env_of lexp) binding_typ
                 )
-          )
         | None -> None
       in
       let lexp =
         match lpat with
         | P_aux (P_typ (target_typ, _), _) when has_top_level_dependent_type ctx target_typ ->
-            let E_aux (_, lexp_annot) = lexp in
+            let (E_aux (_, lexp_annot)) = lexp in
             E_aux (E_typ (target_typ, lexp), lexp_annot)
         | _ -> lexp
       in
@@ -4253,31 +3591,25 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
         | _ -> None
       in
       let locally_bound_nvars =
-        if Option.is_none named_result && pattern_destructures_value lpat then
+        if Option.is_none named_result && pattern_destructures_value lpat then (
           match expand_synonyms_for_dependent_type ctx binding_typ with
           | Typ_aux (Typ_exist (kopts, _, inner), _) ->
               KidSet.of_list (List.map kopt_kid (relevant_existential_kopts kopts inner))
           | _ -> KidSet.empty
+        )
         else KidSet.empty
       in
       let nested_packed_bindings =
         match named_result with
-        | Some _ when pattern_destructures_value lpat ->
-            nested_dependent_pattern_bindings ctx binding_typ lpat
+        | Some _ when pattern_destructures_value lpat -> nested_dependent_pattern_bindings ctx binding_typ lpat
         | Some _ -> Bindings.empty
         | None ->
-            if has_top_level_dependent_type ctx binding_typ then
-              Bindings.empty
+            if has_top_level_dependent_type ctx binding_typ then Bindings.empty
             else nested_dependent_pattern_bindings ctx binding_typ lpat
       in
       let lexp_ctx = ctx in
       let ctx = update_ctx_pat ctx lpat in
-      let ctx =
-        {
-          ctx with
-          local_let_ids = IdSet.union bound_ids ctx.local_let_ids;
-        }
-      in
+      let ctx = { ctx with local_let_ids = IdSet.union bound_ids ctx.local_let_ids } in
       let ctx =
         if KBindings.is_empty pattern_kid_docs then ctx
         else
@@ -4285,18 +3617,14 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
             ctx with
             dependent_pattern_kid_docs =
               IdSet.fold
-                (fun id bindings ->
-                  Bindings.add id pattern_projection_kid_docs bindings
-                )
+                (fun id bindings -> Bindings.add id pattern_projection_kid_docs bindings)
                 bound_ids ctx.dependent_pattern_kid_docs;
           }
       in
       let ctx = { ctx with lean_bound_nvars = KidSet.union ctx.lean_bound_nvars locally_bound_nvars } in
       let ctx =
         if
-          Option.is_none named_result
-          && pattern_destructures_value lpat
-          && has_top_level_dependent_type ctx binding_typ
+          Option.is_none named_result && pattern_destructures_value lpat && has_top_level_dependent_type ctx binding_typ
         then
           add_existential_carrier_witness_docs ctx binding_typ
             [lexp_typ; typ_of_pat lpat]
@@ -4310,8 +3638,7 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
               ctx with
               unpacked_dependent_ids = IdSet.remove id ctx.unpacked_dependent_ids;
               packed_dependent_types = Bindings.add id typ ctx.packed_dependent_types;
-              packed_dependent_results =
-                Bindings.remove id ctx.packed_dependent_results;
+              packed_dependent_results = Bindings.remove id ctx.packed_dependent_results;
             }
           )
           nested_packed_bindings ctx
@@ -4322,73 +3649,62 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
             {
               ctx with
               unpacked_dependent_ids =
-                IdSet.fold
-                  (fun id ids -> IdSet.remove id ids)
-                  bound_ids ctx.unpacked_dependent_ids;
+                IdSet.fold (fun id ids -> IdSet.remove id ids) bound_ids ctx.unpacked_dependent_ids;
               packed_dependent_types =
-                IdSet.fold
-                  (fun id bindings -> Bindings.remove id bindings)
-                  bound_ids ctx.packed_dependent_types;
+                IdSet.fold (fun id bindings -> Bindings.remove id bindings) bound_ids ctx.packed_dependent_types;
               packed_dependent_results =
-                IdSet.fold
-                  (fun id bindings -> Bindings.add id result bindings)
-                  bound_ids ctx.packed_dependent_results;
+                IdSet.fold (fun id bindings -> Bindings.add id result bindings) bound_ids ctx.packed_dependent_results;
             }
         | Some _ ->
             {
               ctx with
               packed_dependent_results =
-                IdSet.fold
-                  (fun id bindings -> Bindings.remove id bindings)
-                  bound_ids ctx.packed_dependent_results;
+                IdSet.fold (fun id bindings -> Bindings.remove id bindings) bound_ids ctx.packed_dependent_results;
             }
-        | None
-          when
-            has_top_level_dependent_type ctx binding_typ
-            && not preserve_prop_dependent ->
-          {
-            ctx with
-            unpacked_dependent_ids = IdSet.union ctx.unpacked_dependent_ids bound_ids;
-            packed_dependent_types =
-              IdSet.fold (fun id bindings -> Bindings.remove id bindings) bound_ids ctx.packed_dependent_types;
-          }
+        | None when has_top_level_dependent_type ctx binding_typ && not preserve_prop_dependent ->
+            {
+              ctx with
+              unpacked_dependent_ids = IdSet.union ctx.unpacked_dependent_ids bound_ids;
+              packed_dependent_types =
+                IdSet.fold (fun id bindings -> Bindings.remove id bindings) bound_ids ctx.packed_dependent_types;
+            }
         | None when preserve_prop_dependent ->
-          {
-            ctx with
-            unpacked_dependent_ids =
-              IdSet.fold (fun id ids -> IdSet.remove id ids) bound_ids ctx.unpacked_dependent_ids;
-            packed_dependent_types =
-              IdSet.fold
-                (fun id bindings -> Bindings.add id binding_typ bindings)
-                bound_ids ctx.packed_dependent_types;
-          }
-        | None ->
-          match packed_target with
-          | Some target_typ ->
-              let ctx =
-                {
-                  ctx with
-                  unpacked_dependent_ids =
-                    IdSet.fold (fun id ids -> IdSet.remove id ids) bound_ids ctx.unpacked_dependent_ids;
-                  packed_dependent_types =
-                    IdSet.fold
-                      (fun id bindings -> Bindings.add id target_typ bindings)
-                      bound_ids ctx.packed_dependent_types;
-                }
-              in
-              (match IdSet.elements bound_ids with
-              | [id] ->
-                  let rec witness_path value index =
-                    if index = 0 then parens value ^^ string ".1"
-                    else witness_path (parens value ^^ string ".2") (index - 1)
-                  in
-                  add_existential_carrier_witness_docs ctx target_typ
-                    [lexp_typ; typ_of_pat lpat]
-                    (fun index _ ->
-                      witness_path (doc_id_ctor id) index
-                    )
-              | _ -> ctx)
-          | None -> ctx
+            {
+              ctx with
+              unpacked_dependent_ids =
+                IdSet.fold (fun id ids -> IdSet.remove id ids) bound_ids ctx.unpacked_dependent_ids;
+              packed_dependent_types =
+                IdSet.fold
+                  (fun id bindings -> Bindings.add id binding_typ bindings)
+                  bound_ids ctx.packed_dependent_types;
+            }
+        | None -> (
+            match packed_target with
+            | Some target_typ -> (
+                let ctx =
+                  {
+                    ctx with
+                    unpacked_dependent_ids =
+                      IdSet.fold (fun id ids -> IdSet.remove id ids) bound_ids ctx.unpacked_dependent_ids;
+                    packed_dependent_types =
+                      IdSet.fold
+                        (fun id bindings -> Bindings.add id target_typ bindings)
+                        bound_ids ctx.packed_dependent_types;
+                  }
+                in
+                match IdSet.elements bound_ids with
+                | [id] ->
+                    let rec witness_path value index =
+                      if index = 0 then parens value ^^ string ".1"
+                      else witness_path (parens value ^^ string ".2") (index - 1)
+                    in
+                    add_existential_carrier_witness_docs ctx target_typ
+                      [lexp_typ; typ_of_pat lpat]
+                      (fun index _ -> witness_path (doc_id_ctor id) index)
+                | _ -> ctx
+              )
+            | None -> ctx
+          )
       in
       let pp_let_line_f l = group (nest 2 (flow (break 1) l)) in
       let pp_let_line =
@@ -4426,10 +3742,8 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
         else (
           match typ_ascription with
           | Some asc ->
-              pp_let_line_f
-                [separate space [string "let"; id_typ; colon; asc; coloneq]; doc_exp false lexp_ctx lexp]
-          | None ->
-              pp_let_line_f [separate space [string "let"; id_typ; coloneq]; doc_exp false lexp_ctx lexp]
+              pp_let_line_f [separate space [string "let"; id_typ; colon; asc; coloneq]; doc_exp false lexp_ctx lexp]
+          | None -> pp_let_line_f [separate space [string "let"; id_typ; coloneq]; doc_exp false lexp_ctx lexp]
         )
       in
       pp_let_line ^^ hardline ^^ doc_exp as_monadic ctx e'
@@ -4452,78 +3766,52 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
   | E_field (exp, id) ->
       let rec record_root_id = function
         | E_aux (E_id record_id, _) -> Some record_id
-        | E_aux (E_field (record, _), _)
-        | E_aux (E_typ (_, record), _)
-        | E_aux (E_block [record], _) ->
+        | E_aux (E_field (record, _), _) | E_aux (E_typ (_, record), _) | E_aux (E_block [record], _) ->
             record_root_id record
         | _ -> None
       in
       let root_id = record_root_id exp in
       let has_record_witnesses =
-        match root_id with
-        | Some record_id ->
-            Bindings.mem record_id ctx.dependent_pattern_kid_docs
-        | None -> false
+        match root_id with Some record_id -> Bindings.mem record_id ctx.dependent_pattern_kid_docs | None -> false
       in
       let use_singleton_index =
         match root_id with
         | Some record_id
-          when
-            ( IdSet.mem record_id ctx.unpacked_dependent_ids
-              || IdSet.mem record_id ctx.local_let_ids )
-            && not has_record_witnesses ->
+          when (IdSet.mem record_id ctx.unpacked_dependent_ids || IdSet.mem record_id ctx.local_let_ids)
+               && not has_record_witnesses ->
             false
         | _ -> true
       in
       let projection_ctx =
         match root_id with
         | Some record_id -> (
-            match
-              Bindings.find_opt record_id ctx.dependent_pattern_kid_docs
-            with
+            match Bindings.find_opt record_id ctx.dependent_pattern_kid_docs with
             | Some docs -> context_with_pattern_kid_docs ctx docs
             | None -> ctx
           )
         | _ -> ctx
       in
       let field =
-        match
-          if use_singleton_index then
-            singleton_nexp_of_typ projection_ctx (typ_of full_exp)
-          else None
-        with
+        match if use_singleton_index then singleton_nexp_of_typ projection_ctx (typ_of full_exp) else None with
         | Some nexp -> doc_nexp projection_ctx nexp
-        | None ->
+        | None -> (
             let record = doc_exp false ctx exp in
             let record =
               if exp_has_dependent_representation ctx exp then
-                doc_dependent_unpack ctx
-                  (dependent_representation_type ctx exp) record
+                doc_dependent_unpack ctx (dependent_representation_type ctx exp) record
               else record
             in
             let field = record ^^ dot ^^ doc_id_ctor id in
-            (match semantic_record_field_of_exp ctx exp id with
-            | Some typ
-              when
-                exp_has_dependent_representation ctx exp
-                && contains_prop_dependent_alias ctx typ ->
-              parens
-                (doc_dependent_pack ctx typ field ^^ space ^^ colon
-                ^^ space ^^ doc_dependent_shape ctx typ
-                )
-            | Some typ when has_semantic_range ctx typ ->
-                doc_semantic_unpack ctx typ field
+            match semantic_record_field_of_exp ctx exp id with
+            | Some typ when exp_has_dependent_representation ctx exp && contains_prop_dependent_alias ctx typ ->
+                parens (doc_dependent_pack ctx typ field ^^ space ^^ colon ^^ space ^^ doc_dependent_shape ctx typ)
+            | Some typ when has_semantic_range ctx typ -> doc_semantic_unpack ctx typ field
             | _ ->
                 let typ = typ_of full_exp in
-                if
-                  exp_has_dependent_representation ctx exp
-                  && contains_prop_dependent_alias ctx typ
-                then
-                  parens
-                    (doc_dependent_pack ctx typ field ^^ space ^^ colon
-                    ^^ space ^^ doc_dependent_shape ctx typ
-                    )
-                else field)
+                if exp_has_dependent_representation ctx exp && contains_prop_dependent_alias ctx typ then
+                  parens (doc_dependent_pack ctx typ field ^^ space ^^ colon ^^ space ^^ doc_dependent_shape ctx typ)
+                else field
+          )
       in
       wrap_with_pure as_monadic field
   | E_struct_update (exp, fexps) ->
@@ -4577,22 +3865,20 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
         | LE_id id | LE_typ (_, id) ->
             let value = d_of_arg ctx e in
             let value =
-              if Env.is_register id env then
+              if Env.is_register id env then (
                 let register_typ = Env.get_register id env in
                 let value =
                   if has_top_level_dependent_type ctx register_typ then
-                    if exp_has_dependent_representation ctx e then
+                    if exp_has_dependent_representation ctx e then (
                       let representation_typ = dependent_representation_type ctx e in
-                      if
-                        dependent_types_equivalent ctx representation_typ
-                          register_typ
-                      then value
-                      else
-                        doc_dependent_repack ctx representation_typ register_typ value
+                      if dependent_types_equivalent ctx representation_typ register_typ then value
+                      else doc_dependent_repack ctx representation_typ register_typ value
+                    )
                     else doc_dependent_pack ctx register_typ value
                   else value
                 in
                 if has_semantic_range ctx register_typ then doc_semantic_pack ctx register_typ value else value
+              )
               else value
             in
             string "writeReg " ^^ doc_id_ctor id ^^ space ^^ value
@@ -4614,14 +3900,10 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
       let statements_monadic = as_monadic || has_effect t || has_effect e in
       let condition =
         if has_dependent_type ctx (typ_of full_exp) || refines_index then
-          string "if " ^^ name_if_hypothesis ctx ^^ string " : ("
-          ^^ nest 1 (d_of_arg ctx i)
-          ^^ string " : Bool) = true"
-        else
-          string "if (" ^^ nest 1 (d_of_arg ctx i) ^^ string " : Bool)"
+          string "if " ^^ name_if_hypothesis ctx ^^ string " : (" ^^ nest 1 (d_of_arg ctx i) ^^ string " : Bool) = true"
+        else string "if (" ^^ nest 1 (d_of_arg ctx i) ^^ string " : Bool)"
       in
-      nest 2 condition
-      ^^ hardline
+      nest 2 condition ^^ hardline
       ^^ prefix 2 1 (string "then") (wrap_exp statements_monadic ctx t)
       ^^ hardline
       ^^ prefix 2 1 (string "else") (wrap_exp statements_monadic ctx e)
@@ -4652,11 +3934,8 @@ and doc_fexp ?field_typ with_arrow ctx (FE_aux (FE_fexp (field, e), _)) =
   let expression_ctx =
     match field_typ with
     | Some typ
-      when
-        has_top_level_dependent_type ctx typ
-        &&
-        ( prop_dependent_mode_active ()
-          || exp_has_dependent_representation ctx e ) ->
+      when has_top_level_dependent_type ctx typ
+           && (prop_dependent_mode_active () || exp_has_dependent_representation ctx e) ->
         { ctx with expected_dependent = Some typ }
     | _ -> ctx
   in
@@ -4674,13 +3953,11 @@ and doc_fexp ?field_typ with_arrow ctx (FE_aux (FE_fexp (field, e), _)) =
         let pack value =
           let value =
             if has_top_level_dependent_type ctx typ then
-              if exp_has_dependent_representation ctx e then
+              if exp_has_dependent_representation ctx e then (
                 let representation_typ = dependent_representation_type ctx e in
-                if
-                  dependent_types_equivalent ctx representation_typ typ
-                then value
-                else
-                  doc_dependent_repack ctx representation_typ typ value
+                if dependent_types_equivalent ctx representation_typ typ then value
+                else doc_dependent_repack ctx representation_typ typ value
+              )
               else doc_dependent_pack ctx typ value
             else value
           in
@@ -4710,10 +3987,7 @@ let doc_binder ctx i t =
   in
   (* Overwrite the id if it's captured *)
   let ctx = match captured_typ_var (i, t) with Some (i, ki) -> add_single_kid_id_rename ctx i ki | _ -> ctx in
-  let typ =
-    if prop_dependent_record_typ t then doc_dependent_shape ctx t
-    else doc_typ ctx t
-  in
+  let typ = if prop_dependent_record_typ t then doc_dependent_shape ctx t else doc_typ ctx t in
   (ctx, separate space [doc_id_ctor i; colon; typ] |> parenthesizer)
 
 (** Find all patterns in the arguments of the sail function that Lean cannot handle in a [def], and add them as let
@@ -4753,24 +4027,10 @@ let dependent_binder_witnesses ctx binder public_typ raw_typ pattern_typ =
         let relevant = relevant_existential_kopts kopts inner in
         let ctx, bindings, value_path, witness_index =
           List.fold_left
-            (fun (ctx, bindings, value_path, witness_index)
-                 (KOpt_aux (KOpt_kind (_, kid), _)) ->
-              let witness =
-                Printf.sprintf "%s_dependentWitness%i"
-                  (fix_id (string_of_id binder)) witness_index
-              in
-              let binding =
-                separate space
-                  [
-                    string "let";
-                    string witness;
-                    coloneq;
-                    parens value_path ^^ string ".1";
-                  ]
-              in
-              ( { ctx with
-                  kid_docs = KBindings.add kid (string witness) ctx.kid_docs;
-                },
+            (fun (ctx, bindings, value_path, witness_index) (KOpt_aux (KOpt_kind (_, kid), _)) ->
+              let witness = Printf.sprintf "%s_dependentWitness%i" (fix_id (string_of_id binder)) witness_index in
+              let binding = separate space [string "let"; string witness; coloneq; parens value_path ^^ string ".1"] in
+              ( { ctx with kid_docs = KBindings.add kid (string witness) ctx.kid_docs },
                 bindings @ [binding],
                 parens value_path ^^ string ".2",
                 witness_index + 1
@@ -4778,86 +4038,50 @@ let dependent_binder_witnesses ctx binder public_typ raw_typ pattern_typ =
             )
             (ctx, [], value_path, witness_index) relevant
         in
-        let ctx, nested, _, witness_index =
-          collect ctx value_path witness_index inner
-        in
+        let ctx, nested, _, witness_index = collect ctx value_path witness_index inner in
         (ctx, bindings @ nested, value_path, witness_index)
     | _ -> (ctx, [], value_path, witness_index)
   in
-  let ctx, bindings, _, _ =
-    collect ctx (doc_id_ctor binder) 0 public_typ
-  in
+  let ctx, bindings, _, _ = collect ctx (doc_id_ctor binder) 0 public_typ in
   let rec existential_carrier ctx kopts typ =
     let typ = expand_synonyms_for_dependent_type ctx typ in
     match typ with
     | Typ_aux (Typ_exist (outer_kopts, nc, inner), l) ->
-        let env =
-          List.fold_left
-            (fun env kopt -> Env.add_typ_var l kopt env)
-            ctx.env outer_kopts
-        in
-        let env =
-          try Env.add_constraint nc env
-          with Type_internal.Type_error _ -> env
-        in
-        existential_carrier (context_with_env ctx env)
-          (kopts @ relevant_existential_kopts outer_kopts inner) inner
+        let env = List.fold_left (fun env kopt -> Env.add_typ_var l kopt env) ctx.env outer_kopts in
+        let env = try Env.add_constraint nc env with Type_internal.Type_error _ -> env in
+        existential_carrier (context_with_env ctx env) (kopts @ relevant_existential_kopts outer_kopts inner) inner
     | _ -> (ctx, kopts, typ)
   in
-  let carrier_ctx, witness_kopts, carrier_typ =
-    existential_carrier ctx [] public_typ
-  in
+  let carrier_ctx, witness_kopts, carrier_typ = existential_carrier ctx [] public_typ in
   let add_carrier_witness_docs ctx candidate_typ =
     try
-      let goals =
-        KidSet.of_list (List.map kopt_kid witness_kopts)
-      in
-      let unifiers =
-        Type_check.unify (typ_loc candidate_typ) carrier_ctx.env goals
-          carrier_typ candidate_typ
-      in
+      let goals = KidSet.of_list (List.map kopt_kid witness_kopts) in
+      let unifiers = Type_check.unify (typ_loc candidate_typ) carrier_ctx.env goals carrier_typ candidate_typ in
       let () =
         if debug_dependent_representation then
           Printf.eprintf
             "lean-dependent-binder: binder=%s public=%s carrier=%s candidate=%s witnesses={%s} unifiers={%s}\n%!"
-            (string_of_id binder) (string_of_typ public_typ)
-            (string_of_typ carrier_typ) (string_of_typ candidate_typ)
+            (string_of_id binder) (string_of_typ public_typ) (string_of_typ carrier_typ) (string_of_typ candidate_typ)
+            (String.concat "," (List.map (fun kopt -> string_of_kid (kopt_kid kopt)) witness_kopts))
             (String.concat ","
                (List.map
-                  (fun kopt -> string_of_kid (kopt_kid kopt))
-                  witness_kopts
-               )
-            )
-            (String.concat ","
-               (List.map
-                  (fun (kid, arg) ->
-                    string_of_kid kid ^ "=" ^ string_of_typ_arg arg
-                  )
+                  (fun (kid, arg) -> string_of_kid kid ^ "=" ^ string_of_typ_arg arg)
                   (KBindings.bindings unifiers)
                )
             )
       in
       List.mapi (fun index kopt -> (index, kopt_kid kopt)) witness_kopts
       |> List.fold_left
-        (fun ctx (index, witness) ->
-          match KBindings.find_opt witness unifiers with
-          | Some
-              (A_aux
-                (A_nexp (Nexp_aux (Nexp_var raw_kid, _)), _)) ->
-              let witness_doc =
-                string
-                  (Printf.sprintf "%s_dependentWitness%i"
-                     (fix_id (string_of_id binder)) index
-                  )
-              in
-              {
-                ctx with
-                kid_docs =
-                  KBindings.add raw_kid witness_doc ctx.kid_docs;
-              }
-          | _ -> ctx
-        )
-        ctx
+           (fun ctx (index, witness) ->
+             match KBindings.find_opt witness unifiers with
+             | Some (A_aux (A_nexp (Nexp_aux (Nexp_var raw_kid, _)), _)) ->
+                 let witness_doc =
+                   string (Printf.sprintf "%s_dependentWitness%i" (fix_id (string_of_id binder)) index)
+                 in
+                 { ctx with kid_docs = KBindings.add raw_kid witness_doc ctx.kid_docs }
+             | _ -> ctx
+           )
+           ctx
     with _ -> ctx
   in
   let ctx = add_carrier_witness_docs ctx raw_typ in
@@ -4889,25 +4113,15 @@ let doc_funcl_init global (FCL_aux (FCL_funcl (id, pexp), annot)) =
       (fun kids typ -> KidSet.union kids (lean_nvars_of_typ typ))
       (lean_nvars_of_typ public_ret_typ) public_arg_typs
   in
-  let ctx =
-    {
-      ctx with
-      lean_bound_nvars;
-      function_bound_nvars = lean_bound_nvars;
-    }
-  in
+  let ctx = { ctx with lean_bound_nvars; function_bound_nvars = lean_bound_nvars } in
   let relevant_constraint_kids =
     if contains_prop_dependent_alias ctx public_ret_typ then
       close_constraint_kids tq
-        (KidSet.union
-           (dependent_tail_carrier_kids ctx exp)
-           (dependent_record_construction_kids ctx exp)
-        )
+        (KidSet.union (dependent_tail_carrier_kids ctx exp) (dependent_record_construction_kids ctx exp))
     else KidSet.empty
   in
   prop_dependent_constraint_kids :=
-    if KidSet.is_empty relevant_constraint_kids then
-      Bindings.remove id !prop_dependent_constraint_kids
+    if KidSet.is_empty relevant_constraint_kids then Bindings.remove id !prop_dependent_constraint_kids
     else Bindings.add id relevant_constraint_kids !prop_dependent_constraint_kids;
   let binders : (tannot pat * id * typ * typ) list =
     pats
@@ -4933,42 +4147,30 @@ let doc_funcl_init global (FCL_aux (FCL_funcl (id, pexp), annot)) =
         let ctx, d = doc_binder ctx i public_typ in
         let () =
           if debug_dependent_representation then
-            Printf.eprintf
-              "lean-dependent-function-binder: binder=%s pattern=%s pattern-type=%s raw=%s public=%s\n%!"
+            Printf.eprintf "lean-dependent-function-binder: binder=%s pattern=%s pattern-type=%s raw=%s public=%s\n%!"
               (string_of_id i) (string_of_pat pat)
-              (string_of_typ (typ_of_pat pat)) (string_of_typ raw_typ)
-              (string_of_typ public_typ)
+              (string_of_typ (typ_of_pat pat))
+              (string_of_typ raw_typ) (string_of_typ public_typ)
         in
         let preserve_prop_dependent =
           prop_dependent_alias_for_typ ctx public_typ
           || prop_dependent_record_typ public_typ
-          || prop_dependent_record_typ
-               (expand_synonyms_for_dependent_type ctx public_typ)
+          || prop_dependent_record_typ (expand_synonyms_for_dependent_type ctx public_typ)
         in
         let ctx, witness_unpacks =
-          if
-            has_top_level_dependent_type ctx public_typ
-            && not preserve_prop_dependent
-          then
-            dependent_binder_witnesses ctx i public_typ raw_typ
-              (typ_of_pat pat)
+          if has_top_level_dependent_type ctx public_typ && not preserve_prop_dependent then
+            dependent_binder_witnesses ctx i public_typ raw_typ (typ_of_pat pat)
           else (ctx, [])
         in
         let fixup_binders = add_function_pattern ctx fixup_binders pat i raw_typ in
         let ctx = add_path_renamings ~path:(string_of_id i) ctx pat raw_typ in
         let binder_carrier =
-          if preserve_prop_dependent then
-            doc_dependent_unpack ctx public_typ (doc_id_ctor i)
-          else doc_id_ctor i
+          if preserve_prop_dependent then doc_dependent_unpack ctx public_typ (doc_id_ctor i) else doc_id_ctor i
         in
-        let ctx =
-          add_prop_dependent_record_binder_kid_docs ctx binder_carrier raw_typ
-        in
+        let ctx = add_prop_dependent_record_binder_kid_docs ctx binder_carrier raw_typ in
         let unpacked =
-          if
-            has_top_level_dependent_type ctx public_typ
-            && not preserve_prop_dependent
-          then doc_dependent_unpack ctx public_typ (doc_id_ctor i)
+          if has_top_level_dependent_type ctx public_typ && not preserve_prop_dependent then
+            doc_dependent_unpack ctx public_typ (doc_id_ctor i)
           else doc_id_ctor i
         in
         let unpacked =
@@ -4976,21 +4178,13 @@ let doc_funcl_init global (FCL_aux (FCL_funcl (id, pexp), annot)) =
         in
         let arg_unpacks =
           if
-            ( has_top_level_dependent_type ctx public_typ
-              && not preserve_prop_dependent
-            )
+            (has_top_level_dependent_type ctx public_typ && not preserve_prop_dependent)
             || has_semantic_range ctx public_typ
-          then
-            arg_unpacks
-            @ witness_unpacks
-            @ [separate space [string "let"; doc_id_ctor i; coloneq; unpacked]]
+          then arg_unpacks @ witness_unpacks @ [separate space [string "let"; doc_id_ctor i; coloneq; unpacked]]
           else arg_unpacks
         in
         let ctx =
-          if
-            has_top_level_dependent_type ctx public_typ
-            && not preserve_prop_dependent
-          then
+          if has_top_level_dependent_type ctx public_typ && not preserve_prop_dependent then
             { ctx with unpacked_dependent_ids = IdSet.add i ctx.unpacked_dependent_ids }
           else if preserve_prop_dependent then
             {
@@ -5013,20 +4207,14 @@ let doc_funcl_init global (FCL_aux (FCL_funcl (id, pexp), annot)) =
           | QI_constraint nc when constraint_relevant_to relevant_constraint_kids nc ->
               Some
                 (parens
-                   (separate space
-                      [
-                        string (Printf.sprintf "_sailConstraint%i" index);
-                        colon;
-                        doc_nconstraint ctx nc;
-                      ]
-                   )
+                   (separate space [string (Printf.sprintf "_sailConstraint%i" index); colon; doc_nconstraint ctx nc])
                 )
           | _ -> None
         )
         tq
       |> List.filter_map Fun.id
     else if not !opt_constraint_obligations then []
-    else
+    else (
       (* Sail discharges a function's constraints at every call site, so its
          body may rely on them.  Lean has to be told: without them a validity
          obligation raised inside the body -- constructing a constrained
@@ -5040,7 +4228,7 @@ let doc_funcl_init global (FCL_aux (FCL_funcl (id, pexp), annot)) =
       let env = try Env.add_typquant Unknown tq ctx.env with Type_internal.Type_error _ -> ctx.env in
       let constraint_var_available kid =
         KidSet.mem kid ctx.function_bound_nvars
-        || (match KBindings.find_opt kid ctx.kid_id_renames with Some (Some _) -> true | _ -> false)
+        || match KBindings.find_opt kid ctx.kid_id_renames with Some (Some _) -> true | _ -> false
       in
       List.mapi
         (fun index (QI_aux (item, _)) ->
@@ -5063,14 +4251,14 @@ let doc_funcl_init global (FCL_aux (FCL_funcl (id, pexp), annot)) =
         )
         tq
       |> List.filter_map Fun.id
+    )
   in
   (* Use auto-implicits for type quanitifiers for now and see if this works *)
   let doc_ret_typ_orig =
     match dependent_result with
     | Some result -> doc_prop_dependent_result_type ctx result
     | None ->
-        if prop_dependent_record_typ public_ret_typ then
-          doc_dependent_shape ctx public_ret_typ
+        if prop_dependent_record_typ public_ret_typ then doc_dependent_shape ctx public_ret_typ
         else doc_typ ctx public_ret_typ
   in
   let is_monadic = not (Effects.function_is_pure id ctx.global.effect_info) in
@@ -5104,7 +4292,8 @@ let doc_funcl_init global (FCL_aux (FCL_funcl (id, pexp), annot)) =
   ( typ_quant_comment,
     separate space
       (remove_empties [partiality; computability; string "def"; doc_id_ctor id]
-      @ binders @ constraint_binders @ [colon] @ decl_val),
+      @ binders @ constraint_binders @ [colon] @ decl_val
+      ),
     ctx,
     fixup_binders,
     arg_unpacks,
@@ -5188,25 +4377,20 @@ let doc_funcl_body fixup_binders arg_unpacks has_outer_do ctx (FCL_aux (FCL_func
       | Some (limit, predecessor, exhausted, body) ->
           let exhausted, body =
             match ctx.dependent_return with
-            | Some public_typ ->
-                (annotate_dependent_tail public_typ exhausted, annotate_dependent_tail public_typ body)
+            | Some public_typ -> (annotate_dependent_tail public_typ exhausted, annotate_dependent_tail public_typ body)
             | None -> (exhausted, body)
           in
           doc_structural_fuel_body is_monadic ctx limit predecessor exhausted body
       | None ->
           let exp =
-            match ctx.dependent_return with
-            | Some public_typ -> annotate_dependent_tail public_typ exp
-            | None -> exp
+            match ctx.dependent_return with Some public_typ -> annotate_dependent_tail public_typ exp | None -> exp
           in
           doc_exp is_monadic ctx exp
     )
   in
   let body =
     let pack value =
-      let value =
-        match ctx.semantic_return with Some typ -> doc_semantic_pack ctx typ value | None -> value
-      in
+      let value = match ctx.semantic_return with Some typ -> doc_semantic_pack ctx typ value | None -> value in
       value
     in
     match (ctx.semantic_return, ctx.dependent_return) with
@@ -5289,19 +4473,14 @@ let string_of_type_def_con (TD_aux (td, _)) =
   | TD_enum _ -> "TD_enum"
 
 let prop_dependent_record_validity ctx id tq _fields =
-  let witness_paths =
-    prop_dependent_record_declaration_witness_paths ctx IdSet.empty id
-  in
-  let kid_docs =
-    KBindings.map (doc_field_path (string "fields")) witness_paths
-  in
+  let witness_paths = prop_dependent_record_declaration_witness_paths ctx IdSet.empty id in
+  let kid_docs = KBindings.map (doc_field_path (string "fields")) witness_paths in
   let quantified_kids = quantified_int_kids tq in
   List.iter
     (fun kid ->
       if not (KBindings.mem kid kid_docs) then
         failwith
-          (Printf.sprintf
-             "Lean proof-refined record %s cannot recover numeric index %s from a singleton-valued field"
+          (Printf.sprintf "Lean proof-refined record %s cannot recover numeric index %s from a singleton-valued field"
              (string_of_id id) (string_of_kid kid)
           )
     )
@@ -5320,17 +4499,10 @@ let prop_dependent_record_validity ctx id tq _fields =
         constraint_ constraints
 
 let prop_dependent_record_index_equalities ctx id tq =
-  let witness_paths =
-    prop_dependent_record_declaration_witness_paths ctx IdSet.empty id
-  in
+  let witness_paths = prop_dependent_record_declaration_witness_paths ctx IdSet.empty id in
   List.map
     (fun kid ->
-      flow (break 1)
-        [
-          doc_field_path (string "fields") (KBindings.find kid witness_paths);
-          string "=";
-          doc_kid ctx kid;
-        ]
+      flow (break 1) [doc_field_path (string "fields") (KBindings.find kid witness_paths); string "="; doc_kid ctx kid]
     )
     (quantified_int_kids tq)
 
@@ -5338,121 +4510,69 @@ let prop_dependent_alias_validity ctx alias =
   match prop_dependent_alias_parts ctx alias with
   | Some (record, nc, inner) ->
       let witness_paths = prop_dependent_record_witness_paths ctx inner in
-      let kid_docs =
-        KBindings.map (doc_field_path (string "fields")) witness_paths
-      in
+      let kid_docs = KBindings.map (doc_field_path (string "fields")) witness_paths in
       let valid_ctx = { ctx with kid_docs } in
       flow (break 1)
         [
-          parens
-            (separate space
-               [
-                 doc_id_ctor record ^^ string ".Valid";
-                 string "fields";
-               ]
-            );
+          parens (separate space [doc_id_ctor record ^^ string ".Valid"; string "fields"]);
           string "∧";
           doc_nconstraint valid_ctx nc;
         ]
-  | None ->
-      failwith
-        ("No proof-refined carrier and existential constraint found for "
-        ^ string_of_id alias)
+  | None -> failwith ("No proof-refined carrier and existential constraint found for " ^ string_of_id alias)
 
 let doc_prop_dependent_result_declaration ctx result =
-  let Typ_aux (_, l) = result.result_typ in
-  let env =
-    try Env.add_typquant l result.result_quant ctx.env
-    with Type_internal.Type_error _ -> ctx.env
-  in
-  let env =
-    List.fold_left
-      (fun env kopt -> Env.add_typ_var l kopt env)
-      env result.result_kopts
-  in
-  let env =
-    try Env.add_constraint result.result_constraint env
-    with Type_internal.Type_error _ -> env
-  in
+  let (Typ_aux (_, l)) = result.result_typ in
+  let env = try Env.add_typquant l result.result_quant ctx.env with Type_internal.Type_error _ -> ctx.env in
+  let env = List.fold_left (fun env kopt -> Env.add_typ_var l kopt env) env result.result_kopts in
+  let env = try Env.add_constraint result.result_constraint env with Type_internal.Type_error _ -> env in
   let declaration_ctx = context_with_env ctx env in
-  let carrier_doc =
-    doc_prop_dependent_result_carrier_shape declaration_ctx
-      result.result_carrier
-  in
-  let witness_docs =
-    prop_dependent_carrier_witness_docs declaration_ctx
-      (string "value") result.result_carrier
-  in
+  let carrier_doc = doc_prop_dependent_result_carrier_shape declaration_ctx result.result_carrier in
+  let witness_docs = prop_dependent_carrier_witness_docs declaration_ctx (string "value") result.result_carrier in
   let parameter_docs =
     List.map
       (fun (KOpt_aux (KOpt_kind (kind, kid), _)) ->
-        parens
-          (separate space
-             [
-               doc_kid declaration_ctx kid;
-               colon;
-               doc_existential_kind declaration_ctx kid kind;
-             ]
-          )
+        parens (separate space [doc_kid declaration_ctx kid; colon; doc_existential_kind declaration_ctx kid kind])
       )
       result.result_params
   in
   let kid_docs =
     List.fold_left
-      (fun docs (KOpt_aux (KOpt_kind (_, kid), _)) ->
-        KBindings.add kid (doc_kid declaration_ctx kid) docs
-      )
+      (fun docs (KOpt_aux (KOpt_kind (_, kid), _)) -> KBindings.add kid (doc_kid declaration_ctx kid) docs)
       witness_docs result.result_params
   in
-  let valid_ctx =
-    { declaration_ctx with kid_docs }
-  in
+  let valid_ctx = { declaration_ctx with kid_docs } in
   let validity =
     let component_validities =
-      doc_prop_dependent_result_carrier_validities valid_ctx
-        (string "value") result.result_carrier
+      doc_prop_dependent_result_carrier_validities valid_ctx (string "value") result.result_carrier
     in
     flow (break 1)
-      (List.concat_map
-         (fun validity -> [validity; string "∧"])
-         component_validities
+      (List.concat_map (fun validity -> [validity; string "∧"]) component_validities
       @ [doc_nconstraint valid_ctx result.result_constraint]
       )
   in
   let name = string result.result_name in
   let valid_head =
     separate space
-      ([string "def"; string "Valid"] @ parameter_docs
+      ([string "def"; string "Valid"]
+      @ parameter_docs
       @ [parens (string "value : " ^^ carrier_doc); colon; string "Prop :="]
       )
   in
   let valid_application =
     separate space
       ([name ^^ string ".Valid"]
-      @ List.map
-          (fun (KOpt_aux (KOpt_kind (_, kid), _)) ->
-            doc_kid declaration_ctx kid
-          )
-          result.result_params
-      @ [string "value"])
+      @ List.map (fun (KOpt_aux (KOpt_kind (_, kid), _)) -> doc_kid declaration_ctx kid) result.result_params
+      @ [string "value"]
+      )
   in
-  let abbrev_head =
-    separate space ([string "abbrev"; name] @ parameter_docs)
-  in
-  string "namespace " ^^ name
-  ^^ hardline
-  ^^ valid_head
-  ^^ hardline ^^ nest 2 validity
-  ^^ hardline
-  ^^ string "end " ^^ name
-  ^^ hardline
-  ^^ abbrev_head ^^ string " := { value : "
-  ^^ carrier_doc ^^ string " // " ^^ valid_application ^^ string " }"
-  ^^ hardline
+  let abbrev_head = separate space ([string "abbrev"; name] @ parameter_docs) in
+  string "namespace " ^^ name ^^ hardline ^^ valid_head ^^ hardline ^^ nest 2 validity ^^ hardline ^^ string "end "
+  ^^ name ^^ hardline ^^ abbrev_head ^^ string " := { value : " ^^ carrier_doc ^^ string " // " ^^ valid_application
+  ^^ string " }" ^^ hardline
 
 let rec prop_dependent_record_default ctx seen record =
   if IdSet.mem record seen then string "default"
-  else
+  else (
     match
       ( Bindings.find_opt record ctx.global.semantic_types.record_quants,
         Bindings.find_opt record ctx.global.semantic_types.record_fields
@@ -5466,13 +4586,9 @@ let rec prop_dependent_record_default ctx seen record =
             match singleton_kid_of_field field_env typ with
             | Some _ -> string "0"
             | None -> (
-                let typ =
-                  try Env.expand_synonyms field_env typ
-                  with Type_internal.Type_error _ -> typ
-                in
+                let typ = try Env.expand_synonyms field_env typ with Type_internal.Type_error _ -> typ in
                 match typ with
-                | Typ_aux (Typ_id nested, _) | Typ_aux (Typ_app (nested, _), _)
-                  when prop_dependent_record nested ->
+                | (Typ_aux (Typ_id nested, _) | Typ_aux (Typ_app (nested, _), _)) when prop_dependent_record nested ->
                     prop_dependent_record_default ctx seen nested
                 | _ -> string "default"
               )
@@ -5481,14 +4597,11 @@ let rec prop_dependent_record_default ctx seen record =
         in
         braces
           (space
-          ^^ separate comma_sp
-               (List.map
-                  (fun (field, typ) -> field_default field typ)
-                  (Bindings.bindings fields)
-               )
+          ^^ separate comma_sp (List.map (fun (field, typ) -> field_default field typ) (Bindings.bindings fields))
           ^^ space
           )
     | _ -> string "default"
+  )
 
 let prop_dependent_alias_default_proof ctx alias record =
   let alias_constraint_ids =
@@ -5497,29 +4610,15 @@ let prop_dependent_alias_default_proof ctx alias record =
     | None -> IdSet.empty
   in
   let record_constraint_ids =
-    match
-      Bindings.find_opt record ctx.global.semantic_types.record_quants
-    with
+    match Bindings.find_opt record ctx.global.semantic_types.record_quants with
     | Some quant -> typquant_constraint_application_ids quant
     | None -> IdSet.empty
   in
   let unfold =
-    [
-      doc_id_ctor alias ^^ string ".Valid";
-      doc_id_ctor record ^^ string ".Valid";
-    ]
-    @ List.map doc_id_ctor
-        (IdSet.elements
-           (IdSet.union alias_constraint_ids record_constraint_ids)
-        )
+    [doc_id_ctor alias ^^ string ".Valid"; doc_id_ctor record ^^ string ".Valid"]
+    @ List.map doc_id_ctor (IdSet.elements (IdSet.union alias_constraint_ids record_constraint_ids))
   in
-  string "by"
-  ^^ nest 2
-       (hardline
-       ^^ string "simp ["
-       ^^ separate comma_sp unfold
-       ^^ string "] <;> first | omega | grind"
-       )
+  string "by" ^^ nest 2 (hardline ^^ string "simp [" ^^ separate comma_sp unfold ^^ string "] <;> first | omega | grind")
 
 let prop_dependent_alias_has_parameters ctx alias =
   match Bindings.find_opt alias ctx.global.semantic_types.alias_quants with
@@ -5528,38 +4627,29 @@ let prop_dependent_alias_has_parameters ctx alias =
 
 let rec typ_blocks_derived_inhabited ctx seen (Typ_aux (typ, _) as full_typ) =
   match typ with
-  | Typ_id id | Typ_app (id, _)
-    when prop_dependent_alias id ->
-      prop_dependent_alias_has_parameters ctx id
-  | Typ_id id | Typ_app (id, _) when not (IdSet.mem id seen) -> (
+  | (Typ_id id | Typ_app (id, _)) when prop_dependent_alias id -> prop_dependent_alias_has_parameters ctx id
+  | (Typ_id id | Typ_app (id, _)) when not (IdSet.mem id seen) -> (
       let seen = IdSet.add id seen in
       match Bindings.find_opt id ctx.global.semantic_types.record_fields with
-      | Some fields ->
-          Bindings.exists
-            (fun _ typ -> typ_blocks_derived_inhabited ctx seen typ)
-            fields
+      | Some fields -> Bindings.exists (fun _ typ -> typ_blocks_derived_inhabited ctx seen typ) fields
       | None -> (
           match Bindings.find_opt id ctx.global.semantic_types.aliases with
           | Some typ -> typ_blocks_derived_inhabited ctx seen typ
-          | None ->
-              (match full_typ with
-               | Typ_aux (Typ_app (_, args), _) ->
-                   List.exists
-                     (fun (A_aux (arg, _)) ->
-                       match arg with
-                       | A_typ typ -> typ_blocks_derived_inhabited ctx seen typ
-                       | _ -> false
-                     )
-                     args
-               | _ -> false)
+          | None -> (
+              match full_typ with
+              | Typ_aux (Typ_app (_, args), _) ->
+                  List.exists
+                    (fun (A_aux (arg, _)) ->
+                      match arg with A_typ typ -> typ_blocks_derived_inhabited ctx seen typ | _ -> false
+                    )
+                    args
+              | _ -> false
+            )
         )
     )
-  | Typ_tuple typs ->
-      List.exists (typ_blocks_derived_inhabited ctx seen) typs
-  | Typ_exist (_, _, typ) ->
-      typ_blocks_derived_inhabited ctx seen typ
-  | Typ_fn (args, ret) ->
-      List.exists (typ_blocks_derived_inhabited ctx seen) (ret :: args)
+  | Typ_tuple typs -> List.exists (typ_blocks_derived_inhabited ctx seen) typs
+  | Typ_exist (_, _, typ) -> typ_blocks_derived_inhabited ctx seen typ
+  | Typ_fn (args, ret) -> List.exists (typ_blocks_derived_inhabited ctx seen) (ret :: args)
   | Typ_id _ | Typ_app _ | Typ_var _ | Typ_bidir _ | Typ_internal_unknown -> false
 
 (* Fields the Lean structure does not store, emitted instead as projections of
@@ -5612,14 +4702,13 @@ let record_validity_field_name = "sailValid"
 
 let doc_record_validity_field ctx tq =
   if not !opt_constraint_obligations then None
-  else
-  match record_validity_constraint ctx tq with
-  | None -> None
-  | Some nc ->
-      Some
-        (flow (break 1)
-           [string record_validity_field_name; colon; doc_nconstraint ctx nc; coloneq; doc_discharge_by]
-        )
+  else (
+    match record_validity_constraint ctx tq with
+    | None -> None
+    | Some nc ->
+        Some
+          (flow (break 1) [string record_validity_field_name; colon; doc_nconstraint ctx nc; coloneq; doc_discharge_by])
+  )
 
 let record_stored_fields ctx id tq fields =
   List.filter (fun ((_, typ), _) -> Option.is_none (record_index_projection_nexp ctx id tq typ)) fields
@@ -5665,13 +4754,15 @@ let doc_record_validity_instances ctx id tq stored derive_inhabited =
     | [] -> string "⟨fun _ _ => true⟩"
     | names ->
         string "⟨fun x y => "
-        ^^ separate (string " && ")
-             (List.map (fun n -> string "x." ^^ n ^^ string " == y." ^^ n) names)
+        ^^ separate (string " && ") (List.map (fun n -> string "x." ^^ n ^^ string " == y." ^^ n) names)
         ^^ string "⟩"
   in
   let all_int_indices =
     List.for_all
-      (function QI_aux (QI_id (KOpt_aux (KOpt_kind (K_aux (K_int, _), _), _)), _) | QI_aux (QI_constraint _, _) -> true | _ -> false)
+      (function
+        | QI_aux (QI_id (KOpt_aux (KOpt_kind (K_aux (K_int, _), _), _)), _) | QI_aux (QI_constraint _, _) -> true
+        | _ -> false
+        )
       tq
   in
   let zero_indices = List.map (fun _ -> string "0") (doc_typ_quant_only_vars ctx tq) in
@@ -5681,13 +4772,11 @@ let doc_record_validity_instances ctx id tq stored derive_inhabited =
   let default_literal =
     match field_names with
     | [] -> string "{ }"
-    | names ->
-        braces (space ^^ separate comma_sp (List.map (fun n -> n ^^ string " := default") names) ^^ space)
+    | names -> braces (space ^^ separate comma_sp (List.map (fun n -> n ^^ string " := default") names) ^^ space)
   in
   let instances =
     [
-      nest 2
-        (instance_head (implicit_binders @ type_param_instances "BEq") "BEq" applied ^^ hardline ^^ beq_body);
+      nest 2 (instance_head (implicit_binders @ type_param_instances "BEq") "BEq" applied ^^ hardline ^^ beq_body);
       nest 2
         (instance_head implicit_binders "Repr" applied
         ^^ hardline
@@ -5697,10 +4786,7 @@ let doc_record_validity_instances ctx id tq stored derive_inhabited =
     ]
     @
     if derive_inhabited && all_int_indices then
-      [
-        nest 2
-          (instance_head [] "Inhabited" default_applied ^^ hardline ^^ string "⟨" ^^ default_literal ^^ string "⟩");
-      ]
+      [nest 2 (instance_head [] "Inhabited" default_applied ^^ hardline ^^ string "⟨" ^^ default_literal ^^ string "⟩")]
     else []
   in
   hardline ^^ hardline ^^ separate hardline instances
@@ -5729,16 +4815,10 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
         )
   | TD_record (id, tq, fields, _) when prop_dependent_record id ->
       let validity = prop_dependent_record_validity ctx id tq fields in
-      let indexed_vars =
-        doc_typ_quant_relevant ctx tq |> List.map parens
-      in
+      let indexed_vars = doc_typ_quant_relevant ctx tq |> List.map parens in
       let indexed_args = doc_typ_quant_only_vars ctx tq in
-      let indexed_implicit_vars =
-        doc_typ_quant_relevant ctx tq |> List.map braces
-      in
-      let indexed_equalities =
-        prop_dependent_record_index_equalities ctx id tq
-      in
+      let indexed_implicit_vars = doc_typ_quant_relevant ctx tq |> List.map braces in
+      let indexed_equalities = prop_dependent_record_index_equalities ctx id tq in
       let fields_doc = doc_structure_fields (List.map (doc_typ_id ctx) (record_stored_fields ctx id tq fields)) in
       let projections = doc_record_index_projections ctx id tq fields in
       let derivers = [string "Inhabited"; string "Repr"] in
@@ -5765,121 +4845,65 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
                    string "Prop";
                    coloneq;
                  ]
-              ^^ hardline
-              ^^ validity
+              ^^ hardline ^^ validity
               );
             nest 2
               (separate space
-                 [
-                   string "abbrev Refined";
-                   coloneq;
-                   string "{ fields :";
-                   id_doc;
-                   string "// Valid fields }";
-                 ]
+                 [string "abbrev Refined"; coloneq; string "{ fields :"; id_doc; string "// Valid fields }"]
               );
             nest 2
               (flow (break 1)
-                 ([
-                    string "def Indexed.Valid";
-                  ]
+                 ([string "def Indexed.Valid"]
                  @ indexed_vars
-                 @ [
-                     parens
-                       (separate space
-                          [string "fields"; colon; id_doc]
-                       );
-                     colon;
-                     string "Prop";
-                     coloneq;
-                   ]
+                 @ [parens (separate space [string "fields"; colon; id_doc]); colon; string "Prop"; coloneq]
                  )
               ^^ hardline
               ^^ flow (break 1)
-                   ((parens
-                       (separate space
-                          [doc_id_ctor id ^^ string ".Valid"; string "fields"]
-                       )
-                    )
-                   :: List.concat_map
-                        (fun equality -> [string "∧"; equality])
-                        indexed_equalities
+                   (parens (separate space [doc_id_ctor id ^^ string ".Valid"; string "fields"])
+                   :: List.concat_map (fun equality -> [string "∧"; equality]) indexed_equalities
                    )
               );
             nest 2
               (flow (break 1)
-                 ([
-                    string "abbrev Indexed";
-                  ]
+                 ([string "abbrev Indexed"]
                  @ indexed_vars
                  @ [
                      coloneq;
                      string "{ fields :";
                      id_doc;
                      string "//";
-                     parens
-                       (flow space
-                          ((string "Indexed.Valid") :: indexed_args
-                          @ [string "fields"]
-                          )
-                       );
+                     parens (flow space ((string "Indexed.Valid" :: indexed_args) @ [string "fields"]));
                      string "}";
                    ]
                  )
               );
             nest 2
               (flow (break 1)
-                 ([
-                    string "theorem Indexed.toRefined_valid";
-                  ]
+                 ([string "theorem Indexed.toRefined_valid"]
                  @ indexed_implicit_vars
                  @ [
-                     parens
-                       (flow space
-                          ([string "value"; colon; string "Indexed"]
-                          @ indexed_args
-                          )
-                       );
+                     parens (flow space ([string "value"; colon; string "Indexed"] @ indexed_args));
                      colon;
-                     flow space
-                       [
-                         id_doc ^^ string ".Valid";
-                         parens (string "value.val");
-                       ];
+                     flow space [id_doc ^^ string ".Valid"; parens (string "value.val")];
                      coloneq;
                    ]
                  )
               ^^ hardline
-              ^^
-              if indexed_equalities = [] then
-                string "value.property"
-              else
-                string "value.property.1"
+              ^^ if indexed_equalities = [] then string "value.property" else string "value.property.1"
               );
             nest 2
               (flow (break 1)
-                 ([
-                    string "def Indexed.toRefined";
-                  ]
+                 ([string "def Indexed.toRefined"]
                  @ indexed_implicit_vars
                  @ [
-                     parens
-                       (flow space
-                          ([string "value"; colon; string "Indexed"]
-                          @ indexed_args
-                          )
-                       );
+                     parens (flow space ([string "value"; colon; string "Indexed"] @ indexed_args));
                      colon;
                      string "Refined";
                      coloneq;
                    ]
                  )
               ^^ hardline
-              ^^ flow space
-                   [
-                     string "⟨value.val,";
-                     string "Indexed.toRefined_valid value⟩";
-                   ]
+              ^^ flow space [string "⟨value.val,"; string "Indexed.toRefined_valid value⟩"]
               );
             string "end " ^^ id_doc;
           ]
@@ -5890,24 +4914,15 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
       let projections = doc_record_index_projections ctx id tq fields in
       let validity = doc_record_validity_field ctx tq in
       let derive_inhabited =
-        not
-          (List.exists
-             (fun ((_, typ), _) ->
-               typ_blocks_derived_inhabited ctx IdSet.empty typ
-             )
-             stored)
+        not (List.exists (fun ((_, typ), _) -> typ_blocks_derived_inhabited ctx IdSet.empty typ) stored)
       in
       let fields_doc = doc_structure_fields (List.map (doc_typ_id ctx) stored @ Option.to_list validity) in
       let rectyp = doc_typ_quant_relevant ctx tq in
       let rectyp = List.map (fun d -> parens d) rectyp |> separate space in
-      let derivers =
-        if derive_inhabited then [string "Inhabited"; string "Repr"]
-        else [string "Repr"]
-      in
+      let derivers = if derive_inhabited then [string "Inhabited"; string "Repr"] else [string "Repr"] in
       let derivers = if IdSet.mem id !non_beq_types then derivers else string "BEq" :: derivers in
       let deriving_doc =
-        if Option.is_some validity then empty
-        else hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers
+        if Option.is_some validity then empty else hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers
       in
       (* A structure whose only field is the validity proof would land in
          [Prop]; the model needs it to carry data-free runtime values, so the
@@ -5915,8 +4930,7 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
       let sort_doc = if Option.is_some validity then string ": Type" else empty in
       doc_typ_quant_in_comment ctx tq
       ^^ nest 2
-           (flow (break 1)
-              (remove_empties [string "structure"; doc_id_ctor id; rectyp; sort_doc; string "where"])
+           (flow (break 1) (remove_empties [string "structure"; doc_id_ctor id; rectyp; sort_doc; string "where"])
            ^^ fields_doc ^^ deriving_doc
            )
       ^^ (if Option.is_some validity then doc_record_validity_instances ctx id tq stored derive_inhabited else empty)
@@ -5964,11 +4978,7 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
           let carrier = doc_id_ctor record in
           let alias = doc_id_ctor id in
           let alias_typ = mk_id_typ id in
-          let applied_alias =
-            match var_args with
-            | [] -> alias
-            | _ -> parens (separate space (alias :: var_args))
-          in
+          let applied_alias = match var_args with [] -> alias | _ -> parens (separate space (alias :: var_args)) in
           let valid_doc =
             nest 2
               (flow (break 1)
@@ -5976,21 +4986,13 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
                     [
                       string "def" ^^ space ^^ alias ^^ string ".Valid";
                       vars;
-                      parens
-                        (separate space
-                           [
-                             string "fields";
-                             colon;
-                             carrier;
-                           ]
-                        );
+                      parens (separate space [string "fields"; colon; carrier]);
                       colon;
                       string "Prop";
                       coloneq;
                     ]
                  )
-              ^^ hardline
-              ^^ prop_dependent_alias_validity ctx id
+              ^^ hardline ^^ prop_dependent_alias_validity ctx id
               )
           in
           let abbreviation =
@@ -6010,10 +5012,7 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
                                colon;
                                carrier;
                                string "//";
-                               parens
-                                 (separate space
-                                    ((alias ^^ string ".Valid") :: var_args @ [string "fields"])
-                                 );
+                               parens (separate space (((alias ^^ string ".Valid") :: var_args) @ [string "fields"]));
                              ]
                         ^^ space
                         );
@@ -6027,8 +5026,7 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
                 hardline ^^ hardline
                 ^^ nest 2
                      (separate space [string "instance"; colon; string "Inhabited"; applied_alias; coloneq]
-                     ^^ hardline
-                     ^^ string "⟨⟨"
+                     ^^ hardline ^^ string "⟨⟨"
                      ^^ prop_dependent_record_default ctx IdSet.empty record
                      ^^ string ", "
                      ^^ prop_dependent_alias_default_proof ctx id record
@@ -6040,26 +5038,11 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
       | None -> failwith ("No proof-refined carrier configured for " ^ string_of_id id)
     )
   | TD_abbrev (id, tq, A_aux (A_typ t, _))
-    when
-      Option.is_some (prop_dependent_record_application t)
-      && List.exists
-           (fun (QI_aux (item, _)) ->
-             match item with QI_constraint _ -> true | _ -> false
-           )
-           tq ->
+    when Option.is_some (prop_dependent_record_application t)
+         && List.exists (fun (QI_aux (item, _)) -> match item with QI_constraint _ -> true | _ -> false) tq ->
       let vars = doc_typ_quant_relevant ctx tq |> List.map parens |> separate space in
       nest 2
-        (flow (break 1)
-           (remove_empties
-              [
-                string "abbrev";
-                doc_id_ctor id;
-                vars;
-                coloneq;
-                doc_dependent_shape ctx t;
-              ]
-           )
-        )
+        (flow (break 1) (remove_empties [string "abbrev"; doc_id_ctor id; vars; coloneq; doc_dependent_shape ctx t]))
   | TD_abbrev (id, tq, A_aux (A_typ (Typ_aux (Typ_app (Id_aux (Id "range", _), _), _) as t), _)) ->
       let vars = doc_typ_quant_relevant ctx tq in
       let vars = List.map parens vars in
@@ -6127,16 +5110,11 @@ let doc_val ctx pat exp =
     match pat_typ with
     | None -> empty
     | Some typ ->
-        let typ_doc =
-          if prop_dependent_record_typ typ then doc_dependent_shape ctx typ
-          else doc_typ ctx typ
-        in
+        let typ_doc = if prop_dependent_record_typ typ then doc_dependent_shape ctx typ else doc_typ ctx typ in
         space ^^ colon ^^ space ^^ typ_doc
   in
   let semantic_typ = match pat_typ with Some typ when has_semantic_range ctx typ -> Some typ | _ -> None in
-  let dependent_typ =
-    match pat_typ with Some typ when has_top_level_dependent_type ctx typ -> Some typ | _ -> None
-  in
+  let dependent_typ = match pat_typ with Some typ when has_top_level_dependent_type ctx typ -> Some typ | _ -> None in
   let idpp = doc_id_ctor id in
   let base_pp =
     if has_effect exp then string "unwrapValue" ^^ space ^^ parens (doc_exp true ctx exp) else doc_exp false ctx exp
@@ -6146,11 +5124,8 @@ let doc_val ctx pat exp =
     match dependent_typ with
     | Some typ when exp_has_dependent_representation ctx exp ->
         let representation_typ = dependent_representation_type ctx exp in
-        if
-          dependent_types_equivalent ctx representation_typ typ
-        then base_pp
-        else
-          doc_dependent_repack ctx representation_typ typ base_pp
+        if dependent_types_equivalent ctx representation_typ typ then base_pp
+        else doc_dependent_repack ctx representation_typ typ base_pp
     | Some typ -> doc_dependent_pack ctx typ base_pp
     | None -> base_pp
   in
@@ -6160,11 +5135,16 @@ let doc_val ctx pat exp =
      a test against the constant refines an index the same way a test against
      the literal does. *)
   let singleton_constant =
-    let typ = match pat_typ with Some typ -> Some typ | None -> (try Some (typ_of exp) with _ -> None) in
+    let typ =
+      match pat_typ with
+      | Some typ -> Some typ
+      | None -> (
+          try Some (typ_of exp) with _ -> None
+        )
+    in
     match Option.map (fun typ -> try Env.expand_synonyms ctx.env typ with Type_internal.Type_error _ -> typ) typ with
     | Some
-        (Typ_aux
-          (Typ_app (Id_aux (Id ("atom" | "implicit"), _), [A_aux (A_nexp (Nexp_aux (Nexp_constant c, _)), _)]), _)
+        (Typ_aux (Typ_app (Id_aux (Id ("atom" | "implicit"), _), [A_aux (A_nexp (Nexp_aux (Nexp_constant c, _)), _)]), _)
           ) ->
         Some c
     | _ -> None
@@ -6274,9 +5254,7 @@ let rec doc_defs_rec ctx defs types (former_funcs : document list) (docdefs : do
          checking termination, whereas a definition placed after the block is
          simply not in scope inside it. *)
       let group_ids = List.fold_left (fun ids fdef -> IdSet.add (id_of_fundef fdef) ids) IdSet.empty fdefs in
-      let is_group_measure_wrapper fdef =
-        IdSet.mem (mk_id ("#rec#" ^ string_of_id (id_of_fundef fdef))) group_ids
-      in
+      let is_group_measure_wrapper fdef = IdSet.mem (mk_id ("#rec#" ^ string_of_id (id_of_fundef fdef))) group_ids in
       let rec split_measure_wrappers wrappers = function
         | DEF_aux (DEF_fundef fdef, _) :: rest when is_group_measure_wrapper fdef ->
             split_measure_wrappers (wrappers @ [fdef]) rest
@@ -6592,12 +5570,7 @@ let collect_semantic_types defs =
       (fun (valspecs, valspec_quants, bindings, record_fields, record_quants) (DEF_aux (def, _)) ->
         match def with
         | DEF_val (VS_aux (VS_val_spec (TypSchm_aux (TypSchm_ts (quant, typ), _), id, _), _)) ->
-            ( Bindings.add id typ valspecs,
-              Bindings.add id quant valspec_quants,
-              bindings,
-              record_fields,
-              record_quants
-            )
+            (Bindings.add id typ valspecs, Bindings.add id quant valspec_quants, bindings, record_fields, record_quants)
         | DEF_let (P_aux (P_typ (typ, P_aux (P_id id, _)), _), _) ->
             (valspecs, valspec_quants, Bindings.add id typ bindings, record_fields, record_quants)
         | DEF_type (TD_aux (TD_variant (id, _, arms, _), _)) ->
@@ -6629,11 +5602,9 @@ let collect_semantic_types defs =
 let infer_prop_dependent_types env semantic_types =
   let rec record_witness_paths seen record =
     if IdSet.mem record seen then None
-    else
+    else (
       match
-        ( Bindings.find_opt record semantic_types.record_quants,
-          Bindings.find_opt record semantic_types.record_fields
-        )
+        (Bindings.find_opt record semantic_types.record_quants, Bindings.find_opt record semantic_types.record_fields)
       with
       | Some quant, Some fields ->
           let seen = IdSet.add record seen in
@@ -6644,10 +5615,7 @@ let infer_prop_dependent_types env semantic_types =
                 match singleton_kid_of_field field_env typ with
                 | Some kid -> KBindings.add kid [field] witnesses
                 | None -> (
-                    let typ =
-                      try Env.expand_synonyms field_env typ
-                      with Type_internal.Type_error _ -> typ
-                    in
+                    let typ = try Env.expand_synonyms field_env typ with Type_internal.Type_error _ -> typ in
                     match typ with
                     | Typ_aux (Typ_app (nested_record, args), _) -> (
                         match
@@ -6657,10 +5625,7 @@ let infer_prop_dependent_types env semantic_types =
                         with
                         | Some nested_quant, Some nested_paths ->
                             let nested_kids = quantified_int_kids nested_quant in
-                            let actuals =
-                              try List.combine nested_kids args
-                              with Invalid_argument _ -> []
-                            in
+                            let actuals = try List.combine nested_kids args with Invalid_argument _ -> [] in
                             List.fold_left
                               (fun witnesses (nested_kid, A_aux (arg, _)) ->
                                 match (KBindings.find_opt nested_kid nested_paths, arg) with
@@ -6677,47 +5642,37 @@ let infer_prop_dependent_types env semantic_types =
               fields KBindings.empty
           in
           let required = quantified_int_kids quant in
-          if List.for_all (fun kid -> KBindings.mem kid witnesses) required then Some witnesses
-          else None
+          if List.for_all (fun kid -> KBindings.mem kid witnesses) required then Some witnesses else None
       | _ -> None
+    )
   in
   let inferred_types =
     Bindings.fold
       (fun alias typ inferred ->
-      match typ with
-      | Typ_aux (Typ_exist (kopts, _, (Typ_aux (Typ_app (record, args), _) as inner)), _) -> (
-          match
-            ( Bindings.find_opt record semantic_types.record_quants,
-              record_witness_paths IdSet.empty record
-            )
-          with
-          | Some record_quant, Some record_paths ->
-              let declaration_kids = quantified_int_kids record_quant in
-              let actuals =
-                try List.combine declaration_kids args
-                with Invalid_argument _ -> []
-              in
-              let witnesses =
-                List.fold_left
-                  (fun witnesses (declaration_kid, A_aux (arg, _)) ->
-                    match (KBindings.find_opt declaration_kid record_paths, arg) with
-                    | Some path, A_nexp (Nexp_aux (Nexp_var actual_kid, _)) ->
-                        KBindings.add actual_kid path witnesses
-                    | _ -> witnesses
-                  )
-                  KBindings.empty actuals
-              in
-              let required =
-                List.map
-                  (fun (KOpt_aux (KOpt_kind (_, kid), _)) -> kid)
-                  (relevant_existential_kopts kopts inner)
-              in
-              if List.for_all (fun kid -> KBindings.mem kid witnesses) required then
-                (string_of_id record, string_of_id alias) :: inferred
-              else inferred
-          | _ -> inferred
-        )
-      | _ -> inferred
+        match typ with
+        | Typ_aux (Typ_exist (kopts, _, (Typ_aux (Typ_app (record, args), _) as inner)), _) -> (
+            match (Bindings.find_opt record semantic_types.record_quants, record_witness_paths IdSet.empty record) with
+            | Some record_quant, Some record_paths ->
+                let declaration_kids = quantified_int_kids record_quant in
+                let actuals = try List.combine declaration_kids args with Invalid_argument _ -> [] in
+                let witnesses =
+                  List.fold_left
+                    (fun witnesses (declaration_kid, A_aux (arg, _)) ->
+                      match (KBindings.find_opt declaration_kid record_paths, arg) with
+                      | Some path, A_nexp (Nexp_aux (Nexp_var actual_kid, _)) -> KBindings.add actual_kid path witnesses
+                      | _ -> witnesses
+                    )
+                    KBindings.empty actuals
+                in
+                let required =
+                  List.map (fun (KOpt_aux (KOpt_kind (_, kid), _)) -> kid) (relevant_existential_kopts kopts inner)
+                in
+                if List.for_all (fun kid -> KBindings.mem kid witnesses) required then
+                  (string_of_id record, string_of_id alias) :: inferred
+                else inferred
+            | _ -> inferred
+          )
+        | _ -> inferred
       )
       semantic_types.aliases []
   in
@@ -6725,20 +5680,13 @@ let infer_prop_dependent_types env semantic_types =
     Bindings.fold
       (fun record quant inferred ->
         let has_constraint =
-          List.exists
-            (fun (QI_aux (item, _)) ->
-              match item with QI_constraint _ -> true | _ -> false
-            )
-            quant
+          List.exists (fun (QI_aux (item, _)) -> match item with QI_constraint _ -> true | _ -> false) quant
         in
         let numeric_kids = quantified_int_kids quant in
         match record_witness_paths IdSet.empty record with
         | Some witnesses
-          when has_constraint
-               && numeric_kids <> []
-               && List.for_all
-                    (fun kid -> KBindings.mem kid witnesses)
-                    numeric_kids ->
+          when has_constraint && numeric_kids <> []
+               && List.for_all (fun kid -> KBindings.mem kid witnesses) numeric_kids ->
             string_of_id record :: inferred
         | _ -> inferred
       )
@@ -6781,19 +5729,12 @@ let pp_ast_lean (env : Type_check.env) effect_info ({ defs; _ } as ast : Libsail
   let fun_args = populate_fun_args defs in
   let semantic_types = collect_semantic_types defs in
   let inferred_prop_dependent_types, inferred_records =
-    if
-      !opt_semantic_range_types
-      || !opt_infer_prop_dependent_types
-      || !opt_prop_dependent_types <> []
-    then
+    if !opt_semantic_range_types || !opt_infer_prop_dependent_types || !opt_prop_dependent_types <> [] then
       infer_prop_dependent_types env semantic_types
     else ([], [])
   in
-  inferred_prop_dependent_records :=
-    List.sort_uniq String.compare inferred_records;
-  opt_prop_dependent_types :=
-    List.sort_uniq compare
-      (inferred_prop_dependent_types @ !opt_prop_dependent_types);
+  inferred_prop_dependent_records := List.sort_uniq String.compare inferred_records;
+  opt_prop_dependent_types := List.sort_uniq compare (inferred_prop_dependent_types @ !opt_prop_dependent_types);
   let global =
     {
       effect_info;
@@ -6811,10 +5752,7 @@ let pp_ast_lean (env : Type_check.env) effect_info ({ defs; _ } as ast : Libsail
         (fun id typ results ->
           match typ with
           | Typ_aux (Typ_fn (_, ret), _) -> (
-              let tq =
-                Option.value ~default:[]
-                  (Bindings.find_opt id semantic_types.valspec_quants)
-              in
+              let tq = Option.value ~default:[] (Bindings.find_opt id semantic_types.valspec_quants) in
               match infer_prop_dependent_result inference_ctx id tq ret with
               | Some result -> Bindings.add id result results
               | None -> results
@@ -6842,10 +5780,7 @@ let pp_ast_lean (env : Type_check.env) effect_info ({ defs; _ } as ast : Libsail
   let types, all_fundefss = doc_defs ctx defs in
   let prop_dependent_result_declarations =
     Bindings.fold
-      (fun _ result declarations ->
-        declarations ^^ doc_prop_dependent_result_declaration ctx result
-        ^^ hardline
-      )
+      (fun _ result declarations -> declarations ^^ doc_prop_dependent_result_declaration ctx result ^^ hardline)
       global.prop_dependent_results empty
   in
   let dependent_pair_instances =
@@ -6864,9 +5799,8 @@ let pp_ast_lean (env : Type_check.env) effect_info ({ defs; _ } as ast : Libsail
   in
   let opens = IdSet.fold (fun id doc -> string "open " ^^ doc_id_ctor id ^^ hardline ^^ doc) !opens empty in
   print types_file
-    (dependent_pair_instances ^^ types
-    ^^ prop_dependent_result_declarations
-    ^^ register_refs ^^ monad ^^ instantiation_deps ^^ instantiations
+    (dependent_pair_instances ^^ types ^^ prop_dependent_result_declarations ^^ register_refs ^^ monad
+   ^^ instantiation_deps ^^ instantiations
     );
   let _ =
     List.map2

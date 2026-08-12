@@ -91,8 +91,8 @@ type representation_specialization = {
   argument_bounds : (Big_int.num * Big_int.num) option list;
   result_bound : (Big_int.num * Big_int.num) option;
   calls : (id * ctyp list * ctyp * bool) list;
-  (** Source representation, destination representation, and whether the
-      conversion carries compiler-reconstructed range evidence. *)
+      (** Source representation, destination representation, and whether the conversion carries compiler-reconstructed
+          range evidence. *)
   conversions : (ctyp * ctyp * bool) list;
   recursive : bool;
 }

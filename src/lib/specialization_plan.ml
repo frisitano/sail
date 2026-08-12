@@ -228,10 +228,11 @@ let obligation_json obligation =
       ("evidence", `String obligation.evidence);
     ]
 
-let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~narrowing_policy ~input_locations traces =
+let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~narrowing_policy ~input_locations traces
+    =
   let configuration_identity =
     digest_string "configuration"
-        ("specialization-plan-schema=1.1.0;representation-policy=c-specialize-v1;backend-symbols=excluded;"
+      ("specialization-plan-schema=1.1.0;representation-policy=c-specialize-v1;backend-symbols=excluded;"
      ^ configuration
       )
   in
@@ -286,31 +287,31 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~n
     let conversions =
       trace.conversions
       |> List.map (fun (source, destination, proven) ->
-             let validation =
-               match (narrowing_policy, proven) with
-               | "checked", _ -> "checked"
-               | ("proven" | "all"), true -> "proven"
-               | "proven", false -> "checked"
-               | "all", false -> "assumed"
-               | _, _ -> invalid_arg ("Unknown narrowing policy: " ^ narrowing_policy)
-             in
-             (string_of_ctyp source, string_of_ctyp destination, validation)
-         )
+          let validation =
+            match (narrowing_policy, proven) with
+            | "checked", _ -> "checked"
+            | ("proven" | "all"), true -> "proven"
+            | "proven", false -> "checked"
+            | "all", false -> "assumed"
+            | _, _ -> invalid_arg ("Unknown narrowing policy: " ^ narrowing_policy)
+          in
+          (string_of_ctyp source, string_of_ctyp destination, validation)
+      )
       |> unique_sorted Stdlib.compare
       |> List.map (fun (source, destination, validation) ->
           {
             conversion_id =
-              digest_string "conversion"
-                (String.concat "\x1f" [base.clone_identity; source; destination; validation]);
+              digest_string "conversion" (String.concat "\x1f" [base.clone_identity; source; destination; validation]);
             source_type = source;
             destination_type = destination;
             validation;
             reason =
-              (match validation with
+              ( match validation with
               | "checked" -> "runtime-checked typed JIB assignment boundary"
               | "proven" -> "range-proved typed JIB assignment boundary"
               | "assumed" -> "unchecked typed JIB assignment boundary; refinement proof required"
-              | _ -> assert false);
+              | _ -> assert false
+              );
           }
       )
       |> List.sort (fun left right -> String.compare left.conversion_id right.conversion_id)
@@ -450,20 +451,19 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~n
     |> List.map (fun obligation -> Yojson.Safe.Util.member "id" obligation)
     |> List.sort (fun left right -> String.compare (Yojson.Safe.Util.to_string left) (Yojson.Safe.Util.to_string right))
   in
-  let has_extern_contract =
-    List.exists (fun clone -> List.exists (fun call -> call.is_extern) clone.calls) clones
-  in
+  let has_extern_contract = List.exists (fun clone -> List.exists (fun call -> call.is_extern) clone.calls) clones in
   let assumptions =
-    (if has_assumed_conversion then
-       [
-         `Assoc
-           [
-             ("id", `String (digest_string "assumption" "unchecked-narrowing"));
-             ("kind", `String "unchecked_narrowing");
-             ("text", `String "Unchecked narrowing conversions preserve the source Sail value.");
-           ];
-       ]
-     else [])
+    ( if has_assumed_conversion then
+        [
+          `Assoc
+            [
+              ("id", `String (digest_string "assumption" "unchecked-narrowing"));
+              ("kind", `String "unchecked_narrowing");
+              ("text", `String "Unchecked narrowing conversions preserve the source Sail value.");
+            ];
+        ]
+      else []
+    )
     @
     if unresolved <> [] && has_extern_contract then
       [
@@ -474,12 +474,13 @@ let create ~compiler_name ~compiler_version ~compiler_revision ~configuration ~n
             ("text", `String "Extern implementations refine their declared Sail contracts.");
           ];
       ]
-    else []
-    |> List.sort (fun left right ->
-           String.compare
-             (Yojson.Safe.Util.member "id" left |> Yojson.Safe.Util.to_string)
-             (Yojson.Safe.Util.member "id" right |> Yojson.Safe.Util.to_string)
-       )
+    else
+      []
+      |> List.sort (fun left right ->
+          String.compare
+            (Yojson.Safe.Util.member "id" left |> Yojson.Safe.Util.to_string)
+            (Yojson.Safe.Util.member "id" right |> Yojson.Safe.Util.to_string)
+      )
   in
   let json =
     `Assoc

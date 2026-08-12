@@ -108,8 +108,7 @@ let rec parse_redundant_nested_if = function
   | Parse_ast.E_aux (Parse_ast.E_block [inner], _) -> (
       match strip_parse_exp inner with Parse_ast.E_aux (Parse_ast.E_if _, _) -> true | _ -> false
     )
-  | Parse_ast.E_aux ((Parse_ast.E_typ (_, exp) | Parse_ast.E_attribute (_, exp)), _) ->
-      parse_redundant_nested_if exp
+  | Parse_ast.E_aux ((Parse_ast.E_typ (_, exp) | Parse_ast.E_attribute (_, exp)), _) -> parse_redundant_nested_if exp
   | _ -> false
 
 let parse_is_unit_literal exp =
@@ -123,7 +122,8 @@ let warn_parse_tail_conditional exp =
   | E_aux (E_if (_, then_exp, else_exp, locations), l)
     when Option.is_some locations.else_loc && Bool.(parse_is_unit_literal then_exp <> parse_is_unit_literal else_exp) ->
       readability_warning "sail-prefer-early-return" l
-        "This tail conditional has one empty branch; return from that branch and continue with the non-empty branch as a guard clause."
+        "This tail conditional has one empty branch; return from that branch and continue with the non-empty branch as \
+         a guard clause."
   | _ -> ()
 
 let rec inspect_parse_tail_exp exp =

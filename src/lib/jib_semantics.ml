@@ -41,8 +41,7 @@ let invalidate_missing present =
 let bindings evidence = List.map snd (InstructionMap.bindings evidence)
 
 let fixed_unsigned_bounds width =
-  if width < 0 then None
-  else Some (Big_int.zero, Big_int.pred (Big_int.pow_int_positive 2 width))
+  if width < 0 then None else Some (Big_int.zero, Big_int.pred (Big_int.pow_int_positive 2 width))
 
 let rec refine_comparison_bounds comparison ~truth ~left:(left_lower, left_upper) ~right:(right_lower, right_upper) =
   let interval lower upper = if Big_int.less_equal lower upper then Some (lower, upper) else None in
@@ -57,31 +56,28 @@ let rec refine_comparison_bounds comparison ~truth ~left:(left_lower, left_upper
     else Some (lower, upper)
   in
   let equal () =
-    Option.map (fun bounds -> (bounds, bounds))
-      (intersect (left_lower, left_upper) (right_lower, right_upper))
+    Option.map (fun bounds -> (bounds, bounds)) (intersect (left_lower, left_upper) (right_lower, right_upper))
   in
   let not_equal () =
     if Big_int.equal left_lower left_upper then
-      Option.map (fun right -> ((left_lower, left_upper), right))
-        (exclude left_lower (right_lower, right_upper))
+      Option.map (fun right -> ((left_lower, left_upper), right)) (exclude left_lower (right_lower, right_upper))
     else if Big_int.equal right_lower right_upper then
-      Option.map (fun left -> (left, (right_lower, right_upper)))
-        (exclude right_lower (left_lower, left_upper))
+      Option.map (fun left -> (left, (right_lower, right_upper))) (exclude right_lower (left_lower, left_upper))
     else Some ((left_lower, left_upper), (right_lower, right_upper))
   in
   let less_than () =
-    Option.bind (interval left_lower (Big_int.min left_upper (Big_int.pred right_upper))) (fun left ->
+    Option.bind
+      (interval left_lower (Big_int.min left_upper (Big_int.pred right_upper)))
+      (fun left ->
         Option.map
           (fun right -> (left, right))
           (interval (Big_int.max right_lower (Big_int.succ left_lower)) right_upper)
-    )
+      )
   in
   let less_equal () =
-    Option.bind (interval left_lower (Big_int.min left_upper right_upper)) (fun left ->
-        Option.map
-          (fun right -> (left, right))
-          (interval (Big_int.max right_lower left_lower) right_upper)
-    )
+    Option.bind
+      (interval left_lower (Big_int.min left_upper right_upper))
+      (fun left -> Option.map (fun right -> (left, right)) (interval (Big_int.max right_lower left_lower) right_upper))
   in
   match (comparison, truth) with
   | Equal, true | Not_equal, false -> equal ()
@@ -89,14 +85,13 @@ let rec refine_comparison_bounds comparison ~truth ~left:(left_lower, left_upper
   | Less_than, true | Greater_equal, false -> less_than ()
   | Less_equal, true | Greater_than, false -> less_equal ()
   | Greater_than, true | Less_equal, false ->
-      Option.map (fun (right, left) -> (left, right))
-        (refine_comparison_bounds Less_than ~truth:true ~left:(right_lower, right_upper)
-           ~right:(left_lower, left_upper)
-        )
+      Option.map
+        (fun (right, left) -> (left, right))
+        (refine_comparison_bounds Less_than ~truth:true ~left:(right_lower, right_upper) ~right:(left_lower, left_upper))
   | Greater_equal, true | Less_than, false ->
-      Option.map (fun (right, left) -> (left, right))
-        (refine_comparison_bounds Less_equal ~truth:true ~left:(right_lower, right_upper)
-           ~right:(left_lower, left_upper)
+      Option.map
+        (fun (right, left) -> (left, right))
+        (refine_comparison_bounds Less_equal ~truth:true ~left:(right_lower, right_upper) ~right:(left_lower, left_upper)
         )
 
 let nonnegative_upper = function
@@ -125,8 +120,7 @@ let unsigned_cover upper = Option.bind (unsigned_width upper) (fun width -> fixe
 
 let slice_result_bounds ~width ~source ~start =
   match (fixed_unsigned_bounds width, nonnegative_upper source, start) with
-  | Some (_, width_upper), Some source_upper, Some (start_lower, _)
-    when Big_int.less_equal Big_int.zero start_lower ->
+  | Some (_, width_upper), Some source_upper, Some (start_lower, _) when Big_int.less_equal Big_int.zero start_lower ->
       let shifted_upper =
         match unsigned_width source_upper with
         | Some source_width when Big_int.greater_equal start_lower (Big_int.of_int source_width) -> Big_int.zero
@@ -143,7 +137,7 @@ let concat_result_bounds ~right_width ~left ~right =
   | Some left_upper, Some right_upper, Some (_, right_width_upper) ->
       let shifted_left = Big_int.mul left_upper (Big_int.pow_int_positive 2 right_width) in
       Some (Big_int.zero, Big_int.add shifted_left (Big_int.min right_upper right_width_upper))
-  | (Some _, Some _, None) | (None, _, _) | (_, None, _) -> None
+  | Some _, Some _, None | None, _, _ | _, None, _ -> None
 
 let bitwise_and_result_bounds ~left ~right =
   match (nonnegative_upper left, nonnegative_upper right) with
@@ -163,9 +157,10 @@ let bit_insert_result_bounds ~carrier_width ~base ~start ~inserted =
       | Some base_width, Some inserted_width ->
           let occupied_width =
             if Big_int.greater start_upper (Big_int.of_int carrier_width) then carrier_width
-            else
+            else (
               let start_upper = Big_int.to_int start_upper in
               if inserted_width >= carrier_width - start_upper then carrier_width else start_upper + inserted_width
+            )
           in
           let result_width = min carrier_width (max base_width occupied_width) in
           Option.map
@@ -236,8 +231,7 @@ let prove_argument_excludes_interval ~index ~interval ~value =
     Some { semantic_relation = Argument_excludes (index, value); semantic_proof_method }
   in
   match interval with
-  | Some (actual_lower, actual_upper)
-    when Big_int.less value actual_lower || Big_int.greater value actual_upper ->
+  | Some (actual_lower, actual_upper) when Big_int.less value actual_lower || Big_int.greater value actual_upper ->
       proof Proof_interval
   | Some _ | None -> None
 
@@ -249,11 +243,7 @@ let prove_argument_excludes ~env ~index ~typ ~interval ~value =
       | Some (env, actual_lower, actual_upper)
         when Type_check.prove __POS__ env (nc_lt actual_upper (nconstant value))
              || Type_check.prove __POS__ env (nc_lt (nconstant value) actual_lower) ->
-          Some
-            {
-              semantic_relation = Argument_excludes (index, value);
-              semantic_proof_method = Proof_type_constraint;
-            }
+          Some { semantic_relation = Argument_excludes (index, value); semantic_proof_method = Proof_type_constraint }
       | Some _ | None -> None
     )
 
@@ -298,18 +288,15 @@ let prove_conversion_low_bits ~source_width ~target_width =
 
 let prove_shift_count_interval ~index ~interval ~carrier_width =
   if carrier_width <= 0 then None
-  else
+  else (
     let lower = Big_int.zero in
     let upper = Big_int.of_int (carrier_width - 1) in
     match interval with
     | Some (actual_lower, actual_upper)
       when Big_int.less_equal lower actual_lower && Big_int.less_equal actual_upper upper ->
-        Some
-          {
-            semantic_relation = Shift_count_bounds (index, lower, upper);
-            semantic_proof_method = Proof_interval;
-          }
+        Some { semantic_relation = Shift_count_bounds (index, lower, upper); semantic_proof_method = Proof_interval }
     | Some _ | None -> None
+  )
 
 let prove_shift_count_bounds ~env ~index ~typ ~interval ~carrier_width =
   match prove_shift_count_interval ~index ~interval ~carrier_width with
@@ -355,8 +342,7 @@ let has_argument_excludes ~index ~value proofs =
   List.exists
     (fun proof ->
       match proof.semantic_relation with
-      | Argument_excludes (proof_index, proof_value) ->
-          proof_index = index && Big_int.equal proof_value value
+      | Argument_excludes (proof_index, proof_value) -> proof_index = index && Big_int.equal proof_value value
       | Argument_le _ | Argument_bounds _ | Result_bounds _ | Result_nonnegative | Conversion_value_preserving _
       | Signed_conversion_value_preserving _ | Conversion_low_bits _ | Shift_count_bounds _ ->
           false
@@ -393,8 +379,7 @@ let has_conversion_value_preserving ~source_width ~target_width proofs =
       | Conversion_value_preserving (proof_source, proof_target) ->
           proof_source = source_width && proof_target = target_width
       | Argument_le _ | Argument_bounds _ | Argument_excludes _ | Result_bounds _ | Result_nonnegative
-      | Signed_conversion_value_preserving _
-      | Conversion_low_bits _ | Shift_count_bounds _ ->
+      | Signed_conversion_value_preserving _ | Conversion_low_bits _ | Shift_count_bounds _ ->
           false
     )
     proofs
@@ -406,8 +391,7 @@ let has_signed_conversion_value_preserving ~source_width ~target_width proofs =
       | Signed_conversion_value_preserving (proof_source, proof_target) ->
           proof_source = source_width && proof_target = target_width
       | Argument_le _ | Argument_bounds _ | Argument_excludes _ | Result_bounds _ | Result_nonnegative
-      | Conversion_value_preserving _
-      | Conversion_low_bits _ | Shift_count_bounds _ ->
+      | Conversion_value_preserving _ | Conversion_low_bits _ | Shift_count_bounds _ ->
           false
     )
     proofs
@@ -418,8 +402,7 @@ let has_conversion_low_bits ~source_width ~target_width proofs =
       match proof.semantic_relation with
       | Conversion_low_bits (proof_source, proof_target) -> proof_source = source_width && proof_target = target_width
       | Argument_le _ | Argument_bounds _ | Argument_excludes _ | Result_bounds _ | Result_nonnegative
-      | Conversion_value_preserving _
-      | Signed_conversion_value_preserving _ | Shift_count_bounds _ ->
+      | Conversion_value_preserving _ | Signed_conversion_value_preserving _ | Shift_count_bounds _ ->
           false
     )
     proofs
@@ -433,8 +416,7 @@ let has_shift_count_bounds ~index ~carrier_width proofs =
       | Shift_count_bounds (proof_index, proof_lower, proof_upper) ->
           proof_index = index && Big_int.less_equal lower proof_lower && Big_int.less_equal proof_upper upper
       | Argument_le _ | Argument_bounds _ | Argument_excludes _ | Result_bounds _ | Result_nonnegative
-      | Conversion_value_preserving _
-      | Signed_conversion_value_preserving _ | Conversion_low_bits _ ->
+      | Conversion_value_preserving _ | Signed_conversion_value_preserving _ | Conversion_low_bits _ ->
           false
     )
     proofs

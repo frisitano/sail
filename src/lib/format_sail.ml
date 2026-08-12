@@ -515,9 +515,7 @@ let direct_else_if chunks =
   match List.of_seq (Queue.to_seq chunks) with
   | [If_then_else _] | [If_then _] -> Some chunks
   | [Block (true, [nested])] -> (
-      match List.of_seq (Queue.to_seq nested) with
-      | [If_then_else _] | [If_then _] -> Some nested
-      | _ -> None
+      match List.of_seq (Queue.to_seq nested) with [If_then_else _] | [If_then _] -> Some nested | _ -> None
     )
   | _ -> None
 
@@ -637,14 +635,16 @@ module Make (Config : CONFIG) = struct
         let else_if = if preserve_structure then None else direct_else_if e in
         let e = Option.value ~default:e else_if in
         let then_brace, t =
-          if (not opts.statement) && not preserve_structure then
+          if (not opts.statement) && not preserve_structure then (
             match direct_branch_expression t with Some t -> (false, t) | None -> (bracing.then_brace, t)
+          )
           else (bracing.then_brace, t)
         in
         let else_brace, e =
           if Option.is_some else_if then (false, e)
-          else if (not opts.statement) && not preserve_structure then
+          else if (not opts.statement) && not preserve_structure then (
             match direct_branch_expression e with Some e -> (false, e) | None -> (bracing.else_brace, e)
+          )
           else (bracing.else_brace, e)
         in
         let have_braces = then_brace || else_brace in
@@ -656,7 +656,7 @@ module Make (Config : CONFIG) = struct
           else doc_chunks (opts |> nonatomic |> expression_like) t
         in
         let e =
-          if insert_braces && not else_brace && Option.is_none else_if then doc_forced_block opts [e]
+          if insert_braces && (not else_brace) && Option.is_none else_if then doc_forced_block opts [e]
           else if else_brace then doc_conditional_branch opts e
           else if Option.is_some else_if then doc_chunks (nonatomic opts) e
           else doc_chunks (opts |> nonatomic |> expression_like) e
@@ -674,11 +674,8 @@ module Make (Config : CONFIG) = struct
           let doc = doc_chunks (opts |> nonatomic |> expression_like) chunks in
           match Queue.peek_opt chunks with Some (Type_if_then_else _) -> parens doc | _ -> doc
         in
-        string "if" ^^ space
-        ^^ doc_infix_typ i
-        ^^ break 1 ^^ string "then" ^^ space
-        ^^ doc_infix_typ t
-        ^^ break 1 ^^ string "else" ^^ space
+        string "if" ^^ space ^^ doc_infix_typ i ^^ break 1 ^^ string "then" ^^ space ^^ doc_infix_typ t ^^ break 1
+        ^^ string "else" ^^ space
         ^^ doc_chunks (opts |> nonatomic |> expression_like) e
         |> atomic_parens opts |> align |> group
     | If_then (bracing, i, t) ->
@@ -906,9 +903,7 @@ module Make (Config : CONFIG) = struct
 
   and doc_forced_block opts exps =
     let exps =
-      map_last
-        (fun no_semi chunks -> doc_block_exp_chunks (opts |> nonatomic |> statement_like) no_semi chunks)
-        exps
+      map_last (fun no_semi chunks -> doc_block_exp_chunks (opts |> nonatomic |> statement_like) no_semi chunks) exps
     in
     let exps = List.map fst exps in
     surround_hardline true indent 1 (char '{') (separate hardline exps) (char '}') |> atomic_parens opts

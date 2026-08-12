@@ -56,23 +56,28 @@ let () =
         (I_if
            ( id condition CT_bool,
              [instr (I_copy (CL_id (split, CT_bool), bool true))],
-             [instr (I_copy (CL_id (split, CT_bool), bool true))] ));
+             [instr (I_copy (CL_id (split, CT_bool), bool true))]
+           )
+        );
       instr
         (I_if
            ( id condition CT_bool,
              [instr (I_copy (CL_id (split, CT_bool), bool true))],
-             [instr (I_copy (CL_id (split, CT_bool), bool false))] ));
+             [instr (I_copy (CL_id (split, CT_bool), bool false))]
+           )
+        );
       instr
         (I_if
-           ( id condition CT_bool,
-             [instr (I_return (bool true))],
-             [instr (I_copy (CL_id (split, CT_bool), bool false))] ));
+           (id condition CT_bool, [instr (I_return (bool true))], [instr (I_copy (CL_id (split, CT_bool), bool false))])
+        );
       instr (I_decl (CT_bool, partial));
       instr
         (I_if
            ( id condition CT_bool,
              [instr (I_copy (CL_id (partial, CT_bool), bool true))],
-             [instr (I_comment "falls through without an assignment")] ));
+             [instr (I_comment "falls through without an assignment")]
+           )
+        );
       instr (I_return (id partial CT_bool));
       instr (I_copy (CL_id (split, CT_bool), id split CT_bool));
       instr (I_init (CT_bool, unnamed, Init_cval (V_call (Bnot, [V_call (Bnot, [bool true])]))));
@@ -116,27 +121,23 @@ let () =
       instr (I_copy (CL_id (rewritten, CT_bool), bool false));
       instr (I_funcall (CR_one (CL_id (call_result, CT_bool)), Extern CT_bool, (mk_id "observe", []), []));
       instr (I_if (id condition CT_bool, [instr (I_comment "nonempty")], []));
-      instr
-        (I_if
-           ( id condition CT_bool,
-             [instr (I_comment "left")],
-             [instr (I_comment "right")] ));
+      instr (I_if (id condition CT_bool, [instr (I_comment "left")], [instr (I_comment "right")]));
       instr
         (I_if
            ( id condition CT_bool,
              [instr (I_copy (CL_id (semantic, CT_bool), bool true))],
-             [instr (I_copy (CL_id (rewritten, CT_bool), bool false))] ));
-      instr
-        (I_if
-           ( id condition CT_bool,
-             [instr (I_comment "continues")],
-             [instr (I_return (bool false))] ));
+             [instr (I_copy (CL_id (rewritten, CT_bool), bool false))]
+           )
+        );
+      instr (I_if (id condition CT_bool, [instr (I_comment "continues")], [instr (I_return (bool false))]));
       instr (I_decl (CT_bool, safely_partial));
       instr
         (I_if
            ( id condition CT_bool,
              [instr (I_copy (CL_id (safely_partial, CT_bool), bool true))],
-             [instr (I_return (bool false))] ));
+             [instr (I_return (bool false))]
+           )
+        );
       instr (I_return (id safely_partial CT_bool));
       instr (I_copy (CL_id (semantic, CT_bool), id multi_use CT_bool));
     ]

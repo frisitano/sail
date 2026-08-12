@@ -38,14 +38,12 @@ val bindings : t -> evidence list
 (** Inclusive bounds for an unsigned value represented by exactly [width] bits. *)
 val fixed_unsigned_bounds : int -> integer_interval option
 
-(** Structurally prove that [mask] is exactly the low [n] one-bits of a
-    [carrier_width]-bit unsigned word, returning [n]. Zero, negative,
-    non-contiguous, and over-wide masks are rejected. *)
+(** Structurally prove that [mask] is exactly the low [n] one-bits of a [carrier_width]-bit unsigned word, returning
+    [n]. Zero, negative, non-contiguous, and over-wide masks are rejected. *)
 val prove_low_mask_width : carrier_width:int -> mask:Nat_big_num.num -> int option
 
-(** Refine the inclusive bounds of both operands on one edge of an integer
-    comparison. [None] means the edge is infeasible. This is a semantic range
-    operation and deliberately does not select a target representation. *)
+(** Refine the inclusive bounds of both operands on one edge of an integer comparison. [None] means the edge is
+    infeasible. This is a semantic range operation and deliberately does not select a target representation. *)
 val refine_comparison_bounds :
   comparison ->
   truth:bool ->
@@ -53,16 +51,15 @@ val refine_comparison_bounds :
   right:integer_interval ->
   (integer_interval * integer_interval) option
 
-(** Derive composable unsigned result bounds from fixed-width bit operations. These rules are deliberately
-    independent of any C representation: later graph and lowering passes may consume the same facts. *)
+(** Derive composable unsigned result bounds from fixed-width bit operations. These rules are deliberately independent
+    of any C representation: later graph and lowering passes may consume the same facts. *)
 val slice_result_bounds :
   width:int -> source:integer_interval option -> start:integer_interval option -> integer_interval option
 
 val concat_result_bounds :
   right_width:int -> left:integer_interval option -> right:integer_interval option -> integer_interval option
 
-val bitwise_and_result_bounds :
-  left:integer_interval option -> right:integer_interval option -> integer_interval option
+val bitwise_and_result_bounds : left:integer_interval option -> right:integer_interval option -> integer_interval option
 
 val bitwise_union_result_bounds :
   left:integer_interval option -> right:integer_interval option -> integer_interval option
@@ -101,9 +98,8 @@ val prove_argument_bounds :
   upper:Nat_big_num.num ->
   semantic_proof option
 
-(** Prove that no value denoted by a call argument is equal to [value].
-    This is useful for semantic definedness obligations such as a nonzero
-    divisor and the signed MIN / -1 overflow exclusion. *)
+(** Prove that no value denoted by a call argument is equal to [value]. This is useful for semantic definedness
+    obligations such as a nonzero divisor and the signed MIN / -1 overflow exclusion. *)
 val prove_argument_excludes :
   env:Env.t ->
   index:int ->
@@ -112,9 +108,8 @@ val prove_argument_excludes :
   value:Nat_big_num.num ->
   semantic_proof option
 
-(** Prove that an argument interval excludes one value. This interval-only
-    form is used after call-graph and path refinement have made a source value
-    more precise than its declared type. *)
+(** Prove that an argument interval excludes one value. This interval-only form is used after call-graph and path
+    refinement have made a source value more precise than its declared type. *)
 val prove_argument_excludes_interval :
   index:int -> interval:integer_interval option -> value:Nat_big_num.num -> semantic_proof option
 
@@ -141,15 +136,13 @@ val prove_conversion_low_bits : source_width:int -> target_width:int -> semantic
 val prove_shift_count_bounds :
   env:Env.t -> index:int -> typ:typ -> interval:integer_interval option -> carrier_width:int -> semantic_proof option
 
-(** Prove a defined native shift directly from an inferred interval. This is
-    used after path analysis, when the source Sail type is no longer attached
-    to the JIB value but the branch-refined semantic interval is available. *)
+(** Prove a defined native shift directly from an inferred interval. This is used after path analysis, when the source
+    Sail type is no longer attached to the JIB value but the branch-refined semantic interval is available. *)
 val prove_shift_count_interval :
   index:int -> interval:integer_interval option -> carrier_width:int -> semantic_proof option
 
-(** Prove that a fixed-width bit insertion position keeps the entire inserted
-    value within its carrier. The resulting argument-bounds certificate lets
-    a backend select an unchecked native mask/shift implementation. *)
+(** Prove that a fixed-width bit insertion position keeps the entire inserted value within its carrier. The resulting
+    argument-bounds certificate lets a backend select an unchecked native mask/shift implementation. *)
 val prove_bit_insert_position_bounds :
   env:Env.t ->
   index:int ->

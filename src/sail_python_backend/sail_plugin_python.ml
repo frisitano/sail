@@ -200,10 +200,9 @@ let python_target out_file { ast; effect_info; env; _ } =
     let package_root = package_path out_file in
     ensure_directory package_root;
     Python_backend.generate_package ?runtime_module:!opt_runtime_module ?extern_module:!opt_extern_module
-      ?source_root:!opt_source_root
-      ~preserve_structure:!opt_preserve_structure ~source_val_specs:!source_val_specs
-      ~pydantic:!opt_pydantic ~ethereum_fixed_bytes:!opt_ethereum_fixed_bytes
-      ~package_name:(package_name package_root) env effect_info ast
+      ?source_root:!opt_source_root ~preserve_structure:!opt_preserve_structure ~source_val_specs:!source_val_specs
+      ~pydantic:!opt_pydantic ~ethereum_fixed_bytes:!opt_ethereum_fixed_bytes ~package_name:(package_name package_root)
+      env effect_info ast
     |> add_import_files
     |> List.iter (write_generated_file package_root)
   )
@@ -215,8 +214,7 @@ let python_target out_file { ast; effect_info; env; _ } =
         );
     let generated =
       Python_backend.generate ?runtime_module:!opt_runtime_module ?extern_module:!opt_extern_module
-        ~preserve_structure:!opt_preserve_structure
-        ~source_val_specs:!source_val_specs ~pydantic:!opt_pydantic
+        ~preserve_structure:!opt_preserve_structure ~source_val_specs:!source_val_specs ~pydantic:!opt_pydantic
         ~ethereum_fixed_bytes:!opt_ethereum_fixed_bytes env effect_info ast
     in
     let output = Util.open_output_with_check (output_path out_file) in

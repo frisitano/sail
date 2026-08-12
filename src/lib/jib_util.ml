@@ -193,8 +193,7 @@ let string_of_op = function
   | Proven_bvshiftl n -> "@proven_bvshiftl::<" ^ string_of_int n ^ ">"
   | Proven_bvshiftr n -> "@proven_bvshiftr::<" ^ string_of_int n ^ ">"
   | Proven_bvarith_shiftr n -> "@proven_bvarith_shiftr::<" ^ string_of_int n ^ ">"
-  | Bvrotr (width, amount) ->
-      "@bvrotr::<" ^ string_of_int width ^ "," ^ string_of_int amount ^ ">"
+  | Bvrotr (width, amount) -> "@bvrotr::<" ^ string_of_int width ^ "," ^ string_of_int amount ^ ">"
   | Bvaccess -> "@bvaccess"
   | Ilt -> "@lt"
   | Igt -> "@gt"
@@ -225,8 +224,7 @@ let string_of_op = function
   | Zero_extend n -> "@zero_extend::<" ^ string_of_int n ^ ">"
   | Sign_extend n -> "@sign_extend::<" ^ string_of_int n ^ ">"
   | Slice n -> "@slice::<" ^ string_of_int n ^ ">"
-  | Proven_slice (n, carrier) ->
-      "@proven_slice::<" ^ string_of_int n ^ "," ^ string_of_int carrier ^ ">"
+  | Proven_slice (n, carrier) -> "@proven_slice::<" ^ string_of_int n ^ "," ^ string_of_int carrier ^ ">"
   | Sslice n -> "@sslice::<" ^ string_of_int n ^ ">"
   | Replicate n -> "@replicate::<" ^ string_of_int n ^ ">"
   | Set_slice -> "@set_slice"
