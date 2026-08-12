@@ -331,6 +331,10 @@ let c_options =
       Arg.Set C_backend.optimize_inline_attr,
       "inline calls to $[c_inline]-annotated Sail functions in generated C"
     );
+    ( Flag.create ~prefix:["c"] "always_inline_attr",
+      Arg.Set C_backend.optimize_always_inline_attr,
+      "emit C __always_inline__ attributes for $[c_inline]-annotated Sail functions"
+    );
     ( Flag.create ~prefix:["c"] "narrowing",
       Arg.Symbol
         ( ["checked"; "proven"; "all"],

@@ -84,6 +84,10 @@ val optimize_dead_letbinds : bool ref
 (** Inline calls to $[c_inline]-annotated functions in generated C (--c-inline-attr). *)
 val optimize_inline_attr : bool ref
 
+(** Emit C [__always_inline__] attributes on $[c_inline]-annotated function declarations and definitions
+    (--c-always-inline-attr). *)
+val optimize_always_inline_attr : bool ref
+
 module type CODEGEN_CONFIG = sig
   (** A list of includes for the generated C file *)
   val includes : string list

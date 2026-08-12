@@ -67,29 +67,32 @@ let scan_ast { defs; _ } =
   in
   List.fold_left scan (IdSet.empty, Bindings.empty, Bindings.empty) defs
 
-let filter_old_ast repl_ids repl_specs repl_types { defs; _ } =
+let filter_old_ast repl_ids repl_specs repl_types repl_undefined_ids { defs; _ } =
   let check (rdefs, specs_found, types_found) (DEF_aux (aux, def_annot) as def) =
     match aux with
     | DEF_fundef fd ->
         let id = id_of_fundef fd in
-        if IdSet.mem id repl_ids then
+        if IdSet.mem id repl_undefined_ids then (rdefs, specs_found, types_found)
+        else if IdSet.mem id repl_ids then
           ( DEF_aux (DEF_pragma ("spliced_function#", Pragma_line (string_of_id id, def_annot.loc)), def_annot) :: rdefs,
             specs_found,
             types_found
           )
         else (def :: rdefs, specs_found, types_found)
-    | DEF_val (VS_aux (VS_val_spec (_, id, _), _)) -> (
-        match Bindings.find_opt id repl_specs with
-        (* Keep the replacement's def_annot so attribute-only val splices
+    | DEF_val (VS_aux (VS_val_spec (_, id, _), _)) ->
+        if IdSet.mem id repl_undefined_ids then (rdefs, specs_found, types_found)
+        else (
+          match Bindings.find_opt id repl_specs with
+          (* Keep the replacement's def_annot so attribute-only val splices
            (e.g. $[c_inline] on a spec-defined function) survive, mirroring
            how replacement type definitions already retain their attributes. *)
-        | Some (vs, repl_annot) ->
-            ( DEF_aux (DEF_val vs, { repl_annot with loc = def_annot.loc }) :: rdefs,
-              IdSet.add id specs_found,
-              types_found
-            )
-        | None -> (def :: rdefs, specs_found, types_found)
-      )
+          | Some (vs, repl_annot) ->
+              ( DEF_aux (DEF_val vs, { repl_annot with loc = def_annot.loc }) :: rdefs,
+                IdSet.add id specs_found,
+                types_found
+              )
+          | None -> (def :: rdefs, specs_found, types_found)
+        )
     | DEF_type td -> (
         let id = id_of_type_def td in
         match Bindings.find_opt id repl_types with
@@ -142,7 +145,16 @@ let splice ctx ast file =
   let repl_ast = map_ast_annot (fun (l, _) -> (l, Type_check.empty_tannot)) repl_ast in
   let repl_ast = annotate_ast repl_ast in
   let repl_ids, repl_specs, repl_types = scan_ast repl_ast in
-  let defs1, specs_found, types_found = filter_old_ast repl_ids repl_specs repl_types ast in
+  let repl_undefined_ids =
+    Bindings.fold
+      (fun id def ids ->
+        match def with
+        | DEF_aux (DEF_type (TD_aux ((TD_record _ | TD_enum _), _)), _) -> IdSet.add (prepend_id "undefined_" id) ids
+        | _ -> ids
+      )
+      repl_types IdSet.empty
+  in
+  let defs1, specs_found, types_found = filter_old_ast repl_ids repl_specs repl_types repl_undefined_ids ast in
   let defs2 = filter_replacements specs_found types_found repl_ast in
   { ast with defs = defs1 @ defs2 }
 

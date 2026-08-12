@@ -87,6 +87,7 @@ let optimize_fixed_bits = ref false
 let optimize_stack_aggregates = ref false
 let optimize_unit_results = ref false
 let optimize_inline_attr = ref false
+let optimize_always_inline_attr = ref false
 
 let ngensym = symbol_generator ()
 
@@ -2221,8 +2222,9 @@ let rec insert_heap_returns ctx ret_ctyps = function
 
    The attribute is read from the CDEF_fundef def_annot, so specialized
    clones (which share the annotated definition's def_annot) inline exactly
-   like their source function.  Marked functions are still emitted as
-   ordinary definitions; only their call sites change.
+   like their source function.  This option changes only call sites.
+   --c-always-inline-attr separately controls whether marked declarations and
+   definitions carry the C compiler attribute.
 
    The inliner freshens labels but not declared locals, so a caller and an
    inlined body may declare the same source-named local.  The later custom
@@ -2233,21 +2235,22 @@ let c_inline_attribute = "c_inline"
 
 let has_c_inline_attribute def_annot = Option.is_some (get_def_attribute c_inline_attribute def_annot)
 
-(* Copy $[c_inline] from val specs onto their function definitions: the
-   optimized model attaches the attribute through attribute-only val splices,
-   and jib_compile builds each CDEF_fundef def_annot from the DEF_fundef. *)
+(* Keep $[c_inline] on both the val spec and function definition.  The JIB
+   inliner reads the definition annotation, while modular C emission uses the
+   val annotation for the public declaration consumed by hand-written C. *)
 let propagate_inline_attributes ast =
   let open Ast_defs in
-  let annotated_specs =
+  let annotated_functions =
     List.fold_left
       (fun ids (DEF_aux (def, def_annot)) ->
         match def with
         | DEF_val (VS_aux (VS_val_spec (_, id, _), _)) when has_c_inline_attribute def_annot -> IdSet.add id ids
+        | DEF_fundef fd when has_c_inline_attribute def_annot -> IdSet.add (id_of_fundef fd) ids
         | _ -> ids
       )
       IdSet.empty ast.defs
   in
-  if IdSet.is_empty annotated_specs then ast
+  if IdSet.is_empty annotated_functions then ast
   else
     {
       ast with
@@ -2255,8 +2258,11 @@ let propagate_inline_attributes ast =
         List.map
           (fun (DEF_aux (def, def_annot) as full_def) ->
             match def with
-            | DEF_fundef fd when IdSet.mem (id_of_fundef fd) annotated_specs && not (has_c_inline_attribute def_annot)
-              ->
+            | DEF_val (VS_aux (VS_val_spec (_, id, _), _))
+              when IdSet.mem id annotated_functions && not (has_c_inline_attribute def_annot) ->
+                DEF_aux (def, add_def_attribute (gen_loc def_annot.loc) c_inline_attribute None def_annot)
+            | DEF_fundef fd
+              when IdSet.mem (id_of_fundef fd) annotated_functions && not (has_c_inline_attribute def_annot) ->
                 DEF_aux (def, add_def_attribute (gen_loc def_annot.loc) c_inline_attribute None def_annot)
             | _ -> full_def
           )
@@ -11986,7 +11992,12 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             )
         )
 
-  let codegen_def' ctx (CDEF_aux (aux, _)) =
+  let codegen_def' ctx (CDEF_aux (aux, def_annot)) =
+    let inline_attribute =
+      if !optimize_always_inline_attr && has_c_inline_attribute def_annot then
+        string "__attribute__((__always_inline__)) "
+      else empty
+    in
     match aux with
     | CDEF_register (id, _, _) when register_file_member id ->
         (* This register is a member of the model register file: its field,
@@ -12050,6 +12061,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
            deletion covers zero-argument calls.  Generated translation units
            define the guard and spell the leading argument directly instead. *)
         let with_call_compat declaration =
+          let declaration = inline_attribute ^^ declaration in
           if not thread_regs then [FunctionDeclaration declaration]
           else
             [
@@ -12068,7 +12080,9 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         if is_fatal_error then
           [
             FunctionDeclaration
-              (string (Printf.sprintf "_Noreturn void %s(%s);" function_name (c_parameter_list parameters)));
+              (inline_attribute
+              ^^ string (Printf.sprintf "_Noreturn void %s(%s);" function_name (c_parameter_list parameters))
+              );
           ]
         else if Option.is_some external_name && not Config.optimized_model then []
         else if erase_unit_values && ctyp_equal ret_ctyp CT_unit then
@@ -12156,6 +12170,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           let unused_parameter_markers = separate hardline unused_parameters in
           let c_args = c_parameter_list ~thread_regs named_parameters in
           let function_header =
+            inline_attribute
+            ^^
             match ret_arg with
             | Return_plain ->
                 assert (is_stack_ctyp ctx ret_ctyp);
@@ -13232,7 +13248,9 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           format
       in
       let self_dependent_assignments = self_dependent_assignments ast in
-      let ast = if !optimize_inline_attr then propagate_inline_attributes ast else ast in
+      let ast =
+        if !optimize_inline_attr || !optimize_always_inline_attr then propagate_inline_attributes ast else ast
+      in
       log_phase "lowering Sail AST to JIB";
       let cdefs, ctx = jib_of_ast env effect_info ast in
       log_phase "lowered JIB definitions=%d" (List.length cdefs);
