@@ -67,9 +67,20 @@ jobs:
           echo "attempt ${attempt} failed, retrying"
           sleep $((attempt * 5))
         done
-        unzip -q /tmp/z3.zip -d /tmp/z3
-        echo "/tmp/z3/${dir}/bin" >> "$GITHUB_PATH"
-        /tmp/z3/${dir}/bin/z3 --version
+        if [ -s /tmp/z3.zip ]; then
+          unzip -q /tmp/z3.zip -d /tmp/z3
+          echo "/tmp/z3/${dir}/bin" >> "$GITHUB_PATH"
+          /tmp/z3/${dir}/bin/z3 --version
+        else
+          # The release CDN has been returning 503 for these runners. The same
+          # build is on PyPI behind a different CDN, so fall back to it rather
+          # than to the distribution package, which is 4.8.x and would make
+          # this leg's solving incomparable with the others.
+          echo "release download failed; falling back to the PyPI wheel"
+          pipx install "z3-solver==${ver}.0" || pip install --user "z3-solver==${ver}.0"
+          python3 -c "import z3, os, pathlib; print(pathlib.Path(z3.__file__).parent / 'bin')" >> "$GITHUB_PATH"
+          z3 --version || true
+        fi
 
     - name: Setup Z3
       id: z3
@@ -104,6 +115,12 @@ jobs:
       run: |
         opam pin --yes --no-action add .
         opam install sail --yes
+
+    # test/run_core_tests.sh runs test/python/run_tests.py, whose generated
+    # code imports ethereum_types.
+    - name: Python test dependencies
+      if: runner.os != 'Windows'
+      run: pip install --user --break-system-packages ethereum-types==0.4.1 || pip install --user ethereum-types==0.4.1
 
     - name: Test Sail
       # Tests use lots of unix-isms currently (fork, mkdir -p, etc).

@@ -1,12 +1,11 @@
-# Backend regression suites that the matrix workflows do not cover.
+# Coq backend regression cases.
 #
-# The matrix workflows build across several operating systems and OCaml
-# versions and run test/run_tests.sh. That script does not include the Python
-# backend suite, and there is no Coq test harness at all, so both only ever
-# run by hand.
+# The matrix workflows run test/run_core_tests.sh, which covers the C, SMT,
+# Lean and Python suites among others. Nothing runs the cases under test/coq/
+# -- there is no Coq test harness -- so without this they only run by hand.
 #
-# This builds Sail once and runs each.
-name: Backend suites
+# One Linux build, asserting the generated Coq for each case.
+name: Coq backend
 
 on: [push, pull_request, workflow_dispatch]
 
@@ -14,7 +13,7 @@ env:
   OPAMVERBOSE: 1
 
 jobs:
-  backends:
+  coq-backend:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -84,18 +83,3 @@ jobs:
           opam exec -- sail --coq --coq-output-dir /tmp/c_again -o c \
             test/coq/constraint_obligations.sail
           diff /tmp/c_off/c.v /tmp/c_again/c.v
-
-      # test/python/run_tests.py is not run by test/run_tests.sh. It compares
-      # generated Python against checked-in goldens; a developer who believes a
-      # difference is correct reruns it with --update-goldens so the new golden
-      # lands as a reviewable diff. CI must never pass that flag -- a golden
-      # that regenerates itself always matches and detects nothing.
-      - name: Python backend suite
-        run: |
-          pipx install uv || pip install uv
-          # opam install does not leave a _build tree, so the harness's default
-          # binary path does not exist here; point it at the installed sail.
-          SAIL="$(opam exec -- which sail)"
-          cd test/python
-          SAIL="$SAIL" uv run --no-project --with ethereum-types==0.4.1 \
-            python run_tests.py
