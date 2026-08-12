@@ -20,3 +20,17 @@ sail --coq --coq-output-dir OUT -o m test/coq/<case>.sail
 
 - `mutrec_all_measured.sail` — the same group with measures on both
   members. Generates, and the generated Coq compiles.
+
+- `constraint_obligations.sail` — a function with a `forall 'n, 0 <= 'n &
+  'n < 256` constraint, plus a caller. By default the constraint is emitted
+  as a comment, so the Coq type admits values the Sail type forbids and any
+  downstream proof re-derives the bound by hand. Under
+  `--coq-constraint-obligations` it becomes a hypothesis
+  `(_sailConstraint0 : (0 <=? n) && (n <? 256) = true)` and the call site
+  supplies it with `ltac:(sail_constraint)`. Generate both ways and compile:
+
+  ```sh
+  sail --coq --coq-constraint-obligations --coq-output-dir OUT -o c \
+      test/coq/constraint_obligations.sail
+  (cd OUT && rocq c c_types.v && rocq c c.v)
+  ```

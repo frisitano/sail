@@ -74,6 +74,21 @@ let kbindings_filter_map f m =
 let separate_in sep = function [] -> empty | l -> group (sep ^^ separate sep l)
 
 let opt_undef_axioms = ref false
+
+(* Whether Sail's function constraints are carried into Coq as proof
+   obligations rather than dropped into a comment.  Sail discharges them at
+   every call site, so extraction without them yields Coq types that admit
+   values the Sail types forbid, and every downstream proof re-derives the
+   bound by hand.  Under this flag each constraint becomes an explicit
+   hypothesis `(_sailConstraint<i> : <nc> = true)` on the signature -- the
+   constraint language renders as a boolean expression, so `= true` is the
+   Coq-idiomatic reading -- and call sites fill it with `ltac:(sail_constraint)`,
+   the same shape the backend already uses for recursion budgets.
+
+   Off by default, for the same reason as the Lean flag: the obligations only
+   discharge where the surrounding types still carry the facts they need, and
+   erased `range` types on parameters and results currently do not. *)
+let opt_constraint_obligations : bool ref = ref false
 let opt_debug_on : string list ref = ref []
 let opt_extern_types : string list ref = ref []
 let opt_generate_extern_types : bool ref = ref false
@@ -1170,20 +1185,38 @@ let quant_item_id_name ctx (QI_aux (qi, _)) =
       )
   | QI_constraint _nc -> None
 
+(* Constraints render as boolean expressions, so an obligation is stated as
+   `<nc> = true`.  Numbered so that a signature carrying several constraints
+   gives each a distinct, stable name to refer to in proofs. *)
+let constraint_obligation_pp ctx env index nc =
+  parens
+    (separate space
+       [string (Printf.sprintf "_sailConstraint%i" index); colon; doc_nc_exp ctx env nc; string "= true"]
+    )
+
 let doc_quant_item_constr ?(prop_vars = false) ctx env delimit (QI_aux (qi, _)) =
   match qi with QI_id _ -> None | QI_constraint nc -> Some (comment (doc_nc_exp ctx env nc))
 
-(* At the moment these are all anonymous - when used we rely on Coq to fill
-   them in. *)
+(* Constraint quantifier items, numbered in order, as either the comment form
+   or -- under --coq-constraint-obligations -- real hypotheses. *)
+let doc_quant_item_constrs ctx env qis =
+  let is_constraint (QI_aux (qi, _)) = match qi with QI_constraint nc -> Some nc | QI_id _ -> None in
+  let ncs = List.filter_map is_constraint qis in
+  if !opt_constraint_obligations then List.mapi (fun i nc -> constraint_obligation_pp ctx env i nc) ncs
+  else List.map (fun nc -> comment (doc_nc_exp ctx env nc)) ncs
+
+(* Call sites: an anonymous underscore cannot be solved by unification for a
+   proof, so discharge with a tactic, as the recursion-budget arguments do. *)
 let quant_item_constr_name ctx (QI_aux (qi, _)) =
-  match qi with QI_id _ -> None | QI_constraint _nc -> None (*Some underscore*)
+  match qi with
+  | QI_id _ -> None
+  | QI_constraint _nc -> if !opt_constraint_obligations then Some (string "ltac:(sail_constraint)") else None
 
 let doc_typquant_items ?(prop_vars = false) ctx env delimit qis =
-  List.filter_map (doc_quant_item_id ~prop_vars ctx delimit) qis
-  @ List.filter_map (doc_quant_item_constr ~prop_vars ctx env delimit) qis
+  List.filter_map (doc_quant_item_id ~prop_vars ctx delimit) qis @ doc_quant_item_constrs ctx env qis
 
 let doc_typquant_items_separate ctx env delimit qis =
-  (List.filter_map (doc_quant_item_id ctx delimit) qis, List.filter_map (doc_quant_item_constr ctx env delimit) qis)
+  (List.filter_map (doc_quant_item_id ctx delimit) qis, doc_quant_item_constrs ctx env qis)
 
 let typquant_names_separate ctx qis =
   (List.filter_map (quant_item_id_name ctx) qis, List.filter_map (quant_item_constr_name ctx) qis)
@@ -2445,18 +2478,27 @@ let doc_exp, doc_let =
                     semantic_arg_typs
                 in
                 let () = debug_depth := !debug_depth - 1 in
+                (* Under --coq-constraint-obligations the callee carries one
+                   hypothesis per constraint of its own typquant; supply each
+                   from the caller's context by tactic. *)
+                let constraint_args =
+                  if !opt_constraint_obligations && not (is_extern || is_ctor) then
+                    List.map (fun _ -> string "ltac:(sail_constraint)") (snd (quant_split tqs))
+                  else []
+                in
                 let all =
                   match is_rec with
                   | Some (pre, post, is_measured) ->
                       (call :: (if ctxt.proof_mode then List.init pre (fun _ -> underscore) else []))
                       @ argspp
                       @ List.init post (fun _ -> underscore)
+                      @ constraint_args
                       @ if is_measured then [parens (string "_limit_reduces_bool _acc ltac:(assumption)")] else []
                   | None -> (
                       match f with
                       | Id_aux (Id x, _) when is_prefix "#rec#" x ->
-                          (call :: argspp) @ [parens (string "Zwf_guarded _")]
-                      | _ -> call :: argspp
+                          (call :: argspp) @ constraint_args @ [parens (string "Zwf_guarded _")]
+                      | _ -> (call :: argspp) @ constraint_args
                     )
                 in
                 hang 2 (flow (break 1) all)
@@ -6225,6 +6267,25 @@ let pp_ast_coq library_style (types_file, types_modules) (interface_file, interf
             string "Open Scope bool.";
             string "Open Scope Z.";
             empty;
+            ( if !opt_constraint_obligations then
+                separate hardline
+                  [
+                    comment
+                      (string
+                         "Discharges the constraint obligations carried by --coq-constraint-obligations. \
+                          Constraints are boolean expressions, so the goal is `e = true`: try the caller's \
+                          own hypotheses first, then decide the arithmetic."
+                      );
+                    string "Ltac sail_constraint :=";
+                    string "  solve [ assumption | reflexivity";
+                    string "        | apply andb_true_intro; split; sail_constraint";
+                    string "        | (apply Z.leb_le || apply Z.ltb_lt || apply Z.geb_le || apply Z.gtb_lt";
+                    string "           || apply Z.eqb_eq); lia";
+                    string "        | lia ].";
+                    empty;
+                  ]
+              else empty
+            );
             ( match library_style with
             | BBV -> empty
             | Stdpp ->

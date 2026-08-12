@@ -104,6 +104,10 @@ let make_options prefix hide =
       Arg.Set Pretty_print_coq.opt_undef_axioms,
       "generate axioms for functions that are declared but not defined"
     );
+    ( Flag.create ~prefix ~hide "constraint_obligations",
+      Arg.Set Pretty_print_coq.opt_constraint_obligations,
+      "carry Sail's function constraints into Coq as tactic-discharged proof obligations"
+    );
     ( Flag.create ~prefix ~hide "semantic_range_types",
       Arg.Unit
         (fun () ->
