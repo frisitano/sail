@@ -1,21 +1,16 @@
-# Focused CI for the evm-sail compiler branch.
+# Regression cases for the Coq backend.
 #
-# The upstream matrix workflows build across four operating systems and two
-# OCaml versions, which is the right check for upstream Sail but slow feedback
-# for a downstream compiler branch. This job answers the two questions that
-# matter here: does the custom compiler still build, and do the Coq backend
-# regression cases under test/coq/ still behave as documented?
+# The matrix workflows build across several operating systems and OCaml
+# versions, which checks that Sail compiles and its main test suite passes.
+# They do not exercise the cases under test/coq/, and the repository has no
+# Coq test harness, so those only ever run by hand.
 #
-# Those cases are otherwise unexercised -- there is no Coq test harness in the
-# repository -- so without this they only ever run by hand.
-name: evm-sail Coq backend
+# This job builds Sail once and asserts the generated Coq for each case,
+# covering recursion measures in mutual groups and the constraint-obligation
+# flag.
+name: Coq backend
 
-on:
-  push:
-    branches: [evm-sail]
-  pull_request:
-    branches: [evm-sail]
-  workflow_dispatch:
+on: [push, pull_request, workflow_dispatch]
 
 env:
   OPAMVERBOSE: 1
@@ -39,14 +34,15 @@ jobs:
         with:
           ocaml-compiler: 5.2.1
 
-      - name: Build the compiler
+      - name: Install Sail
         run: |
           opam pin --yes --no-action add .
           opam install sail --yes
 
       # A mutual recursion group where only some members declare a
-      # termination_measure used to emit Coq that cannot compile. The backend
-      # must now reject it, naming the members that need a measure.
+      # termination_measure cannot be emitted as a well-formed Coq Fixpoint:
+      # measured members carry (_reclimit, _acc) and {struct _acc} while the
+      # rest carry neither. Sail must reject it rather than emit that.
       - name: Mixed measured/unmeasured mutual group is rejected
         run: |
           set +e
@@ -62,7 +58,6 @@ jobs:
           echo "$out" | grep -q "termination_measure" || {
             echo "::error::rejected, but not with the expected diagnostic"; exit 1; }
 
-      # The same group with measures on every member must generate.
       - name: Uniformly measured mutual group generates
         run: |
           opam exec -- sail --coq --coq-output-dir /tmp/allmeasured -o m \
@@ -85,7 +80,7 @@ jobs:
           grep -q 'ltac:(sail_constraint)' /tmp/c_on/c.v || {
             echo "::error::call site does not discharge the obligation"; exit 1; }
 
-      # Turning the flag on must not change anything when it is off.
+      # The flag must not change anything when it is off.
       - name: Flag off leaves output unchanged
         run: |
           opam exec -- sail --coq --coq-output-dir /tmp/c_again -o c \
