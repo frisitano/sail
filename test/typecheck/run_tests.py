@@ -16,6 +16,13 @@ from sailtest import *
 sail_dir = get_sail_dir()
 sail = get_sail()
 
+# Diagnostics embed freshly generated type-variable names ('ex193 vs 'ex198)
+# whose numbering depends on how much of the library was loaded first, so an
+# expectation can drift without any semantic change. SAIL_UPDATE_EXPECTS=1
+# rewrites the .expect files from this run. CI must never set it: an
+# expectation that regenerates itself always matches and detects nothing.
+UPDATE_EXPECTS = os.environ.get('SAIL_UPDATE_EXPECTS') == '1'
+
 print('Sail is {}'.format(sail))
 print('Sail dir is {}'.format(sail_dir))
 
@@ -46,7 +53,10 @@ def test_pass():
                     if re.match('.+\.sail$', variantname):
                         variantbasename = os.path.splitext(os.path.basename(variantname))[0]
                         step('\'{}\' --no-memo-z3 --dsequential --no-memo-z3 --strict-bitvector pass/{}/{} 2> pass/{}/{}.error'.format(sail, basename, variantname, basename, variantbasename), expected_status = 1)
-                        step('diff pass/{}/{}.error pass/{}/{}.expect'.format(basename, variantbasename, basename, variantbasename))
+                        if UPDATE_EXPECTS:
+                            step('cp pass/{}/{}.error pass/{}/{}.expect'.format(basename, variantbasename, basename, variantbasename))
+                        else:
+                            step('diff pass/{}/{}.error pass/{}/{}.expect'.format(basename, variantbasename, basename, variantbasename))
                         step('rm pass/{}/{}.error'.format(basename, variantbasename))
                         i = i + 1
                 print_ok(filename)
@@ -84,7 +94,10 @@ def test_fail():
             tests[filename] = os.fork()
             if tests[filename] == 0:
                 step('\'{}\' --no-memo-z3 --dsequential --strict-bitvector fail/{} 2> fail/{}.error'.format(sail, filename, basename), expected_status = 1)
-                step('diff fail/{}.error fail/{}.expect'.format(basename, basename))
+                if UPDATE_EXPECTS:
+                    step('cp fail/{}.error fail/{}.expect'.format(basename, basename))
+                else:
+                    step('diff fail/{}.error fail/{}.expect'.format(basename, basename))
                 step('rm fail/{}.error'.format(basename))
                 print_ok(filename)
                 sys.exit()
