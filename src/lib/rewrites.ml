@@ -4460,7 +4460,7 @@ let rewrite_explicit_measure_with_fuel use_nat_fuel effect_info env ast =
            principled recursion budget to synthesise for a member that has
            declared none -- a public entry point needs its own measure -- so
            require the termination story to be stated rather than guessed. *)
-        if (not (IdSet.is_empty recset)) && not (IdSet.equal recset group) then begin
+        if (not (IdSet.is_empty recset)) && not (IdSet.equal recset group) then (
           let missing = IdSet.diff group recset in
           let names ids = String.concat ", " (List.map string_of_id (IdSet.elements ids)) in
           raise
@@ -4470,7 +4470,7 @@ let rewrite_explicit_measure_with_fuel use_nat_fuel effect_info env ast =
               ^ names missing
                )
             )
-        end;
+        );
         let fds, extras = List.split (List.map (rewrite_function recset) fds) in
         let extras = List.concat extras in
         DEF_aux (DEF_internal_mutrec fds, def_annot) :: List.map (fun f -> DEF_aux (DEF_fundef f, def_annot)) extras
