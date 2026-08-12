@@ -4447,7 +4447,30 @@ let rewrite_explicit_measure_with_fuel use_nat_fuel effect_info env ast =
         (* Only measured functions receive a #rec# helper.  Internal mutual
            groups may also contain structurally recursive functions; rewriting
            calls to those functions would target helpers that do not exist. *)
-        let recset = IdSet.filter (fun id -> Bindings.mem id measures) (ids_of_def d) in
+        let group = ids_of_def d in
+        let recset = IdSet.filter (fun id -> Bindings.mem id measures) group in
+        (* A mutual group must be uniformly measured or uniformly unmeasured.
+           Mixing the two silently produced ill-formed Coq: measured members
+           carry the (_reclimit, _acc) pair and a {struct _acc} annotation
+           while unmeasured members carry neither, so the emitted mutual
+           Fixpoint has no decreasing argument for every branch ("Cannot guess
+           decreasing argument of fix").  Unmeasured members also call the
+           measured members' entry-point wrappers, which are emitted after the
+           block and are therefore not in scope inside it.  There is no
+           principled recursion budget to synthesise for a member that has
+           declared none -- a public entry point needs its own measure -- so
+           require the termination story to be stated rather than guessed. *)
+        if (not (IdSet.is_empty recset)) && not (IdSet.equal recset group) then begin
+          let missing = IdSet.diff group recset in
+          let names ids = String.concat ", " (List.map string_of_id (IdSet.elements ids)) in
+          raise
+            (Reporting.err_general def_annot.loc
+               ("Mutually recursive group [" ^ names group
+              ^ "] mixes functions with and without a termination_measure. Add a termination_measure for: "
+              ^ names missing
+               )
+            )
+        end;
         let fds, extras = List.split (List.map (rewrite_function recset) fds) in
         let extras = List.concat extras in
         DEF_aux (DEF_internal_mutrec fds, def_annot) :: List.map (fun f -> DEF_aux (DEF_fundef f, def_annot)) extras
