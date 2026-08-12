@@ -21,10 +21,16 @@ jobs:
       - name: System dependencies
         run: sudo apt-get install -y build-essential libgmp-dev
 
+      # Same pinned Z3, same reason, as the build matrix -- see build.yml for
+      # why this goes through the wheel rather than cda-tum/setup-z3.
       - name: Setup Z3
-        uses: cda-tum/setup-z3@v1
-        with:
-          version: 4.15.3
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/z3venv"
+          "${RUNNER_TEMP}/z3venv/bin/python" -m pip install --quiet \
+            --disable-pip-version-check "z3-solver==4.15.3.0"
+          echo "${RUNNER_TEMP}/z3venv/bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/z3venv/bin/z3" --version
 
       - name: Set-up OCaml
         uses: ocaml/setup-ocaml@v3

@@ -45,49 +45,30 @@ jobs:
       if: runner.os == 'Windows'
       run: vcpkg install gmp
 
-    # cda-tum/setup-z3 fails on linux/arm64 with 'socket hang up' while
-    # fetching the release -- reproduced on consecutive runs, same leg, same
-    # step. The asset itself is published (z3-<ver>-arm64-glibc-2.34.zip), so
-    # fetch it directly with retries rather than falling back to the
-    # distribution package: apt on noble carries 4.8.x, and solving with a
-    # different Z3 than the other legs would make this leg's typechecking
-    # results incomparable.
-    - name: Setup Z3 (pinned release, linux/arm64)
-      if: matrix.os == 'ubuntu-24.04-arm'
+    # Every leg must solve with the SAME Z3: a different version makes that
+    # leg's typechecking results incomparable with the others, and the
+    # distribution packages are far behind (apt on noble carries 4.8.x).
+    #
+    # cda-tum/setup-z3 resolves the release through the GitHub API, which has
+    # returned 503 / 'socket hang up' on us repeatedly -- linux/arm64 first,
+    # then windows, different runs. The z3-solver wheel is the same upstream
+    # build behind a different CDN, is published for all six runner platforms
+    # we use, and ships a statically linked z3 executable under the data
+    # scheme, so it lands in the venv's bin (Scripts on Windows) and runs
+    # without libz3 alongside it. Installing into a throwaway venv means we
+    # own the directory we put on PATH instead of guessing an install scheme.
+    - name: Setup Z3
+      shell: bash
       run: |
         set -euo pipefail
-        ver=4.15.3
-        dir="z3-${ver}-arm64-glibc-2.34"
-        url="https://github.com/Z3Prover/z3/releases/download/z3-${ver}/${dir}.zip"
-        for attempt in 1 2 3; do
-          if curl -fL --retry 5 --retry-all-errors --connect-timeout 20 \
-               -o /tmp/z3.zip "$url"; then
-            break
-          fi
-          echo "attempt ${attempt} failed, retrying"
-          sleep $((attempt * 5))
-        done
-        if [ -s /tmp/z3.zip ]; then
-          unzip -q /tmp/z3.zip -d /tmp/z3
-          echo "/tmp/z3/${dir}/bin" >> "$GITHUB_PATH"
-          /tmp/z3/${dir}/bin/z3 --version
-        else
-          # The release CDN has been returning 503 for these runners. The same
-          # build is on PyPI behind a different CDN, so fall back to it rather
-          # than to the distribution package, which is 4.8.x and would make
-          # this leg's solving incomparable with the others.
-          echo "release download failed; falling back to the PyPI wheel"
-          pipx install "z3-solver==${ver}.0" || pip install --user "z3-solver==${ver}.0"
-          python3 -c "import z3, os, pathlib; print(pathlib.Path(z3.__file__).parent / 'bin')" >> "$GITHUB_PATH"
-          z3 --version || true
-        fi
-
-    - name: Setup Z3
-      id: z3
-      if: matrix.os != 'ubuntu-24.04-arm'
-      uses: cda-tum/setup-z3@v1
-      with:
-        version: 4.15.3
+        py=python3; command -v "$py" >/dev/null 2>&1 || py=python
+        "$py" -m venv "${RUNNER_TEMP}/z3venv"
+        bin="${RUNNER_TEMP}/z3venv/bin"
+        [ -d "${RUNNER_TEMP}/z3venv/Scripts" ] && bin="${RUNNER_TEMP}/z3venv/Scripts"
+        "${bin}/python" -m pip install --quiet --disable-pip-version-check \
+          "z3-solver==4.15.3.0"
+        echo "${bin}" >> "$GITHUB_PATH"
+        "${bin}/z3" --version
 
     - name: Set-up OCaml
       uses: ocaml/setup-ocaml@v3
