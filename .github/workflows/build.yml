@@ -52,20 +52,29 @@ jobs:
     # cda-tum/setup-z3 resolves the release through the GitHub API, which has
     # returned 503 / 'socket hang up' on us repeatedly -- linux/arm64 first,
     # then windows, different runs. The z3-solver wheel is the same upstream
-    # build behind a different CDN, is published for all six runner platforms
-    # we use, and ships a statically linked z3 executable that runs without
-    # libz3 beside it. A throwaway venv means we own the directory we put on
-    # PATH instead of guessing at a user/system install scheme.
+    # build behind a different CDN and is published for all six runner
+    # platforms we use.
     #
-    # The executable ships under the wheel's *data* scheme (data/bin/z3), which
-    # installs relative to sys.prefix as <venv>/bin -- on Windows that is NOT
-    # the Scripts directory that holds python.exe. So locate it rather than
-    # assuming the two coincide, as they do only on POSIX.
+    # Install it into a throwaway venv, then put ONLY the executable on PATH,
+    # in a directory of its own. Two traps this avoids:
+    #
+    #  - The venv's bin also holds python and pip. Exporting it would make
+    #    every later step resolve pip to the venv, which breaks `pip install
+    #    --user` ("not visible in this virtualenv") and would silently run the
+    #    Python test suite against an interpreter without its dependencies.
+    #  - The executable ships under the wheel's *data* scheme (data/bin/z3),
+    #    which installs relative to sys.prefix as <venv>/bin. On Windows that
+    #    is NOT the Scripts directory holding python.exe, so the two coincide
+    #    only on POSIX -- locate it rather than assume.
+    #
+    # Copying is safe: bin/z3 is ~20 MB on every platform and ships beside a
+    # separately packaged libz3, i.e. it is statically linked.
     - name: Setup Z3
       shell: bash
       run: |
         set -euo pipefail
         venv="${RUNNER_TEMP}/z3venv"
+        dest="${RUNNER_TEMP}/z3bin"
         py=python3; command -v "$py" >/dev/null 2>&1 || py=python
         "$py" -m venv "$venv"
 
@@ -74,19 +83,21 @@ jobs:
         "$pybin/python" -m pip install --quiet --disable-pip-version-check \
           "z3-solver==4.15.3.0"
 
-        z3bin=
+        mkdir -p "$dest"
+        found=
         for d in "$venv/bin" "$venv/Scripts"; do
-          if [ -f "$d/z3" ] || [ -f "$d/z3.exe" ]; then z3bin="$d"; break; fi
+          for exe in z3 z3.exe; do
+            if [ -f "$d/$exe" ]; then cp "$d/$exe" "$dest/$exe"; found="$dest/$exe"; break 2; fi
+          done
         done
-        if [ -z "$z3bin" ]; then
+        if [ -z "$found" ]; then
           echo "::error::no z3 executable under $venv after installing the wheel"
           ls -R "$venv" | head -60
           exit 1
         fi
 
-        z3exe="$z3bin/z3"; [ -f "$z3exe" ] || z3exe="$z3bin/z3.exe"
-        echo "$z3bin" >> "$GITHUB_PATH"
-        "$z3exe" --version
+        echo "$dest" >> "$GITHUB_PATH"
+        "$found" --version
 
     - name: Set-up OCaml
       uses: ocaml/setup-ocaml@v3
