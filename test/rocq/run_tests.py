@@ -62,7 +62,8 @@ def test(name, dir, lib):
             tests[filename] = os.fork()
             if tests[filename] == 0:
                 step('mkdir -p _build_{}'.format(basename))
-                step('\'{}\' --rocq --rocq-lib-style {} --rocq-undef-axioms --strict-bitvector --rocq-output-dir _build_{} -o out {}/{}'.format(sail, lib, basename, dir, filename))
+                extra_flags = '--rocq-constraint-obligations' if filename == 'constraint_dependent_types.sail' else ''
+                step('\'{}\' --rocq --rocq-lib-style {} --rocq-undef-axioms --strict-bitvector {} --rocq-output-dir _build_{} -o out {}/{}'.format(sail, lib, extra_flags, basename, dir, filename))
                 os.chdir('_build_{}'.format(basename))
                 step('{} out_types.v'.format(rocq_compile), name=basename)
                 step('{} out.v'.format(rocq_compile), name=basename)

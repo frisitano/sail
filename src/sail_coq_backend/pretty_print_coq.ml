@@ -105,6 +105,7 @@ type semantic_types = {
   valspecs : (typquant * typ) Bindings.t;
   bindings : typ Bindings.t;
   record_fields : typ Bindings.t Bindings.t;
+  type_quants : typquant Bindings.t;
 }
 
 let empty_semantic_types =
@@ -114,6 +115,7 @@ let empty_semantic_types =
     valspecs = Bindings.empty;
     bindings = Bindings.empty;
     record_fields = Bindings.empty;
+    type_quants = Bindings.empty;
   }
 
 let prefix_recordtype = true
@@ -509,23 +511,29 @@ let typ_of_constructor env f typ l =
 
 (* Calculate the existential type bindings that should make it into the Rocq output as dependent pairs. *)
 
-let relevant_existential_vars ctxt env kopts typ =
-  let relevant_kids = coq_nvars_of_typ typ in
+let has_existential_constraint nc =
+  !opt_constraint_obligations && match constraint_simp nc with NC_aux (NC_true, _) -> false | _ -> true
+
+let relevant_existential_vars ctxt env kopts nc typ =
+  let relevant_kids =
+    if has_existential_constraint nc then KidSet.union (coq_nvars_of_typ typ) (tyvars_of_constraint nc)
+    else coq_nvars_of_typ typ
+  in
   let relevant_kopts = List.filter (fun kopt -> KidSet.mem (kopt_kid kopt) relevant_kids) kopts in
   (relevant_kopts, typ)
 
 let relevant_type_vars ctxt env typ =
   let typ = Env.expand_synonyms env typ in
   match typ with
-  | Typ_aux (Typ_exist (kopts, _nc, typ'), _) -> relevant_existential_vars ctxt env kopts typ'
+  | Typ_aux (Typ_exist (kopts, nc, typ'), _) -> relevant_existential_vars ctxt env kopts nc typ'
   | _ -> ([], typ)
 
 let rec has_dependent_type ctxt env typ =
   let typ = Env.expand_synonyms env typ in
   match typ with
-  | Typ_aux (Typ_exist (kopts, _nc, inner), _) ->
-      let relevant_kopts, _ = relevant_existential_vars ctxt env kopts inner in
-      relevant_kopts <> [] || has_dependent_type ctxt env inner
+  | Typ_aux (Typ_exist (kopts, nc, inner), _) ->
+      let relevant_kopts, _ = relevant_existential_vars ctxt env kopts nc inner in
+      relevant_kopts <> [] || has_existential_constraint nc || has_dependent_type ctxt env inner
   | Typ_aux (Typ_app (_, args), _) ->
       List.exists (function A_aux (A_typ inner, _) -> has_dependent_type ctxt env inner | _ -> false) args
   | Typ_aux (Typ_tuple typs, _) -> List.exists (has_dependent_type ctxt env) typs
@@ -644,7 +652,17 @@ let rec flatten_nc (NC_aux (nc, l) as nc_full) =
   match nc with NC_and (nc1, nc2) -> flatten_nc nc1 @ flatten_nc nc2 | _ -> [nc_full]
 
 (* When making changes here, check whether they affect coq_nvars_of_typ *)
-let rec doc_typ_fns ctx env =
+let rec doc_typ_fns ?(type_constraint_proofs = Bindings.empty) ctx env =
+  let type_constraint_args id =
+    match Bindings.find_opt id type_constraint_proofs with
+    | Some proofs -> proofs
+    | None -> (
+        match Bindings.find_opt id ctx.global.semantic_types.type_quants with
+        | Some typq when !opt_constraint_obligations ->
+            List.map (fun _ -> string "ltac:(sail_constraint)") (snd (quant_split typq))
+        | _ -> []
+      )
+  in
   (* following the structure of parser for precedence *)
   let rec typ ?(skip_vars = KidSet.empty) ty = fn_typ true skip_vars ty
   and typ' ?(skip_vars = KidSet.empty) ty = fn_typ false skip_vars ty
@@ -686,7 +704,12 @@ let rec doc_typ_fns ctx env =
         string "Z"
     | Typ_app (Id_aux (Id "atom_bool", _), [A_aux (A_bool _atom_nc, _)]) -> string "bool"
     | Typ_app (id, args) ->
-        let tpp = doc_id_type ctx.global (Some env) id ^^ space ^^ separate_map space (doc_typ_arg ~skip_vars) args in
+        let tpp =
+          separate space
+            (doc_id_type ctx.global (Some env) id
+            :: (List.map (fun arg -> doc_typ_arg ~skip_vars arg) args @ type_constraint_args id)
+            )
+        in
         if atyp_needed then parens tpp else tpp
     | _ -> atomic_typ atyp_needed ~skip_vars ty
   and atomic_typ atyp_needed ?(skip_vars = KidSet.empty) (Typ_aux (t, l) as ty) =
@@ -698,7 +721,7 @@ let rec doc_typ_fns ctx env =
         (*if List.exists ((=) (string_of_id id)) regtypes
           then string "register"
           else*)
-        doc_id_type ctx.global (Some env) id
+        separate space (doc_id_type ctx.global (Some env) id :: type_constraint_args id)
     | Typ_var v -> doc_var ctx v
     | Typ_app _ | Typ_tuple _ | Typ_fn _ ->
         (* exhaustiveness matters here to avoid infinite loops
@@ -707,10 +730,30 @@ let rec doc_typ_fns ctx env =
         if atyp_needed then parens tpp else tpp
     (* TODO: handle non-integer kopts *)
     | Typ_exist (kopts, nc, ty') -> (
-        match relevant_existential_vars ctx env kopts ty' with
-        | [], ty'' -> atomic_typ atyp_needed ty''
+        match relevant_existential_vars ctx env kopts nc ty' with
+        | [], ty'' when not (has_existential_constraint nc) -> atomic_typ atyp_needed ty''
         | kopts_to_print, ty'' ->
-            let inner = atomic_typ false ty'' in
+            let constraint_name = "_sailExistentialConstraint" in
+            let inner =
+              if has_existential_constraint nc then (
+                match ty'' with
+                | Typ_aux (Typ_id id, _) ->
+                    separate space [doc_id_type ctx.global (Some env) id; string constraint_name]
+                | Typ_aux (Typ_app (id, args), _) ->
+                    separate space
+                      (doc_id_type ctx.global (Some env) id :: (List.map doc_typ_arg args @ [string constraint_name]))
+                | _ -> atomic_typ false ty''
+              )
+              else atomic_typ false ty''
+            in
+            let inner =
+              if has_existential_constraint nc then
+                braces
+                  (separate space
+                     [string constraint_name; colon; doc_nc_exp ctx env nc; string "= true"; ampersand; inner]
+                  )
+              else inner
+            in
             let pp =
               List.fold_left
                 (fun d kopt -> braces (doc_var ctx (kopt_kid kopt) ^^ space ^^ ampersand ^^ space ^^ d))
@@ -888,30 +931,138 @@ let rec has_semantic_range ctxt (Typ_aux (typ, _) as full_typ) =
 
 let semantic_lambda binder body = parens (string "fun " ^^ binder ^^ string " => " ^^ body)
 
-let rec doc_dependent_pack ctxt env typ value =
+let rec doc_dependent_pack ?actual_typ ctxt env typ value =
   let typ = Env.expand_synonyms env typ in
+  let actual_typ = Option.map (Env.expand_synonyms env) actual_typ in
   match typ with
-  | Typ_aux (Typ_exist (kopts, _nc, inner), _) ->
-      let relevant_kopts, _ = relevant_existential_vars ctxt env kopts inner in
-      let value = doc_dependent_pack ctxt env inner value in
-      List.fold_left (fun value _kid -> string "@existT _ _ _" ^^ space ^^ parens value) value relevant_kopts
+  | Typ_aux (Typ_exist (kopts, nc, inner), _) ->
+      let relevant_kopts, _ = relevant_existential_vars ctxt env kopts nc inner in
+      let constraint_binder = "_sailExistentialConstraint" in
+      let constraint_value = "_sailExistentialConstraintValue" in
+      let inner_type constraint_proof =
+        match inner with
+        | Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, _), _) ->
+            let doc_typ, _, _ =
+              doc_typ_fns ~type_constraint_proofs:(Bindings.singleton id [constraint_proof]) ctxt env
+            in
+            doc_typ inner
+        | _ -> doc_typ ctxt env inner
+      in
+      let value = doc_dependent_pack ?actual_typ ctxt env inner value in
+      let value =
+        if !opt_constraint_obligations && (relevant_kopts <> [] || has_existential_constraint nc) then (
+          let typ =
+            if has_existential_constraint nc then inner_type (string constraint_value) else doc_typ ctxt env inner
+          in
+          parens (separate space [value; colon; typ])
+        )
+        else value
+      in
+      let value =
+        if has_existential_constraint nc then (
+          let predicate =
+            parens
+              (separate space
+                 [
+                   string "fun";
+                   string constraint_binder;
+                   colon;
+                   doc_nc_exp ctxt env nc;
+                   string "= true";
+                   bigarrow;
+                   inner_type (string constraint_binder);
+                 ]
+              )
+          in
+          let packed = separate space [string "@existT _"; predicate; string constraint_value; parens value] in
+          parens
+            (separate space
+               [
+                 string "let";
+                 string constraint_value;
+                 colon;
+                 doc_nc_exp ctxt env nc;
+                 string "= true";
+                 coloneq;
+                 string "ltac:(sail_constraint)";
+                 string "in";
+                 packed;
+               ]
+            )
+        )
+        else value
+      in
+      let inferred_witnesses =
+        match actual_typ with
+        | Some actual -> (
+            let goals = relevant_kopts |> List.map kopt_kid |> KidSet.of_list in
+            try
+              let unifiers = Type_check.unify (typ_loc typ) env goals inner actual in
+              Some
+                (List.map
+                   (fun kopt ->
+                     match KBindings.find (kopt_kid kopt) unifiers with
+                     | A_aux (A_nexp nexp, _) -> doc_nexp ctxt env (orig_nexp nexp)
+                     | A_aux (A_bool nc, _) -> doc_nc_exp ctxt env (orig_nc nc)
+                     | A_aux (A_typ _, _) -> underscore
+                   )
+                   relevant_kopts
+                )
+            with _ -> None
+          )
+        | None -> None
+      in
+      let fallback_witness kopt =
+        let kid = kopt_kid kopt in
+        match KBindings.find_opt kid ctxt.kid_id_renames with
+        | Some (Some id) -> doc_id ctxt id
+        | _ when KidSet.mem kid ctxt.bound_nvars -> doc_var ctxt kid
+        | _ -> underscore
+      in
+      let witnesses =
+        if not !opt_constraint_obligations then List.map (fun _ -> underscore) relevant_kopts
+        else (
+          let contextual = List.map fallback_witness relevant_kopts in
+          if List.for_all (fun kopt -> KBindings.mem (kopt_kid kopt) ctxt.kid_id_renames) relevant_kopts then contextual
+          else Option.value ~default:contextual inferred_witnesses
+        )
+      in
+      List.fold_left (fun value witness -> separate space [string "@existT _ _"; witness; parens value]) value witnesses
   | Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _) when has_dependent_type ctxt env inner ->
+      let actual_inner =
+        match actual_typ with
+        | Some (Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _)) -> Some inner
+        | _ -> None
+      in
       parens
         (string "option_map "
-        ^^ semantic_lambda (string "dependentValue") (doc_dependent_pack ctxt env inner (string "dependentValue"))
+        ^^ semantic_lambda (string "dependentValue")
+             (doc_dependent_pack ?actual_typ:actual_inner ctxt env inner (string "dependentValue"))
         ^^ space ^^ parens value
         )
   | Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _) when has_dependent_type ctxt env inner ->
+      let actual_inner =
+        match actual_typ with
+        | Some (Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _)) -> Some inner
+        | _ -> None
+      in
       parens
         (string "List.map "
-        ^^ semantic_lambda (string "dependentValue") (doc_dependent_pack ctxt env inner (string "dependentValue"))
+        ^^ semantic_lambda (string "dependentValue")
+             (doc_dependent_pack ?actual_typ:actual_inner ctxt env inner (string "dependentValue"))
         ^^ space ^^ parens value
         )
   | Typ_aux (Typ_app (Id_aux (Id "vector", _), [A_aux (A_nexp _, _); A_aux (A_typ inner, _)]), _)
     when has_dependent_type ctxt env inner ->
+      let actual_inner =
+        match actual_typ with
+        | Some (Typ_aux (Typ_app (Id_aux (Id "vector", _), [_; A_aux (A_typ inner, _)]), _)) -> Some inner
+        | _ -> None
+      in
       parens
         (string "vec_map "
-        ^^ semantic_lambda (string "dependentValue") (doc_dependent_pack ctxt env inner (string "dependentValue"))
+        ^^ semantic_lambda (string "dependentValue")
+             (doc_dependent_pack ?actual_typ:actual_inner ctxt env inner (string "dependentValue"))
         ^^ space ^^ parens value
         )
   | Typ_aux (Typ_tuple typs, _) when List.exists (has_dependent_type ctxt env) typs ->
@@ -920,7 +1071,15 @@ let rec doc_dependent_pack ctxt env typ value =
       let body =
         parens
           (separate (comma ^^ space)
-             (List.map2 (fun typ name -> doc_dependent_pack ctxt env typ (string name)) typs names)
+             (List.mapi
+                (fun i typ ->
+                  let actual_typ =
+                    match actual_typ with Some (Typ_aux (Typ_tuple typs, _)) -> List.nth_opt typs i | _ -> None
+                  in
+                  doc_dependent_pack ?actual_typ ctxt env typ (string (List.nth names i))
+                )
+                typs
+             )
           )
       in
       parens (separate space [string "let"; pat; coloneq; value; string "in"; body])
@@ -1209,7 +1368,11 @@ let doc_typquant_items_separate ctx env delimit qis =
   (List.filter_map (doc_quant_item_id ctx delimit) qis, doc_quant_item_constrs ctx env qis)
 
 let typquant_names_separate ctx qis =
-  (List.filter_map (quant_item_id_name ctx) qis, List.filter_map (quant_item_constr_name ctx) qis)
+  ( List.filter_map (quant_item_id_name ctx) qis,
+    if !opt_constraint_obligations then
+      List.mapi (fun i _ -> string (Printf.sprintf "_sailConstraint%i" i)) (snd (quant_split qis))
+    else []
+  )
 
 let doc_typquant ctx env qs typ =
   match qs with
@@ -1298,15 +1461,20 @@ let compute_kid_shadow env kid loc =
 let rec doc_pat ctxt apat_needed pat typ = doc_pat_in_env ctxt (env_of_pat pat) apat_needed pat typ
 
 and doc_pat_in_env ?(anonymous_existentials = false) ctxt env apat_needed pat typ =
+  let existential_constraint =
+    match Env.expand_synonyms env typ with
+    | Typ_aux (Typ_exist (_, nc, _), _) when has_existential_constraint nc -> Some nc
+    | _ -> None
+  in
   let kids_to_print, typ = relevant_type_vars ctxt env typ in
   let rec payload_binder_id = function
     | P_aux (P_id id, _) -> Some id
     | P_aux (P_typ (_, pat), _) | P_aux (P_var (pat, _), _) -> payload_binder_id pat
     | _ -> None
   in
-  match kids_to_print with
-  | [] -> doc_pat_no_existential ~anonymous_existentials ctxt apat_needed pat typ
-  | h :: t ->
+  match (kids_to_print, existential_constraint) with
+  | [], None -> doc_pat_no_existential ~anonymous_existentials ctxt apat_needed pat typ
+  | _, _ ->
       let inner = doc_pat_no_existential ~anonymous_existentials ctxt true pat typ in
       let doc_existential kopt =
         if anonymous_existentials then (
@@ -1316,10 +1484,25 @@ and doc_pat_in_env ?(anonymous_existentials = false) ctxt env apat_needed pat ty
         )
         else doc_var ctxt (kopt_kid kopt)
       in
+      let inner =
+        match existential_constraint with
+        | Some _ ->
+            let proof_name =
+              if anonymous_existentials then (
+                match payload_binder_id pat with
+                | Some id -> doc_id ctxt (mk_id (string_of_id id ^ "__constraint"))
+                | None -> underscore
+              )
+              else string "_sailExistentialConstraint"
+            in
+            string "@existT _ _ " ^^ proof_name ^^ space ^^ inner
+        | None -> inner
+      in
       (* Ensure that the inner pattern only gets parens when it needs to *)
-      let inner = string "@existT _ _ " ^^ doc_existential h ^^ space ^^ inner in
       let pp =
-        List.fold_left (fun pp kopt -> string "@existT _ _ " ^^ doc_existential kopt ^^ space ^^ parens pp) inner t
+        List.fold_left
+          (fun pp kopt -> string "@existT _ _ " ^^ doc_existential kopt ^^ space ^^ parens pp)
+          inner kids_to_print
       in
       if apat_needed then parens pp else pp
 
@@ -1610,8 +1793,8 @@ let add_dependent_type_aliases ctxt env source_typ target_typ =
   debug ctxt (lazy (" aligning dependent type " ^ string_of_typ source_typ ^ " with " ^ string_of_typ target_typ));
   let source_inner, goals =
     match source_typ with
-    | Typ_aux (Typ_exist (kopts, _, inner), _) ->
-        let relevant_kopts, _ = relevant_existential_vars ctxt env kopts inner in
+    | Typ_aux (Typ_exist (kopts, nc, inner), _) ->
+        let relevant_kopts, _ = relevant_existential_vars ctxt env kopts nc inner in
         (inner, relevant_kopts |> List.map kopt_kid |> KidSet.of_list)
     | typ -> (typ, tyvars_of_typ typ)
   in
@@ -2512,7 +2695,15 @@ let doc_exp, doc_let =
                 public_kids = [] && has_dependent_type ctxt env public_typ
                 && (not (has_dependent_type ctxt inst_env ret_typ_inst))
                 && not is_monadic
-              then doc_dependent_pack ctxt env public_typ epp
+              then (
+                let actual_typ =
+                  match (Env.expand_synonyms env public_typ, full_exp) with
+                  | Typ_aux (Typ_app (container, [_]), _), E_aux (E_app (_, [arg]), _) ->
+                      mk_typ (Typ_app (container, [mk_typ_arg (A_typ (typ_of arg))]))
+                  | _ -> general_typ_of full_exp
+                in
+                doc_dependent_pack ~actual_typ ctxt env public_typ epp
+              )
               else epp
             in
 
@@ -2534,8 +2725,8 @@ let doc_exp, doc_let =
                   let returned_typ = Env.expand_synonyms inst_env ret_typ_inst in
                   let witnesses =
                     match public_typ with
-                    | Typ_aux (Typ_exist (kopts, _nc, inner), _) -> (
-                        let relevant_kopts, _ = relevant_existential_vars ctxt env kopts inner in
+                    | Typ_aux (Typ_exist (kopts, nc, inner), _) -> (
+                        let relevant_kopts, _ = relevant_existential_vars ctxt env kopts nc inner in
                         let goals = relevant_kopts |> List.map kopt_kid |> KidSet.of_list in
                         try
                           let unifiers = Type_check.unify l env goals inner returned_typ in
@@ -2651,9 +2842,10 @@ let doc_exp, doc_let =
             match Bindings.find_opt id ctxt.global.toplevel_let_types with
             | Some typ when IdSet.mem id (Env.get_toplevel_lets env) -> (
                 match Env.expand_synonyms env typ with
-                | Typ_aux (Typ_exist (kopts, _, inner), _) ->
-                    let relevant_kopts, _ = relevant_existential_vars ctxt env kopts inner in
-                    List.fold_left (fun pp _ -> string "projT2 " ^^ parens pp) id_pp relevant_kopts
+                | Typ_aux (Typ_exist (kopts, nc, inner), _) ->
+                    let relevant_kopts, _ = relevant_existential_vars ctxt env kopts nc inner in
+                    let layers = List.length relevant_kopts + if has_existential_constraint nc then 1 else 0 in
+                    List.fold_left (fun pp _ -> string "projT2 " ^^ parens pp) id_pp (List.init layers Fun.id)
                 | _ -> id_pp
               )
             | _ -> id_pp
@@ -3062,8 +3254,8 @@ let doc_exp, doc_let =
     in
     let witness_docs, payload_typ =
       match Env.expand_synonyms env public_typ with
-      | Typ_aux (Typ_exist (kopts, _nc, inner), _) -> (
-          let relevant_kopts, _ = relevant_existential_vars ctxt env kopts inner in
+      | Typ_aux (Typ_exist (kopts, nc, inner), _) -> (
+          let relevant_kopts, _ = relevant_existential_vars ctxt env kopts nc inner in
           let goals = relevant_kopts |> List.map kopt_kid |> KidSet.of_list in
           let actual_typ = Env.expand_synonyms (env_of exp) (typ_of exp) in
           try
@@ -3175,6 +3367,12 @@ let doc_exp, doc_let =
                 (match kids_to_print with [] -> want_parens | _ -> false)
                 false exp
         in
+        let pack_constraint inner =
+          match Env.expand_synonyms env public_typ with
+          | Typ_aux (Typ_exist (_, nc, _), _) when has_existential_constraint nc ->
+              separate space [string "@existT _ _"; string "ltac:(sail_constraint)"; parens inner]
+          | _ -> inner
+        in
         let pp =
           match witness_docs with
           | Some witnesses when List.length witnesses = List.length kids_to_print ->
@@ -3187,10 +3385,13 @@ let doc_exp, doc_let =
                   )
                 | _ -> inner
               in
+              let inner = pack_constraint inner in
               List.fold_left
                 (fun pp witness -> separate space [string "@existT _ _"; witness; parens pp])
                 inner witnesses
-          | _ -> List.fold_left (fun pp _kid -> string "@existT _ _ _" ^^ space ^^ parens pp) inner kids_to_print
+          | _ ->
+              let inner = pack_constraint inner in
+              List.fold_left (fun pp _kid -> string "@existT _ _ _" ^^ space ^^ parens pp) inner kids_to_print
         in
         if want_parens then parens pp else pp
   and if_exp ctxt full_env full_typ (elseif : bool) (tail_position : bool) c t e =
@@ -3242,7 +3443,23 @@ let doc_exp, doc_let =
           string "else" ^/^ top_exp branch_ctxt false tail_position (E_aux (E_internal_plet (pat, exp1, exp2), ann))
       | _ -> prefix 2 1 (string "else") (branch_exp e)
     in
-    prefix 2 1 (soft_surround 2 1 if_pp (add_type_pp c_pp) (string "then")) t_pp ^^ break 1 ^^ else_pp
+    if !opt_constraint_obligations then
+      parens
+        (align
+           (separate space
+              [
+                string "match";
+                c_pp;
+                string "as _sailBranch return";
+                parens (separate space [c_pp; string "= _sailBranch -> _"]);
+                string "with";
+              ]
+           ^/^ prefix 2 1 (string "| true => fun _sailBranchEq =>") t_pp
+           ^/^ prefix 2 1 (string "| false => fun _sailBranchEq =>") (branch_exp e)
+           ^/^ string "end eq_refl"
+           )
+        )
+    else prefix 2 1 (soft_surround 2 1 if_pp (add_type_pp c_pp) (string "then")) t_pp ^^ break 1 ^^ else_pp
   and let_exp ctxt lb =
     match lb with
     | pat, e
@@ -3526,12 +3743,14 @@ let rec doc_range ctxt (BF_aux(r,_)) = match r with
 let doc_field_updates ctxt typq record_id fields =
   let type_id_pp = doc_id_type ctxt.global None record_id in
   let typq_pps = doc_typquant_items ctxt Env.empty braces typq in
+  let parameter_count =
+    List.length (quant_kopts typq) + if !opt_constraint_obligations then List.length (snd (quant_split typq)) else 0
+  in
   let match_parameters =
-    match quant_kopts typq with [] -> empty | l -> space ^^ separate_map space (fun _ -> underscore) l
+    if parameter_count = 0 then empty else space ^^ separate space (List.init parameter_count (fun _ -> underscore))
   in
   let build_parameters =
-    let kopts, _ = quant_split typq in
-    match kopts with [] -> empty | _ -> space ^^ separate_map space (fun _ -> underscore) kopts
+    if parameter_count = 0 then empty else space ^^ separate space (List.init parameter_count (fun _ -> underscore))
   in
   let doc_update_field ((fid, _), _) =
     let idpp = doc_field_name ctxt record_id fid in
@@ -3555,10 +3774,13 @@ let doc_field_updates ctxt typq record_id fields =
         ^^ separate space (List.mapi (pp_field false "e") fields)
         ^//^ string "end (at level 1)" ^^ dot
   in
-  if !opt_coq_record_update then (
-    let typq_ids, _ = typquant_names_separate ctxt typq in
+  if !opt_coq_record_update && ((not !opt_constraint_obligations) || snd (quant_split typq) = []) then (
+    let typq_ids, constraint_args = typquant_names_separate ctxt typq in
     let name_pp = string "Build_" ^^ type_id_pp in
-    let constructor = match typq_ids with [] -> name_pp | _ -> parens (name_pp ^^ space ^^ separate space typq_ids) in
+    let constructor_args = typq_ids @ constraint_args in
+    let constructor =
+      match constructor_args with [] -> name_pp | _ -> parens (name_pp ^^ space ^^ separate space constructor_args)
+    in
     (* The settable! notation needs at least one field *)
     match fields with
     | [] -> empty
@@ -3744,7 +3966,8 @@ let rec doc_typdef global generic_eq_types countable_types enum_number_defs (TD_
         ^^ separate space (List.init numfields (fun n -> string (s ^ string_of_int n)))
         ^^ string "]." ^^ hardline
       in
-      let full_type_pps = type_id_pp :: List.filter_map (quant_item_id_name bare_ctxt) typq in
+      let typq_ids, constraint_args = typquant_names_separate bare_ctxt typq in
+      let full_type_pps = (type_id_pp :: typq_ids) @ constraint_args in
       let full_type_pp = separate space full_type_pps in
       let eq_pp =
         if !opt_coq_all_eq_dec || IdSet.mem id generic_eq_types then (
@@ -3785,7 +4008,9 @@ let rec doc_typdef global generic_eq_types countable_types enum_number_defs (TD_
                         );
                       string "refine {|";
                       string "  encode x := encode ("
-                      ^^ separate_map (string ", ") (fun ((fid, _), _) -> fname fid ^^ space ^^ string "x") fs
+                      ^^ separate_map (string ", ")
+                           (fun ((fid, _), _) -> fname fid ^^ space ^^ separate space (constraint_args @ [string "x"]))
+                           fs
                       ^^ string ");";
                       string "  decode x := '(" ^^ separate (string ", ") tmp_vars ^^ string ") ← decode x;";
                       string "              mret (Build_" ^^ full_type_pp ^^ space ^^ separate space tmp_vars
@@ -3857,7 +4082,8 @@ let rec doc_typdef global generic_eq_types countable_types enum_number_defs (TD_
                 Some (string "`{Inhabited " ^^ doc_var bare_ctxt kid ^^ string "}")
             | _ -> None
           in
-          let typ_use_pps = id_pp :: List.filter_map (quant_item_id_name bare_ctxt) typq in
+          let typq_ids, constraint_args = typquant_names_separate bare_ctxt typq in
+          let typ_use_pps = (id_pp :: typq_ids) @ constraint_args in
           let typ_use_pp = separate space typ_use_pps in
           let eq_pp =
             if !opt_coq_all_eq_dec || IdSet.mem id generic_eq_types then (
@@ -5580,7 +5806,8 @@ end = struct
     let generic_fns_for_record typ_id quant fields =
       let type_id_pp = doc_id_type global None typ_id in
       let typq_pps = doc_typquant_items bare_ctxt Env.empty braces quant in
-      let full_type_pps = type_id_pp :: List.filter_map (quant_item_id_name bare_ctxt) quant in
+      let typq_ids, constraint_args = typquant_names_separate bare_ctxt quant in
+      let full_type_pps = (type_id_pp :: typq_ids) @ constraint_args in
       let full_type_pp = separate space full_type_pps in
       let type_for_class = if List.length full_type_pps > 1 then parens full_type_pp else full_type_pp in
       let type_reqs class_str =
@@ -5646,7 +5873,8 @@ end = struct
     let generic_fns_for_variant typ_id quant ar =
       let type_id_pp = doc_id_type global None typ_id in
       let typq_pps = doc_typquant_items bare_ctxt Env.empty braces quant in
-      let full_type_pps = type_id_pp :: List.filter_map (quant_item_id_name bare_ctxt) quant in
+      let typq_ids, constraint_args = typquant_names_separate bare_ctxt quant in
+      let full_type_pps = (type_id_pp :: typq_ids) @ constraint_args in
       let full_type_pp = separate space full_type_pps in
       let type_for_class = if List.length full_type_pps > 1 then parens full_type_pp else full_type_pp in
       let type_reqs classes =
@@ -5823,7 +6051,19 @@ let collect_toplevel_let_types defs =
     Bindings.empty defs
 
 let collect_semantic_types defs =
-  if not !opt_semantic_range_types then empty_semantic_types
+  let type_quants =
+    List.fold_left
+      (fun quants (DEF_aux (def, _)) ->
+        match def with
+        | DEF_type (TD_aux (TD_abbrev (id, typq, _), _))
+        | DEF_type (TD_aux (TD_record (id, typq, _, _), _))
+        | DEF_type (TD_aux (TD_variant (id, typq, _, _), _)) ->
+            Bindings.add id typq quants
+        | _ -> quants
+      )
+      Bindings.empty defs
+  in
+  if not !opt_semantic_range_types then { empty_semantic_types with type_quants }
   else (
     let ranges, aliases =
       List.fold_left
@@ -5880,7 +6120,7 @@ let collect_semantic_types defs =
         (Bindings.empty, Bindings.empty, Bindings.empty)
         defs
     in
-    { ranges; aliases; valspecs; bindings; record_fields }
+    { ranges; aliases; valspecs; bindings; record_fields; type_quants }
   )
 
 let pp_ast_coq library_style (types_file, types_modules) (interface_file, interface_modules) (defs_file, defs_modules)
@@ -6209,7 +6449,7 @@ let pp_ast_coq library_style (types_file, types_modules) (interface_file, interf
                           then decide the arithmetic."
                       );
                     string "Ltac sail_constraint :=";
-                    string "  solve [ assumption | reflexivity";
+                    string "  first [ assumption | reflexivity";
                     string "        | apply andb_true_intro; split; sail_constraint";
                     string "        | (apply Z.leb_le || apply Z.ltb_lt || apply Z.geb_le || apply Z.gtb_lt";
                     string "           || apply Z.eqb_eq); lia";
