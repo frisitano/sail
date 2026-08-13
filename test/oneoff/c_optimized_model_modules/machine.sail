@@ -86,6 +86,40 @@ enum terminal_choice = {
   TerminalFour,
 }
 
+enum state_passing_outcome = {
+  StateContinue,
+  StateFailed,
+}
+
+type state_passing_zero = range(0, 0)
+let STATE_PASSING_ZERO : state_passing_zero = 0
+
+$[c_inline]
+val state_passing_guard : (byte, word, bool) -> (word, state_passing_outcome)
+
+function state_passing_guard(read_only, state, fail) =
+  if fail then (STATE_PASSING_ZERO, StateFailed) else (state, StateContinue)
+
+function forward_state_passing_guard(read_only : byte, state : word, fail : bool) -> (word, state_passing_outcome) = {
+  let (state_after, status_after) = state_passing_guard(read_only, state, fail);
+  (state_after, status_after)
+}
+
+function call_state_passing_guard(read_only : byte, state : word, fail : bool) -> (word, state_passing_outcome) = {
+  let (state_after, status_after) = forward_state_passing_guard(read_only, state, fail);
+  (state_after, status_after)
+}
+
+function state_passing_guard_failed(read_only : byte, state : word, fail : bool) -> bool = {
+  let (state_after, status_after) = state_passing_guard(read_only, state, fail);
+  if state_after == STATE_PASSING_ZERO then {
+    match status_after {
+      StateFailed => true,
+      _ => false
+    }
+  } else false
+}
+
 function terminal_enum_match(choice : terminal_choice) -> byte =
   match choice {
     TerminalOne => 1,

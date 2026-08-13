@@ -1,0 +1,3 @@
+StatePassingDiscard {
+  files state_passing_discard.sail
+}

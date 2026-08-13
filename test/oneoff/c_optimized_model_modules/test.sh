@@ -91,6 +91,8 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve call_specialized_comparison --c-preserve call_specialized_enum_comparison \
   --c-preserve conditional_word --c-preserve conditional_bool --c-preserve conditional_bool_false \
   --c-preserve terminal_choice --c-preserve terminal_enum_match --c-preserve terminal_enum_grouped \
+  --c-preserve state_passing_outcome --c-preserve state_passing_guard --c-preserve call_state_passing_guard \
+  --c-preserve state_passing_guard_failed \
   --c-preserve terminal_enum_match_or_fatal \
   --c-preserve fatal_guard_result_is_unread \
   --c-preserve terminal_unit_variant_match \
@@ -120,6 +122,33 @@ grep -Fq 'uint8_t canonical_slice_len(TestBytes value);' "$SPEC_INCLUDE/evmsail/
 grep -Fq 'uint8_t canonical_list_count(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'TestList canonical_list_identity(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint8_t canonical_list_count_after_identity(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'enum state_passing_outcome state_passing_guard(uint8_t read_only, uint32_t *restrict state, bool fail);' "$SPEC_INCLUDE/evmsail/spec/machine.h"
+sed -n '/^enum state_passing_outcome state_passing_guard(/,/^}/p' "$SPEC_SOURCE/machine.c" > "$TMP_DIR/state_passing_guard.c"
+grep -Eq '\(\*state\) = (UINT32_C\(0\)|\(uint32_t\)STATE_PASSING_ZERO);' \
+  "$TMP_DIR/state_passing_guard.c"
+grep -Fq 'return StateFailed;' "$TMP_DIR/state_passing_guard.c"
+grep -Fq 'return StateContinue;' "$TMP_DIR/state_passing_guard.c"
+if grep -Eq 'tuple_|rop[0-9]|\(\*state\) = \(\*state\)' "$TMP_DIR/state_passing_guard.c"; then
+  echo 'state-passing lowering retained a tuple, positional output, or self-assignment' >&2
+  exit 1
+fi
+sed -n '/^enum state_passing_outcome forward_state_passing_guard(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/forward_state_passing_guard.c"
+grep -Fq 'return state_passing_guard(read_only, state, fail);' \
+  "$TMP_DIR/forward_state_passing_guard.c"
+if grep -Eq 'tuple_|rop[0-9]|state_passing_outcome_[0-9]' \
+    "$TMP_DIR/forward_state_passing_guard.c"; then
+  echo 'nested state-passing call retained an aggregate or one-use result local' >&2
+  exit 1
+fi
+sed -n '/^bool state_passing_guard_failed(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/state_passing_guard_failed.c"
+grep -Eq 'state_passing_guard\(read_only, &state_after(_[0-9]+)*, fail\)' \
+  "$TMP_DIR/state_passing_guard_failed.c"
+if grep -Eq 'tuple_|\.tup[0-9]|rop[0-9]' "$TMP_DIR/state_passing_guard_failed.c"; then
+  echo 'non-state-returning caller retained a state-passing tuple carrier' >&2
+  exit 1
+fi
 if grep -Fq 'struct canonical_slice' "$SPEC_INCLUDE/evmsail/spec/base.h"; then
   echo 'optimized extraction emitted a nominal definition for a canonically named external representation' >&2
   exit 1
@@ -1089,3 +1118,35 @@ grep -Fq "file stem 'foo_bar'" "$TMP_DIR/collision.stderr"
 test ! -e "$TMP_DIR/collision/ffi/optimized/include/evmsail/spec.h"
 test ! -e "$TMP_DIR/collision/ffi/optimized/include/evmsail/spec/foo_bar.h"
 test ! -e "$TMP_DIR/collision/ffi/optimized/src/spec/foo_bar.c"
+
+if "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
+    --all-modules \
+    --c-optimized-model --c-package evmsail \
+    --c-output-dir "$TMP_DIR/state-passing-discard/ffi/optimized" \
+    --c-preserve-type state_passing_status \
+    --c-preserve update_state --c-preserve discard_updated_state \
+    "$TEST_DIR/state_passing_discard.sail_project" \
+    >"$TMP_DIR/state-passing-discard.stdout" 2>"$TMP_DIR/state-passing-discard.stderr"; then
+  echo 'optimized extraction unexpectedly accepted a discarded state result' >&2
+  exit 1
+fi
+
+grep -Fq 'call to optimized state-passing function update_state discards returned state field 0' \
+  "$TMP_DIR/state-passing-discard.stderr"
+
+if ! "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
+    --all-modules \
+    --c-optimized-model --c-package evmsail \
+    --c-output-dir "$TMP_DIR/state-passing-invalid/ffi/optimized" \
+    --c-preserve-type invalid_state_status \
+    --c-preserve invalid_state_order --c-preserve state_last_product \
+    "$TEST_DIR/state_passing_invalid.sail_project" \
+    >"$TMP_DIR/state-passing-invalid.stdout" 2>"$TMP_DIR/state-passing-invalid.stderr"; then
+  echo 'optimized extraction rejected an ordinary non-mirroring tuple result' >&2
+  exit 1
+fi
+
+grep -Eq 'struct tuple_bool_uint_8_invalid_state_status invalid_state_order\(uint8_t state_word, bool state_flag\);' \
+  "$TMP_DIR/state-passing-invalid/ffi/optimized/include/evmsail/spec/state_passing_invalid.h"
+grep -Fq 'struct tuple_bool_uint_8 state_last_product(uint8_t state_word);' \
+  "$TMP_DIR/state-passing-invalid/ffi/optimized/include/evmsail/spec/state_passing_invalid.h"

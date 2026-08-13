@@ -1,0 +1,3 @@
+StatePassingInvalid {
+  files state_passing_invalid.sail
+}

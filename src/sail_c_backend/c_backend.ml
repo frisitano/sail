@@ -2209,6 +2209,794 @@ let rec insert_heap_returns ctx ret_ctyps = function
   | cdef :: cdefs -> cdef :: insert_heap_returns ctx ret_ctyps cdefs
   | [] -> []
 
+(* Optimized C lowers an internal tuple result as a state-passing ABI when all
+   fields except the final result uniquely mirror one contiguous block of input
+   parameters. Those fields become named in/out pointers and the final field is
+   returned natively. Other tuple shapes remain ordinary product values: the
+   compiler must not guess which inputs an ambiguous product updates. *)
+type direct_tuple_result_field = {
+  direct_field_index : int;
+  direct_field_ctyp : ctyp;
+  direct_field_name : name;
+  direct_input_index : int option;
+}
+
+type direct_tuple_result_abi = {
+  direct_result_ctyp : ctyp;
+  direct_result_fields : direct_tuple_result_field list;
+  direct_return_field : direct_tuple_result_field;
+}
+
+let direct_tuple_result_abis = ref Bindings.empty
+
+let direct_result_name ctyp index =
+  let source_name =
+    match ctyp with
+    | CT_bool -> "condition"
+    | CT_enum id | CT_struct (id, _) | CT_variant (id, _) -> String.lowercase_ascii (string_of_id id)
+    | _ -> "result_" ^ string_of_int index
+  in
+  ngensym ~source_name ~source_type:(string_of_ctyp ctyp) ()
+
+let direct_output_for_input abi input_index =
+  List.find_opt
+    (fun field -> match field.direct_input_index with Some index -> index = input_index | None -> false)
+    abi.direct_result_fields
+
+let direct_result_destinations abi =
+  List.map (fun field -> CL_id (field.direct_field_name, field.direct_field_ctyp)) abi.direct_result_fields
+
+let make_direct_tuple_result_abi arg_ctyps args ret_ctyp =
+  match ret_ctyp with
+  | CT_tup field_ctyps when List.length field_ctyps >= 2 ->
+      let state_ctyps = List.rev field_ctyps |> List.tl |> List.rev in
+      let return_ctyp = List.hd (List.rev field_ctyps) in
+      let state_count = List.length state_ctyps in
+      let rec matches expected actual =
+        match (expected, actual) with
+        | [], _ -> true
+        | expected :: expecteds, actual :: actuals when ctyp_equal expected actual -> matches expecteds actuals
+        | _ -> false
+      in
+      let candidates =
+        if List.exists (ctyp_equal return_ctyp) arg_ctyps then []
+        else
+          List.init (max 0 (List.length arg_ctyps - state_count + 1)) Fun.id
+          |> List.filter (fun start -> matches state_ctyps (Util.drop start arg_ctyps))
+      in
+      ( match candidates with
+      | [state_start] ->
+          let state_fields =
+            List.mapi
+              (fun field_index field_ctyp ->
+                let input_index = state_start + field_index in
+                {
+                  direct_field_index = field_index;
+                  direct_field_ctyp = field_ctyp;
+                  direct_field_name = List.nth args input_index;
+                  direct_input_index = Some input_index;
+                }
+              )
+              state_ctyps
+          in
+          let return_index = List.length field_ctyps - 1 in
+          let return_field =
+            {
+              direct_field_index = return_index;
+              direct_field_ctyp = return_ctyp;
+              direct_field_name = direct_result_name return_ctyp return_index;
+              direct_input_index = None;
+            }
+          in
+          Some
+            {
+              direct_result_ctyp = ret_ctyp;
+              direct_result_fields = state_fields @ [return_field];
+              direct_return_field = return_field;
+            }
+      | _ -> None
+      )
+  | _ -> None
+
+let rec direct_return_carrier abi = function
+  | [] -> None
+  | I_aux (I_return (V_id (name, ctyp)), _) :: _ when ctyp_equal ctyp abi.direct_result_ctyp -> Some name
+  | I_aux (I_if (_, then_instrs, else_instrs), _) :: instrs -> (
+      match direct_return_carrier abi then_instrs with
+      | Some _ as carrier -> carrier
+      | None -> (
+          match direct_return_carrier abi else_instrs with
+          | Some _ as carrier -> carrier
+          | None -> direct_return_carrier abi instrs
+        )
+    )
+  | I_aux ((I_block instrs | I_try_block instrs), _) :: rest -> (
+      match direct_return_carrier abi instrs with
+      | Some _ as carrier -> carrier
+      | None -> direct_return_carrier abi rest
+    )
+  | _ :: instrs -> direct_return_carrier abi instrs
+
+let lower_direct_tuple_function id ctx abi body =
+  let carrier = direct_return_carrier abi body in
+  let is_carrier name =
+    match name with
+    | Return _ -> true
+    | _ -> (match carrier with Some carrier -> Name.compare name carrier = 0 | None -> false)
+  in
+  let destinations = direct_result_destinations abi in
+  let result_values value =
+    match value with
+    | V_tuple values when List.length values = List.length destinations -> values
+    | value ->
+        List.mapi
+          (fun index field -> V_tuple_member (value, List.length destinations, index))
+          abi.direct_result_fields
+  in
+  let identity_copy destination value =
+    match (destination, value) with
+    | CL_id (destination, _), V_id (source, _) -> Name.compare destination source = 0
+    | _ -> false
+  in
+  let assign_result aux value =
+    List.map2 (fun destination value -> (destination, value)) destinations (result_values value)
+    |> List.filter_map (fun (destination, value) ->
+           if identity_copy destination value then None else Some (I_aux (I_copy (destination, value), aux))
+       )
+  in
+  let return_result aux value =
+    let values = result_values value in
+    let state_values = List.rev values |> List.tl |> List.rev in
+    let state_destinations = List.rev destinations |> List.tl |> List.rev in
+    let state_assignments =
+      List.map2 (fun destination value -> (destination, value)) state_destinations state_values
+      |> List.filter_map (fun (destination, value) ->
+             if identity_copy destination value then None else Some (I_aux (I_copy (destination, value), aux))
+         )
+    in
+    state_assignments @ [I_aux (I_return (List.hd (List.rev values)), aux)]
+  in
+  let same_result_arity ctyp =
+    match ctyp with
+    | CT_tup fields -> List.length fields = List.length destinations
+    | _ -> false
+  in
+  let referenced_by instrs =
+    List.fold_left
+      (fun referenced instr -> NameSet.union referenced (instr_ids ~direct:false instr))
+      NameSet.empty instrs
+  in
+  let coalesce_call_results callee_abi call_destinations args remaining =
+    let remaining_references = referenced_by remaining in
+    let destinations, copies =
+      List.fold_left2
+        (fun (destinations, copies) field destination ->
+          match field.direct_input_index with
+          | Some input_index -> (
+              match List.nth args input_index with
+              | V_id (input, input_ctyp)
+                when ctyp_equal input_ctyp field.direct_field_ctyp
+                     && ( match destination with
+                        | CL_id (destination_name, _) -> Name.compare destination_name input = 0
+                        | _ -> false
+                        ) ->
+                  (CL_id (input, input_ctyp) :: destinations, copies)
+              | V_id (input, input_ctyp)
+                when ctyp_equal input_ctyp field.direct_field_ctyp
+                     && not (NameSet.mem input remaining_references) ->
+                  ( CL_id (input, input_ctyp) :: destinations,
+                    (destination, V_id (input, input_ctyp)) :: copies
+                  )
+              | _ -> (destination :: destinations, copies)
+            )
+          | None -> (destination :: destinations, copies)
+        )
+        ([], []) callee_abi.direct_result_fields call_destinations
+    in
+    (List.rev destinations, List.rev copies)
+  in
+  let rec returnize_carrier carrier_name = function
+    | [] -> None
+    | [I_aux (I_copy (CL_id (name, _), value), aux)]
+      when Name.compare name carrier_name = 0 ->
+        Some [I_aux (I_return value, aux)]
+    | [I_aux (I_if (condition, then_instrs, else_instrs), aux)] -> (
+        match
+          ( returnize_carrier carrier_name then_instrs,
+            returnize_carrier carrier_name else_instrs
+          )
+        with
+        | Some then_instrs, Some else_instrs ->
+            Some [I_aux (I_if (condition, then_instrs, else_instrs), aux)]
+        | _ -> None
+      )
+    | instr :: instrs ->
+        Option.map (fun instrs -> instr :: instrs) (returnize_carrier carrier_name instrs)
+  in
+  let rec rewrite = function
+    | [] -> []
+    | I_aux (I_init (_, temporary, Init_cval (V_tuple values)), _)
+      :: I_aux (I_copy (CL_id (carrier_name, _), V_id (source, _)), aux)
+      :: instrs
+      when Name.compare temporary source = 0
+           && is_carrier carrier_name
+           && List.length values = List.length destinations ->
+        ( match carrier_name with
+        | Return _ -> return_result aux (V_tuple values)
+        | _ -> assign_result aux (V_tuple values)
+        )
+        @ rewrite instrs
+    | I_aux (I_init (_, temporary, Init_cval (V_tuple values)), _)
+      :: I_aux (I_return (V_id (source, _)), aux)
+      :: instrs
+      when Name.compare temporary source = 0
+           && List.length values = List.length destinations ->
+        return_result aux (V_tuple values) @ rewrite instrs
+    | I_aux (I_decl (_, temporary), _)
+      :: I_aux (I_copy (CL_id (assigned, _), V_tuple values), _)
+      :: I_aux (I_return (V_id (source, _)), aux)
+      :: instrs
+      when Name.compare temporary assigned = 0
+           && Name.compare temporary source = 0
+           && List.length values = List.length destinations ->
+        return_result aux (V_tuple values) @ rewrite instrs
+    | I_aux (I_decl (temporary_ctyp, temporary), _)
+      :: I_aux (I_copy (CL_id (assigned, _), V_tuple values), _)
+      :: I_aux (I_copy (CL_id (carrier_name, _), V_id (source, _)), aux)
+      :: instrs
+      when Name.compare temporary assigned = 0
+           && Name.compare temporary source = 0
+           && is_carrier carrier_name ->
+        ( match carrier_name with
+        | Return _ -> return_result aux (V_tuple values)
+        | _ -> assign_result aux (V_tuple values)
+        )
+        @ rewrite instrs
+    | I_aux (I_decl (temporary_ctyp, temporary), decl_aux)
+      :: I_aux (I_funcall (CR_one (CL_id (assigned, _)), extern, ((callee, _) as uid), args), call_aux)
+      :: remaining
+      when Name.compare temporary assigned = 0 -> (
+        let carrier_form =
+          match remaining with
+          | I_aux (I_copy (CL_id (carrier_name, _), V_tuple values), copy_aux) :: instrs
+            when is_carrier carrier_name ->
+              Some (false, values, copy_aux, instrs)
+          | I_aux (I_return (V_tuple values), return_aux) :: instrs ->
+              Some (true, values, return_aux, instrs)
+          | _ -> None
+        in
+        match (Bindings.find_opt callee !direct_tuple_result_abis, carrier_form) with
+        | Some callee_abi, Some (returns, values, result_aux, instrs)
+          when ctyp_equal temporary_ctyp callee_abi.direct_result_ctyp ->
+            let member_index = function
+              | V_tuple_member (V_id (name, _), arity, index)
+                when Name.compare name temporary = 0
+                     && arity = List.length callee_abi.direct_result_fields ->
+                  Some index
+              | _ -> None
+            in
+            let rec find_outer_index field_index index = function
+              | [] -> None
+              | value :: values -> (
+                  match member_index value with
+                  | Some index' when index' = field_index -> Some index
+                  | _ -> find_outer_index field_index (index + 1) values
+                )
+            in
+            let outer_indices =
+              List.map
+                (fun field -> find_outer_index field.direct_field_index 0 values)
+                callee_abi.direct_result_fields
+            in
+            if List.for_all Option.is_some outer_indices
+               && List.length values = List.length destinations
+            then
+              let call_destinations =
+                List.map
+                  (fun outer_index -> List.nth destinations (Option.get outer_index))
+                  outer_indices
+              in
+              let call_destinations =
+                if returns then
+                  List.map2
+                    (fun outer_index destination ->
+                      if Option.get outer_index = abi.direct_return_field.direct_field_index then
+                        CL_id
+                          ( Return (-1),
+                            abi.direct_return_field.direct_field_ctyp
+                          )
+                      else destination
+                    )
+                    outer_indices call_destinations
+                else call_destinations
+              in
+              let call_destinations, copies =
+                coalesce_call_results callee_abi call_destinations args instrs
+              in
+              let copied_from_call value = Option.is_some (member_index value) in
+              let remaining_assignments =
+                List.map2 (fun destination value -> (destination, value)) destinations values
+                |> List.filter_map (fun (destination, value) ->
+                       if copied_from_call value || identity_copy destination value then None
+                       else Some (I_aux (I_copy (destination, value), result_aux))
+                   )
+              in
+              [I_aux (I_funcall (CR_multi call_destinations, extern, uid, args), call_aux)]
+              @ List.map (fun (destination, value) -> I_aux (I_copy (destination, value), call_aux)) copies
+              @ remaining_assignments @ rewrite instrs
+            else
+              I_aux (I_decl (temporary_ctyp, temporary), decl_aux)
+              :: rewrite
+                   (I_aux (I_funcall (CR_one (CL_id (assigned, temporary_ctyp)), extern, uid, args), call_aux)
+                   :: remaining
+                   )
+        | _ ->
+            I_aux (I_decl (temporary_ctyp, temporary), decl_aux)
+            :: rewrite
+                 (I_aux (I_funcall (CR_one (CL_id (assigned, temporary_ctyp)), extern, uid, args), call_aux)
+                 :: remaining
+                 )
+      )
+    | I_aux (I_decl (_, name), _) :: instrs when is_carrier name -> rewrite instrs
+    | I_aux (I_copy (CL_id (name, _), value), aux) :: instrs when is_carrier name ->
+        ( match name with
+        | Return _ -> return_result aux value
+        | _ -> assign_result aux value
+        )
+        @ rewrite instrs
+    | I_aux (I_copy (CL_tuple (CL_id (name, _), index), value), aux) :: instrs when is_carrier name ->
+        I_aux (I_copy (List.nth destinations index, value), aux) :: rewrite instrs
+    | I_aux (I_funcall (CR_one (CL_id (name, _)), extern, callee, args), aux) :: instrs when is_carrier name ->
+        ( match Bindings.find_opt (fst callee) !direct_tuple_result_abis with
+        | Some callee_abi ->
+            let destinations =
+              match name with
+              | Return _ ->
+                  List.mapi
+                    (fun index destination ->
+                      if index = abi.direct_return_field.direct_field_index then
+                        CL_id (name, abi.direct_return_field.direct_field_ctyp)
+                      else destination
+                    )
+                    destinations
+              | _ -> destinations
+            in
+            let call_destinations, copies = coalesce_call_results callee_abi destinations args instrs in
+            I_aux (I_funcall (CR_multi call_destinations, extern, callee, args), aux)
+            :: List.map (fun (destination, value) -> I_aux (I_copy (destination, value), aux)) copies
+            @ rewrite instrs
+        | None
+          when String.equal
+                 ( match extern with
+                 | Extern _ -> string_of_id (fst callee)
+                 | Call _ when ctx_is_extern (fst callee) ctx -> ctx_get_extern (fst callee) ctx
+                 | Call _ -> string_of_id (fst callee)
+                 )
+                 "fatal_error" ->
+            I_aux (I_funcall (CR_one (CL_void abi.direct_result_ctyp), extern, callee, args), aux) :: rewrite instrs
+        | None ->
+            let fallback =
+              ngensym
+                ~source_name:(string_of_id (fst callee) ^ "_result")
+                ~source_type:(string_of_ctyp abi.direct_result_ctyp) ()
+            in
+            I_aux (I_decl (abi.direct_result_ctyp, fallback), aux)
+            :: I_aux
+                 (I_funcall (CR_one (CL_id (fallback, abi.direct_result_ctyp)), extern, callee, args), aux)
+            :: ( match name with
+               | Return _ -> return_result aux (V_id (fallback, abi.direct_result_ctyp))
+               | _ -> assign_result aux (V_id (fallback, abi.direct_result_ctyp))
+               )
+            @ rewrite instrs
+        )
+    | I_aux (I_return (V_id (name, _)), aux) :: instrs when is_carrier name ->
+        I_aux
+          (I_return (V_id (abi.direct_return_field.direct_field_name, abi.direct_return_field.direct_field_ctyp)), aux)
+        :: rewrite instrs
+    | I_aux (I_return (V_tuple values), aux) :: instrs
+      when List.length values = List.length destinations ->
+        return_result aux (V_tuple values) @ rewrite instrs
+    | I_aux (I_return value, aux) :: instrs
+      when ctyp_equal (cval_ctyp value) abi.direct_result_ctyp
+           || same_result_arity (cval_ctyp value) ->
+        return_result aux value @ rewrite instrs
+    | I_aux (I_if (condition, then_instrs, else_instrs), aux)
+      :: I_aux (I_return (V_id (carrier_name, _)), return_aux)
+      :: instrs
+      when is_carrier carrier_name -> (
+        match
+          ( returnize_carrier carrier_name then_instrs,
+            returnize_carrier carrier_name else_instrs
+          )
+        with
+        | Some then_instrs, Some else_instrs ->
+            I_aux (I_if (condition, rewrite then_instrs, rewrite else_instrs), aux)
+            :: rewrite instrs
+        | _ ->
+            I_aux (I_if (condition, rewrite then_instrs, rewrite else_instrs), aux)
+            :: rewrite (I_aux (I_return (V_id (carrier_name, abi.direct_result_ctyp)), return_aux) :: instrs)
+      )
+    | I_aux (I_if (condition, then_instrs, else_instrs), aux) :: instrs ->
+        I_aux (I_if (condition, rewrite then_instrs, rewrite else_instrs), aux) :: rewrite instrs
+    | I_aux (I_block block, aux) :: instrs -> I_aux (I_block (rewrite block), aux) :: rewrite instrs
+    | I_aux (I_try_block block, aux) :: instrs -> I_aux (I_try_block (rewrite block), aux) :: rewrite instrs
+    | I_aux (I_funcall (CR_one destination, extern, ((callee, _) as uid), args), aux) :: instrs -> (
+        match Bindings.find_opt callee !direct_tuple_result_abis with
+        | Some callee_abi ->
+            let destinations =
+              List.mapi (fun index _ -> CL_tuple (destination, index)) callee_abi.direct_result_fields
+            in
+            let call_destinations, copies = coalesce_call_results callee_abi destinations args instrs in
+            I_aux (I_funcall (CR_multi call_destinations, extern, uid, args), aux)
+            :: List.map (fun (destination, value) -> I_aux (I_copy (destination, value), aux)) copies
+            @ rewrite instrs
+        | None -> I_aux (I_funcall (CR_one destination, extern, uid, args), aux) :: rewrite instrs
+      )
+    | instr :: instrs -> instr :: rewrite instrs
+  in
+  let body = rewrite body in
+  match carrier with
+  | Some _
+    when NameSet.mem abi.direct_return_field.direct_field_name (referenced_by body) ->
+      idecl (id_loc id) abi.direct_return_field.direct_field_ctyp
+        abi.direct_return_field.direct_field_name
+      :: body
+  | Some _ -> body
+  | None -> body
+
+let validate_direct_tuple_calls abis cdefs =
+  let tuple_field_is_read tuple_name field_index instrs =
+    let found = ref false in
+    let visitor =
+      object
+        inherit empty_jib_visitor
+
+        method! vcval = function
+          | V_tuple_member (V_id (name, _), _, index) when Name.compare name tuple_name = 0 ->
+              if index = field_index then found := true;
+              SkipChildren
+          | V_id (name, _) when Name.compare name tuple_name = 0 ->
+              found := true;
+              SkipChildren
+          | _ -> DoChildren
+      end
+    in
+    List.iter (fun instr -> ignore (visit_instr visitor instr)) instrs;
+    !found
+  in
+  let validate_destination loc callee abi destination remaining =
+    match destination with
+    | CL_id ((Return _), _) -> ()
+    | CL_id (tuple_name, _) ->
+        List.iter
+          (fun field ->
+            match field.direct_input_index with
+            | Some _ when not (tuple_field_is_read tuple_name field.direct_field_index remaining) ->
+                c_error ~loc
+                  (Printf.sprintf
+                     "call to optimized state-passing function %s discards returned state field %d"
+                     (string_of_id callee) field.direct_field_index
+                  )
+            | _ -> ()
+          )
+          abi.direct_result_fields
+    | CL_void _ ->
+        c_error ~loc
+          (Printf.sprintf "call to optimized state-passing function %s discards its returned state" (string_of_id callee))
+    | _ -> ()
+  in
+  let rec validate_instrs continuation = function
+    | [] -> ()
+    | I_aux (I_funcall (CR_one destination, _, (callee, _), _), (_, loc)) :: instrs ->
+        ( match Bindings.find_opt callee abis with
+        | Some abi -> validate_destination loc callee abi destination (instrs @ continuation)
+        | None -> ()
+        );
+        validate_instrs continuation instrs
+    | I_aux (I_if (_, then_instrs, else_instrs), _) :: instrs ->
+        let continuation = instrs @ continuation in
+        validate_instrs continuation then_instrs;
+        validate_instrs continuation else_instrs;
+        validate_instrs continuation instrs
+    | I_aux ((I_block block | I_try_block block), _) :: instrs ->
+        validate_instrs (instrs @ continuation) block;
+        validate_instrs continuation instrs
+    | _ :: instrs -> validate_instrs continuation instrs
+  in
+  List.iter
+    (function
+      | CDEF_aux (CDEF_fundef (_, Return_plain, _, body), _) -> validate_instrs [] body
+      | _ -> ()
+    )
+    cdefs
+
+let scalarize_direct_tuple_call_carriers abis instrs =
+  let projection carrier arity index = function
+    | I_aux
+        ( I_init
+            (ctyp, name, Init_cval (V_tuple_member (V_id (source, _), source_arity, source_index))),
+          aux
+        )
+      :: _
+      when Name.compare source carrier = 0 && source_arity = arity && source_index = index ->
+        Some (name, ctyp, aux)
+    | I_aux (I_decl (ctyp, name), aux)
+      :: I_aux
+           ( I_copy
+               ( CL_id (assigned, _),
+                 V_tuple_member (V_id (source, _), source_arity, source_index)
+               ),
+             _
+           )
+      :: _
+      when Name.compare name assigned = 0
+           && Name.compare source carrier = 0
+           && source_arity = arity
+           && source_index = index ->
+        Some (name, ctyp, aux)
+    | _ -> None
+  in
+  let rec find_projection carrier arity index = function
+    | [] -> None
+    | (instr :: instrs as remaining) -> (
+        match projection carrier arity index remaining with
+        | Some _ as result -> result
+        | None -> find_projection carrier arity index instrs
+      )
+  in
+  let carrier_used_whole carrier arity instrs =
+    let used = ref false in
+    let visitor =
+      object
+        inherit empty_jib_visitor
+
+        method! vcval = function
+          | V_tuple_member (V_id (source, _), source_arity, _)
+            when Name.compare source carrier = 0 && source_arity = arity ->
+              SkipChildren
+          | V_id (source, _) when Name.compare source carrier = 0 ->
+              used := true;
+              SkipChildren
+          | _ -> DoChildren
+      end
+    in
+    List.iter (fun instr -> ignore (visit_instr visitor instr)) instrs;
+    !used
+  in
+  let remove_projections carrier arity bindings instrs =
+    let selected index name =
+      match List.nth_opt bindings index with
+      | Some (selected, _, _) -> Name.compare selected name = 0
+      | None -> false
+    in
+    let replace = function
+      | V_tuple_member (V_id (source, _), source_arity, index)
+        when Name.compare source carrier = 0 && source_arity = arity ->
+          let name, ctyp, _ = List.nth bindings index in
+          V_id (name, ctyp)
+      | value -> value
+    in
+    let rec remove = function
+      | I_aux
+          ( I_init
+              (_, name, Init_cval (V_tuple_member (V_id (source, _), source_arity, index))),
+            _
+          )
+        :: instrs
+        when Name.compare source carrier = 0
+             && source_arity = arity
+             && selected index name ->
+          remove instrs
+      | I_aux (I_decl (_, name), _)
+        :: I_aux
+             ( I_copy
+                 ( CL_id (assigned, _),
+                   V_tuple_member (V_id (source, _), source_arity, index)
+                 ),
+               _
+             )
+        :: instrs
+        when Name.compare name assigned = 0
+             && Name.compare source carrier = 0
+             && source_arity = arity
+             && selected index name ->
+          remove instrs
+      | instr :: instrs -> map_instr_cval replace instr :: remove instrs
+      | [] -> []
+    in
+    remove instrs
+  in
+  let call_writes_carrier carrier abi = function
+    | CR_one (CL_id (destination, _)) -> Name.compare destination carrier = 0
+    | CR_one (CL_tuple (CL_id (destination, _), field_index)) ->
+        Name.compare destination carrier = 0
+        && field_index = abi.direct_return_field.direct_field_index
+    | CR_multi destinations when List.length destinations = List.length abi.direct_result_fields ->
+        List.mapi
+          (fun index -> function
+            | CL_tuple (CL_id (destination, _), field_index) ->
+                Name.compare destination carrier = 0 && field_index = index
+            | _ -> false
+          )
+          destinations
+        |> List.for_all Fun.id
+    | _ -> false
+  in
+  let carrier_field carrier arity bindings = function
+    | CL_tuple (CL_id (source, _), index)
+      when Name.compare source carrier = 0 && index >= 0 && index < arity ->
+        let name, ctyp, _ = List.nth bindings index in
+        CL_id (name, ctyp)
+    | clexp -> clexp
+  in
+  let scalarize_carrier_instr carrier arity bindings = function
+    | I_aux (I_copy (destination, value), aux) ->
+        I_aux
+          ( I_copy
+              ( carrier_field carrier arity bindings destination,
+                map_cval
+                  (function
+                    | V_tuple_member (V_id (source, _), source_arity, index)
+                      when Name.compare source carrier = 0
+                           && source_arity = arity ->
+                        let name, ctyp, _ = List.nth bindings index in
+                        V_id (name, ctyp)
+                    | value -> value
+                  )
+                  value
+              ),
+            aux
+          )
+    | instr ->
+        map_instr_cval
+          (function
+            | V_tuple_member (V_id (source, _), source_arity, index)
+              when Name.compare source carrier = 0 && source_arity = arity ->
+                let name, ctyp, _ = List.nth bindings index in
+                V_id (name, ctyp)
+            | value -> value
+          )
+          instr
+  in
+  let rec split_direct_call carrier carrier_ctyp before = function
+    | I_aux (I_funcall (destination, extern, ((callee, _) as uid), args), call_aux)
+      :: remaining -> (
+        match Bindings.find_opt callee abis with
+        | Some abi
+          when ctyp_equal carrier_ctyp abi.direct_result_ctyp
+               && call_writes_carrier carrier abi destination ->
+            Some (List.rev before, abi, extern, uid, args, call_aux, remaining)
+        | _ -> None
+      )
+    | (I_aux ((I_if _ | I_block _ | I_try_block _), _) as _instr) :: _ -> None
+    | instr :: remaining ->
+        split_direct_call carrier carrier_ctyp (instr :: before) remaining
+    | [] -> None
+  in
+  let rec rewrite = function
+    | I_aux (I_decl (carrier_ctyp, carrier), decl_aux) :: remaining -> (
+        match split_direct_call carrier carrier_ctyp [] remaining with
+        | Some (before, abi, extern, uid, args, call_aux, after) ->
+            let arity = List.length abi.direct_result_fields in
+            let bindings =
+              List.mapi
+                (fun index field ->
+                  match find_projection carrier arity index after with
+                  | Some binding -> binding
+                  | None ->
+                      let source_name = string_of_name ~zencode:false field.direct_field_name in
+                      let source_name =
+                        match field.direct_input_index with
+                        | Some _ -> source_name ^ "_after"
+                        | None -> source_name
+                      in
+                      ( ngensym
+                          ~source_name
+                          ~source_type:(string_of_ctyp field.direct_field_ctyp)
+                          (),
+                        field.direct_field_ctyp,
+                        decl_aux
+                      )
+                )
+                abi.direct_result_fields
+            in
+            if not (carrier_used_whole carrier arity (before @ after)) then
+              let declarations =
+                List.map
+                  (fun (name, ctyp, aux) -> I_aux (I_decl (ctyp, name), aux))
+                  bindings
+              in
+              let destinations =
+                List.map (fun (name, ctyp, _) -> CL_id (name, ctyp)) bindings
+              in
+              declarations
+              @ List.map (scalarize_carrier_instr carrier arity bindings) before
+              @ [ I_aux
+                    ( I_funcall
+                        ( CR_multi destinations,
+                          extern,
+                          uid,
+                          List.map
+                            (map_cval
+                               (function
+                                 | V_tuple_member (V_id (source, _), source_arity, index)
+                                   when Name.compare source carrier = 0
+                                        && source_arity = arity ->
+                                     let name, ctyp, _ = List.nth bindings index in
+                                     V_id (name, ctyp)
+                                 | value -> value
+                               )
+                            )
+                            args
+                        ),
+                      call_aux
+                    )
+                ]
+              @ rewrite (remove_projections carrier arity bindings after)
+            else
+              I_aux (I_decl (carrier_ctyp, carrier), decl_aux) :: rewrite remaining
+        | _ ->
+            I_aux (I_decl (carrier_ctyp, carrier), decl_aux) :: rewrite remaining
+      )
+    | I_aux (I_if (condition, then_instrs, else_instrs), aux) :: instrs ->
+        I_aux (I_if (condition, rewrite then_instrs, rewrite else_instrs), aux) :: rewrite instrs
+    | I_aux (I_block block, aux) :: instrs -> I_aux (I_block (rewrite block), aux) :: rewrite instrs
+    | I_aux (I_try_block block, aux) :: instrs -> I_aux (I_try_block (rewrite block), aux) :: rewrite instrs
+    | instr :: instrs -> instr :: rewrite instrs
+    | [] -> []
+  in
+  rewrite instrs
+
+let lower_direct_tuple_results ctx cdefs =
+  let function_args =
+    List.fold_left
+      (fun function_args -> function
+        | CDEF_aux (CDEF_fundef (id, _, args, _), _) -> Bindings.add id args function_args
+        | _ -> function_args
+      )
+      Bindings.empty cdefs
+  in
+  let abis =
+    List.fold_left
+      (fun abis -> function
+        | CDEF_aux (CDEF_val (id, _, arg_ctyps, (CT_tup _ as ret_ctyp), _), _) -> (
+            match (ctx_is_extern id ctx, Bindings.find_opt id function_args) with
+            | false, Some args -> (
+                match make_direct_tuple_result_abi arg_ctyps args ret_ctyp with
+                | Some abi -> Bindings.add id abi abis
+                | None -> abis)
+            | _ -> abis)
+        | _ -> abis
+      )
+      Bindings.empty cdefs
+  in
+  direct_tuple_result_abis := abis;
+  validate_direct_tuple_calls abis cdefs;
+  let cdefs =
+    List.map
+    (function
+      | CDEF_aux (CDEF_fundef (id, Return_plain, args, body), annot) -> (
+          match Bindings.find_opt id abis with
+          | Some abi ->
+              CDEF_aux (CDEF_fundef (id, Return_plain, args, lower_direct_tuple_function id ctx abi body), annot)
+          | None -> CDEF_aux (CDEF_fundef (id, Return_plain, args, body), annot)
+        )
+      | cdef -> cdef
+    )
+    cdefs
+  in
+  List.map
+    (function
+      | CDEF_aux (CDEF_fundef (id, return_style, args, body), annot) ->
+          CDEF_aux
+            ( CDEF_fundef
+                (id, return_style, args, scalarize_direct_tuple_call_carriers abis body),
+              annot
+            )
+      | cdef -> cdef
+    )
+    cdefs
+
 (* == --c-inline-attr ======================================================
    Calls to functions carrying the $[c_inline] attribute are inlined into
    their callers with the generic JIB inliner.  This MUST run before
@@ -2256,15 +3044,20 @@ let propagate_inline_attributes ast =
       ast with
       defs =
         List.map
-          (fun (DEF_aux (def, def_annot) as full_def) ->
-            match def with
-            | DEF_val (VS_aux (VS_val_spec (_, id, _), _))
-              when IdSet.mem id annotated_functions && not (has_c_inline_attribute def_annot) ->
-                DEF_aux (def, add_def_attribute (gen_loc def_annot.loc) c_inline_attribute None def_annot)
-            | DEF_fundef fd
-              when IdSet.mem (id_of_fundef fd) annotated_functions && not (has_c_inline_attribute def_annot) ->
-                DEF_aux (def, add_def_attribute (gen_loc def_annot.loc) c_inline_attribute None def_annot)
-            | _ -> full_def
+          (fun (DEF_aux (def, def_annot)) ->
+            let id =
+              match def with
+              | DEF_val (VS_aux (VS_val_spec (_, id, _), _)) -> Some id
+              | DEF_fundef fd -> Some (id_of_fundef fd)
+              | _ -> None
+            in
+            let def_annot =
+              match id with
+              | Some id when IdSet.mem id annotated_functions && not (has_c_inline_attribute def_annot) ->
+                  add_def_attribute (gen_loc def_annot.loc) c_inline_attribute None def_annot
+              | _ -> def_annot
+            in
+            DEF_aux (def, def_annot)
           )
           ast.defs;
     }
@@ -5832,7 +6625,10 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let sgen_tuple_id n = sgen_id (mk_id ("tup" ^ string_of_int n))
 
+  let current_direct_result_parameters = ref NameSet.empty
+
   let rec sgen_cval = function
+    | V_id (id, _) when NameSet.mem id !current_direct_result_parameters -> "(*" ^ sgen_name id ^ ")"
     | V_id (id, _) -> sgen_name id
     | V_member (id, _) -> sgen_id id
     | V_lit (vl, ctyp) -> sgen_value ctyp vl
@@ -6648,6 +7444,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CL_id (Memory_writes _, _) -> "memory_writes"
     | CL_id (Channel _, _) -> Reporting.unreachable l __POS__ "CL_id Channel should not appear in C backend"
     | CL_id (Return _, _) -> Reporting.unreachable l __POS__ "CL_id Return should have been removed"
+    | CL_id (name, _) when NameSet.mem name !current_direct_result_parameters -> sgen_name name
     | CL_id (name, _) -> "&" ^ sgen_name name
     | CL_field (clexp, field, _) -> "&((" ^ sgen_clexp l clexp ^ ")->" ^ sgen_id field ^ ")"
     | CL_tuple (clexp, n) -> sprintf "&((%s)->%s)" (sgen_clexp l clexp) (sgen_tuple_id n)
@@ -6662,6 +7459,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | CL_id (Memory_writes _, _) -> "memory_writes"
     | CL_id (Channel _, _) -> Reporting.unreachable l __POS__ "CL_id Channel should not appear in C backend"
     | CL_id (Return _, _) -> Reporting.unreachable l __POS__ "CL_id Return should have been removed"
+    | CL_id (name, _) when NameSet.mem name !current_direct_result_parameters -> "(*" ^ sgen_name name ^ ")"
     | CL_id (name, _) -> sgen_name name
     | CL_field (clexp, field, _) -> sgen_clexp_pure l clexp ^ "." ^ sgen_id field
     | CL_tuple (clexp, n) -> sgen_clexp_pure l clexp ^ "." ^ sgen_tuple_id n
@@ -7782,7 +8580,104 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | I_block instrs -> string "  {" ^^ jump 2 2 (codegen_instrs fid ctx instrs) ^^ hardline ^^ string "  }"
     | I_try_block instrs ->
         string "  { /* try */" ^^ jump 2 2 (codegen_instrs fid ctx instrs) ^^ hardline ^^ string "  }"
-    | I_funcall (x, extern_info, f, args) ->
+    | I_funcall (x, extern_info, f, args) -> (
+        let direct_abi =
+          match extern_info with
+          | Call _ -> Bindings.find_opt (fst f) !direct_tuple_result_abis
+          | Extern _ -> None
+        in
+        match direct_abi with
+        | Some abi ->
+            let return_carrier =
+              match x with
+              | CR_one (CL_id (Return _, destination_ctyp)) ->
+                  let name =
+                    ngensym
+                      ~source_name:(string_of_id (fst f) ^ "_result")
+                      ~source_type:(string_of_ctyp destination_ctyp) ()
+                  in
+                  Some (name, destination_ctyp)
+              | _ -> None
+            in
+            let x =
+              match return_carrier with
+              | Some (name, destination_ctyp) -> CR_one (CL_id (name, destination_ctyp))
+              | None -> x
+            in
+            let carrier_declaration =
+              ( match return_carrier with
+              | Some (name, destination_ctyp) ->
+                  [ksprintf string "  %s %s;" (sgen_ctyp destination_ctyp) (sgen_name name)]
+              | None -> []
+              )
+              @
+              match (!stack_call_initializer, x) with
+              | Some (declared, declared_ctyp), CR_one (CL_id (destination, destination_ctyp))
+                when Name.compare declared destination = 0
+                     && stack_call_initializer_compatible declared_ctyp destination_ctyp ->
+                  [ksprintf string "  %s %s;" (sgen_ctyp declared_ctyp) (sgen_name declared)]
+              | _ -> []
+            in
+            let destinations =
+              match x with
+              | CR_multi destinations when List.length destinations = List.length abi.direct_result_fields ->
+                  destinations
+              | CR_one destination ->
+                  List.mapi (fun index _ -> CL_tuple (destination, index)) abi.direct_result_fields
+              | CR_multi _ -> c_error ~loc:l "direct tuple-result call with incompatible destination arity"
+            in
+            let initializations =
+              abi.direct_result_fields
+              |> List.filter_map (fun field ->
+                     match field.direct_input_index with
+                     | None -> None
+                     | Some input_index ->
+                         let destination = List.nth destinations field.direct_field_index in
+                         let argument = List.nth args input_index in
+                         if String.equal (sgen_clexp_pure l destination) (sgen_cval argument) then None
+                         else Some (codegen_conversion l ctx destination argument)
+                 )
+            in
+            let ordinary_arguments =
+              List.mapi
+                (fun input_index argument ->
+                  match direct_output_for_input abi input_index with
+                  | Some field ->
+                      Some (sgen_clexp l (List.nth destinations field.direct_field_index))
+                  | None when erase_unit_values && ctyp_equal (cval_ctyp argument) CT_unit -> None
+                  | None -> Some (sgen_cval_in_value_context argument)
+                )
+                args
+              |> List.filter_map Fun.id
+            in
+            let arguments = String.concat ", " ordinary_arguments in
+            let regs_argument =
+              if register_file_threaded_function (fst f) then
+                if !current_function_threaded then register_file_param else "&" ^ register_file_variable
+              else ""
+            in
+            let arguments =
+              if regs_argument = "" then arguments
+              else if arguments = "" then regs_argument
+              else regs_argument ^ ", " ^ arguments
+            in
+            let fname = sgen_function_uid f in
+            current_static_helper_demands := Util.StringSet.add fname !current_static_helper_demands;
+            let call = Printf.sprintf "%s(%s%s)" fname (extra_arguments false) arguments in
+            let return_destination = List.nth destinations abi.direct_return_field.direct_field_index in
+            let call_statement =
+              match return_destination with
+              | CL_id (Return _, _) -> "  return " ^ call ^ ";"
+              | CL_void _ -> "  " ^ call ^ ";"
+              | _ -> "  " ^ sgen_clexp_pure l return_destination ^ " = " ^ call ^ ";"
+            in
+            let return_statement =
+              match return_carrier with
+              | Some (name, _) -> [ksprintf string "  return %s;" (sgen_name name)]
+              | None -> []
+            in
+            separate hardline (carrier_declaration @ initializations @ [string call_statement] @ return_statement)
+        | None ->
         let special_extern = match extern_info with Extern _ -> true | Call _ -> false in
         let x =
           match x with
@@ -8062,6 +8957,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                (with_regs_argument (sgen_clexp l x))
                c_args
             )
+      )
     | I_clear (ctyp, _) when is_stack_ctyp ctx ctyp -> empty
     | I_clear (ctyp, id) -> sail_kill ~prefix:"  " ~suffix:";" (sgen_ctyp_name ctyp) "&%s" (sgen_name id)
     | I_init (ctyp, id, init) -> (
@@ -12085,6 +12981,47 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
               );
           ]
         else if Option.is_some external_name && not Config.optimized_model then []
+        else if Option.is_some external_name then (
+          if erase_unit_values && ctyp_equal ret_ctyp CT_unit then
+            with_call_compat
+              (string (Printf.sprintf "void %s(%s);" function_name (c_parameter_list ~thread_regs parameters)))
+          else if is_stack_ctyp ctx ret_ctyp then
+            with_call_compat
+              (string
+                 (Printf.sprintf "%s %s(%s);" (sgen_ctyp ret_ctyp) function_name
+                    (c_parameter_list ~thread_regs parameters)
+                 )
+              )
+          else (
+            let ordinary_args = c_parameter_items parameters in
+            let ordinary_args = (sgen_ctyp ret_ctyp ^ " *rop") :: ordinary_args in
+            let ordinary_args = if thread_regs then register_file_thread_parameter :: ordinary_args else ordinary_args in
+            let parameters = extra_params () ^ String.concat ", " ordinary_args in
+            with_call_compat (string (Printf.sprintf "void %s(%s);" function_name parameters))
+          )
+        )
+        else if Bindings.mem id !direct_tuple_result_abis then (
+          let abi = Bindings.find id !direct_tuple_result_abis in
+          let ordinary_args =
+            List.mapi
+              (fun index (ctyp, name) ->
+                match direct_output_for_input abi index with
+                | Some _ -> Some (sgen_ctyp ctyp ^ " *restrict " ^ name)
+                | None -> (
+                    match c_parameter_items [(ctyp, name)] with [item] -> Some item | [] -> None | _ -> assert false
+                  )
+              )
+              parameters
+            |> List.filter_map Fun.id
+          in
+          let ordinary_args = if thread_regs then register_file_thread_parameter :: ordinary_args else ordinary_args in
+          with_call_compat
+            (string
+               (Printf.sprintf "%s %s(%s);" (sgen_ctyp abi.direct_return_field.direct_field_ctyp) function_name
+                  (extra_params () ^ String.concat ", " ordinary_args)
+               )
+            )
+        )
         else if erase_unit_values && ctyp_equal ret_ctyp CT_unit then
           with_call_compat
             (string (Printf.sprintf "void %s(%s);" function_name (c_parameter_list ~thread_regs parameters)))
@@ -12150,6 +13087,19 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
              [regs] parameter for the whole body being rendered here. *)
           let thread_regs = register_file_threaded_function id in
           current_function_threaded := thread_regs;
+          let direct_abi = Bindings.find_opt id !direct_tuple_result_abis in
+          current_direct_result_parameters :=
+            ( match direct_abi with
+            | Some abi ->
+                List.fold_left
+                  (fun names field ->
+                    match field.direct_input_index with
+                    | Some _ -> NameSet.add field.direct_field_name names
+                    | None -> names
+                  )
+                  NameSet.empty abi.direct_result_fields
+            | None -> NameSet.empty
+            );
           let named_parameters = List.map2 (fun ctyp arg -> (ctyp, sgen_name arg)) arg_ctyps args in
           let referenced =
             List.fold_left
@@ -12172,7 +13122,33 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           let function_header =
             inline_attribute
             ^^
-            match ret_arg with
+            match direct_abi with
+            | Some abi ->
+                let ordinary_args =
+                  List.mapi
+                    (fun index (ctyp, parameter) ->
+                      match direct_output_for_input abi index with
+                      | Some _ -> Some (sgen_ctyp ctyp ^ " *restrict " ^ parameter)
+                      | None -> (
+                          match c_parameter_items [(ctyp, parameter)] with
+                          | [item] -> Some item
+                          | [] -> None
+                          | _ -> assert false
+                        )
+                    )
+                    named_parameters
+                  |> List.filter_map Fun.id
+                in
+                let ordinary_args =
+                  if thread_regs then register_file_thread_parameter :: ordinary_args else ordinary_args
+                in
+                string (sgen_ctyp abi.direct_return_field.direct_field_ctyp) ^^ space
+                ^^ string (class_impl_prefix ())
+                ^^ codegen_function_id id
+                ^^ parens (string (extra_params () ^ String.concat ", " ordinary_args))
+                ^^ hardline
+            | None -> (
+              match ret_arg with
             | Return_plain ->
                 assert (is_stack_ctyp ctx ret_ctyp);
                 string (if erase_unit_values && ctyp_equal ret_ctyp CT_unit then "void" else sgen_ctyp ret_ctyp)
@@ -12194,6 +13170,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
                 ^^ codegen_function_id id
                 ^^ parens (string return_via_args)
                 ^^ hardline
+            )
           in
           let definition =
             FunctionDefinition
@@ -12204,6 +13181,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
               )
           in
           current_function_threaded := false;
+          current_direct_result_parameters := NameSet.empty;
           [definition]
         )
     | CDEF_type ctype_def ->
@@ -13249,7 +14227,9 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
       in
       let self_dependent_assignments = self_dependent_assignments ast in
       let ast =
-        if !optimize_inline_attr || !optimize_always_inline_attr then propagate_inline_attributes ast else ast
+        if !optimize_inline_attr || !optimize_always_inline_attr || Config.optimized_model then
+          propagate_inline_attributes ast
+        else ast
       in
       log_phase "lowering Sail AST to JIB";
       let cdefs, ctx = jib_of_ast env effect_info ast in
@@ -13609,6 +14589,14 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         if Config.optimized_model then remove_parameters_and_results ctx cdefs 0 else (cdefs, ctx, 0)
       in
       if removed_parameters > 0 then log_phase "removed unused internal parameters=%d" removed_parameters;
+
+      let cdefs =
+        if Config.optimized_model && not Config.cpp then lower_direct_tuple_results ctx cdefs
+        else (
+          direct_tuple_result_abis := Bindings.empty;
+          cdefs
+        )
+      in
 
       generated := IdSet.empty;
       emitted_external_functions := Util.StringSet.empty;
