@@ -7598,7 +7598,9 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
   (* Return the expression for conversions that can be written directly in a
      stack-local initializer.  Checked native-integer conversions deliberately
      return [None]: their guard must execute before the assignment, so keeping
-     a separate declaration is the honest C representation. *)
+     a separate declaration is the honest C representation.  The optimized
+     model's unchecked policy is already a plain cast assignment, which is
+     equally valid as an initializer. *)
   let stack_conversion_initializer ctyp_to cval =
     let ctyp_from = cval_ctyp cval in
     let value = if ctyp_equal ctyp_to ctyp_from then sgen_cval_in_value_context cval else sgen_cval cval in
@@ -7620,6 +7622,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             | _ -> None
           )
           else Some (sprintf "%s((uint64_t)%s)" adapter value)
+      | (CT_fint _ | CT_fuint _), (CT_fint _ | CT_fuint _) when Config.narrowing_policy = Narrowing_all -> cast ()
       | CT_fuint to_width, CT_fuint from_width when storage_width from_width <= storage_width to_width -> cast ()
       | CT_fuint to_width, (CT_fuint _ | CT_fint _ | CT_constant _)
         when integer_cval_fits Big_int.zero (max_uint (storage_width to_width)) cval ->
@@ -9316,6 +9319,34 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
          initializer expressions, retain that source expression directly as
          one C conditional initializer.  Checked conversions and non-stack
          values deliberately remain structured control flow. *)
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux
+             ( I_if
+                 ( condition,
+                   [I_aux (I_copy (then_destination, then_value), _)],
+                   [I_aux (I_copy (else_destination, else_value), _)]
+                 ),
+               _
+             )
+        :: I_aux (I_return (V_id (result, result_ctyp)), _)
+        :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
+             && Name.compare declared result = 0
+             && ctyp_equal declared_ctyp result_ctyp
+             && ( match then_destination with
+                | CL_id (destination, destination_ctyp) ->
+                    Name.compare declared destination = 0 && ctyp_equal declared_ctyp destination_ctyp
+                | _ -> false
+                )
+             && Option.is_some
+                  (conditional_assignment_expression ctx condition then_destination then_value else_destination
+                     else_value
+                  ) ->
+          ksprintf string "  return %s;"
+            (Option.get
+               (conditional_assignment_expression ctx condition then_destination then_value else_destination else_value)
+            )
+          :: docs rest
       | I_aux (I_decl (declared_ctyp, declared), _)
         :: I_aux
              ( I_if

@@ -241,6 +241,22 @@ function aggregate_early_return(flag : bool, value : wide_word) -> wide_word = {
 
 function widen_byte(value : byte) -> wide_word = value
 
+val conditional_wide_return : forall 'left 'right,
+  0 <= 'left & 'left < 2 ^ 256 & 0 <= 'right & 'right < 2 ^ 256.
+  (int('left), int('right)) -> wide_word
+function conditional_wide_return(left, right) =
+  if right <= left then {
+    left - right
+  } else {
+    let maximum : int(2 ^ 256 - 1) = 2 ^ 256 - 1;
+    (maximum - (right - left)) + 1
+  }
+
+function narrow_then_decrement(distance : range(1, 256)) -> byte = {
+  let index : byte = distance - 1;
+  decrement_byte(index)
+}
+
 function widen_three_byte(value : three_byte) -> word = value
 
 function narrow_wide_byte(value : wide_word) -> byte = {

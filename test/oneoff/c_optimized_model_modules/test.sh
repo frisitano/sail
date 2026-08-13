@@ -62,7 +62,8 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve decrement_byte --c-preserve increment_to --c-preserve count_four \
   --c-preserve increment_to_via_call \
   --c-preserve wide_identity --c-preserve aggregate_early_return \
-  --c-preserve widen_byte --c-preserve widen_three_byte --c-preserve narrow_wide_byte \
+  --c-preserve widen_byte --c-preserve conditional_wide_return --c-preserve narrow_then_decrement \
+  --c-preserve widen_three_byte --c-preserve narrow_wide_byte \
   --c-preserve narrow_word_remainder --c-preserve masked_high_nibble \
   --c-preserve one_bit_is_set \
   --c-preserve unsigned_le_signed --c-preserve signed_lt_unsigned --c-preserve unsigned_eq_signed \
@@ -564,6 +565,27 @@ awk '
 grep -Fq 'return u256_of_fbits(value);' "$TMP_DIR/widen_byte.c"
 if grep -Eq 'result_|tmp_|u256 [A-Za-z0-9_]+ =' "$TMP_DIR/widen_byte.c"; then
   echo 'optimized extraction retained an immediate converted return temporary' >&2
+  exit 1
+fi
+awk '
+  /^u256 conditional_wide_return\(/ { printing = 1 }
+  printing { print }
+  printing && /^}/ { printing = 0 }
+' "$SPEC_SOURCE/base.c" > "$TMP_DIR/conditional_wide_return.c"
+grep -Eq 'return .* \? .* : .*;' "$TMP_DIR/conditional_wide_return.c"
+if grep -Eq 'result_|tmp_|u256 [A-Za-z0-9_]+ =' "$TMP_DIR/conditional_wide_return.c"; then
+  echo 'optimized extraction retained a scalar initialized only to be returned' >&2
+  exit 1
+fi
+awk '
+  /^uint8_t narrow_then_decrement\(/ { printing = 1 }
+  printing { print }
+  printing && /^}/ { printing = 0 }
+' "$SPEC_SOURCE/base.c" > "$TMP_DIR/narrow_then_decrement.c"
+grep -Eq 'uint8_t [A-Za-z0-9_]+ = \(uint8_t\).*distance.*UINT16_C\(1\).*;' \
+  "$TMP_DIR/narrow_then_decrement.c"
+if grep -Eq '^[[:space:]]+uint8_t [A-Za-z0-9_]+;$' "$TMP_DIR/narrow_then_decrement.c"; then
+  echo 'optimized extraction retained an adjacent scalar declaration and assignment' >&2
   exit 1
 fi
 sed -n \
