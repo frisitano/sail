@@ -23,6 +23,43 @@ skip_tests = {
   'type_pow_zero', # uses cvc4, not worth rerunning for rocq output
 }
 
+constraint_obligation_tests = {
+  'constraint_dependent_types.sail',
+  'constraint_implication_dependent_types.sail',
+}
+
+flag_off_goldens = {
+  'existential_cast_flag_off': (
+    'pass/existential_cast.sail',
+    'ea4a48b5ab22d27aba332d7eb3d6e380b4d5b5093e36f2e2aac3dfc08a8d5509',
+  ),
+}
+
+def test_flag_off_goldens():
+    banner('Testing flag-off Rocq output goldens')
+    results = Results('flag-off Rocq output goldens')
+    tests = {}
+    for name, (source, golden_sha256) in flag_off_goldens.items():
+        if args.test and name not in args.test:
+            continue
+        tests[name] = os.fork()
+        if tests[name] == 0:
+            build_dir = '_build_{}'.format(name)
+            step('mkdir -p {}'.format(build_dir))
+            step('\'{}\' --rocq --rocq-lib-style stdpp --rocq-undef-axioms --strict-bitvector --rocq-output-dir {} -o out {}'.format(sail, build_dir, source))
+            with open(os.path.join(build_dir, 'out.v'), 'rb') as generated:
+                generated_sha256 = hashlib.sha256(generated.read()).hexdigest()
+            if generated_sha256 != golden_sha256:
+                print('{}Failed{}: {} generated out.v SHA-256 {} (expected {})'.format(
+                  color.FAIL, color.END, name, generated_sha256, golden_sha256
+                ))
+                sys.exit(1)
+            step('rm -r {}'.format(build_dir))
+            print_ok(name)
+            sys.exit()
+    results.collect(tests)
+    return results.finish()
+
 def test(name, dir, lib):
     banner('Testing Rocq backend on {} with {}'.format(name, lib))
     results = Results('{} on {}'.format(name, lib))
@@ -62,7 +99,7 @@ def test(name, dir, lib):
             tests[filename] = os.fork()
             if tests[filename] == 0:
                 step('mkdir -p _build_{}'.format(basename))
-                extra_flags = '--rocq-constraint-obligations' if filename == 'constraint_dependent_types.sail' else ''
+                extra_flags = '--rocq-constraint-obligations' if filename in constraint_obligation_tests else ''
                 step('\'{}\' --rocq --rocq-lib-style {} --rocq-undef-axioms --strict-bitvector {} --rocq-output-dir _build_{} -o out {}/{}'.format(sail, lib, extra_flags, basename, dir, filename))
                 os.chdir('_build_{}'.format(basename))
                 step('{} out_types.v'.format(rocq_compile), name=basename)
@@ -76,6 +113,7 @@ def test(name, dir, lib):
 
 xml = '<testsuites>\n'
 
+xml += test_flag_off_goldens()
 xml += test('typecheck tests', '../typecheck/pass', 'stdpp')
 xml += test('Coq specific tests', 'pass', 'stdpp')
 

@@ -734,18 +734,11 @@ let rec doc_typ_fns ?(type_constraint_proofs = Bindings.empty) ctx env =
         | [], ty'' when not (has_existential_constraint nc) -> atomic_typ atyp_needed ty''
         | kopts_to_print, ty'' ->
             let constraint_name = "_sailExistentialConstraint" in
-            let inner =
-              if has_existential_constraint nc then (
-                match ty'' with
-                | Typ_aux (Typ_id id, _) ->
-                    separate space [doc_id_type ctx.global (Some env) id; string constraint_name]
-                | Typ_aux (Typ_app (id, args), _) ->
-                    separate space
-                      (doc_id_type ctx.global (Some env) id :: (List.map doc_typ_arg args @ [string constraint_name]))
-                | _ -> atomic_typ false ty''
-              )
-              else atomic_typ false ty''
-            in
+            (* The enclosing existential proof need not have the same type as
+               a constrained payload's proof arguments.  Print the payload
+               through the ordinary type path so each of its obligations is
+               solved from the existential hypothesis in scope. *)
+            let inner = atomic_typ false ty'' in
             let inner =
               if has_existential_constraint nc then
                 braces
@@ -931,29 +924,67 @@ let rec has_semantic_range ctxt (Typ_aux (typ, _) as full_typ) =
 
 let semantic_lambda binder body = parens (string "fun " ^^ binder ^^ string " => " ^^ body)
 
-let rec doc_dependent_pack ?actual_typ ctxt env typ value =
+(* Keep the disabled feature on the exact pre-constraint-obligations rendering
+   path.  In particular, do not let witness inference or payload annotations
+   perturb legacy output. *)
+let rec doc_dependent_pack_legacy ctxt env typ value =
   let typ = Env.expand_synonyms env typ in
-  let actual_typ = Option.map (Env.expand_synonyms env) actual_typ in
   match typ with
+  | Typ_aux (Typ_exist (kopts, nc, inner), _) ->
+      let relevant_kopts, _ = relevant_existential_vars ctxt env kopts nc inner in
+      let value = doc_dependent_pack_legacy ctxt env inner value in
+      List.fold_left (fun value _kid -> string "@existT _ _ _" ^^ space ^^ parens value) value relevant_kopts
+  | Typ_aux (Typ_app (Id_aux (Id "option", _), [A_aux (A_typ inner, _)]), _)
+    when has_dependent_type ctxt env inner ->
+      parens
+        (string "option_map "
+        ^^ semantic_lambda (string "dependentValue")
+             (doc_dependent_pack_legacy ctxt env inner (string "dependentValue"))
+        ^^ space ^^ parens value
+        )
+  | Typ_aux (Typ_app (Id_aux (Id "list", _), [A_aux (A_typ inner, _)]), _)
+    when has_dependent_type ctxt env inner ->
+      parens
+        (string "List.map "
+        ^^ semantic_lambda (string "dependentValue")
+             (doc_dependent_pack_legacy ctxt env inner (string "dependentValue"))
+        ^^ space ^^ parens value
+        )
+  | Typ_aux (Typ_app (Id_aux (Id "vector", _), [A_aux (A_nexp _, _); A_aux (A_typ inner, _)]), _)
+    when has_dependent_type ctxt env inner ->
+      parens
+        (string "vec_map "
+        ^^ semantic_lambda (string "dependentValue")
+             (doc_dependent_pack_legacy ctxt env inner (string "dependentValue"))
+        ^^ space ^^ parens value
+        )
+  | Typ_aux (Typ_tuple typs, _) when List.exists (has_dependent_type ctxt env) typs ->
+      let names = List.mapi (fun i _ -> Printf.sprintf "dependentValue%i" i) typs in
+      let pat = squote ^^ parens (separate (comma ^^ space) (List.map string names)) in
+      let body =
+        parens
+          (separate (comma ^^ space)
+             (List.map2 (fun typ name -> doc_dependent_pack_legacy ctxt env typ (string name)) typs names)
+          )
+      in
+      parens (separate space [string "let"; pat; coloneq; value; string "in"; body])
+  | _ -> value
+
+let rec doc_dependent_pack ?actual_typ ctxt env typ value =
+  if not !opt_constraint_obligations then doc_dependent_pack_legacy ctxt env typ value
+  else
+    let typ = Env.expand_synonyms env typ in
+    let actual_typ = Option.map (Env.expand_synonyms env) actual_typ in
+    match typ with
   | Typ_aux (Typ_exist (kopts, nc, inner), _) ->
       let relevant_kopts, _ = relevant_existential_vars ctxt env kopts nc inner in
       let constraint_binder = "_sailExistentialConstraint" in
       let constraint_value = "_sailExistentialConstraintValue" in
-      let inner_type constraint_proof =
-        match inner with
-        | Typ_aux (Typ_id id, _) | Typ_aux (Typ_app (id, _), _) ->
-            let doc_typ, _, _ =
-              doc_typ_fns ~type_constraint_proofs:(Bindings.singleton id [constraint_proof]) ctxt env
-            in
-            doc_typ inner
-        | _ -> doc_typ ctxt env inner
-      in
+      let inner_type = doc_typ ctxt env inner in
       let value = doc_dependent_pack ?actual_typ ctxt env inner value in
       let value =
         if !opt_constraint_obligations && (relevant_kopts <> [] || has_existential_constraint nc) then (
-          let typ =
-            if has_existential_constraint nc then inner_type (string constraint_value) else doc_typ ctxt env inner
-          in
+          let typ = if has_existential_constraint nc then inner_type else doc_typ ctxt env inner in
           parens (separate space [value; colon; typ])
         )
         else value
@@ -970,7 +1001,7 @@ let rec doc_dependent_pack ?actual_typ ctxt env typ value =
                    doc_nc_exp ctxt env nc;
                    string "= true";
                    bigarrow;
-                   inner_type (string constraint_binder);
+                   inner_type;
                  ]
               )
           in
@@ -1472,9 +1503,31 @@ and doc_pat_in_env ?(anonymous_existentials = false) ctxt env apat_needed pat ty
     | P_aux (P_typ (_, pat), _) | P_aux (P_var (pat, _), _) -> payload_binder_id pat
     | _ -> None
   in
-  match (kids_to_print, existential_constraint) with
-  | [], None -> doc_pat_no_existential ~anonymous_existentials ctxt apat_needed pat typ
-  | _, _ ->
+  if not !opt_constraint_obligations then (
+    match kids_to_print with
+    | [] -> doc_pat_no_existential ~anonymous_existentials ctxt apat_needed pat typ
+    | h :: t ->
+        let inner = doc_pat_no_existential ~anonymous_existentials ctxt true pat typ in
+        let doc_existential kopt =
+          if anonymous_existentials then (
+            match payload_binder_id pat with
+            | Some id -> doc_id ctxt (mk_id (string_of_id id ^ "__" ^ string_of_kid (kopt_kid kopt)))
+            | None -> underscore
+          )
+          else doc_var ctxt (kopt_kid kopt)
+        in
+        let inner = string "@existT _ _ " ^^ doc_existential h ^^ space ^^ inner in
+        let pp =
+          List.fold_left
+            (fun pp kopt -> string "@existT _ _ " ^^ doc_existential kopt ^^ space ^^ parens pp)
+            inner t
+        in
+        if apat_needed then parens pp else pp
+  )
+  else
+    match (kids_to_print, existential_constraint) with
+    | [], None -> doc_pat_no_existential ~anonymous_existentials ctxt apat_needed pat typ
+    | _, _ ->
       let inner = doc_pat_no_existential ~anonymous_existentials ctxt true pat typ in
       let doc_existential kopt =
         if anonymous_existentials then (
@@ -6448,9 +6501,17 @@ let pp_ast_coq library_style (types_file, types_modules) (interface_file, interf
                           are boolean expressions, so the goal is `e = true`: try the caller's own hypotheses first, \
                           then decide the arithmetic."
                       );
+                    string "Ltac sail_constraint_from H :=";
+                    string "  clear - H;";
+                    string "  first [ assumption | reflexivity";
+                    string "        | apply andb_true_intro; split; sail_constraint_from H";
+                    string "        | (apply Z.leb_le || apply Z.ltb_lt || apply Z.geb_le || apply Z.gtb_lt";
+                    string "           || apply Z.eqb_eq); lia";
+                    string "        | lia ].";
                     string "Ltac sail_constraint :=";
                     string "  first [ assumption | reflexivity";
                     string "        | apply andb_true_intro; split; sail_constraint";
+                    string "        | match goal with H : _ = true |- _ => sail_constraint_from H end";
                     string "        | (apply Z.leb_le || apply Z.ltb_lt || apply Z.geb_le || apply Z.gtb_lt";
                     string "           || apply Z.eqb_eq); lia";
                     string "        | lia ].";
