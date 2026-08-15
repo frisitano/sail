@@ -26,6 +26,7 @@ skip_tests = {
 constraint_obligation_tests = {
   'constraint_dependent_types.sail',
   'constraint_implication_dependent_types.sail',
+  'enum_cast.sail',
 }
 
 flag_off_goldens = {

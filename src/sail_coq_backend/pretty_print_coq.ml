@@ -528,6 +528,14 @@ let relevant_type_vars ctxt env typ =
   | Typ_aux (Typ_exist (kopts, nc, typ'), _) -> relevant_existential_vars ctxt env kopts nc typ'
   | _ -> ([], typ)
 
+let dependent_projection_count ctxt env typ =
+  let typ = Env.expand_synonyms env typ in
+  match typ with
+  | Typ_aux (Typ_exist (kopts, nc, inner), _) ->
+      let relevant_kopts, _ = relevant_existential_vars ctxt env kopts nc inner in
+      List.length relevant_kopts + if has_existential_constraint nc then 1 else 0
+  | _ -> 0
+
 let rec has_dependent_type ctxt env typ =
   let typ = Env.expand_synonyms env typ in
   match typ with
@@ -659,7 +667,7 @@ let rec doc_typ_fns ?(type_constraint_proofs = Bindings.empty) ctx env =
     | None -> (
         match Bindings.find_opt id ctx.global.semantic_types.type_quants with
         | Some typq when !opt_constraint_obligations ->
-            List.map (fun _ -> string "ltac:(sail_constraint)") (snd (quant_split typq))
+            List.map (fun _ -> string "ltac:(first [assumption | sail_constraint])") (snd (quant_split typq))
         | _ -> []
       )
   in
@@ -2707,19 +2715,15 @@ let doc_exp, doc_let =
                the public value at a matching function-return boundary; otherwise
                project it inside the monad. *)
             let epp =
-              let relevant_kids, _ = relevant_type_vars ctxt inst_env (Env.expand_synonyms inst_env ret_typ_inst) in
+              let projection_count = dependent_projection_count ctxt inst_env ret_typ_inst in
               let preserve_public_result =
                 tail_position
-                && Option.fold ~none:false
-                     ~some:(fun typ ->
-                       let relevant_kids, _ = relevant_type_vars ctxt env typ in
-                       relevant_kids <> []
-                     )
+                && Option.fold ~none:false ~some:(fun typ -> dependent_projection_count ctxt env typ > 0)
                      ctxt.public_return
               in
-              if relevant_kids = [] || preserve_public_result || is_monadic || Option.is_some ctxt.dependent_result then
-                epp
-              else List.fold_left (fun pp _kid -> string "projT2 " ^^ parens pp) epp relevant_kids
+              if projection_count = 0 || preserve_public_result || is_monadic || Option.is_some ctxt.dependent_result
+              then epp
+              else List.fold_left (fun pp _ -> string "projT2 " ^^ parens pp) epp (List.init projection_count Fun.id)
             in
 
             (* Public semantic wrappers are erased within function bodies.  Calls
@@ -2841,9 +2845,9 @@ let doc_exp, doc_let =
                   fst (List.find (fun (_, field) -> Id.compare field id == 0) fields)
                 with _ -> general_typ_of full_exp
               in
-              let relevant_kids, _ = relevant_type_vars ctxt env field_typ in
-              if relevant_kids = [] || Option.is_some ctxt.dependent_result then exp_pp
-              else List.fold_left (fun pp _kid -> string "projT2 " ^^ parens pp) exp_pp relevant_kids
+              let projection_count = dependent_projection_count ctxt env field_typ in
+              if projection_count = 0 || Option.is_some ctxt.dependent_result then exp_pp
+              else List.fold_left (fun pp _ -> string "projT2 " ^^ parens pp) exp_pp (List.init projection_count Fun.id)
             in
             let exp_pp =
               match semantic_record_field ctxt tid id with
@@ -2893,14 +2897,9 @@ let doc_exp, doc_let =
           let id_pp =
             let id_pp = doc_id ctxt id in
             match Bindings.find_opt id ctxt.global.toplevel_let_types with
-            | Some typ when IdSet.mem id (Env.get_toplevel_lets env) -> (
-                match Env.expand_synonyms env typ with
-                | Typ_aux (Typ_exist (kopts, nc, inner), _) ->
-                    let relevant_kopts, _ = relevant_existential_vars ctxt env kopts nc inner in
-                    let layers = List.length relevant_kopts + if has_existential_constraint nc then 1 else 0 in
-                    List.fold_left (fun pp _ -> string "projT2 " ^^ parens pp) id_pp (List.init layers Fun.id)
-                | _ -> id_pp
-              )
+            | Some typ when IdSet.mem id (Env.get_toplevel_lets env) ->
+                let projection_count = dependent_projection_count ctxt env typ in
+                List.fold_left (fun pp _ -> string "projT2 " ^^ parens pp) id_pp (List.init projection_count Fun.id)
             | _ -> id_pp
           in
           match Bindings.find_opt id ctxt.global.semantic_types.bindings with
@@ -4332,9 +4331,18 @@ let rec doc_typdef global generic_eq_types countable_types enum_number_defs (TD_
             | Some of_num_pp, Some num_of_pp ->
                 let of_num_id_pp = doc_id bare_ctxt of_num_id in
                 let num_of_id_pp = doc_id bare_ctxt num_of_id in
-                ( Some (of_num_id_pp, num_of_id_pp),
-                  num_of_pp ^^ of_num_pp ^^ separate hardline (doc_enum_eq id_pp num_of_id_pp of_num_id_pp)
-                )
+                if !opt_constraint_obligations then
+                  (* The generated numeric conversion functions use semantic
+                     range types.  With constraint obligations enabled, those
+                     ranges are dependent pairs rather than plain [Z] values,
+                     so the numeric equality and countability boilerplate
+                     below is ill-typed.  Keep the conversions themselves,
+                     but use the ordinary structural enum instances. *)
+                  (None, num_of_pp ^^ of_num_pp ^^ fallback)
+                else
+                  ( Some (of_num_id_pp, num_of_id_pp),
+                    num_of_pp ^^ of_num_pp ^^ separate hardline (doc_enum_eq id_pp num_of_id_pp of_num_id_pp)
+                  )
             | Some pp, None | None, Some pp -> (None, pp ^^ fallback)
             | None, None -> (None, fallback)
           )
@@ -6503,6 +6511,11 @@ let pp_ast_coq library_style (types_file, types_modules) (interface_file, interf
                       );
                     string "Ltac sail_constraint_from H :=";
                     string "  clear - H;";
+                    string "  autounfold with sail in H |- *;";
+                    string "  repeat match goal with";
+                    string "         | H' : (_ && _) = true |- _ =>";
+                    string "             apply andb_true_iff in H'; destruct H'";
+                    string "         end;";
                     string "  first [ assumption | reflexivity";
                     string "        | apply andb_true_intro; split; sail_constraint_from H";
                     string "        | (apply Z.leb_le || apply Z.ltb_lt || apply Z.geb_le || apply Z.gtb_lt";
