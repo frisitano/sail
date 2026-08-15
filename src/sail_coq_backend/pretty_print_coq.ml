@@ -6536,6 +6536,24 @@ let pp_ast_coq library_style (types_file, types_modules) (interface_file, interf
                           are boolean expressions, so the goal is `e = true`: try the caller's own hypotheses first, \
                           then decide the arithmetic."
                       );
+                    string "Ltac sail_rem_constraint :=";
+                    string "  match goal with";
+                    string "  | |- context [Z.rem ?dividend ?divisor] =>";
+                    string "      repeat match goal with";
+                    string "             | H : Z.leb _ _ = true |- _ => apply Z.leb_le in H";
+                    string "             | H : Z.ltb _ _ = true |- _ => apply Z.ltb_lt in H";
+                    string "             | H : Z.geb _ _ = true |- _ => apply Z.geb_le in H";
+                    string "             | H : Z.gtb _ _ = true |- _ => apply Z.gtb_lt in H";
+                    string "             end;";
+                    string "      let Hrem := fresh \"H_rem_range\" in";
+                    string "      pose proof";
+                    string "        (Z.rem_bound_pos dividend divisor ltac:(lia)";
+                    string "          ltac:(first [lia | unfold pow2; apply Z.pow_pos_nonneg; lia]))";
+                    string "        as Hrem;";
+                    string "      cbv [pow2 pow] in Hrem |- *;";
+                    string "      first [(apply Z.leb_le || apply Z.ltb_lt || apply Z.geb_le || apply Z.gtb_lt";
+                    string "              || apply Z.eqb_eq); lia | lia]";
+                    string "  end.";
                     string "Ltac sail_constraint_from H :=";
                     string "  clear - H;";
                     string "  autounfold with sail in H |- *;";
@@ -6549,6 +6567,7 @@ let pp_ast_coq library_style (types_file, types_modules) (interface_file, interf
                     string "            subst local_value; autounfold with sail; cbn; sail_constraint_from H end";
                     string "        | match goal with value := uint _ |- _ =>";
                     string "            subst value; sail_constraint_from H end";
+                    string "        | sail_rem_constraint";
                     string "        | match goal with |- context [uint ?value] =>";
                     string "            let Huint := fresh \"H_uint_range\" in";
                     string "            pose proof (uint_range value ltac:(lia)) as Huint;";
@@ -6565,6 +6584,7 @@ let pp_ast_coq library_style (types_file, types_modules) (interface_file, interf
                     string "            subst local_value; autounfold with sail; cbn; sail_constraint end";
                     string "        | match goal with value := uint _ |- _ =>";
                     string "            subst value; sail_constraint end";
+                    string "        | sail_rem_constraint";
                     string "        | match goal with |- context [uint ?value] =>";
                     string "            let Huint := fresh \"H_uint_range\" in";
                     string "            pose proof (uint_range value ltac:(lia)) as Huint;";

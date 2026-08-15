@@ -28,12 +28,14 @@ constraint_obligation_tests = {
   'constraint_implication_dependent_types.sail',
   'enum_cast.sail',
   'semantic_range_argument.sail',
+  'semantic_range_remainder.sail',
   'semantic_range_result_argument.sail',
   'semantic_range_uint.sail',
 }
 
 semantic_range_tests = {
   'semantic_range_argument.sail',
+  'semantic_range_remainder.sail',
   'semantic_range_result_argument.sail',
   'semantic_range_uint.sail',
 }
