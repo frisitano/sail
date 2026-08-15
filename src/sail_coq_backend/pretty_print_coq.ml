@@ -6518,6 +6518,13 @@ let pp_ast_coq library_style (types_file, types_modules) (interface_file, interf
                     string "         end;";
                     string "  first [ assumption | reflexivity";
                     string "        | apply andb_true_intro; split; sail_constraint_from H";
+                    string "        | match goal with value := uint _ |- _ =>";
+                    string "            subst value; sail_constraint_from H end";
+                    string "        | match goal with |- context [uint ?value] =>";
+                    string "            let Huint := fresh \"H_uint_range\" in";
+                    string "            pose proof (uint_range value ltac:(lia)) as Huint;";
+                    string "            first [(apply Z.leb_le || apply Z.ltb_lt || apply Z.geb_le || apply Z.gtb_lt";
+                    string "                    || apply Z.eqb_eq); lia | lia] end";
                     string "        | (apply Z.leb_le || apply Z.ltb_lt || apply Z.geb_le || apply Z.gtb_lt";
                     string "           || apply Z.eqb_eq); lia";
                     string "        | lia ].";
@@ -6525,6 +6532,13 @@ let pp_ast_coq library_style (types_file, types_modules) (interface_file, interf
                     string "  first [ assumption | reflexivity";
                     string "        | apply andb_true_intro; split; sail_constraint";
                     string "        | match goal with H : _ = true |- _ => sail_constraint_from H end";
+                    string "        | match goal with value := uint _ |- _ =>";
+                    string "            subst value; sail_constraint end";
+                    string "        | match goal with |- context [uint ?value] =>";
+                    string "            let Huint := fresh \"H_uint_range\" in";
+                    string "            pose proof (uint_range value ltac:(lia)) as Huint;";
+                    string "            first [(apply Z.leb_le || apply Z.ltb_lt || apply Z.geb_le || apply Z.gtb_lt";
+                    string "                    || apply Z.eqb_eq); lia | lia] end";
                     string "        | (apply Z.leb_le || apply Z.ltb_lt || apply Z.geb_le || apply Z.gtb_lt";
                     string "           || apply Z.eqb_eq); lia";
                     string "        | lia ].";

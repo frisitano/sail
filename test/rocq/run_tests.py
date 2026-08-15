@@ -27,6 +27,11 @@ constraint_obligation_tests = {
   'constraint_dependent_types.sail',
   'constraint_implication_dependent_types.sail',
   'enum_cast.sail',
+  'semantic_range_uint.sail',
+}
+
+semantic_range_tests = {
+  'semantic_range_uint.sail',
 }
 
 flag_off_goldens = {
@@ -100,8 +105,13 @@ def test(name, dir, lib):
             tests[filename] = os.fork()
             if tests[filename] == 0:
                 step('mkdir -p _build_{}'.format(basename))
-                extra_flags = '--rocq-constraint-obligations' if filename in constraint_obligation_tests else ''
-                step('\'{}\' --rocq --rocq-lib-style {} --rocq-undef-axioms --strict-bitvector {} --rocq-output-dir _build_{} -o out {}/{}'.format(sail, lib, extra_flags, basename, dir, filename))
+                extra_flags = ['--strict-bitvector']
+                if filename in constraint_obligation_tests:
+                    extra_flags.append('--rocq-constraint-obligations')
+                if filename in semantic_range_tests:
+                    extra_flags.append('--coq-semantic-range-types')
+                    extra_flags.remove('--strict-bitvector')
+                step('\'{}\' --rocq --rocq-lib-style {} --rocq-undef-axioms {} --rocq-output-dir _build_{} -o out {}/{}'.format(sail, lib, ' '.join(extra_flags), basename, dir, filename))
                 os.chdir('_build_{}'.format(basename))
                 step('{} out_types.v'.format(rocq_compile), name=basename)
                 step('{} out.v'.format(rocq_compile), name=basename)
