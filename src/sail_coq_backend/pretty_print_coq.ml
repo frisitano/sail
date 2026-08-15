@@ -1734,6 +1734,8 @@ let no_proof_fns =
     "length_mword";
     "length";
     "vec_length";
+    "count_leading_zeros";
+    "count_trailing_zeros";
     "negb";
     "andb";
     "orb";
@@ -2728,7 +2730,9 @@ let doc_exp, doc_let =
                 && Option.fold ~none:false ~some:(fun typ -> dependent_projection_count ctxt env typ > 0)
                      ctxt.public_return
               in
-              if projection_count = 0 || preserve_public_result || is_monadic || Option.is_some ctxt.dependent_result
+              if
+                projection_count = 0 || preserve_public_result || is_no_proof_fn inst_env f || is_monadic
+                || Option.is_some ctxt.dependent_result
               then epp
               else List.fold_left (fun pp _ -> string "projT2 " ^^ parens pp) epp (List.init projection_count Fun.id)
             in
