@@ -596,10 +596,10 @@ awk '
   printing { print }
   printing && /^}/ { printing = 0 }
 ' "$SPEC_SOURCE/base.c" > "$TMP_DIR/narrow_then_decrement.c"
-grep -Eq 'uint8_t [A-Za-z0-9_]+ = \(uint8_t\).*distance.*UINT16_C\(1\).*;' \
+grep -Eq 'return decrement_byte\(\(uint8_t\).*distance.*UINT16_C\(1\).*\);' \
   "$TMP_DIR/narrow_then_decrement.c"
-if grep -Eq '^[[:space:]]+uint8_t [A-Za-z0-9_]+;$' "$TMP_DIR/narrow_then_decrement.c"; then
-  echo 'optimized extraction retained an adjacent scalar declaration and assignment' >&2
+if grep -Eq 'result_|tmp_|^[[:space:]]+uint8_t [A-Za-z0-9_]+[[:space:]]*=' "$TMP_DIR/narrow_then_decrement.c"; then
+  echo 'optimized extraction retained a single-use scalar initializer before its call' >&2
   exit 1
 fi
 sed -n \

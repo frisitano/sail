@@ -5540,6 +5540,52 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
       | _ -> None
     in
     let rec scan acc = function
+      | (I_aux (I_init (initialized_ctyp, ((Name _ | Gen _) as x), Init_cval cval), _) as initialization)
+        :: rest -> (
+          match preserve_assignment_conversion initialized_ctyp cval with
+          | None -> scan (initialization :: acc) rest
+          | Some propagated_cval ->
+              let roots = instr_reads ~direct:true initialization in
+              let reads_of instr = if instr_references ~read:x ~direct:false instr then 1 else 0 in
+              let read_count = List.fold_left (fun n instr -> n + reads_of instr) 0 rest in
+              let written_later name =
+                List.exists (fun instr -> instr_references ~write:name ~direct:false instr) rest
+              in
+              let label_before_last_read =
+                let rec check remaining_reads = function
+                  | [] -> false
+                  | _ when remaining_reads <= 0 -> false
+                  | instr :: rest -> contains_label instr || check (remaining_reads - reads_of instr) rest
+                in
+                check read_count rest
+              in
+              let safe =
+                NameSet.subset roots locals
+                && (not (NameSet.exists written_later roots))
+                && (not (written_later x))
+                && (not label_before_last_read)
+                && (read_count = 1 || trivial propagated_cval)
+              in
+              if not safe then scan (initialization :: acc) rest
+              else if read_count = 0 then scan acc rest
+              else (
+                let substitute = function
+                  | V_id (name, _) when Name.compare name x = 0 -> propagated_cval
+                  | other -> other
+                in
+                let simplify_tuple_projection = function
+                  | V_tuple_member (V_tuple values, length, index)
+                    when List.length values = length && index >= 0 && index < length ->
+                      List.nth values index
+                  | value -> value
+                in
+                scan acc
+                  (List.map
+                     (fun instr -> map_instr_cval substitute instr |> map_instr_cval simplify_tuple_projection)
+                     rest
+                  )
+              )
+        )
       | (I_aux (I_decl (decl_ctyp, ((Name _ | Gen _) as x)), _) as decl) :: tail -> (
           match first_copy x decl_ctyp [] tail with
           | None -> scan (decl :: acc) tail
