@@ -94,6 +94,7 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve terminal_choice --c-preserve terminal_enum_match --c-preserve terminal_enum_grouped \
   --c-preserve state_passing_outcome --c-preserve state_passing_guard --c-preserve call_state_passing_guard \
   --c-preserve state_passing_guard_failed \
+  --c-preserve reused_boolean_guard \
   --c-preserve terminal_enum_match_or_fatal \
   --c-preserve fatal_guard_result_is_unread \
   --c-preserve terminal_unit_variant_match \
@@ -150,6 +151,15 @@ if grep -Eq 'tuple_|\.tup[0-9]|rop[0-9]' "$TMP_DIR/state_passing_guard_failed.c"
   echo 'non-state-returning caller retained a state-passing tuple carrier' >&2
   exit 1
 fi
+if grep -Eq 'bool eq_int_result_' "$TMP_DIR/state_passing_guard_failed.c"; then
+  echo 'optimized extraction retained a single-use boolean guard temporary' >&2
+  exit 1
+fi
+sed -n '/^bool reused_boolean_guard(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/reused_boolean_guard.c"
+grep -Eq 'bool [A-Za-z0-9_]+ = .*value != UINT8_C\(0\)' \
+  "$TMP_DIR/reused_boolean_guard.c"
+grep -Eq 'return [A-Za-z0-9_]+;' "$TMP_DIR/reused_boolean_guard.c"
 if grep -Fq 'struct canonical_slice' "$SPEC_INCLUDE/evmsail/spec/base.h"; then
   echo 'optimized extraction emitted a nominal definition for a canonically named external representation' >&2
   exit 1
@@ -364,6 +374,10 @@ if grep -Fq '    return;' "$TMP_DIR/terminal_enum_match_or_fatal.c"; then
 fi
 if grep -Eq 'goto |finish_match_|uint8_t (tmp_|result_)' "$TMP_DIR/terminal_enum_match_or_fatal.c"; then
   echo 'optimized extraction retained a mutable join for a fatal match arm' >&2
+  exit 1
+fi
+if grep -Eq 'bool neq_int_result_' "$TMP_DIR/terminal_enum_match_or_fatal.c"; then
+  echo 'optimized extraction retained a branch-local boolean guard temporary' >&2
   exit 1
 fi
 

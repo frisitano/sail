@@ -120,6 +120,12 @@ function state_passing_guard_failed(read_only : byte, state : word, fail : bool)
   } else false
 }
 
+function reused_boolean_guard(value : byte) -> bool = {
+  let is_nonzero = value != 0;
+  if is_nonzero then public_counter = 0;
+  is_nonzero
+}
+
 function terminal_enum_match(choice : terminal_choice) -> byte =
   match choice {
     TerminalOne => 1,

@@ -9303,6 +9303,33 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
          expose another one immediately before emission. *)
       | instr :: I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp -> docs (instr :: rest)
       | I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp -> docs rest
+      (* A pure boolean value that is consumed only by the immediately
+         following conditional does not need a named C local.  Keep the
+         reference check deliberately global: later uses, including uses in
+         either arm, still require the snapshot represented by the JIB
+         initializer. *)
+      | I_aux (I_init (CT_bool, initialized, Init_cval condition), _)
+        :: I_aux (I_if (V_id (tested, tested_ctyp), then_body, else_body), if_annot)
+        :: rest
+        when Config.optimized_model && (not Config.cpp)
+             && Name.compare initialized tested = 0
+             && ctyp_equal tested_ctyp CT_bool && ctyp_equal (cval_ctyp condition) CT_bool
+             &&
+             (match (then_body, else_body) with
+             | ( [I_aux (I_copy (then_destination, then_value), _)],
+                 [I_aux (I_copy (else_destination, else_value), _)] ) ->
+                 Option.is_none
+                   (conditional_assignment_expression ctx condition then_destination then_value else_destination
+                      else_value
+                   )
+             | _ -> true
+             )
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:initialized ~direct:false instr)
+                     (then_body @ else_body @ rest)
+                  ) ->
+          codegen_instr fid ctx (I_aux (I_if (condition, then_body, else_body), if_annot)) :: docs rest
       (* A try expression writes its result only on the normal or handled
          paths.  An unhandled exception deliberately returns through the C
          exception ABI with that value unread by the caller, but reading an
