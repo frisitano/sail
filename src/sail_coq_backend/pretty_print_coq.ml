@@ -160,6 +160,8 @@ type context = {
      n_constraints with equivalent variables in doc_nc_exp. *)
   kid_id_renames : id option KBindings.t; (* tyvar -> argument renames *)
   kid_id_renames_rev : kid Bindings.t; (* reverse of kid_id_renames *)
+  semantic_kid_values : PPrint.document KBindings.t;
+      (* Constraint-only projections from semantic-range arguments to their arithmetic carriers. *)
   fixed_toplevel_kids : typ_arg KBindings.t;
       (* type variables that are defined by an equation in the function signature *)
   dropped_kids : KidSet.t; (* type variables from the function signature that don't appear in the generated code *)
@@ -196,6 +198,7 @@ let empty_ctxt =
     kid_renames = KBindings.empty;
     kid_id_renames = KBindings.empty;
     kid_id_renames_rev = Bindings.empty;
+    semantic_kid_values = KBindings.empty;
     fixed_toplevel_kids = KBindings.empty;
     dropped_kids = KidSet.empty;
     bound_nvars = KidSet.empty;
@@ -317,14 +320,18 @@ let doc_id_ctor ctxt (Id_aux (i, _)) =
   | Operator x -> string (Util.zencode_string ("op " ^ x))
 
 let doc_var ctxt kid =
-  match KBindings.find kid ctxt.kid_id_renames with
-  | Some id -> doc_id ctxt id
-  | None -> underscore (* The original id has been shadowed, hope Coq can work it out...  TODO: warn? *)
-  | exception Not_found ->
-      string
-        (fix_id ctxt.global.avoid_target_names true
-           (string_of_kid (try KBindings.find kid ctxt.kid_renames with Not_found -> kid))
-        )
+  match KBindings.find_opt kid ctxt.semantic_kid_values with
+  | Some value -> value
+  | None -> (
+      match KBindings.find kid ctxt.kid_id_renames with
+      | Some id -> doc_id ctxt id
+      | None -> underscore (* The original id has been shadowed, hope Coq can work it out...  TODO: warn? *)
+      | exception Not_found ->
+          string
+            (fix_id ctxt.global.avoid_target_names true
+               (string_of_kid (try KBindings.find kid ctxt.kid_renames with Not_found -> kid))
+            )
+    )
 
 let doc_field_name ctxt typ_id field_id =
   if prefix_recordtype && string_of_id typ_id <> "regstate" then
@@ -4700,6 +4707,7 @@ let doc_funcl_init global proof_mode mutrec rec_opt ?rec_set (FCL_aux (FCL_funcl
       kid_renames = mk_kid_renames global.avoid_target_names ids_to_avoid kids_used;
       kid_id_renames = kid_to_arg_rename;
       kid_id_renames_rev = kir_rev;
+      semantic_kid_values = KBindings.empty;
       fixed_toplevel_kids = simple_type_equations;
       dropped_kids = KidSet.diff bound_kids (coq_nvars_of_typ typ);
       bound_nvars = bound_kids;
@@ -4759,7 +4767,26 @@ let doc_funcl_init global proof_mode mutrec rec_opt ?rec_set (FCL_aux (FCL_funcl
 
   (* Put the constraints after pattern matching so that any type variable that's
      been replaced by one of the term-level arguments is bound. *)
-  let quantspp, constrspp = doc_typquant_items_separate ctxt env braces tq in
+  let semantic_kid_values =
+    if !opt_constraint_obligations then
+      List.fold_left2
+        (fun values ((P_aux (_, ann) as pat), _) public_typ ->
+          let env = env_of_annot ann in
+          let public_typ = Type_check.subst_unifiers simple_type_equations public_typ in
+          match (pat_is_plain_binder env pat, semantic_range_id ctxt public_typ) with
+          | Some (Some id), Some _ -> (
+              match Bindings.find_opt id ctxt.kid_id_renames_rev with
+              | Some kid -> KBindings.add kid (doc_semantic_unpack ctxt public_typ (doc_id ctxt id)) values
+              | None -> values
+            )
+          | _, _ -> values
+        )
+        KBindings.empty pats public_arg_typs
+    else KBindings.empty
+  in
+  let constraint_ctxt = { ctxt with semantic_kid_values } in
+  let quantspp = List.filter_map (doc_quant_item_id ctxt braces) tq in
+  let constrspp = doc_quant_item_constrs constraint_ctxt env tq in
   let is_fixed_constant env typ =
     match destruct_atom_nexp env typ with
     | Some (Nexp_aux (Nexp_var kid, _)) -> KBindings.find_opt kid constant_kids
