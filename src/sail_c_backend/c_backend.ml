@@ -4256,34 +4256,35 @@ let flatten_unique_stack_blocks ctx (CDEF_aux (aux, def_annot)) =
   | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
+let assigned_boolean_value destination instrs =
+  let rec meaningful = function
+    | I_aux (I_clear (ctyp, _), _) :: rest when ctyp_equal ctyp CT_bool -> meaningful rest
+    | I_aux (I_block block, _) :: rest -> meaningful block @ meaningful rest
+    | instr :: rest -> instr :: meaningful rest
+    | [] -> []
+  in
+  match meaningful instrs with
+  | [I_aux (I_copy (CL_id (assigned, assigned_ctyp), value), _)]
+    when Name.compare destination assigned = 0 && ctyp_equal assigned_ctyp CT_bool ->
+      Some value
+  | _ -> None
+
+let short_circuit_boolean_expression condition then_value else_value =
+  let bool_literal expected = function
+    | V_lit (VL_bool actual, CT_bool) -> Bool.equal expected actual
+    | _ -> false
+  in
+  if bool_literal false else_value then Some (V_call (Band, [condition; then_value]))
+  else if bool_literal true then_value then Some (V_call (Bor, [condition; else_value]))
+  else if bool_literal false then_value then Some (V_call (Band, [V_call (Bnot, [condition]); else_value]))
+  else if bool_literal true else_value then Some (V_call (Bor, [V_call (Bnot, [condition]); then_value]))
+  else None
+
 (* Recover the short-circuit boolean expression represented by JIB's ANF
    diamond. The right operand remains under C's &&/|| short-circuit operator,
    so this changes neither its evaluation condition nor its order. Cvals are
    pure; effectful calls remain explicit instructions and cannot match here. *)
 let collapse_short_circuit_booleans (CDEF_aux (aux, def_annot)) =
-  let bool_literal expected = function V_lit (VL_bool actual, CT_bool) -> Bool.equal expected actual | _ -> false in
-  let assigned_value destination = function
-    | instrs -> (
-        let rec meaningful = function
-          | I_aux (I_clear (ctyp, _), _) :: rest when ctyp_equal ctyp CT_bool -> meaningful rest
-          | I_aux (I_block block, _) :: rest -> meaningful block @ meaningful rest
-          | instr :: rest -> instr :: meaningful rest
-          | [] -> []
-        in
-        match meaningful instrs with
-        | [I_aux (I_copy (CL_id (assigned, assigned_ctyp), value), _)]
-          when Name.compare destination assigned = 0 && ctyp_equal assigned_ctyp CT_bool ->
-            Some value
-        | _ -> None
-      )
-  in
-  let expression condition then_value else_value =
-    if bool_literal false else_value then Some (V_call (Band, [condition; then_value]))
-    else if bool_literal true then_value then Some (V_call (Bor, [condition; else_value]))
-    else if bool_literal false then_value then Some (V_call (Band, [V_call (Bnot, [condition]); else_value]))
-    else if bool_literal true else_value then Some (V_call (Bor, [V_call (Bnot, [condition]); then_value]))
-    else None
-  in
   let rewrite_lists instrs =
     let rec rewrite = function
       | (I_aux (I_decl (result_ctyp, result), _) as result_declaration)
@@ -4296,9 +4297,11 @@ let collapse_short_circuit_booleans (CDEF_aux (aux, def_annot)) =
              && Name.compare temporary source = 0
              && ctyp_equal result_ctyp assigned_result_ctyp
              && ctyp_equal temporary_ctyp source_ctyp -> (
-          match (assigned_value temporary then_instrs, assigned_value temporary else_instrs) with
+          match
+            (assigned_boolean_value temporary then_instrs, assigned_boolean_value temporary else_instrs)
+          with
           | Some then_value, Some else_value -> (
-              match expression condition then_value else_value with
+              match short_circuit_boolean_expression condition then_value else_value with
               | Some value ->
                   result_declaration :: I_aux (I_copy (CL_id (result, CT_bool), value), copy_aux) :: rewrite rest
               | None ->
@@ -4317,9 +4320,11 @@ let collapse_short_circuit_booleans (CDEF_aux (aux, def_annot)) =
         :: I_aux (I_if (condition, then_instrs, else_instrs), if_aux)
         :: rest
         when ctyp_equal declared_ctyp CT_bool -> (
-          match (assigned_value destination then_instrs, assigned_value destination else_instrs) with
+          match
+            (assigned_boolean_value destination then_instrs, assigned_boolean_value destination else_instrs)
+          with
           | Some then_value, Some else_value -> (
-              match expression condition then_value else_value with
+              match short_circuit_boolean_expression condition then_value else_value with
               | Some value ->
                   declaration :: I_aux (I_copy (CL_id (destination, CT_bool), value), if_aux) :: rewrite rest
               | None -> declaration :: I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rewrite rest
@@ -9354,6 +9359,42 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
          reference check deliberately global: later uses, including uses in
          either arm, still require the snapshot represented by the JIB
          initializer. *)
+      | (I_aux (I_decl (CT_bool, declared), _) as declaration)
+        :: (I_aux (I_if (short_condition, short_then, short_else), _) as short_circuit)
+        :: (I_aux (I_if (V_id (tested, tested_ctyp), then_body, else_body), if_annot) as guard)
+        :: rest
+        when Config.optimized_model && (not Config.cpp)
+             && Name.compare declared tested = 0
+             && ctyp_equal tested_ctyp CT_bool && ctyp_equal (cval_ctyp short_condition) CT_bool
+             &&
+             (match (then_body, else_body) with
+             | ( [I_aux (I_copy (then_destination, then_value), _)],
+                 [I_aux (I_copy (else_destination, else_value), _)] ) ->
+                 Option.is_none
+                   (conditional_assignment_expression ctx (V_id (tested, tested_ctyp)) then_destination
+                      then_value else_destination else_value
+                   )
+             | _ -> true
+             )
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:declared ~direct:false instr)
+                     (then_body @ else_body @ rest)
+                  ) -> (
+          match
+            (assigned_boolean_value declared short_then, assigned_boolean_value declared short_else)
+          with
+          | Some short_then_value, Some short_else_value -> (
+              match
+                short_circuit_boolean_expression short_condition short_then_value short_else_value
+              with
+              | Some condition ->
+                  codegen_instr fid ctx (I_aux (I_if (condition, then_body, else_body), if_annot))
+                  :: docs rest
+              | None -> codegen_instr fid ctx declaration :: docs (short_circuit :: guard :: rest)
+            )
+          | _ -> codegen_instr fid ctx declaration :: docs (short_circuit :: guard :: rest)
+        )
       | I_aux (I_init (CT_bool, initialized, Init_cval condition), _)
         :: I_aux (I_if (V_id (tested, tested_ctyp), then_body, else_body), if_annot)
         :: rest

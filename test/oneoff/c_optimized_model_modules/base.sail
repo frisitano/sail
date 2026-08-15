@@ -144,6 +144,13 @@ function early_wide_guard(per_unit : halfword, units : wide_word) -> bool = {
   if units <= remaining then true else false
 }
 
+function short_circuit_guard(length : byte, first : bits(8)) -> byte = {
+  if (length == 1) & (first[7] == bitzero) then {
+    return 1
+  };
+  tmod_nat(add_byte(length, 1), 256)
+}
+
 function widened_tuple_match(choice : tuple_choice) -> (halfword, halfword) =
   match choice {
     TupleOne => (1, 2),

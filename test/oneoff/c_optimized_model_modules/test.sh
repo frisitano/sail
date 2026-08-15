@@ -49,7 +49,7 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve-type wide_word --c-preserve-type four_bytes --c-preserve-type twenty_bytes --c-preserve-type lane_five_bytes --c-preserve-type fixed_ids \
   --c-preserve-type fixed_ids_box --c-preserve-type equality_pair \
   --c-preserve pair_sum --c-preserve sample_choice_value --c-preserve added_is_nonzero \
-  --c-preserve boolean_cleanup --c-preserve positive_branch --c-preserve early_wide_guard --c-preserve widened_tuple_match \
+  --c-preserve boolean_cleanup --c-preserve positive_branch --c-preserve early_wide_guard --c-preserve short_circuit_guard --c-preserve widened_tuple_match \
   --c-preserve repeated_branch \
   --c-preserve repeated_call_branch --c-preserve boolean_value_join --c-preserve boolean_comparison_join \
   --c-preserve call_discard_internal_parameter --c-preserve call_discard_computed_parameter \
@@ -318,6 +318,16 @@ awk '
 grep -Fq 'return true;' "$TMP_DIR/early_wide_guard.c"
 if grep -Eq 'goto |end_function_|result_' "$TMP_DIR/early_wide_guard.c"; then
   echo 'optimized extraction retained a mutable join for an early scalar return' >&2
+  exit 1
+fi
+awk '
+  /^uint8_t short_circuit_guard\(/ { printing = 1 }
+  printing { print }
+  printing && /^}/ { printing = 0 }
+' "$SPEC_SOURCE/base.c" > "$TMP_DIR/short_circuit_guard.c"
+grep -Eq '^  if \(.*&&.*\) \{' "$TMP_DIR/short_circuit_guard.c"
+if grep -Eq 'bool (tmp_|result_)|if \((tmp_|result_)' "$TMP_DIR/short_circuit_guard.c"; then
+  echo 'optimized extraction retained a temporary for an immediately consumed short-circuit guard' >&2
   exit 1
 fi
 sed -n \
