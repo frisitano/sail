@@ -134,6 +134,12 @@ function one_use_guard_before_local_write(value : byte) -> byte = {
   current
 }
 
+function one_use_guard_in_composed_condition(value : byte, fallback : bool) -> byte = {
+  let is_nonzero = value != 0;
+  if is_nonzero | fallback then public_counter = 0;
+  value
+}
+
 function terminal_enum_match(choice : terminal_choice) -> byte =
   match choice {
     TerminalOne => 1,

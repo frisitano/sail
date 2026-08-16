@@ -9201,6 +9201,26 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         ^^ space ^^ lbrace ^^ hardline ^^ render_case_labels cases ^^ hardline ^^ string "  }"
 
   and codegen_instrs ?(function_tail = false) fid ctx instrs =
+    let cval_name_read_count target value =
+      let count = ref 0 in
+      ignore
+        (map_cval
+           (function
+             | V_id (name, _) as value when Name.compare name target = 0 ->
+                 incr count;
+                 value
+             | value -> value
+             )
+           value
+        );
+      !count
+    in
+    let cval_name_subst target replacement =
+      map_cval (function
+        | V_id (name, _) when Name.compare name target = 0 -> replacement
+        | value -> value
+        )
+    in
     let split_simple_loop loop_label end_label instrs =
       let rec split reversed = function
         | I_aux (I_goto back_edge, _) :: I_aux (I_label end_target, _) :: rest
@@ -9395,18 +9415,18 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           | _ -> codegen_instr fid ctx declaration :: docs (short_circuit :: guard :: rest)
         )
       | I_aux (I_init (CT_bool, initialized, Init_cval condition), _)
-        :: I_aux (I_if (V_id (tested, tested_ctyp), then_body, else_body), if_annot)
+        :: I_aux (I_if (guard_condition, then_body, else_body), if_annot)
         :: rest
         when Config.optimized_model && (not Config.cpp)
-             && Name.compare initialized tested = 0
-             && ctyp_equal tested_ctyp CT_bool && ctyp_equal (cval_ctyp condition) CT_bool
+             && ctyp_equal (cval_ctyp guard_condition) CT_bool && ctyp_equal (cval_ctyp condition) CT_bool
+             && cval_name_read_count initialized guard_condition = 1
              &&
              (match (then_body, else_body) with
              | ( [I_aux (I_copy (then_destination, then_value), _)],
                  [I_aux (I_copy (else_destination, else_value), _)] ) ->
                  Option.is_none
-                   (conditional_assignment_expression ctx condition then_destination then_value else_destination
-                      else_value
+                   (conditional_assignment_expression ctx guard_condition then_destination then_value
+                      else_destination else_value
                    )
              | _ -> true
              )
@@ -9415,7 +9435,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                      (fun instr -> instr_references ~read:initialized ~direct:false instr)
                      (then_body @ else_body @ rest)
                   ) ->
-          codegen_instr fid ctx (I_aux (I_if (condition, then_body, else_body), if_annot)) :: docs rest
+          let guard_condition = cval_name_subst initialized condition guard_condition in
+          codegen_instr fid ctx (I_aux (I_if (guard_condition, then_body, else_body), if_annot)) :: docs rest
       (* A try expression writes its result only on the normal or handled
          paths.  An unhandled exception deliberately returns through the C
          exception ABI with that value unread by the caller, but reading an
