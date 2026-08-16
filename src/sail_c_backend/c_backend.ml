@@ -5511,7 +5511,12 @@ let prune_after_noreturn_call ctx (CDEF_aux (aux, def_annot)) =
       CDEF_aux (CDEF_fundef (id, ret, args, rewrite body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
-let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
+let propagate_pure_copies_in_cdef ctx immutable_globals (CDEF_aux (aux, def_annot)) =
+  let stable_root locals root =
+    NameSet.mem root locals
+    || match root with Name (id, _) -> IdSet.mem id immutable_globals | _ -> false
+  in
+  let roots_are_stable locals roots = NameSet.for_all (stable_root locals) roots in
   let rec trivial = function
     | V_id _ | V_member _ | V_lit _ -> true
     | V_tuple values -> List.for_all trivial values
@@ -5555,19 +5560,36 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
       | _ -> None
     in
     let hazard_before_last_read roots reads_of read_count =
+      let clears_managed_root instr =
+        let found = ref false in
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               ( match aux with
+               | I_clear (ctyp, name) when NameSet.mem name roots && not (is_stack_ctyp ctx ctyp) -> found := true
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          );
+        !found
+      in
       let rec check remaining_reads = function
         | [] -> false
         | _ when remaining_reads <= 0 -> false
         | instr :: rest ->
             contains_label instr
-            || NameSet.exists (fun name -> instr_references ~write:name ~direct:false instr) roots
+            || clears_managed_root instr
+            || not (NameSet.is_empty (NameSet.inter roots (instr_writes ~direct:false instr)))
             || check (remaining_reads - reads_of instr) rest
       in
       check read_count
     in
     (* Use the dependency relation here rather than the lifecycle-oriented
-       reference predicate: [I_clear] consumes a value but does not redefine
-       it, so it must not block propagation of that value into its sole use. *)
+       reference predicate: a stack-value [I_clear] is removed before C
+       emission and does not redefine the value.  A managed-value clear still
+       blocks propagation because it releases ownership. *)
     let written_later name instrs =
       List.exists (fun instr -> NameSet.mem name (instr_writes ~direct:false instr)) instrs
     in
@@ -5581,7 +5603,7 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
               let reads_of instr = if instr_references ~read:x ~direct:false instr then 1 else 0 in
               let read_count = List.fold_left (fun n instr -> n + reads_of instr) 0 rest in
               let safe =
-                NameSet.subset roots locals
+                roots_are_stable locals roots
                 && (not (written_later x rest))
                 && (not (hazard_before_last_read roots reads_of read_count rest))
                 && (read_count = 1 || trivial propagated_cval)
@@ -5617,7 +5639,7 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
                   let reads_of instr = if instr_references ~read:x ~direct:false instr then 1 else 0 in
                   let read_count = List.fold_left (fun n instr -> n + reads_of instr) 0 rest in
                   let safe =
-                    NameSet.subset roots locals
+                    roots_are_stable locals roots
                     && (not (written_later x rest))
                     && (not (hazard_before_last_read roots reads_of read_count rest))
                     && (read_count = 1 || trivial propagated_cval)
@@ -5658,7 +5680,10 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
          value lifetimes that this local data-flow proof can track.  A [Gen]
          call destination is also necessarily a compiler-created local, even
          when its C declaration is fused into the call by the renderer; named
-         call destinations remain excluded because they may be registers. *)
+         call destinations remain excluded because they may be registers.
+         Enum constructors and top-level [let] bindings are immutable global
+         constants, so they are also stable roots even though they have
+         ordinary named JIB identifiers. *)
       let locals = ref (NameSet.of_list args) in
       List.iter
         (fun instr ->
@@ -5689,6 +5714,26 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
       let body = fixpoint 2 body in
       CDEF_aux (CDEF_fundef (id, ret, args, body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
+
+let propagate_pure_copies ctx cdefs =
+  (* [Jib_compile.ctx.enums] is populated while source definitions are
+     compiled, but the C optimizer deliberately receives the initial context.
+     The typed JIB stream is therefore the authoritative place to identify
+     immutable enum constructors and top-level [let] bindings.  Keep this set
+     distinct from values merely having the same types: registers remain
+     mutable and are not safe propagation roots. *)
+  let immutable_globals =
+    List.fold_left
+      (fun members (CDEF_aux (aux, _)) ->
+        match aux with
+        | CDEF_type (CTD_enum (_, ids)) -> IdSet.union (IdSet.of_list ids) members
+        | CDEF_let (_, bindings, _) ->
+            IdSet.union (IdSet.of_list (List.map fst bindings)) members
+        | _ -> members
+      )
+      IdSet.empty cdefs
+  in
+  List.map (propagate_pure_copies_in_cdef ctx immutable_globals) cdefs
 
 (* Declaration fusion is intentionally the final producer of local
    declarations.  Doing it before copy propagation and terminal-return
@@ -6004,32 +6049,32 @@ let optimize ~have_rts ~specialize_c ~optimized_model ctx recursive_functions cd
   |> (if !optimize_pure_copies then List.map prune_constant_branches else nothing)
   |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_alias then List.concat_map remove_alias else nothing)
   |> (if !optimize_alias then combine_variables ctx else nothing)
   |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction ctx) else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map (flatten_unique_stack_blocks ctx) else nothing)
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction ctx) else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
   |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
@@ -6044,16 +6089,16 @@ let optimize ~have_rts ~specialize_c ~optimized_model ctx recursive_functions cd
   |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
   |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
   |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_unit_results then List.map (discard_unread_stack_results ctx) else nothing)
   |> (if !optimize_unit_results then List.map (erase_unit_scaffolding ctx) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
   |> (if !optimize_pure_copies then List.map merge_repeated_conditional_branches else nothing)
@@ -6067,7 +6112,7 @@ let optimize ~have_rts ~specialize_c ~optimized_model ctx recursive_functions cd
   |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
   |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   (* The preceding propagation can expose a narrow tuple literal only after
      the earlier aggregate passes have run. Normalize its field widening in
      typed JIB, then sink the exact result before local initialization makes
@@ -6092,7 +6137,7 @@ let optimize ~have_rts ~specialize_c ~optimized_model ctx recursive_functions cd
      that match arms return their values directly before C emission. *)
   |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then List.map propagate_pure_copies else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
   |> (if !optimize_pure_copies then List.map structure_forward_match_joins else nothing)
   |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
   |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)

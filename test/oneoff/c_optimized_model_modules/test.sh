@@ -49,7 +49,7 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve-type wide_word --c-preserve-type four_bytes --c-preserve-type twenty_bytes --c-preserve-type lane_five_bytes --c-preserve-type fixed_ids \
   --c-preserve-type fixed_ids_box --c-preserve-type equality_pair \
   --c-preserve pair_sum --c-preserve byte_identity --c-preserve pack_widened_record --c-preserve widened_record_sum \
-  --c-preserve construct_widened_record --c-preserve construct_widened_record_direct \
+  --c-preserve construct_widened_record --c-preserve construct_widened_record_direct --c-preserve schema_widened_record \
   --c-preserve sample_choice_value --c-preserve added_is_nonzero \
   --c-preserve boolean_cleanup --c-preserve positive_branch --c-preserve early_wide_guard --c-preserve short_circuit_guard --c-preserve widened_tuple_match \
   --c-preserve repeated_branch \
@@ -136,11 +136,22 @@ grep -Fq 'struct widened_record_fields construct_widened_record_direct(uint8_t v
   "$SPEC_INCLUDE/evmsail/spec/base.h"
 sed -n '/^struct widened_record_fields construct_widened_record_direct(/,/^}/p' \
   "$SPEC_SOURCE/base.c" > "$TMP_DIR/construct_widened_record_direct.c"
-grep -Fq 'return pack_widened_record(((struct widened_record_fields)' \
-  "$TMP_DIR/construct_widened_record_direct.c"
+if ! grep -Fq 'return pack_widened_record(((struct widened_record_fields)' \
+    "$TMP_DIR/construct_widened_record_direct.c"; then
+  echo 'optimized extraction did not sink the dependent record into its sole call' >&2
+  exit 1
+fi
+grep -Fq '.choice = profile_current' "$TMP_DIR/construct_widened_record_direct.c"
 if grep -Eq 'struct widened_record_fields (tmp_|result_)' \
     "$TMP_DIR/construct_widened_record_direct.c"; then
-  echo 'optimized extraction retained a one-use aggregate around a generated call result' >&2
+  echo 'optimized extraction retained a one-use dependent aggregate rooted in an immutable top-level binding' >&2
+  exit 1
+fi
+sed -n '/^struct widened_record_fields schema_widened_record(/,/^}/p' \
+  "$SPEC_SOURCE/base.c" > "$TMP_DIR/schema_widened_record.c"
+if grep -Eq 'struct widened_record_fields (tmp_|result_|[A-Za-z0-9_]+;)' \
+    "$TMP_DIR/schema_widened_record.c"; then
+  echo 'optimized extraction retained a branch-local dependent aggregate rooted in an immutable top-level binding' >&2
   exit 1
 fi
 grep -Fq 'uint8_t canonical_slice_len(TestBytes value);' "$SPEC_INCLUDE/evmsail/spec/base.h"

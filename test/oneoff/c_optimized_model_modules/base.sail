@@ -36,7 +36,13 @@ struct pair = {
   second : byte,
 }
 
+enum profile_choice = { ProfileLegacy, ProfileCurrent }
+
+let profile_legacy : profile_choice = ProfileLegacy
+let profile_current : profile_choice = ProfileCurrent
+
 struct widened_record_fields('wide : Int), 0 <= 'wide & 'wide <= 4294967295 = {
+  choice : profile_choice,
   wide : int('wide),
   marker : byte,
 }
@@ -361,7 +367,11 @@ val construct_widened_record : forall 'value, 0 <= 'value & 'value <= 255.
   atom('value) -> range(0, 4294967550)
 
 function construct_widened_record(value) = {
-  let record = struct { wide = byte_identity(value), marker = value } : widened_record_fields('value);
+  let record = struct {
+    choice = profile_current,
+    wide = byte_identity(value),
+    marker = value,
+  } : widened_record_fields('value);
   widened_record_sum(pack_widened_record(record))
 }
 
@@ -369,9 +379,36 @@ val construct_widened_record_direct : forall 'value, 0 <= 'value & 'value <= 255
   atom('value) -> widened_record
 
 function construct_widened_record_direct(value) = {
-  let record = struct { wide = byte_identity(value), marker = value } : widened_record_fields('value);
+  let record = struct {
+    choice = profile_current,
+    wide = byte_identity(value),
+    marker = value,
+  } : widened_record_fields('value);
   pack_widened_record(record)
 }
+
+val schema_widened_record : forall 'value, 0 <= 'value & 'value <= 255.
+  (byte, atom('value)) -> widened_record
+
+function schema_widened_record(schema, value) =
+  match schema {
+    0 => {
+      let record = struct {
+        choice = profile_legacy,
+        wide = byte_identity(value),
+        marker = value,
+      } : widened_record_fields('value);
+      pack_widened_record(record)
+    },
+    _ => {
+      let record = struct {
+        choice = profile_current,
+        wide = byte_identity(value),
+        marker = value,
+      } : widened_record_fields('value);
+      pack_widened_record(record)
+    },
+  }
 
 function sample_choice_value(value : sample_choice) -> byte = match value {
   InputChoice(value) => value,
