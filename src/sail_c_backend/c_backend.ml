@@ -5565,6 +5565,12 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
       in
       check read_count
     in
+    (* Use the dependency relation here rather than the lifecycle-oriented
+       reference predicate: [I_clear] consumes a value but does not redefine
+       it, so it must not block propagation of that value into its sole use. *)
+    let written_later name instrs =
+      List.exists (fun instr -> NameSet.mem name (instr_writes ~direct:false instr)) instrs
+    in
     let rec scan acc = function
       | (I_aux (I_init (initialized_ctyp, ((Name _ | Gen _) as x), Init_cval cval), _) as initialization)
         :: rest -> (
@@ -5574,12 +5580,9 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
               let roots = instr_reads ~direct:true initialization in
               let reads_of instr = if instr_references ~read:x ~direct:false instr then 1 else 0 in
               let read_count = List.fold_left (fun n instr -> n + reads_of instr) 0 rest in
-              let written_later name =
-                List.exists (fun instr -> instr_references ~write:name ~direct:false instr) rest
-              in
               let safe =
                 NameSet.subset roots locals
-                && (not (written_later x))
+                && (not (written_later x rest))
                 && (not (hazard_before_last_read roots reads_of read_count rest))
                 && (read_count = 1 || trivial propagated_cval)
               in
@@ -5613,12 +5616,9 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
                   let roots = instr_reads ~direct:true copy in
                   let reads_of instr = if instr_references ~read:x ~direct:false instr then 1 else 0 in
                   let read_count = List.fold_left (fun n instr -> n + reads_of instr) 0 rest in
-                  let written_later name =
-                    List.exists (fun instr -> instr_references ~write:name ~direct:false instr) rest
-                  in
                   let safe =
                     NameSet.subset roots locals
-                    && (not (written_later x))
+                    && (not (written_later x rest))
                     && (not (hazard_before_last_read roots reads_of read_count rest))
                     && (read_count = 1 || trivial propagated_cval)
                   in
