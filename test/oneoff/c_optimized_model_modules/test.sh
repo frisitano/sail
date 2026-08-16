@@ -49,7 +49,8 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve-type wide_word --c-preserve-type four_bytes --c-preserve-type twenty_bytes --c-preserve-type lane_five_bytes --c-preserve-type fixed_ids \
   --c-preserve-type fixed_ids_box --c-preserve-type equality_pair \
   --c-preserve pair_sum --c-preserve byte_identity --c-preserve pack_widened_record --c-preserve widened_record_sum \
-  --c-preserve construct_widened_record --c-preserve sample_choice_value --c-preserve added_is_nonzero \
+  --c-preserve construct_widened_record --c-preserve construct_widened_record_direct \
+  --c-preserve sample_choice_value --c-preserve added_is_nonzero \
   --c-preserve boolean_cleanup --c-preserve positive_branch --c-preserve early_wide_guard --c-preserve short_circuit_guard --c-preserve widened_tuple_match \
   --c-preserve repeated_branch \
   --c-preserve repeated_call_branch --c-preserve boolean_value_join --c-preserve boolean_comparison_join \
@@ -131,6 +132,17 @@ grep -Fq '#include "evmsail/host/types.h"' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint8_t' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint16_t pair_sum(struct pair value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint64_t construct_widened_record(uint8_t value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'struct widened_record_fields construct_widened_record_direct(uint8_t value);' \
+  "$SPEC_INCLUDE/evmsail/spec/base.h"
+sed -n '/^struct widened_record_fields construct_widened_record_direct(/,/^}/p' \
+  "$SPEC_SOURCE/base.c" > "$TMP_DIR/construct_widened_record_direct.c"
+grep -Fq 'return pack_widened_record(((struct widened_record_fields)' \
+  "$TMP_DIR/construct_widened_record_direct.c"
+if grep -Eq 'struct widened_record_fields (tmp_|result_)' \
+    "$TMP_DIR/construct_widened_record_direct.c"; then
+  echo 'optimized extraction retained a one-use aggregate around a generated call result' >&2
+  exit 1
+fi
 grep -Fq 'uint8_t canonical_slice_len(TestBytes value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint8_t canonical_list_count(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'TestList canonical_list_identity(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"

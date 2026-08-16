@@ -19,11 +19,14 @@ int main(void) {
   struct byte_slice second = byte_slice_next(byte_slice_small_at(6, 2));
   struct analyzed_code code =
       analyzed_code_copy(analyzed_code_at(4, 9, jumpdest_from_offset(12)));
+  struct widened_record_fields direct_record =
+      construct_widened_record_direct(UINT8_C(7));
   TestList list = {.count = 3};
   evmsail_model_init();
   public_counter = 40;
   return run(2) == 42 && catch_byte(7) == 7 && machine_pick_zero(3) == 0 &&
                  pair_sum(value) == 7 && construct_widened_record(7) == 14 &&
+                 direct_record.wide == 7 && direct_record.marker == 7 &&
                  preserve_counter_snapshot(9) == 9 &&
                  public_counter == 0 && first.bytes == test_bytes_at(3) &&
                  second.bytes == test_bytes_at(7) &&

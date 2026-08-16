@@ -5654,8 +5654,11 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
          ordinary JIB names too, and a function may assign one before taking a
          snapshot of it.  Treating every written name as local allowed the
          snapshot to be substituted across a later call which mutated the
-         register.  Only arguments and names with an actual body declaration
-         have value lifetimes that this local data-flow proof can track. *)
+         register.  Arguments and names with an actual body declaration have
+         value lifetimes that this local data-flow proof can track.  A [Gen]
+         call destination is also necessarily a compiler-created local, even
+         when its C declaration is fused into the call by the renderer; named
+         call destinations remain excluded because they may be registers. *)
       let locals = ref (NameSet.of_list args) in
       List.iter
         (fun instr ->
@@ -5664,6 +5667,12 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
                (fun (I_aux (aux, _) as sub) ->
                  ( match aux with
                  | I_decl (_, name) | I_init (_, name, _) -> locals := NameSet.add name !locals
+                 | I_funcall _ ->
+                     let generated_destinations =
+                       instr_writes ~direct:true sub
+                       |> NameSet.filter (function Gen _ -> true | _ -> false)
+                     in
+                     locals := NameSet.union generated_destinations !locals
                  | _ -> ()
                  );
                  sub

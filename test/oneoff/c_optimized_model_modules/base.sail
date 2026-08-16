@@ -365,6 +365,14 @@ function construct_widened_record(value) = {
   widened_record_sum(pack_widened_record(record))
 }
 
+val construct_widened_record_direct : forall 'value, 0 <= 'value & 'value <= 255.
+  atom('value) -> widened_record
+
+function construct_widened_record_direct(value) = {
+  let record = struct { wide = byte_identity(value), marker = value } : widened_record_fields('value);
+  pack_widened_record(record)
+}
+
 function sample_choice_value(value : sample_choice) -> byte = match value {
   InputChoice(value) => value,
   MemoryChoice(value) => value,
