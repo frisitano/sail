@@ -95,6 +95,7 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve state_passing_outcome --c-preserve state_passing_guard --c-preserve call_state_passing_guard \
   --c-preserve state_passing_guard_failed \
   --c-preserve reused_boolean_guard \
+  --c-preserve one_use_guard_before_local_write \
   --c-preserve terminal_enum_match_or_fatal \
   --c-preserve fatal_guard_result_is_unread \
   --c-preserve widened_result_or_fatal \
@@ -161,6 +162,14 @@ sed -n '/^bool reused_boolean_guard(/,/^}/p' \
 grep -Eq 'bool [A-Za-z0-9_]+ = .*value != UINT8_C\(0\)' \
   "$TMP_DIR/reused_boolean_guard.c"
 grep -Eq 'return [A-Za-z0-9_]+;' "$TMP_DIR/reused_boolean_guard.c"
+sed -n '/^uint8_t one_use_guard_before_local_write(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/one_use_guard_before_local_write.c"
+grep -Eq 'if \([A-Za-z0-9_]+ != UINT8_C\(0\)\)' \
+  "$TMP_DIR/one_use_guard_before_local_write.c"
+if grep -Eq 'bool [A-Za-z0-9_]+' "$TMP_DIR/one_use_guard_before_local_write.c"; then
+  echo 'optimized extraction retained a one-use guard before a later source write' >&2
+  exit 1
+fi
 if grep -Fq 'struct canonical_slice' "$SPEC_INCLUDE/evmsail/spec/base.h"; then
   echo 'optimized extraction emitted a nominal definition for a canonically named external representation' >&2
   exit 1

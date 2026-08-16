@@ -126,6 +126,14 @@ function reused_boolean_guard(value : byte) -> bool = {
   is_nonzero
 }
 
+function one_use_guard_before_local_write(value : byte) -> byte = {
+  var current : byte = value;
+  let is_nonzero = current != 0;
+  if is_nonzero then public_counter = 0;
+  current = tmod_nat(current + 1, 256);
+  current
+}
+
 function terminal_enum_match(choice : terminal_choice) -> byte =
   match choice {
     TerminalOne => 1,

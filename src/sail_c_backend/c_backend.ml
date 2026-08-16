@@ -5550,6 +5550,17 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
           first_copy name decl_ctyp (instr :: rev_gap) rest
       | _ -> None
     in
+    let hazard_before_last_read roots reads_of read_count =
+      let rec check remaining_reads = function
+        | [] -> false
+        | _ when remaining_reads <= 0 -> false
+        | instr :: rest ->
+            contains_label instr
+            || NameSet.exists (fun name -> instr_references ~write:name ~direct:false instr) roots
+            || check (remaining_reads - reads_of instr) rest
+      in
+      check read_count
+    in
     let rec scan acc = function
       | (I_aux (I_init (initialized_ctyp, ((Name _ | Gen _) as x), Init_cval cval), _) as initialization)
         :: rest -> (
@@ -5562,19 +5573,10 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
               let written_later name =
                 List.exists (fun instr -> instr_references ~write:name ~direct:false instr) rest
               in
-              let label_before_last_read =
-                let rec check remaining_reads = function
-                  | [] -> false
-                  | _ when remaining_reads <= 0 -> false
-                  | instr :: rest -> contains_label instr || check (remaining_reads - reads_of instr) rest
-                in
-                check read_count rest
-              in
               let safe =
                 NameSet.subset roots locals
-                && (not (NameSet.exists written_later roots))
                 && (not (written_later x))
-                && (not label_before_last_read)
+                && (not (hazard_before_last_read roots reads_of read_count rest))
                 && (read_count = 1 || trivial propagated_cval)
               in
               if not safe then scan (initialization :: acc) rest
@@ -5610,19 +5612,10 @@ let propagate_pure_copies (CDEF_aux (aux, def_annot)) =
                   let written_later name =
                     List.exists (fun instr -> instr_references ~write:name ~direct:false instr) rest
                   in
-                  let label_before_last_read =
-                    let rec check remaining_reads = function
-                      | [] -> false
-                      | _ when remaining_reads <= 0 -> false
-                      | instr :: rest -> contains_label instr || check (remaining_reads - reads_of instr) rest
-                    in
-                    check read_count rest
-                  in
                   let safe =
                     NameSet.subset roots locals
-                    && (not (NameSet.exists written_later roots))
                     && (not (written_later x))
-                    && (not label_before_last_read)
+                    && (not (hazard_before_last_read roots reads_of read_count rest))
                     && (read_count = 1 || trivial propagated_cval)
                   in
                   if not safe then scan (decl :: acc) tail
