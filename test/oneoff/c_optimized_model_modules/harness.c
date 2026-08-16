@@ -22,6 +22,12 @@ int main(void)
              && empty_jumpdest() == NULL && empty_direct_jumpdest() == NULL
              && allocated_jumpdest(5) == test_jumpdests_at(5)
              && canonical_list_count_after_identity(list) == 3
+             && terminal_signed_byte_or_fatal(UINT64_C(0xff), true, true) == INT8_C(-1)
+             && terminal_signed_halfword_or_fatal(UINT64_C(0x8000), true, true) == INT16_C(-32768)
+             && terminal_signed_word_or_fatal(UINT64_C(0xffffffff), true, true) == INT32_C(-1)
+             && terminal_signed_doubleword_or_fatal(UINT64_MAX, true, true) == INT64_C(-1)
+             && recover_throwing_signed_byte(UINT64_C(0x80), false) == INT8_C(-128)
+             && recover_throwing_signed_byte(UINT64_C(0x7f), true) == INT8_C(-1)
          ? 0
          : 1;
 }

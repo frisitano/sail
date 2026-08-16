@@ -6793,6 +6793,18 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       | V_lit (_, ctyp) when is_c_repr_u128 ctyp || is_c_repr_u256 ctyp || is_c_repr_u320 ctyp -> "(" ^ rendered ^ ")"
       | _ -> rendered
     in
+    let signed_fbits width bits rendered =
+      if bits <= 0 || bits > 64 then c_error (sprintf "Cannot lower a signed conversion from bits(%d)" bits);
+      let sign_bit = Big_int.pow_int_positive 2 (bits - 1) in
+      let mask = Big_int.pred (Big_int.pow_int_positive 2 bits) in
+      let sign_bit = sgen_value (CT_fuint 64) (VL_int sign_bit) in
+      let mask = sgen_value (CT_fuint 64) (VL_int mask) in
+      let signed =
+        sprintf "(((%s) & %s) != 0 ? (-INT64_C(1) - (int64_t)(%s - (%s))) : (int64_t)(%s))" rendered sign_bit
+          mask rendered rendered
+      in
+      if width = 64 then signed else sprintf "((%s)%s)" (sgen_ctyp (CT_fint width)) signed
+    in
     let u320_of value =
       match cval_ctyp value with
       | ctyp when is_c_repr_u320 ctyp -> sgen_cval value
@@ -6913,7 +6925,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             sprintf "(%s)%s" (sgen_ctyp target) (low_u64 ())
         | CT_fint width -> (
             match source with
-            | CT_fbits bits when width = 64 -> sprintf "fast_signed(%s, %d)" rendered bits
+            | CT_fbits bits -> signed_fbits width bits rendered
             | CT_fint _ | CT_fuint _ | CT_constant _ -> sgen_cval_as target value
             | _ -> c_error (sprintf "Cannot lower proved signed conversion from %s" (string_of_ctyp source))
           )
@@ -7269,7 +7281,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | Unsigned width, [vec] -> sgen_cval_as (CT_fuint width) vec
     | Signed width, [value] -> (
         match cval_ctyp value with
-        | CT_fbits n when width = 64 -> sprintf "fast_signed(%s, %d)" (sgen_cval value) n
+        | CT_fbits n -> signed_fbits width n (sgen_cval value)
         | CT_fint _ | CT_fuint _ | CT_constant _ -> sgen_cval_as (CT_fint width) value
         | ctyp -> c_error (sprintf "Cannot lower proved signed conversion from %s" (string_of_ctyp ctyp))
       )

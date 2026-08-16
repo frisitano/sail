@@ -176,6 +176,36 @@ function fatal_guard_result_is_unread(flag : bool) -> byte = {
 function widened_result_or_fatal(value : byte, valid : bool) -> word =
   if valid then value else fatal_error(TestFatal)
 
+function terminal_signed_byte_or_fatal(value : bits(8), outer : bool, valid : bool) -> signed_byte =
+  if outer then {
+    if valid then signed(value) else fatal_error(TestFatal)
+  } else fatal_error(TestFatal)
+
+function terminal_signed_halfword_or_fatal(value : bits(16), outer : bool, valid : bool) -> signed_halfword =
+  if outer then {
+    if valid then signed(value) else fatal_error(TestFatal)
+  } else fatal_error(TestFatal)
+
+function terminal_signed_word_or_fatal(value : bits(32), outer : bool, valid : bool) -> signed_word =
+  if outer then {
+    if valid then signed(value) else fatal_error(TestFatal)
+  } else fatal_error(TestFatal)
+
+function terminal_signed_doubleword_or_fatal(value : bits(64), outer : bool, valid : bool) -> signed_doubleword =
+  if outer then {
+    if valid then signed(value) else fatal_error(TestFatal)
+  } else fatal_error(TestFatal)
+
+function throwing_signed_byte(value : bits(8), should_throw : bool) -> signed_byte = {
+  if should_throw then throw(E_byte(1));
+  signed(value)
+}
+
+function recover_throwing_signed_byte(value : bits(8), should_throw : bool) -> signed_byte =
+  try throwing_signed_byte(value, should_throw) catch {
+    E_byte(_) => -1,
+  }
+
 function terminal_unit_empty() -> unit = reset_counter()
 
 function terminal_unit_other_empty() -> unit = public_counter = 1

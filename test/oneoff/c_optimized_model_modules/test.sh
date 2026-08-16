@@ -100,6 +100,11 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve terminal_enum_match_or_fatal \
   --c-preserve fatal_guard_result_is_unread \
   --c-preserve widened_result_or_fatal \
+  --c-preserve terminal_signed_byte_or_fatal \
+  --c-preserve terminal_signed_halfword_or_fatal \
+  --c-preserve terminal_signed_word_or_fatal \
+  --c-preserve terminal_signed_doubleword_or_fatal \
+  --c-preserve throwing_signed_byte --c-preserve recover_throwing_signed_byte \
   --c-preserve terminal_unit_variant_match \
   --c-preserve terminal_fixed_bytes_match \
   --c-preserve catch_byte \
@@ -426,6 +431,36 @@ if grep -Eq 'uint32_t (tmp_|result_)' "$TMP_DIR/widened_result_or_fatal.c"; then
   echo 'optimized extraction retained a widened mutable join beside a noreturn arm' >&2
   exit 1
 fi
+for signed_case in \
+  'int8_t terminal_signed_byte_or_fatal' \
+  'int16_t terminal_signed_halfword_or_fatal' \
+  'int32_t terminal_signed_word_or_fatal' \
+  'int64_t terminal_signed_doubleword_or_fatal'
+do
+  set -- $signed_case
+  result_type=$1
+  function_name=$2
+  sed -n "/^$result_type $function_name(/,/^}/p" \
+    "$SPEC_SOURCE/machine.c" > "$TMP_DIR/$function_name.c"
+  grep -Fq -- "-INT64_C(1)" "$TMP_DIR/$function_name.c"
+  test "$(grep -Fc 'fatal_error(TestFatal);' "$TMP_DIR/$function_name.c")" -eq 2
+  if grep -Eq "^[[:space:]]+$result_type [A-Za-z_][A-Za-z0-9_]*([[:space:]]*[;=])" \
+      "$TMP_DIR/$function_name.c"; then
+    echo "optimized extraction retained a $result_type result local in $function_name" >&2
+    exit 1
+  fi
+done
+sed -n \
+  '/^int8_t recover_throwing_signed_byte(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/recover_throwing_signed_byte.c"
+call_line=$(grep -n 'throwing_signed_byte(value, should_throw)' \
+  "$TMP_DIR/recover_throwing_signed_byte.c" | head -1 | cut -d: -f1)
+check_line=$(grep -n 'if (have_exception)' \
+  "$TMP_DIR/recover_throwing_signed_byte.c" | head -1 | cut -d: -f1)
+return_line=$(grep -n 'return ' \
+  "$TMP_DIR/recover_throwing_signed_byte.c" | tail -1 | cut -d: -f1)
+test "$call_line" -lt "$check_line"
+test "$check_line" -lt "$return_line"
 sed -n \
   '/^void terminal_unit_variant_match(/,/^}/p' \
   "$SPEC_SOURCE/machine.c" > "$TMP_DIR/terminal_unit_variant_match.c"
