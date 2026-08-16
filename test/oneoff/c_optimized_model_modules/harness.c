@@ -23,7 +23,8 @@ int main(void) {
   evmsail_model_init();
   public_counter = 40;
   return run(2) == 42 && catch_byte(7) == 7 && machine_pick_zero(3) == 0 &&
-                 pair_sum(value) == 7 && preserve_counter_snapshot(9) == 9 &&
+                 pair_sum(value) == 7 && construct_widened_record(7) == 14 &&
+                 preserve_counter_snapshot(9) == 9 &&
                  public_counter == 0 && first.bytes == test_bytes_at(3) &&
                  second.bytes == test_bytes_at(7) &&
                  byte_slice_same_start(first, byte_slice_at(3, 9)) &&

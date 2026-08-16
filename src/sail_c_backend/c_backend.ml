@@ -4471,10 +4471,11 @@ let prune_constant_branches (CDEF_aux (aux, def_annot)) =
   | _ -> CDEF_aux (aux, def_annot)
 
 (* Reassemble the field-by-field JIB lowering of a complete stack aggregate
-   into one pure value.  This is deliberately limited to complete records and
-   tuples whose field assignments require no conversion.  The resulting
-   [V_struct] or [V_tuple] can then participate in ordinary copy propagation,
-   which removes both aggregate-construction temporaries and their scopes. *)
+   into one pure value.  Fixed integer fields retain the same explicit,
+   width-directed assignment conversion used for tuples; every other field
+   must already have the record's exact C type.  The resulting [V_struct] or
+   [V_tuple] can then participate in ordinary copy propagation, which removes
+   both aggregate-construction temporaries and their scopes. *)
 let fold_stack_aggregate_construction ctx (CDEF_aux (aux, def_annot)) =
   let preserve_assignment_conversion target_ctyp value =
     let source_ctyp = cval_ctyp value in
@@ -4513,9 +4514,12 @@ let fold_stack_aggregate_construction ctx (CDEF_aux (aux, def_annot)) =
       | I_aux (I_copy (CL_field (CL_id (base, base_ctyp), field, field_ctyp), value), _) :: rest
         when Name.compare destination base = 0
              && ctyp_equal destination_ctyp base_ctyp
-             && ctyp_equal field_ctyp (cval_ctyp value)
-             && not (reads destination value) ->
-          collect ((field, value) :: rev_fields) rest
+             && (not (List.mem_assoc field rev_fields))
+             && not (reads destination value) -> (
+          match preserve_assignment_conversion field_ctyp value with
+          | Some value -> collect ((field, value) :: rev_fields) rest
+          | None -> (List.rev rev_fields, rest)
+        )
       | rest -> (List.rev rev_fields, rest)
     in
     collect [] instrs

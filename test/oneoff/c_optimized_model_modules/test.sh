@@ -48,7 +48,8 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve-type sample_choice --c-preserve-type erased_unit_choice \
   --c-preserve-type wide_word --c-preserve-type four_bytes --c-preserve-type twenty_bytes --c-preserve-type lane_five_bytes --c-preserve-type fixed_ids \
   --c-preserve-type fixed_ids_box --c-preserve-type equality_pair \
-  --c-preserve pair_sum --c-preserve sample_choice_value --c-preserve added_is_nonzero \
+  --c-preserve pair_sum --c-preserve byte_identity --c-preserve pack_widened_record --c-preserve widened_record_sum \
+  --c-preserve construct_widened_record --c-preserve sample_choice_value --c-preserve added_is_nonzero \
   --c-preserve boolean_cleanup --c-preserve positive_branch --c-preserve early_wide_guard --c-preserve short_circuit_guard --c-preserve widened_tuple_match \
   --c-preserve repeated_branch \
   --c-preserve repeated_call_branch --c-preserve boolean_value_join --c-preserve boolean_comparison_join \
@@ -129,6 +130,7 @@ grep -Fq '#include "evmsail/spec/base.h"' "$SPEC_INCLUDE/evmsail/spec.h"
 grep -Fq '#include "evmsail/host/types.h"' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint8_t' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint16_t pair_sum(struct pair value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+grep -Fq 'uint64_t construct_widened_record(uint8_t value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint8_t canonical_slice_len(TestBytes value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint8_t canonical_list_count(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'TestList canonical_list_identity(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
@@ -249,6 +251,18 @@ fi
 if grep -Eq 'uint8_t result[^;]*;' "$TMP_DIR/decrement_byte.c" && \
    ! grep -Eq 'uint8_t result[^;]* = value;' "$TMP_DIR/decrement_byte.c"; then
   echo 'optimized extraction split an adjacent scalar declaration and initialization' >&2
+  exit 1
+fi
+sed -n \
+  '/^uint64_t construct_widened_record(/,/^}/p' \
+  "$SPEC_SOURCE/base.c" > "$TMP_DIR/construct_widened_record.c"
+grep -Fq 'pack_widened_record(((struct widened_record_fields){' \
+  "$TMP_DIR/construct_widened_record.c"
+grep -Eq '\.wide = \(uint32_t\)byte_identity_result_[A-Za-z0-9_]+' \
+  "$TMP_DIR/construct_widened_record.c"
+if grep -Eq 'struct widened_record_fields [A-Za-z0-9_]+;' \
+  "$TMP_DIR/construct_widened_record.c"; then
+  echo 'optimized extraction retained a field-built record temporary with a fixed-width conversion' >&2
   exit 1
 fi
 sed -n \

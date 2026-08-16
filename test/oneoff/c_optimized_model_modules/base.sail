@@ -36,6 +36,17 @@ struct pair = {
   second : byte,
 }
 
+struct widened_record_fields('wide : Int), 0 <= 'wide & 'wide <= 4294967295 = {
+  wide : int('wide),
+  marker : byte,
+}
+
+type widened_record = {
+  'wide,
+  0 <= 'wide & 'wide <= 4294967295.
+  widened_record_fields('wide)
+}
+
 let RUNTIME_PAIR : pair = struct { first = 1, second = 2 }
 
 function runtime_pair() -> pair = RUNTIME_PAIR
@@ -332,6 +343,27 @@ function branch_one(value : int(1)) -> byte = proof_branch(value)
 function branch_five(value : int(5)) -> byte = proof_branch(value)
 
 function pair_sum(value : pair) -> range(0, 510) = value.first + value.second
+
+val byte_identity : forall 'value, 0 <= 'value & 'value <= 255.
+  atom('value) -> atom('value)
+
+function byte_identity(value) = value
+
+function widened_record_sum(value : widened_record) -> range(0, 4294967550) =
+  value.wide + value.marker
+
+val pack_widened_record : forall 'wide, 0 <= 'wide & 'wide <= 4294967295.
+  widened_record_fields('wide) -> widened_record
+
+function pack_widened_record(record) = record
+
+val construct_widened_record : forall 'value, 0 <= 'value & 'value <= 255.
+  atom('value) -> range(0, 4294967550)
+
+function construct_widened_record(value) = {
+  let record = struct { wide = byte_identity(value), marker = value } : widened_record_fields('value);
+  widened_record_sum(pack_widened_record(record))
+}
 
 function sample_choice_value(value : sample_choice) -> byte = match value {
   InputChoice(value) => value,
