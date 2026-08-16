@@ -97,6 +97,7 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve reused_boolean_guard \
   --c-preserve one_use_guard_before_local_write \
   --c-preserve one_use_guard_in_composed_condition \
+  --c-preserve one_use_guard_in_reversed_composed_condition \
   --c-preserve terminal_enum_match_or_fatal \
   --c-preserve fatal_guard_result_is_unread \
   --c-preserve widened_result_or_fatal \
@@ -183,6 +184,15 @@ grep -Eq 'if \(.*value != UINT8_C\(0\).*\|\| fallback\)' \
 if grep -Eq 'bool [A-Za-z0-9_]+ = .*value != UINT8_C\(0\)' \
   "$TMP_DIR/one_use_guard_in_composed_condition.c"; then
   echo 'optimized extraction retained a one-use boolean inside a composed guard' >&2
+  exit 1
+fi
+sed -n '/^uint8_t one_use_guard_in_reversed_composed_condition(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/one_use_guard_in_reversed_composed_condition.c"
+grep -Eq 'if \(fallback \|\| .*value != UINT8_C\(0\).*\)' \
+  "$TMP_DIR/one_use_guard_in_reversed_composed_condition.c"
+if grep -Eq 'bool [A-Za-z0-9_]+ = .*value != UINT8_C\(0\)' \
+  "$TMP_DIR/one_use_guard_in_reversed_composed_condition.c"; then
+  echo 'optimized extraction retained a one-use boolean inside a reversed composed guard' >&2
   exit 1
 fi
 if grep -Fq 'struct canonical_slice' "$SPEC_INCLUDE/evmsail/spec/base.h"; then
