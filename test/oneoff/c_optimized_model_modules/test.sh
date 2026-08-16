@@ -97,6 +97,7 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve reused_boolean_guard \
   --c-preserve terminal_enum_match_or_fatal \
   --c-preserve fatal_guard_result_is_unread \
+  --c-preserve widened_result_or_fatal \
   --c-preserve terminal_unit_variant_match \
   --c-preserve terminal_fixed_bytes_match \
   --c-preserve catch_byte \
@@ -397,6 +398,15 @@ sed -n \
 grep -Fq 'if (flag)' "$TMP_DIR/fatal_guard_result_is_unread.c"
 grep -Fq 'fatal_error(TestFatal);' "$TMP_DIR/fatal_guard_result_is_unread.c"
 grep -Fq 'return UINT8_C(7);' "$TMP_DIR/fatal_guard_result_is_unread.c"
+sed -n \
+  '/^uint32_t widened_result_or_fatal(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/widened_result_or_fatal.c"
+grep -Fq 'fatal_error(TestFatal);' "$TMP_DIR/widened_result_or_fatal.c"
+grep -Fq 'return (uint32_t)value;' "$TMP_DIR/widened_result_or_fatal.c"
+if grep -Eq 'uint32_t (tmp_|result_)' "$TMP_DIR/widened_result_or_fatal.c"; then
+  echo 'optimized extraction retained a widened mutable join beside a noreturn arm' >&2
+  exit 1
+fi
 sed -n \
   '/^void terminal_unit_variant_match(/,/^}/p' \
   "$SPEC_SOURCE/machine.c" > "$TMP_DIR/terminal_unit_variant_match.c"

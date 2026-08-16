@@ -4830,6 +4830,20 @@ let sink_terminal_stack_returns (CDEF_aux (aux, def_annot)) =
       | _ -> None
     )
   in
+  let rec terminal = function
+    | [] -> false
+    | instrs -> (
+        match List.rev instrs with
+        | I_aux (I_exit _, _) :: _
+        | I_aux (I_return _, _) :: _
+        | I_aux (I_copy (CL_id (Return _, _), _), _) :: _
+        | I_aux (I_funcall (CR_one (CL_id (Return _, _)), _, _, _), _) :: _ ->
+            true
+        | I_aux (I_if (_, then_instrs, else_instrs), _) :: _ -> terminal then_instrs && terminal else_instrs
+        | I_aux (I_block instrs, _) :: _ -> terminal instrs
+        | _ -> false
+      )
+  in
   let sink_tuple result result_ctyp return_aux instrs =
     match result_ctyp with
     | CT_tup field_ctyps ->
@@ -4856,9 +4870,11 @@ let sink_terminal_stack_returns (CDEF_aux (aux, def_annot)) =
     | None -> (
         match List.rev instrs with
         | I_aux (I_copy (CL_id (destination, destination_ctyp), cval), _) :: rev_prefix
-          when same_name destination result && ctyp_equal destination_ctyp result_ctyp
-               && ctyp_equal (cval_ctyp cval) result_ctyp ->
-            Some (List.rev (I_aux (I_return cval, return_aux) :: rev_prefix))
+          when same_name destination result && ctyp_equal destination_ctyp result_ctyp -> (
+            match preserve_assignment_conversion result_ctyp cval with
+            | Some cval -> Some (List.rev (I_aux (I_return cval, return_aux) :: rev_prefix))
+            | None -> None
+          )
         | I_aux (I_funcall (CR_one (CL_id (destination, destination_ctyp)), extern, callee, args), call_aux)
           :: rev_prefix
           when same_name destination result && ctyp_equal destination_ctyp result_ctyp ->
@@ -4871,6 +4887,10 @@ let sink_terminal_stack_returns (CDEF_aux (aux, def_annot)) =
         | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rev_prefix -> (
             match (sink result result_ctyp return_aux then_instrs, sink result result_ctyp return_aux else_instrs) with
             | Some then_instrs, Some else_instrs ->
+                Some (List.rev (I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rev_prefix))
+            | Some then_instrs, None when terminal else_instrs ->
+                Some (List.rev (I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rev_prefix))
+            | None, Some else_instrs when terminal then_instrs ->
                 Some (List.rev (I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rev_prefix))
             | _ -> None
           )
@@ -4943,20 +4963,6 @@ let sink_terminal_stack_returns (CDEF_aux (aux, def_annot)) =
       | [] -> None
     in
     split [] instrs
-  in
-  let rec terminal = function
-    | [] -> false
-    | instrs -> (
-        match List.rev instrs with
-        | I_aux (I_exit _, _) :: _
-        | I_aux (I_return _, _) :: _
-        | I_aux (I_copy (CL_id (Return _, _), _), _) :: _
-        | I_aux (I_funcall (CR_one (CL_id (Return _, _)), _, _, _), _) :: _ ->
-            true
-        | I_aux (I_if (_, then_instrs, else_instrs), _) :: _ -> terminal then_instrs && terminal else_instrs
-        | I_aux (I_block instrs, _) :: _ -> terminal instrs
-        | _ -> false
-      )
   in
   let split_at_terminal_branch instrs =
     let rec split prefix = function

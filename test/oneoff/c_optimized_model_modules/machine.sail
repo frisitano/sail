@@ -159,6 +159,9 @@ function fatal_guard_result_is_unread(flag : bool) -> byte = {
   7
 }
 
+function widened_result_or_fatal(value : byte, valid : bool) -> word =
+  if valid then value else fatal_error(TestFatal)
+
 function terminal_unit_empty() -> unit = reset_counter()
 
 function terminal_unit_other_empty() -> unit = public_counter = 1
