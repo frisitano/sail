@@ -9580,6 +9580,9 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         );
       !count
     in
+    let cvals_name_read_count target values =
+      List.fold_left (fun count value -> count + cval_name_read_count target value) 0 values
+    in
     let cval_name_subst target replacement =
       map_cval (function
         | V_id (name, _) when Name.compare name target = 0 -> replacement
@@ -9752,7 +9755,104 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
          expose another one immediately before emission. *)
       | instr :: I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp -> docs (instr :: rest)
       | I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp -> docs rest
-      (* An ordinary internal scalar call used exactly once by the immediately
+      (* A pure scalar snapshot consumed by the immediately following call has
+         no independent lifetime.  Render the existing safe initializer at the
+         argument use site.  In particular, reuse [stack_conversion_initializer]
+         so specialization-induced representation changes retain their proven
+         conversion helper instead of becoming an invalid raw C cast. *)
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux (I_decl (snapshot_ctyp, snapshot), _)
+        :: I_aux (I_copy (CL_id (destination, destination_ctyp), initial_value), _)
+        :: (I_aux (I_funcall (_, _, _, consumer_arguments), _) as consumer)
+        :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
+             && is_stack_ctyp ctx snapshot_ctyp
+             && Name.compare declared snapshot <> 0
+             && Name.compare snapshot destination = 0
+             && stack_call_initializer_compatible snapshot_ctyp destination_ctyp
+             && call_initializes_stack_local declared declared_ctyp consumer
+             && cvals_name_read_count snapshot consumer_arguments = 1
+             && not (List.exists cval_has_short_circuit consumer_arguments)
+             && not (instr_references ~write:snapshot ~direct:false consumer)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:snapshot ~direct:false instr)
+                     rest
+                  )
+             && Option.is_some (stack_conversion_initializer snapshot_ctyp initial_value) ->
+          let expression = Option.get (stack_conversion_initializer snapshot_ctyp initial_value) in
+          let previous = !stack_call_initializers in
+          stack_call_initializers := [(declared, declared_ctyp)];
+          let call =
+            with_inline_cval_expression snapshot ("(" ^ expression ^ ")") (fun () ->
+                codegen_instr fid ctx consumer
+            )
+          in
+          stack_call_initializers := previous;
+          call :: docs rest
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux (I_copy (CL_id (destination, destination_ctyp), initial_value), _)
+        :: (I_aux (I_funcall (_, _, _, consumer_arguments), _) as consumer)
+        :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
+             && Name.compare declared destination = 0
+             && stack_call_initializer_compatible declared_ctyp destination_ctyp
+             && cvals_name_read_count declared consumer_arguments = 1
+             && not (List.exists cval_has_short_circuit consumer_arguments)
+             && not (instr_references ~write:declared ~direct:false consumer)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:declared ~direct:false instr)
+                     rest
+                  )
+             && Option.is_some (stack_conversion_initializer declared_ctyp initial_value) ->
+          let expression = Option.get (stack_conversion_initializer declared_ctyp initial_value) in
+          with_inline_cval_expression declared ("(" ^ expression ^ ")") (fun () -> codegen_instr fid ctx consumer)
+          :: docs rest
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux (I_init (initialized_ctyp, initialized, Init_cval initial_value), _)
+        :: (I_aux (I_funcall (_, _, _, consumer_arguments), _) as consumer)
+        :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
+             && is_stack_ctyp ctx initialized_ctyp
+             && Name.compare declared initialized <> 0
+             && call_initializes_stack_local declared declared_ctyp consumer
+             && cvals_name_read_count initialized consumer_arguments = 1
+             && not (List.exists cval_has_short_circuit consumer_arguments)
+             && not (instr_references ~write:initialized ~direct:false consumer)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:initialized ~direct:false instr)
+                     rest
+                  )
+             && Option.is_some (stack_conversion_initializer initialized_ctyp initial_value) ->
+          let expression = Option.get (stack_conversion_initializer initialized_ctyp initial_value) in
+          let previous = !stack_call_initializers in
+          stack_call_initializers := [(declared, declared_ctyp)];
+          let call =
+            with_inline_cval_expression initialized ("(" ^ expression ^ ")") (fun () ->
+                codegen_instr fid ctx consumer
+            )
+          in
+          stack_call_initializers := previous;
+          call :: docs rest
+      | I_aux (I_init (initialized_ctyp, initialized, Init_cval initial_value), _)
+        :: (I_aux (I_funcall (_, _, _, consumer_arguments), _) as consumer)
+        :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx initialized_ctyp
+             && cvals_name_read_count initialized consumer_arguments = 1
+             && not (List.exists cval_has_short_circuit consumer_arguments)
+             && not (instr_references ~write:initialized ~direct:false consumer)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:initialized ~direct:false instr)
+                     rest
+                  )
+             && Option.is_some (stack_conversion_initializer initialized_ctyp initial_value) ->
+          let expression = Option.get (stack_conversion_initializer initialized_ctyp initial_value) in
+          with_inline_cval_expression initialized ("(" ^ expression ^ ")") (fun () -> codegen_instr fid ctx consumer)
+          :: docs rest
+        (* An ordinary internal scalar call used exactly once by the immediately
          following eager condition or return expression has no independent
          lifetime.  Keep the call at that use site.  Logical conjunction and
          disjunction are excluded because moving a call into a C short-circuit
