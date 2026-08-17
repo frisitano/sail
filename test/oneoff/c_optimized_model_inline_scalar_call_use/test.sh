@@ -31,6 +31,8 @@ fi
   --c-preserve call_in_short_circuit --c-preserve field_snapshot_into_call \
   --c-preserve converted_field_into_external_call --c-preserve updated_record_into_call \
   --c-preserve updated_record_into_return --c-preserve count_four \
+  --c-preserve record_branch_into_return --c-preserve nested_guard_into_return \
+  --c-preserve retained_branch_condition \
   --c-preserve decode_flag --c-preserve finish_flag --c-preserve forward_flag \
   "$TEST_DIR/model.sail_project"
 
@@ -102,5 +104,29 @@ grep -Fq 'decode_flag' "$TMP_DIR/forward_flag.c"
 grep -Fq 'finish_flag' "$TMP_DIR/forward_flag.c"
 if grep -Eq '(struct tuple_|\.tup[0-9]|tmp_|result_)' "$TMP_DIR/forward_flag.c"; then
   echo 'optimized extraction retained a mixed scalar/tuple carrier for a direct-result call' >&2
+  exit 1
+fi
+
+sed -n '/^struct Pair record_branch_into_return(/,/^}/p' "$SOURCE" > "$TMP_DIR/record_branch.c"
+if grep -Eq '(tmp_|result_)' "$TMP_DIR/record_branch.c"; then
+  echo 'optimized extraction did not name a branch carrier for its semantic return destination' >&2
+  exit 1
+fi
+
+sed -n '/^bool nested_guard_into_return(/,/^}/p' "$SOURCE" > "$TMP_DIR/nested_guard.c"
+if grep -Eq '(tmp_|result_)' "$TMP_DIR/nested_guard.c"; then
+  echo 'optimized extraction did not name a short-circuit carrier for its guard role' >&2
+  exit 1
+fi
+
+sed -n '/^uint8_t retained_branch_condition(/,/^}/p' "$SOURCE" > "$TMP_DIR/retained_condition.c"
+grep -Fq 'external_bool_value_' "$TMP_DIR/retained_condition.c"
+if grep -Eq '(tmp_|result_)' "$TMP_DIR/retained_condition.c"; then
+  echo 'optimized extraction did not give a retained short-circuit carrier a semantic name' >&2
+  exit 1
+fi
+
+if grep -Eq '(^|[^[:alnum:]_])_[0-9]+(_[0-9]+)+([^[:alnum:]_]|$)' "$SOURCE"; then
+  echo 'optimized extraction exposed a numeric JIB provenance name' >&2
   exit 1
 fi
