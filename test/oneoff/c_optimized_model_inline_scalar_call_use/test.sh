@@ -30,7 +30,7 @@ fi
   --c-preserve call_in_eager_guard --c-preserve external_call_in_return \
   --c-preserve call_in_short_circuit --c-preserve field_snapshot_into_call \
   --c-preserve converted_field_into_external_call --c-preserve updated_record_into_call \
-  --c-preserve updated_record_into_return \
+  --c-preserve updated_record_into_return --c-preserve count_four \
   "$TEST_DIR/model.sail_project"
 
 SOURCE="$TMP_DIR/generated/src/spec/model.c"
@@ -85,5 +85,13 @@ sed -n '/^struct Pair updated_record_into_return(/,/^}/p' "$SOURCE" > "$TMP_DIR/
 grep -Fq 'return ((struct Pair){.left = pair.left, .right = value});' "$TMP_DIR/updated_record_return.c"
 if grep -Eq '(tmp_|result_|struct Pair [A-Za-z0-9_]+;)' "$TMP_DIR/updated_record_return.c"; then
   echo 'optimized extraction retained a one-use functional record update before its return' >&2
+  exit 1
+fi
+
+sed -n '/^uint8_t count_four(/,/^}/p' "$SOURCE" > "$TMP_DIR/count_four.c"
+grep -Eq 'while \(index <= \(int64_t\)UINT(8|64)_C\((0x)?3\)\)' "$TMP_DIR/count_four.c"
+grep -Eq 'index = \(index \+ \(int64_t\)UINT(8|64)_C\((0x)?1\)\);' "$TMP_DIR/count_four.c"
+if grep -Eq '(tmp_|result_)' "$TMP_DIR/count_four.c"; then
+  echo 'optimized extraction retained closed literal loop bound or step temporaries' >&2
   exit 1
 fi

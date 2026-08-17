@@ -5755,7 +5755,7 @@ let propagate_pure_copies_in_cdef narrowing_policy ctx immutable_globals (CDEF_a
           first_copy name decl_ctyp (instr :: rev_gap) rest
       | _ -> None
     in
-    let hazard_before_last_read roots reads_of read_count =
+    let hazard_before_last_read ~cross_labels roots reads_of read_count =
       let clears_managed_root instr =
         let found = ref false in
         ignore
@@ -5775,7 +5775,7 @@ let propagate_pure_copies_in_cdef narrowing_policy ctx immutable_globals (CDEF_a
         | [] -> false
         | _ when remaining_reads <= 0 -> false
         | instr :: rest ->
-            contains_label instr
+            ((not cross_labels) && contains_label instr)
             || clears_managed_root instr
             || not (NameSet.is_empty (NameSet.inter roots (instr_writes ~direct:false instr)))
             || check (remaining_reads - reads_of instr) rest
@@ -5789,6 +5789,8 @@ let propagate_pure_copies_in_cdef narrowing_policy ctx immutable_globals (CDEF_a
     let written_later name instrs =
       List.exists (fun instr -> NameSet.mem name (instr_writes ~direct:false instr)) instrs
     in
+    (* A closed pure value has no mutable roots whose state can differ after a
+       control-flow label, so it remains safe to substitute across labels. *)
     let rec scan acc = function
       | (I_aux (I_init (initialized_ctyp, ((Name _ | Gen _) as x), Init_cval cval), _) as initialization)
         :: rest -> (
@@ -5801,7 +5803,7 @@ let propagate_pure_copies_in_cdef narrowing_policy ctx immutable_globals (CDEF_a
               let safe =
                 roots_are_stable locals roots
                 && (not (written_later x rest))
-                && (not (hazard_before_last_read roots reads_of read_count rest))
+                && (not (hazard_before_last_read ~cross_labels:(NameSet.is_empty roots) roots reads_of read_count rest))
                 && (read_count = 1 || trivial propagated_cval)
               in
               if not safe then scan (initialization :: acc) rest
@@ -5837,7 +5839,8 @@ let propagate_pure_copies_in_cdef narrowing_policy ctx immutable_globals (CDEF_a
                   let safe =
                     roots_are_stable locals roots
                     && (not (written_later x rest))
-                    && (not (hazard_before_last_read roots reads_of read_count rest))
+                    &&
+                    not (hazard_before_last_read ~cross_labels:(NameSet.is_empty roots) roots reads_of read_count rest)
                     && (read_count = 1 || trivial propagated_cval)
                   in
                   if not safe then scan (decl :: acc) tail

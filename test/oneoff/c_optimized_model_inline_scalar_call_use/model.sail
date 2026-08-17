@@ -53,3 +53,11 @@ function updated_record_into_call(pair : Pair, value : byte) -> unit =
 
 function updated_record_into_return(pair : Pair, value : byte) -> Pair =
   { pair with right = value }
+
+function count_four() -> byte = {
+  var count : byte = 0;
+  foreach (index from 0 to 3) {
+    count = tmod_nat(count + 1, 256)
+  };
+  count
+}
