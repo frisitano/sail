@@ -3050,7 +3050,24 @@ let scalarize_direct_tuple_call_carriers abis instrs =
    reads/writes and complete tuple-literal assignments.  In particular, reject
    assignments that read the old carrier: expanding those into sequential
    scalar writes would not preserve simultaneous tuple assignment semantics. *)
-let scalarize_projected_tuple_carriers instrs =
+let scalarize_projected_tuple_carriers ctx instrs =
+  let is_fatal_error (extern : funtype) (callee : id) =
+    String.equal
+      ( match extern with
+      | Extern _ -> string_of_id callee
+      | Call _ when ctx_is_extern callee ctx -> ctx_get_extern callee ctx
+      | Call _ -> string_of_id callee
+      )
+      "fatal_error"
+  in
+  let tuple_field_index arity field =
+    let rec find index =
+      if index >= arity then None
+      else if Id.compare field (mk_id ("tup" ^ string_of_int index)) = 0 then Some index
+      else find (index + 1)
+    in
+    find 0
+  in
   let carrier_read_whole carrier arity values =
     let whole = ref false in
     let visitor =
@@ -3062,6 +3079,11 @@ let scalarize_projected_tuple_carriers instrs =
             when Name.compare source carrier = 0
                  && source_arity = arity
                  && index >= 0 && index < arity ->
+              whole := true;
+              SkipChildren
+          | V_field (V_id (source, _), field, _)
+            when Name.compare source carrier = 0
+                 && Option.is_some (tuple_field_index arity field) ->
               whole := true;
               SkipChildren
           | V_id (source, _) when Name.compare source carrier = 0 ->
@@ -3085,6 +3107,10 @@ let scalarize_projected_tuple_carriers instrs =
                  && source_arity = arity
                  && index >= 0 && index < arity ->
               SkipChildren
+          | V_field (V_id (source, _), field, _)
+            when Name.compare source carrier = 0
+                 && Option.is_some (tuple_field_index arity field) ->
+              SkipChildren
           | V_id (source, _) when Name.compare source carrier = 0 ->
               compatible := false;
               SkipChildren
@@ -3095,6 +3121,10 @@ let scalarize_projected_tuple_carriers instrs =
             when Name.compare destination carrier = 0
                  && index >= 0 && index < arity ->
               SkipChildren
+          | CL_field (CL_id (destination, _), field, _)
+            when Name.compare destination carrier = 0
+                 && Option.is_some (tuple_field_index arity field) ->
+              SkipChildren
           | CL_id (destination, _) when Name.compare destination carrier = 0 ->
               compatible := false;
               SkipChildren
@@ -3104,12 +3134,24 @@ let scalarize_projected_tuple_carriers instrs =
     List.iter
       (iter_instr (fun (I_aux (aux, _) as instr) ->
            match aux with
+           | I_funcall (CR_one (CL_id (destination, _)), extern, (callee, _), _)
+             when Name.compare destination carrier = 0
+                  && is_fatal_error extern callee ->
+               ()
+           | I_funcall (CR_one (CL_id (destination, destination_ctyp)), _, (callee, _), _)
+             when Name.compare destination carrier = 0 -> (
+               match Bindings.find_opt callee !direct_tuple_result_abis with
+               | Some abi
+                 when ctyp_equal destination_ctyp abi.direct_result_ctyp
+                      && List.length abi.direct_result_fields = arity ->
+                   ()
+               | _ -> compatible := false
+             )
            | I_copy (CL_id (destination, _), V_tuple values)
              when Name.compare destination carrier = 0
                   && List.length values = arity ->
                if carrier_read_whole carrier arity values then compatible := false
-           | I_decl (_, name) | I_clear (_, name) | I_reset (_, name)
-             when Name.compare name carrier = 0 ->
+           | I_decl (_, name) when Name.compare name carrier = 0 ->
                compatible := false
            | I_init (_, name, _) | I_reinit (_, name, _)
              when Name.compare name carrier = 0 ->
@@ -3135,6 +3177,14 @@ let scalarize_projected_tuple_carriers instrs =
             when Name.compare source carrier = 0 && source_arity = arity ->
               let name, ctyp = List.nth fields index in
               ChangeTo (V_id (name, ctyp))
+          | V_field (V_id (source, _), field, _)
+            when Name.compare source carrier = 0 -> (
+              match tuple_field_index arity field with
+              | Some index ->
+                  let name, ctyp = List.nth fields index in
+                  ChangeTo (V_id (name, ctyp))
+              | None -> DoChildren
+            )
           | _ -> DoChildren
 
         method! vclexp = function
@@ -3142,11 +3192,35 @@ let scalarize_projected_tuple_carriers instrs =
             when Name.compare destination carrier = 0 ->
               let name, ctyp = List.nth fields index in
               ChangeTo (CL_id (name, ctyp))
+          | CL_field (CL_id (destination, _), field, _)
+            when Name.compare destination carrier = 0 -> (
+              match tuple_field_index arity field with
+              | Some index ->
+                  let name, ctyp = List.nth fields index in
+                  ChangeTo (CL_id (name, ctyp))
+              | None -> DoChildren
+            )
           | _ -> DoChildren
       end
     in
     let expand (I_aux (aux, instr_aux) as instr) =
       match aux with
+      | I_funcall
+          (CR_one (CL_id (destination, destination_ctyp)), extern, ((callee, _) as uid), args)
+        when Name.compare destination carrier = 0
+             && is_fatal_error extern callee ->
+          [I_aux (I_funcall (CR_one (CL_void destination_ctyp), extern, uid, args), instr_aux)]
+      | I_funcall
+          (CR_one (CL_id (destination, destination_ctyp)), extern, ((callee, _) as uid), args)
+        when Name.compare destination carrier = 0 -> (
+          match Bindings.find_opt callee !direct_tuple_result_abis with
+          | Some abi
+            when ctyp_equal destination_ctyp abi.direct_result_ctyp
+                 && List.length abi.direct_result_fields = arity ->
+              let destinations = List.map (fun (name, ctyp) -> CL_id (name, ctyp)) fields in
+              [I_aux (I_funcall (CR_multi destinations, extern, uid, args), instr_aux)]
+          | _ -> [instr]
+        )
       | I_copy (CL_id (destination, _), V_tuple values)
         when Name.compare destination carrier = 0
              && List.length values = arity ->
@@ -3155,6 +3229,18 @@ let scalarize_projected_tuple_carriers instrs =
               I_aux (I_copy (CL_id (name, ctyp), value), instr_aux)
             )
             fields values
+      | I_clear (_, name) when Name.compare name carrier = 0 ->
+          List.map
+            (fun (field_name, field_ctyp) ->
+              I_aux (I_clear (field_ctyp, field_name), instr_aux)
+            )
+            fields
+      | I_reset (_, name) when Name.compare name carrier = 0 ->
+          List.map
+            (fun (field_name, field_ctyp) ->
+              I_aux (I_reset (field_ctyp, field_name), instr_aux)
+            )
+            fields
       | _ -> [instr]
     in
     let expanded = List.concat_map (concatmap_instr expand) instrs in
@@ -3235,7 +3321,7 @@ let lower_direct_tuple_results ctx cdefs =
        | CDEF_aux (CDEF_fundef (id, return_style, args, body), annot) ->
            CDEF_aux
              ( CDEF_fundef
-                 (id, return_style, args, scalarize_projected_tuple_carriers body),
+                 (id, return_style, args, scalarize_projected_tuple_carriers ctx body),
                annot
              )
        | cdef -> cdef)

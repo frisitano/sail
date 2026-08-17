@@ -27,7 +27,8 @@ fi
   --all-modules \
   --c-optimized-model --c-specialize \
   --c-package branch_tuple --c-output-dir "$TMP_DIR/generated" \
-  --c-preserve advance --c-preserve choose_pair \
+  --c-preserve advance --c-preserve advance_managed \
+  --c-preserve choose_pair --c-preserve choose_managed \
   "$TEST_DIR/model.sail_project"
 
 SOURCE="$TMP_DIR/generated/src/spec/model.c"
@@ -38,5 +39,13 @@ grep -Fq 'switch (operation)' "$TMP_DIR/choose_pair.c"
 grep -Fq 'advance' "$TMP_DIR/choose_pair.c"
 if grep -Eq '(struct tuple_|\.tup[0-9]|tmp_|result_)' "$TMP_DIR/choose_pair.c"; then
   echo 'optimized extraction retained a projected tuple carrier across branch arms' >&2
+  exit 1
+fi
+
+sed -n '/^uint8_t choose_managed(/,/^}/p' "$SOURCE" > "$TMP_DIR/choose_managed.c"
+grep -Fq 'switch (operation)' "$TMP_DIR/choose_managed.c"
+grep -Fq 'advance_managed' "$TMP_DIR/choose_managed.c"
+if grep -Eq '(struct tuple_|\.tup[0-9]|tmp_|result_)' "$TMP_DIR/choose_managed.c"; then
+  echo 'optimized extraction retained a projected managed tuple carrier across branch arms' >&2
   exit 1
 fi
