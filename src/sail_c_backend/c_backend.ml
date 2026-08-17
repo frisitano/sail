@@ -6885,9 +6885,20 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let current_direct_result_parameters = ref NameSet.empty
 
+  (* A few emission-time lifetime folds render an ordinary internal call at
+     the sole use of its scalar result.  Keep that substitution local to the
+     expression renderer rather than manufacturing a JIB primitive for an
+     arbitrary Sail function call. *)
+  let current_inline_cval_expressions = ref NameMap.empty
+
+  let with_inline_cval_expression name expression render =
+    let previous = !current_inline_cval_expressions in
+    current_inline_cval_expressions := NameMap.add name expression previous;
+    Fun.protect ~finally:(fun () -> current_inline_cval_expressions := previous) render
+
   let rec sgen_cval = function
     | V_id (id, _) when NameSet.mem id !current_direct_result_parameters -> "(*" ^ sgen_name id ^ ")"
-    | V_id (id, _) -> sgen_name id
+    | V_id (id, _) -> Option.value ~default:(sgen_name id) (NameMap.find_opt id !current_inline_cval_expressions)
     | V_member (id, _) -> sgen_id id
     | V_lit (vl, ctyp) -> sgen_value ctyp vl
     | V_call (op, cvals) -> sgen_call op cvals
@@ -9575,6 +9586,20 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
         | value -> value
         )
     in
+    let cval_has_short_circuit value =
+      let found = ref false in
+      ignore
+        (map_cval
+           (function
+             | V_call ((Band | Bor), _) as value ->
+                 found := true;
+                 value
+             | value -> value
+             )
+           value
+        );
+      !found
+    in
     let split_simple_loop loop_label end_label instrs =
       let rec split reversed = function
         | I_aux (I_goto back_edge, _) :: I_aux (I_label end_target, _) :: rest
@@ -9727,6 +9752,73 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
          expose another one immediately before emission. *)
       | instr :: I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp -> docs (instr :: rest)
       | I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp -> docs rest
+      (* An ordinary internal scalar call used exactly once by the immediately
+         following eager condition or return expression has no independent
+         lifetime.  Keep the call at that use site.  Logical conjunction and
+         disjunction are excluded because moving a call into a C short-circuit
+         operand could make an otherwise unconditional evaluation conditional. *)
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux
+             ( I_funcall
+                 ( CR_one (CL_id (destination, destination_ctyp)),
+                   extern_info,
+                   callee,
+                   arguments
+                 ),
+               _
+             )
+        :: (I_aux (I_return return_value, _) as return_instruction)
+        :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
+             && Name.compare declared destination = 0
+             && stack_call_initializer_compatible declared_ctyp destination_ctyp
+             && cval_name_read_count declared return_value = 1
+             && not (cval_has_short_circuit return_value)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:declared ~direct:false instr)
+                     rest
+                  )
+             && Option.is_some
+                  (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp) ->
+          let call =
+            Option.get
+              (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp)
+          in
+          with_inline_cval_expression declared ("(" ^ call ^ ")") (fun () ->
+              codegen_instr fid ctx return_instruction
+          )
+          :: docs rest
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux
+             ( I_funcall
+                 ( CR_one (CL_id (destination, destination_ctyp)),
+                   extern_info,
+                   callee,
+                   arguments
+                 ),
+               _
+             )
+        :: (I_aux (I_if (condition, then_body, else_body), _) as conditional)
+        :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
+             && Name.compare declared destination = 0
+             && stack_call_initializer_compatible declared_ctyp destination_ctyp
+             && cval_name_read_count declared condition = 1
+             && not (cval_has_short_circuit condition)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:declared ~direct:false instr)
+                     (then_body @ else_body @ rest)
+                  )
+             && Option.is_some
+                  (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp) ->
+          let call =
+            Option.get
+              (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp)
+          in
+          with_inline_cval_expression declared ("(" ^ call ^ ")") (fun () -> codegen_instr fid ctx conditional)
+          :: docs rest
       (* A boolean internal-call result used only by the immediately following
          guard has no independent lifetime.  Render the call at its sole use
          site, preserving its evaluation point while avoiding the generated
