@@ -272,6 +272,12 @@ if grep -Eq 'internal_vector_(init|update)_vector_4_bits_8' "$SPEC_SOURCE/base.c
   echo 'optimized extraction retained semantic-vector scaffolding in a fixed-byte zero static let' >&2
   exit 1
 fi
+if ! grep -Fq \
+    'TEST_FIXED_BIT_BYTES_PATH_ZERO = ((struct fixed_bit_bytes_path){.data = ((bytes4){0}), .len = UINT8_C(0)});' \
+    "$SPEC_SOURCE/base.c"; then
+  echo 'optimized extraction retained aggregate temporaries in a fixed-byte zero static let' >&2
+  exit 1
+fi
 if grep -Fq 'test_word_to_four(' "$SPEC_SOURCE/base.c"; then
   echo 'optimized extraction retained an explicitly static-evaluable fixed-byte initializer call' >&2
   exit 1

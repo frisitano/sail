@@ -4793,6 +4793,7 @@ let fold_stack_aggregate_construction narrowing_policy ctx (CDEF_aux (aux, def_a
   let rewrite_body body = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
   match aux with
   | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | CDEF_let (number, bindings, body) -> CDEF_aux (CDEF_let (number, bindings, rewrite_body body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
 (* Turn a structured expression whose one arm exits into an early guard.
@@ -5827,49 +5828,49 @@ let propagate_pure_copies_in_cdef narrowing_policy ctx immutable_globals (CDEF_a
     in
     scan [] instrs
   in
+  (* A write does not make its destination a local: Sail registers and
+     top-level let bindings are ordinary JIB names too.  Arguments and names
+     with an actual body declaration have value lifetimes that this local
+     data-flow proof can track.  A [Gen] call destination is also necessarily
+     a compiler-created local, even when its C declaration is fused into the
+     call by the renderer; named call destinations remain excluded because
+     they may be registers.  Enum constructors and top-level [let] bindings
+     are immutable global constants, so they are stable roots even though
+     they have ordinary named JIB identifiers. *)
+  let rewrite_body args body =
+    let locals = ref (NameSet.of_list args) in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               ( match aux with
+               | I_decl (_, name) | I_init (_, name, _) -> locals := NameSet.add name !locals
+               | I_funcall _ ->
+                   let generated_destinations =
+                     instr_writes ~direct:true sub |> NameSet.filter (function Gen _ -> true | _ -> false)
+                   in
+                   locals := NameSet.union generated_destinations !locals
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    let rec fixpoint n body =
+      let rewritten = List.map (map_instrs (rewrite_lists !locals)) body in
+      let rewritten = rewrite_lists !locals rewritten in
+      if n = 0 then rewritten else fixpoint (n - 1) rewritten
+    in
+    fixpoint 2 body
+  in
   match aux with
   | CDEF_fundef (id, ret, args, body) ->
-      (* A write does not make its destination a local: Sail registers are
-         ordinary JIB names too, and a function may assign one before taking a
-         snapshot of it.  Treating every written name as local allowed the
-         snapshot to be substituted across a later call which mutated the
-         register.  Arguments and names with an actual body declaration have
-         value lifetimes that this local data-flow proof can track.  A [Gen]
-         call destination is also necessarily a compiler-created local, even
-         when its C declaration is fused into the call by the renderer; named
-         call destinations remain excluded because they may be registers.
-         Enum constructors and top-level [let] bindings are immutable global
-         constants, so they are also stable roots even though they have
-         ordinary named JIB identifiers. *)
-      let locals = ref (NameSet.of_list args) in
-      List.iter
-        (fun instr ->
-          ignore
-            (map_instr
-               (fun (I_aux (aux, _) as sub) ->
-                 ( match aux with
-                 | I_decl (_, name) | I_init (_, name, _) -> locals := NameSet.add name !locals
-                 | I_funcall _ ->
-                     let generated_destinations =
-                       instr_writes ~direct:true sub
-                       |> NameSet.filter (function Gen _ -> true | _ -> false)
-                     in
-                     locals := NameSet.union generated_destinations !locals
-                 | _ -> ()
-                 );
-                 sub
-               )
-               instr
-            )
-        )
-        body;
-      let rec fixpoint n body =
-        let rewritten = List.map (map_instrs (rewrite_lists !locals)) body in
-        let rewritten = rewrite_lists !locals rewritten in
-        if n = 0 then rewritten else fixpoint (n - 1) rewritten
-      in
-      let body = fixpoint 2 body in
-      CDEF_aux (CDEF_fundef (id, ret, args, body), def_annot)
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body args body), def_annot)
+  | CDEF_let (number, bindings, body) ->
+      CDEF_aux (CDEF_let (number, bindings, rewrite_body [] body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
 let propagate_pure_copies narrowing_policy ctx cdefs =
