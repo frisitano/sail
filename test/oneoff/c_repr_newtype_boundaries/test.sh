@@ -85,6 +85,65 @@ run_sail --no-color -O -c --c-specialize --c-narrowing=checked \
 test ! -s "$SAFE_OUTPUT.result"
 test ! -s "$SAFE_OUTPUT.err"
 
+# A uint16_t record field is path-refined to one byte before conversion.
+# Specialization records each field-to-byte conversion as Proven_narrow.
+# Under the defensive checked policy, optimizer paths that fold records,
+# converted tuples, returns, copies, or initializers must leave the marker at
+# a standalone assignment where C emission restores the guard.
+build_aggregate_proven_narrow() {
+  policy=$1
+  policy_dir="$TMP_DIR/aggregate_proven_narrow_$policy"
+  output="$policy_dir/aggregate_proven_narrow"
+
+  mkdir -p "$policy_dir"
+  run_sail --no-color -O -c --c-specialize --c-specialize-log --c-no-main \
+    --c-narrowing="$policy" \
+    --c-preserve record_fold --c-preserve converted_tuple_fold \
+    --c-preserve terminal_sink --c-preserve propagated_aggregate \
+    --c-preserve initialized_local \
+    "$TEST_DIR/aggregate_proven_narrow.sail" -o "$output" \
+    2> "$policy_dir/specialize.log"
+  # Word splitting is intentional for user/compiler and pkg-config flags.
+  # shellcheck disable=SC2086
+  "$CC" ${CFLAGS:-} $GMP_CFLAGS "$output.c" \
+    "$TEST_DIR/aggregate_proven_narrow_runner.c" "$SAIL_DIR"/lib/*.c \
+    -I "$policy_dir" -I "$TEST_DIR" -I "$SAIL_DIR/lib" $GMP_LIBS \
+    -o "$policy_dir/runner"
+}
+
+build_aggregate_proven_narrow checked
+checked_dir="$TMP_DIR/aggregate_proven_narrow_checked"
+test "$(grep -Fc \
+  'conversion source=%u16 destination=%u8 interval=0..255 proof=true' \
+  "$checked_dir/specialize.log")" -eq 5
+test "$(grep -Fc \
+  'sail_native_conversion_failure("integer value is outside the uint8_t domain")' \
+  "$checked_dir/aggregate_proven_narrow.c")" -eq 5
+for case_name in record tuple terminal propagation initialization; do
+  "$checked_dir/runner" "$case_name" > "$checked_dir/$case_name.result" \
+    2> "$checked_dir/$case_name.err"
+  test ! -s "$checked_dir/$case_name.result"
+  test ! -s "$checked_dir/$case_name.err"
+done
+
+build_aggregate_proven_narrow all
+all_dir="$TMP_DIR/aggregate_proven_narrow_all"
+test "$(grep -Fc \
+  'conversion source=%u16 destination=%u8 interval=0..255 proof=true' \
+  "$all_dir/specialize.log")" -eq 5
+if grep -Fq \
+    'sail_native_conversion_failure("integer value is outside the uint8_t domain")' \
+    "$all_dir/aggregate_proven_narrow.c"; then
+  echo 'narrowing=all unexpectedly retained a checked Proven_narrow guard' >&2
+  exit 1
+fi
+for case_name in record tuple terminal propagation initialization; do
+  "$all_dir/runner" "$case_name" > "$all_dir/$case_name.result" \
+    2> "$all_dir/$case_name.err"
+  test ! -s "$all_dir/$case_name.result"
+  test ! -s "$all_dir/$case_name.err"
+done
+
 # `all` is the explicit extraction escape hatch: every narrowing is a
 # low-limb projection, including boundaries without reconstructed evidence.
 ALL_OUTPUT="$TMP_DIR/overflow_all"

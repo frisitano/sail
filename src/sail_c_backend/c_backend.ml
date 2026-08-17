@@ -4527,6 +4527,17 @@ let fixed_integer_storage_width width =
    handled by their exact domain rather than their nominal carrier. *)
 let preserve_assignment_conversion narrowing_policy target_ctyp value =
   let source_ctyp = cval_ctyp value in
+  let rec contains_proven_narrow = function
+    | V_call (Proven_narrow _, _) -> true
+    | V_call (_, values) | V_tuple values -> List.exists contains_proven_narrow values
+    | V_field (value, _, _)
+    | V_tuple_member (value, _, _)
+    | V_ctor_kind (value, _)
+    | V_ctor_unwrap (value, _, _) ->
+        contains_proven_narrow value
+    | V_struct (fields, _) -> List.exists (fun (_, value) -> contains_proven_narrow value) fields
+    | V_id _ | V_member _ | V_lit _ -> false
+  in
   let constant_fits lower upper = function
     | CT_constant constant -> Big_int.less_equal lower constant && Big_int.less_equal constant upper
     | _ -> false
@@ -4548,7 +4559,8 @@ let preserve_assignment_conversion narrowing_policy target_ctyp value =
           (max_int (fixed_integer_storage_width to_width)) source
     | _ -> false
   in
-  if ctyp_equal source_ctyp target_ctyp then Some value
+  if narrowing_policy = Narrowing_checked && contains_proven_narrow value then None
+  else if ctyp_equal source_ctyp target_ctyp then Some value
   else (
     match (target_ctyp, source_ctyp) with
     | CT_fuint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _)
