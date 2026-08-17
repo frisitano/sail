@@ -4502,22 +4502,62 @@ let prune_constant_branches (CDEF_aux (aux, def_annot)) =
   | _ -> CDEF_aux (aux, def_annot)
 
 (* Reassemble the field-by-field JIB lowering of a complete stack aggregate
-   into one pure value.  Fixed integer fields retain the same explicit,
-   width-directed assignment conversion used for tuples; every other field
-   must already have the record's exact C type.  The resulting [V_struct] or
-   [V_tuple] can then participate in ordinary copy propagation, which removes
-   both aggregate-construction temporaries and their scopes. *)
-let fold_stack_aggregate_construction ctx (CDEF_aux (aux, def_annot)) =
-  let preserve_assignment_conversion target_ctyp value =
-    let source_ctyp = cval_ctyp value in
-    if ctyp_equal source_ctyp target_ctyp then Some value
-    else (
-      match (target_ctyp, source_ctyp) with
-      | CT_fuint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) -> Some (V_call (Unsigned width, [value]))
-      | CT_fint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) -> Some (V_call (Signed width, [value]))
-      | _ -> None
-    )
+   into one pure value.  Fixed integer fields retain a width-directed
+   conversion only when the narrowing policy permits it at expression level;
+   every other field must already have the record's exact C type.  The
+   resulting [V_struct] or [V_tuple] can then participate in ordinary copy
+   propagation, which removes both aggregate-construction temporaries and
+   their scopes. *)
+let fixed_integer_storage_width width =
+  if width > 64 then 128
+  else if width <= 8 then 8
+  else if width <= 16 then 16
+  else if width <= 32 then 32
+  else 64
+
+(* Folding a field assignment into an aggregate value changes where C emits
+   the conversion: the aggregate's outer assignment now has equal source and
+   destination types, so an inner [Signed]/[Unsigned] expression cannot carry
+   a runtime range check.  Such expressions are therefore valid only when the
+   configured policy explicitly permits unchecked narrowing, or when the
+   source carrier is a subset of the destination carrier.  Constants are
+   handled by their exact domain rather than their nominal carrier. *)
+let preserve_assignment_conversion narrowing_policy target_ctyp value =
+  let source_ctyp = cval_ctyp value in
+  let constant_fits lower upper = function
+    | CT_constant constant -> Big_int.less_equal lower constant && Big_int.less_equal constant upper
+    | _ -> false
   in
+  let total_conversion =
+    match (target_ctyp, source_ctyp) with
+    | CT_fuint to_width, CT_fuint from_width ->
+        fixed_integer_storage_width from_width <= fixed_integer_storage_width to_width
+    | CT_fuint to_width, CT_fbits from_width ->
+        fixed_integer_storage_width from_width <= fixed_integer_storage_width to_width
+    | CT_fint to_width, CT_fint from_width ->
+        fixed_integer_storage_width from_width <= fixed_integer_storage_width to_width
+    | CT_fint to_width, (CT_fuint from_width | CT_fbits from_width) ->
+        fixed_integer_storage_width from_width < fixed_integer_storage_width to_width
+    | CT_fuint to_width, source ->
+        constant_fits Big_int.zero (max_uint (fixed_integer_storage_width to_width)) source
+    | CT_fint to_width, source ->
+        constant_fits (min_int (fixed_integer_storage_width to_width))
+          (max_int (fixed_integer_storage_width to_width)) source
+    | _ -> false
+  in
+  if ctyp_equal source_ctyp target_ctyp then Some value
+  else (
+    match (target_ctyp, source_ctyp) with
+    | CT_fuint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _)
+      when narrowing_policy = Narrowing_all || total_conversion ->
+        Some (V_call (Unsigned width, [value]))
+    | CT_fint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _)
+      when narrowing_policy = Narrowing_all || total_conversion ->
+        Some (V_call (Signed width, [value]))
+    | _ -> None
+  )
+
+let fold_stack_aggregate_construction narrowing_policy ctx (CDEF_aux (aux, def_annot)) =
   let expected_fields = function
     | CT_struct (id, _) -> (
         match Bindings.find_opt id ctx.records with
@@ -4547,7 +4587,7 @@ let fold_stack_aggregate_construction ctx (CDEF_aux (aux, def_annot)) =
              && ctyp_equal destination_ctyp base_ctyp
              && (not (List.mem_assoc field rev_fields))
              && not (reads destination value) -> (
-          match preserve_assignment_conversion field_ctyp value with
+          match preserve_assignment_conversion narrowing_policy field_ctyp value with
           | Some value -> collect ((field, value) :: rev_fields) rest
           | None -> (List.rev rev_fields, rest)
         )
@@ -4581,7 +4621,7 @@ let fold_stack_aggregate_construction ctx (CDEF_aux (aux, def_annot)) =
         when Name.compare destination base = 0
              && ctyp_equal destination_ctyp base_ctyp && index >= 0 && index < length
              && not (List.mem_assoc index rev_fields) -> (
-          match preserve_assignment_conversion (List.nth field_ctyps index) value with
+          match preserve_assignment_conversion narrowing_policy (List.nth field_ctyps index) value with
           | Some value -> collect ((index, value) :: rev_fields) rest
           | None -> (List.rev rev_fields, rest)
         )
@@ -4595,7 +4635,7 @@ let fold_stack_aggregate_construction ctx (CDEF_aux (aux, def_annot)) =
           (I_copy (CL_id (destination, (CT_tup target_ctyps as destination_ctyp)), (V_tuple values as source)), copy_aux)
         :: rest
         when List.length target_ctyps = List.length values ->
-          let converted = List.map2 preserve_assignment_conversion target_ctyps values in
+          let converted = List.map2 (preserve_assignment_conversion narrowing_policy) target_ctyps values in
           if List.for_all Option.is_some converted && not (ctyp_equal destination_ctyp (cval_ctyp source)) then (
             let converted = List.map Option.get converted in
             I_aux (I_copy (CL_id (destination, destination_ctyp), V_tuple converted), copy_aux) :: rewrite rest
@@ -4853,18 +4893,8 @@ let fold_copy_conversions (CDEF_aux (aux, def_annot)) =
    return expression.  Calls followed by exception handling are deliberately
    not terminal, so the check remains between the call and the eventual
    return. *)
-let sink_terminal_stack_returns (CDEF_aux (aux, def_annot)) =
+let sink_terminal_stack_returns narrowing_policy (CDEF_aux (aux, def_annot)) =
   let same_name left right = Name.compare left right = 0 in
-  let preserve_assignment_conversion target_ctyp value =
-    let source_ctyp = cval_ctyp value in
-    if ctyp_equal source_ctyp target_ctyp then Some value
-    else (
-      match (target_ctyp, source_ctyp) with
-      | CT_fuint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) -> Some (V_call (Unsigned width, [value]))
-      | CT_fint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) -> Some (V_call (Signed width, [value]))
-      | _ -> None
-    )
-  in
   let rec terminal = function
     | [] -> false
     | instrs -> (
@@ -4887,7 +4917,7 @@ let sink_terminal_stack_returns (CDEF_aux (aux, def_annot)) =
           | I_aux (I_copy (CL_tuple (CL_id (destination, destination_ctyp), index), value), _) :: reversed
             when same_name destination result && ctyp_equal destination_ctyp result_ctyp && index >= 0 && index < length
                  && not (List.mem_assoc index fields) -> (
-              match preserve_assignment_conversion (List.nth field_ctyps index) value with
+              match preserve_assignment_conversion narrowing_policy (List.nth field_ctyps index) value with
               | Some value -> collect ((index, value) :: fields) reversed
               | None -> None
             )
@@ -4906,7 +4936,7 @@ let sink_terminal_stack_returns (CDEF_aux (aux, def_annot)) =
         match List.rev instrs with
         | I_aux (I_copy (CL_id (destination, destination_ctyp), cval), _) :: rev_prefix
           when same_name destination result && ctyp_equal destination_ctyp result_ctyp -> (
-            match preserve_assignment_conversion result_ctyp cval with
+            match preserve_assignment_conversion narrowing_policy result_ctyp cval with
             | Some cval -> Some (List.rev (I_aux (I_return cval, return_aux) :: rev_prefix))
             | None -> None
           )
@@ -5542,7 +5572,7 @@ let prune_after_noreturn_call ctx (CDEF_aux (aux, def_annot)) =
       CDEF_aux (CDEF_fundef (id, ret, args, rewrite body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
-let propagate_pure_copies_in_cdef ctx immutable_globals (CDEF_aux (aux, def_annot)) =
+let propagate_pure_copies_in_cdef narrowing_policy ctx immutable_globals (CDEF_aux (aux, def_annot)) =
   let stable_root locals root =
     NameSet.mem root locals
     || match root with Name (id, _) -> IdSet.mem id immutable_globals | _ -> false
@@ -5552,16 +5582,6 @@ let propagate_pure_copies_in_cdef ctx immutable_globals (CDEF_aux (aux, def_anno
     | V_id _ | V_member _ | V_lit _ -> true
     | V_tuple values -> List.for_all trivial values
     | _ -> false
-  in
-  let preserve_assignment_conversion target_ctyp value =
-    let source_ctyp = cval_ctyp value in
-    if ctyp_equal source_ctyp target_ctyp then Some value
-    else (
-      match (target_ctyp, source_ctyp) with
-      | CT_fuint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) -> Some (V_call (Unsigned width, [value]))
-      | CT_fint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _) -> Some (V_call (Signed width, [value]))
-      | _ -> None
-    )
   in
   let contains_label instr =
     let found = ref false in
@@ -5627,7 +5647,7 @@ let propagate_pure_copies_in_cdef ctx immutable_globals (CDEF_aux (aux, def_anno
     let rec scan acc = function
       | (I_aux (I_init (initialized_ctyp, ((Name _ | Gen _) as x), Init_cval cval), _) as initialization)
         :: rest -> (
-          match preserve_assignment_conversion initialized_ctyp cval with
+          match preserve_assignment_conversion narrowing_policy initialized_ctyp cval with
           | None -> scan (initialization :: acc) rest
           | Some propagated_cval ->
               let roots = instr_reads ~direct:true initialization in
@@ -5663,7 +5683,7 @@ let propagate_pure_copies_in_cdef ctx immutable_globals (CDEF_aux (aux, def_anno
           match first_copy x decl_ctyp [] tail with
           | None -> scan (decl :: acc) tail
           | Some (gap, copy, cval, rest) -> (
-              match preserve_assignment_conversion decl_ctyp cval with
+              match preserve_assignment_conversion narrowing_policy decl_ctyp cval with
               | None -> scan (decl :: acc) tail
               | Some propagated_cval ->
                   let roots = instr_reads ~direct:true copy in
@@ -5746,7 +5766,7 @@ let propagate_pure_copies_in_cdef ctx immutable_globals (CDEF_aux (aux, def_anno
       CDEF_aux (CDEF_fundef (id, ret, args, body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
-let propagate_pure_copies ctx cdefs =
+let propagate_pure_copies narrowing_policy ctx cdefs =
   (* [Jib_compile.ctx.enums] is populated while source definitions are
      compiled, but the C optimizer deliberately receives the initial context.
      The typed JIB stream is therefore the authoritative place to identify
@@ -5764,31 +5784,21 @@ let propagate_pure_copies ctx cdefs =
       )
       IdSet.empty cdefs
   in
-  List.map (propagate_pure_copies_in_cdef ctx immutable_globals) cdefs
+  List.map (propagate_pure_copies_in_cdef narrowing_policy ctx immutable_globals) cdefs
 
 (* Declaration fusion is intentionally the final producer of local
    declarations.  Doing it before copy propagation and terminal-return
    sinking obscures the declaration/copy patterns those semantic simplifiers
    consume.  A final [fold_copy_conversions] below consumes any
    initialization/return pair created here. *)
-let initialize_stack_locals (CDEF_aux (aux, def_annot)) =
-  let initialization_value target_ctyp value =
-    let source_ctyp = cval_ctyp value in
-    if ctyp_equal source_ctyp target_ctyp then Some value
-    else (
-      match (target_ctyp, source_ctyp) with
-      | CT_fuint width, (CT_fuint _ | CT_fint _ | CT_constant _) -> Some (V_call (Unsigned width, [value]))
-      | CT_fint width, (CT_fuint _ | CT_fint _ | CT_constant _) -> Some (V_call (Signed width, [value]))
-      | _ -> None
-    )
-  in
+let initialize_stack_locals narrowing_policy (CDEF_aux (aux, def_annot)) =
   let rewrite_lists instrs =
     let rec rewrite = function
       | I_aux (I_decl (decl_ctyp, destination), decl_aux)
         :: I_aux (I_copy (CL_id (assigned, copy_ctyp), value), copy_aux)
         :: rest
         when Name.compare destination assigned = 0 && ctyp_equal decl_ctyp copy_ctyp -> (
-          match initialization_value decl_ctyp value with
+          match preserve_assignment_conversion narrowing_policy decl_ctyp value with
           | Some value -> I_aux (I_init (decl_ctyp, destination, Init_cval value), decl_aux) :: rewrite rest
           | None ->
               I_aux (I_decl (decl_ctyp, destination), decl_aux)
@@ -6068,46 +6078,46 @@ let remove_dead_letbinds cdefs =
   in
   (cdefs, live)
 
-let optimize ~have_rts ~specialize_c ~optimized_model ctx recursive_functions cdefs =
+let optimize ~have_rts ~specialize_c ~optimized_model ~narrowing_policy ctx recursive_functions cdefs =
   let nothing cdefs = cdefs in
   cdefs
   |> (if !optimize_unit_results then List.map (discard_unread_stack_results ctx) else nothing)
   |> (if !optimize_pure_copies then List.map (flatten_unique_stack_blocks ctx) else nothing)
-  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction narrowing_policy ctx) else nothing)
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map merge_repeated_conditional_branches else nothing)
   |> (if !optimize_pure_copies then List.map simplify_bounded_integer_predicates else nothing)
   |> (if !optimize_pure_copies then List.map prune_constant_branches else nothing)
   |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
-  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_alias then List.concat_map remove_alias else nothing)
   |> (if !optimize_alias then combine_variables ctx else nothing)
   |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
-  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
-  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction ctx) else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction narrowing_policy ctx) else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map (flatten_unique_stack_blocks ctx) else nothing)
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
-  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction ctx) else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction narrowing_policy ctx) else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
-  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   (* We need the runtime to initialize hoisted allocations *)
   |> ( if !optimize_hoist_allocations && have_rts then List.concat_map (hoist_allocations recursive_functions)
@@ -6118,18 +6128,18 @@ let optimize ~have_rts ~specialize_c ~optimized_model ctx recursive_functions cd
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
   |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
-  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
-  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_unit_results then List.map (discard_unread_stack_results ctx) else nothing)
   |> (if !optimize_unit_results then List.map (erase_unit_scaffolding ctx) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
   |> (if !optimize_pure_copies then List.map merge_repeated_conditional_branches else nothing)
@@ -6141,22 +6151,22 @@ let optimize ~have_rts ~specialize_c ~optimized_model ctx recursive_functions cd
   |> (if !optimize_pure_copies then List.map return_from_terminal_stack_label else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
-  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   (* The preceding propagation can expose a narrow tuple literal only after
      the earlier aggregate passes have run. Normalize its field widening in
      typed JIB, then sink the exact result before local initialization makes
      the remaining match labels lifetime-sensitive in emitted C. *)
-  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction ctx) else nothing)
-  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction narrowing_policy ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
   |> (if !optimize_pure_copies then List.map merge_repeated_conditional_branches else nothing)
-  |> (if !optimize_pure_copies then List.map initialize_stack_locals else nothing)
+  |> (if !optimize_pure_copies then List.map (initialize_stack_locals narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
   |> (if !optimize_pure_copies then List.map structure_forward_match_joins else nothing)
-  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   (* Late return sinking creates new terminal branches after the earlier guard
      cleanup.  Flatten those only after declarations and conversions have
@@ -6166,11 +6176,11 @@ let optimize ~have_rts ~specialize_c ~optimized_model ctx recursive_functions cd
   (* Flattening a terminal guard can expose one last match ladder whose join
      was previously nested in the surviving branch.  Re-run return sinking so
      that match arms return their values directly before C emission. *)
-  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
-  |> (if !optimize_pure_copies then propagate_pure_copies ctx else nothing)
+  |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map structure_forward_match_joins else nothing)
-  |> (if !optimize_pure_copies then List.map sink_terminal_stack_returns else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
   |> (if !optimize_pure_copies then List.map (consolidate_named_aggregate_returns ctx) else nothing)
   |> List.map (prune_after_noreturn_call ctx)
@@ -14603,7 +14613,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
         (IdSet.cardinal recursive_functions);
       let cdefs =
         optimize ~have_rts:(not Config.no_rts) ~specialize_c:Config.specialize_c ~optimized_model:Config.optimized_model
-          ctx recursive_functions cdefs
+          ~narrowing_policy:Config.narrowing_policy ctx recursive_functions cdefs
       in
       let cdefs, ctx =
         if !optimize_dead_letbinds then (

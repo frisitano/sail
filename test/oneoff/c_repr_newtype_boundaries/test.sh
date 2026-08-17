@@ -30,12 +30,13 @@ run_sail() {
   fi
 }
 
-expect_boundary_failure() {
+expect_boundary_failure_with_policy() {
   name=$1
   expected=$2
-  output="$TMP_DIR/$name"
+  policy=$3
+  output="$TMP_DIR/$name.$policy"
 
-  run_sail --no-color -O -c --c-specialize "$TEST_DIR/$name.sail" -o "$output"
+  run_sail --no-color -O -c --c-specialize --c-narrowing="$policy" "$TEST_DIR/$name.sail" -o "$output"
   # Word splitting is intentional for user/compiler and pkg-config flags.
   # shellcheck disable=SC2086
   "$CC" ${CFLAGS:-} $GMP_CFLAGS "$output.c" "$SAIL_DIR"/lib/*.c -I "$SAIL_DIR/lib" $GMP_LIBS -o "$output.bin"
@@ -49,9 +50,13 @@ expect_boundary_failure() {
   grep -Fq "$expected" "$output.err"
 }
 
+expect_boundary_failure() {
+  expect_boundary_failure_with_policy "$1" "$2" checked
+}
+
 expect_boundary_failure negative 'Sail C backend: negative integer cannot be represented as uint64_t'
-grep -Eq 'INT(8|16|32|64)_C\(-1\)' "$TMP_DIR/negative.c"
-if grep -Fq 'neg_int(' "$TMP_DIR/negative.c"; then
+grep -Eq 'INT(8|16|32|64)_C\(-1\)' "$TMP_DIR/negative.checked.c"
+if grep -Fq 'neg_int(' "$TMP_DIR/negative.checked.c"; then
   echo 'bounded negative literal detoured through the Sail integer runtime' >&2
   exit 1
 fi
@@ -59,6 +64,26 @@ expect_boundary_failure overflow 'Sail C backend: integer value is outside the u
 expect_boundary_failure nat_overflow 'Sail C backend: integer value is outside the uint64_t domain'
 expect_boundary_failure negative_u8 'Sail C backend: negative integer cannot be represented as uint8_t'
 expect_boundary_failure overflow_u8 'Sail C backend: integer value is outside the uint8_t domain'
+expect_boundary_failure record_negative_u8 'Sail C backend: negative integer cannot be represented as uint8_t'
+expect_boundary_failure tuple_overflow_u8 'Sail C backend: integer value is outside the uint8_t domain'
+expect_boundary_failure_with_policy record_negative_u8 \
+  'Sail C backend: negative integer cannot be represented as uint8_t' proven
+expect_boundary_failure_with_policy tuple_overflow_u8 \
+  'Sail C backend: integer value is outside the uint8_t domain' proven
+
+# Aggregate folding may retain conversions that are total at the target C
+# carrier. Exercise both signed extrema and unsigned extrema through record
+# and tuple construction under the checked policy.
+SAFE_OUTPUT="$TMP_DIR/aggregate_safe_boundaries"
+run_sail --no-color -O -c --c-specialize --c-narrowing=checked \
+  "$TEST_DIR/aggregate_safe_boundaries.sail" -o "$SAFE_OUTPUT"
+# Word splitting is intentional for user/compiler and pkg-config flags.
+# shellcheck disable=SC2086
+"$CC" ${CFLAGS:-} $GMP_CFLAGS "$SAFE_OUTPUT.c" "$SAIL_DIR"/lib/*.c \
+  -I "$SAIL_DIR/lib" $GMP_LIBS -o "$SAFE_OUTPUT.bin"
+"$SAFE_OUTPUT.bin" > "$SAFE_OUTPUT.result" 2> "$SAFE_OUTPUT.err"
+test ! -s "$SAFE_OUTPUT.result"
+test ! -s "$SAFE_OUTPUT.err"
 
 # `all` is the explicit extraction escape hatch: every narrowing is a
 # low-limb projection, including boundaries without reconstructed evidence.
