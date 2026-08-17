@@ -8832,6 +8832,84 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       )
     | _ -> false
 
+  (* Return the C expression for the ordinary internal-call subset whose
+     renderer is exactly [sgen_function_uid(args)].  Calls routed through an
+     extern, a direct tuple ABI, or one of the runtime primitive spellings
+     below need the full statement renderer and are deliberately excluded.
+     Keeping this predicate beside the call renderer makes the few expression
+     fusions below conservative: if a runtime primitive acquires a special
+     spelling, it must remain a statement until it is added here. *)
+  let inlineable_internal_stack_call_expression ctx extern_info f args result_ctyp =
+    let runtime_primitive_name = function
+      | "__sail_from_bytes_le_fixed_u256"
+      | "__sail_to_bytes_le_u256_fixed"
+      | "__sail_u256_addmod"
+      | "__sail_u256_mulmod"
+      | "__sail_byte_pointer_diff"
+      | "__sail_fixed_assert"
+      | "internal_pick"
+      | "sail_cons"
+      | "eq_anything"
+      | "length"
+      | "vector_access"
+      | "vector_access_inc"
+      | "fast_vector_access"
+      | "fast_unsigned_vector_access"
+      | "vector_init"
+      | "vector_update_subrange"
+      | "vector_update_subrange_inc"
+      | "vector_subrange"
+      | "vector_subrange_inc"
+      | "vector_update"
+      | "vector_update_inc"
+      | "shiftl"
+      | "shiftr"
+      | "arith_shiftr"
+      | "zero_extend"
+      | "string_of_bits"
+      | "decimal_string_of_bits"
+      | "sail_unsigned"
+      | "sail_signed"
+      | "internal_vector_update"
+      | "internal_vector_init"
+      | "undefined_bitvector"
+      | "undefined_bit"
+      | "undefined_vector"
+      | "undefined_list"
+      | "fatal_error"
+      | "reg_deref" -> true
+      | _ -> false
+    in
+    match extern_info with
+    | Jib.Extern _ -> None
+    | Jib.Call _
+      when (not (ctx_is_extern (fst f) ctx))
+           && is_stack_ctyp ctx result_ctyp
+           && (not (ctyp_equal result_ctyp CT_unit))
+           && Option.is_none (Bindings.find_opt (fst f) !direct_tuple_result_abis) ->
+        let args =
+          if erase_unit_values && not (is_variant_constructor ctx (fst f)) then
+            List.filter (fun arg -> not (ctyp_equal (cval_ctyp arg) CT_unit)) args
+          else args
+        in
+        let fname = sgen_function_uid f in
+        if runtime_primitive_name fname then None
+        else
+          let arguments = Util.string_of_list ", " sgen_cval_in_value_context args in
+          let regs_argument =
+            if register_file_threaded_function (fst f) then
+              if !current_function_threaded then register_file_param else "&" ^ register_file_variable
+            else ""
+          in
+          let arguments =
+            if regs_argument = "" then arguments
+            else if arguments = "" then regs_argument
+            else regs_argument ^ ", " ^ arguments
+          in
+          current_static_helper_demands := Util.StringSet.add fname !current_static_helper_demands;
+          Some (Printf.sprintf "%s(%s%s)" fname (extra_arguments false) arguments)
+    | Jib.Call _ -> None
+
   let rec codegen_instr fid ctx (I_aux (instr, (_, l))) =
     match instr with
     | I_decl (ctyp, id) when is_stack_ctyp ctx ctyp -> ksprintf string "  %s %s;" (sgen_ctyp ctyp) (sgen_name id)
@@ -9649,6 +9727,57 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
          expose another one immediately before emission. *)
       | instr :: I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp -> docs (instr :: rest)
       | I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp -> docs rest
+      (* A boolean internal-call result used only by the immediately following
+         guard has no independent lifetime.  Render the call at its sole use
+         site, preserving its evaluation point while avoiding the generated
+         [result_*] declaration.  The expression helper excludes externs,
+         throwing-call sequences, tuple ABIs, and specially rendered runtime
+         primitives. *)
+      | I_aux (I_decl (CT_bool, declared), _)
+        :: I_aux
+             ( I_funcall
+                 ( CR_one (CL_id (destination, destination_ctyp)),
+                   extern_info,
+                   callee,
+                   arguments
+                 ),
+               _
+             )
+        :: I_aux (I_if (V_id (tested, tested_ctyp), then_body, else_body), _)
+        :: rest
+        when Config.optimized_model && (not Config.cpp)
+             && Name.compare declared destination = 0
+             && Name.compare declared tested = 0
+             && ctyp_equal destination_ctyp CT_bool
+             && ctyp_equal tested_ctyp CT_bool
+             && (not (List.is_empty then_body && List.is_empty else_body))
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:declared ~direct:false instr)
+                     (then_body @ else_body @ rest)
+                  )
+             && Option.is_some
+                  (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp) -> (
+          let call =
+            Option.get
+              (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp)
+          in
+          let branch body =
+            lbrace ^^ nest 2 (hardline ^^ codegen_instrs fid ctx body) ^^ hardline ^^ twice space ^^ rbrace
+          in
+          let guard =
+            match (then_body, else_body) with
+            | [], else_body ->
+                string "  if" ^^ space
+                ^^ parens (string ("!(" ^ call ^ ")"))
+                ^^ space ^^ branch else_body
+            | then_body, [] -> string "  if" ^^ space ^^ parens (string call) ^^ space ^^ branch then_body
+            | then_body, else_body ->
+                string "  if" ^^ space ^^ parens (string call) ^^ space ^^ branch then_body
+                ^^ space ^^ string "else" ^^ space ^^ branch else_body
+          in
+          guard :: docs rest
+        )
       (* A pure boolean value that is consumed only by the immediately
          following conditional does not need a named C local.  Keep the
          reference check deliberately global: later uses, including uses in
