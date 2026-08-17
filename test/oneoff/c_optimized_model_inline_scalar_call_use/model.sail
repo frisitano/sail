@@ -15,7 +15,6 @@ function call_in_eager_guard(value : incrementable_byte) -> byte =
   if next_byte(value) == 2 then 3 else 4
 
 val external_byte = pure { c: "external_byte" } : byte -> byte
-val external_bool = pure { c: "external_bool" } : bool -> bool
 
 function external_call_in_return(value : byte) -> bool =
   external_byte(value) == 2
@@ -38,8 +37,6 @@ struct Pair = {
   right : byte
 }
 
-let DEFAULT_PAIR : Pair = struct { left = 0, right = 0 }
-
 val consume_byte = pure { c: "consume_byte" } : byte -> unit
 val consume_pair = pure { c: "consume_pair" } : Pair -> unit
 
@@ -56,23 +53,6 @@ function updated_record_into_call(pair : Pair, value : byte) -> unit =
 
 function updated_record_into_return(pair : Pair, value : byte) -> Pair =
   { pair with right = value }
-
-function record_branch_into_return(enabled : bool) -> Pair =
-  if enabled then struct { left = 1, right = 2 }
-  else struct { left = 3, right = 4 }
-
-function nested_guard_into_return(left : bool, middle : bool, right : bool) -> bool =
-  left & middle & right
-
-struct StateFlags = {
-  cleared : bool,
-  marker : bool
-}
-
-function retained_branch_condition(state : StateFlags) -> byte = {
-  let anchored = not_bool(state.cleared) & external_bool(state.marker);
-  if anchored then 1 else 2
-}
 
 function count_four() -> byte = {
   var count : byte = 0;
