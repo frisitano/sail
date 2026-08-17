@@ -2268,7 +2268,11 @@ let make_direct_tuple_result_abi ctx arg_ctyps args ret_ctyp =
         | _ -> false
       in
       let candidates =
-        if List.exists (ctyp_equal return_ctyp) arg_ctyps then []
+        if
+          not (List.for_all (is_stack_ctyp ctx) field_ctyps)
+          || ctyp_equal return_ctyp CT_unit
+          || List.exists (ctyp_equal return_ctyp) arg_ctyps
+        then []
         else
           List.init (max 0 (List.length arg_ctyps - state_count + 1)) Fun.id
           |> List.filter (fun start -> matches state_ctyps (Util.drop start arg_ctyps))
@@ -2303,7 +2307,9 @@ let make_direct_tuple_result_abi ctx arg_ctyps args ret_ctyp =
               direct_result_fields = state_fields @ [return_field];
               direct_return_field = return_field;
             }
-      | _ when is_stack_ctyp ctx return_ctyp ->
+      | _
+        when List.for_all (is_stack_ctyp ctx) field_ctyps
+             && not (ctyp_equal return_ctyp CT_unit) ->
           let return_index = List.length field_ctyps - 1 in
           let fields =
             List.mapi
@@ -2399,6 +2405,19 @@ let lower_direct_tuple_function id ctx abi body =
   in
   let coalesce_call_results callee_abi call_destinations args remaining =
     let remaining_references = referenced_by remaining in
+    let inout_input_occurrences input =
+      List.fold_left
+        (fun count field ->
+          match field.direct_input_index with
+          | Some input_index -> (
+              match List.nth args input_index with
+              | V_id (name, _) when Name.compare name input = 0 -> count + 1
+              | _ -> count
+            )
+          | None -> count
+        )
+        0 callee_abi.direct_result_fields
+    in
     let destinations, copies =
       List.fold_left2
         (fun (destinations, copies) field destination ->
@@ -2414,6 +2433,7 @@ let lower_direct_tuple_function id ctx abi body =
                   (CL_id (input, input_ctyp) :: destinations, copies)
               | V_id (input, input_ctyp)
                 when ctyp_equal input_ctyp field.direct_field_ctyp
+                     && inout_input_occurrences input = 1
                      && not (NameSet.mem input remaining_references) ->
                   ( CL_id (input, input_ctyp) :: destinations,
                     (destination, V_id (input, input_ctyp)) :: copies
@@ -2506,61 +2526,42 @@ let lower_direct_tuple_function id ctx abi body =
                   Some index
               | _ -> None
             in
-            let rec find_outer_index field_index index = function
-              | [] -> None
-              | value :: values -> (
-                  match member_index value with
-                  | Some index' when index' = field_index -> Some index
-                  | _ -> find_outer_index field_index (index + 1) values
-                )
-            in
-            let outer_indices =
+            let scalar_results =
               List.map
-                (fun field -> find_outer_index field.direct_field_index 0 values)
+                (fun field ->
+                  ( ngensym
+                      ~source_name:(string_of_name ~zencode:false field.direct_field_name)
+                      ~source_type:(string_of_ctyp field.direct_field_ctyp)
+                      (),
+                    field.direct_field_ctyp
+                  )
+                )
                 callee_abi.direct_result_fields
             in
-            if List.for_all Option.is_some outer_indices
-               && List.length values = List.length destinations
-            then
-              let call_destinations =
-                List.map
-                  (fun outer_index -> List.nth destinations (Option.get outer_index))
-                  outer_indices
-              in
-              let call_destinations =
-                if returns then
-                  List.map2
-                    (fun outer_index destination ->
-                      if Option.get outer_index = abi.direct_return_field.direct_field_index then
-                        CL_id
-                          ( Return (-1),
-                            abi.direct_return_field.direct_field_ctyp
-                          )
-                      else destination
-                    )
-                    outer_indices call_destinations
-                else call_destinations
-              in
-              let call_destinations, copies =
-                coalesce_call_results callee_abi call_destinations args instrs
-              in
-              let copied_from_call value = Option.is_some (member_index value) in
-              let remaining_assignments =
-                List.map2 (fun destination value -> (destination, value)) destinations values
-                |> List.filter_map (fun (destination, value) ->
-                       if copied_from_call value || identity_copy destination value then None
-                       else Some (I_aux (I_copy (destination, value), result_aux))
-                   )
-              in
-              [I_aux (I_funcall (CR_multi call_destinations, extern, uid, args), call_aux)]
-              @ List.map (fun (destination, value) -> I_aux (I_copy (destination, value), call_aux)) copies
-              @ remaining_assignments @ rewrite instrs
-            else
-              I_aux (I_decl (temporary_ctyp, temporary), decl_aux)
-              :: rewrite
-                   (I_aux (I_funcall (CR_one (CL_id (assigned, temporary_ctyp)), extern, uid, args), call_aux)
-                   :: remaining
-                   )
+            let declarations =
+              List.map
+                (fun (name, ctyp) -> I_aux (I_decl (ctyp, name), decl_aux))
+                scalar_results
+            in
+            let call_destinations =
+              List.map (fun (name, ctyp) -> CL_id (name, ctyp)) scalar_results
+            in
+            let values =
+              List.map
+                (fun value ->
+                  match member_index value with
+                  | Some index ->
+                      let name, ctyp = List.nth scalar_results index in
+                      V_id (name, ctyp)
+                  | None -> value
+                )
+                values
+            in
+            let result = V_tuple values in
+            declarations
+            @ [I_aux (I_funcall (CR_multi call_destinations, extern, uid, args), call_aux)]
+            @ (if returns then return_result result_aux result else assign_result result_aux result)
+            @ rewrite instrs
         | _ ->
             I_aux (I_decl (temporary_ctyp, temporary), decl_aux)
             :: rewrite
@@ -2631,6 +2632,8 @@ let lower_direct_tuple_function id ctx abi body =
       when ctyp_equal (cval_ctyp value) abi.direct_result_ctyp
            || same_result_arity (cval_ctyp value) ->
         return_result aux value @ rewrite instrs
+    | I_aux (I_undefined ctyp, aux) :: instrs when ctyp_equal ctyp abi.direct_result_ctyp ->
+        I_aux (I_undefined abi.direct_return_field.direct_field_ctyp, aux) :: rewrite instrs
     | I_aux (I_if (condition, then_instrs, else_instrs), aux)
       :: I_aux (I_return (V_id (carrier_name, _)), return_aux)
       :: instrs

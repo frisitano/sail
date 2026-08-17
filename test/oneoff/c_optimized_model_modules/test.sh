@@ -1322,3 +1322,63 @@ grep -Eq 'enum invalid_state_status invalid_state_order\(uint8_t state_word, boo
   "$TMP_DIR/state-passing-invalid/ffi/optimized/include/evmsail/spec/state_passing_invalid.h"
 grep -Eq 'uint8_t state_last_product\(uint8_t state_word, bool \*restrict condition_[A-Za-z0-9_]+\);' \
   "$TMP_DIR/state-passing-invalid/ffi/optimized/include/evmsail/spec/state_passing_invalid.h"
+
+# Direct tuple-result lowering must preserve every projected occurrence, keep
+# aliased state inputs in distinct output slots, and use the scalar ABI on both
+# normal and exceptional exits. A unit tail is not a native return value.
+"$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
+  --all-modules \
+  --c-optimized-model --c-package evmsail \
+  --c-output-dir "$TMP_DIR/direct-tuple/ffi/optimized" \
+  --c-optimized-include-dir "$TMP_DIR/direct-tuple/ffi/optimized/include" \
+  --c-preserve inner_pair \
+  --c-preserve repeated_pair --c-preserve repeated_pair_value \
+  --c-preserve reordered_pair --c-preserve reordered_pair_value \
+  --c-preserve unit_tail --c-preserve unit_tail_value \
+  --c-preserve two_state_step --c-preserve aliased_inout_value \
+  --c-preserve throwing_inner_pair --c-preserve throwing_repeated_pair \
+  --c-preserve recovered_throwing_pair \
+  "$TEST_DIR/direct_tuple_regressions.sail_project"
+
+DIRECT_TUPLE_INCLUDE="$TMP_DIR/direct-tuple/ffi/optimized/include"
+DIRECT_TUPLE_HEADER="$DIRECT_TUPLE_INCLUDE/evmsail/spec/direct_tuple_regressions.h"
+DIRECT_TUPLE_SOURCE="$TMP_DIR/direct-tuple/ffi/optimized/src/spec/direct_tuple_regressions.c"
+
+grep -Fq 'struct tuple_uint_8_unit unit_tail(uint8_t value);' "$DIRECT_TUPLE_HEADER"
+grep -Eq 'uint8_t repeated_pair\(bool selector, uint8_t \*restrict [^,]+, uint8_t \*restrict [^)]+\);' \
+  "$DIRECT_TUPLE_HEADER"
+grep -Eq 'uint8_t reordered_pair\(bool selector, uint8_t \*restrict [^)]+\);' \
+  "$DIRECT_TUPLE_HEADER"
+grep -Eq 'uint8_t throwing_repeated_pair\(bool selector, bool should_throw, uint8_t \*restrict [^,]+, uint8_t \*restrict [^)]+\);' \
+  "$DIRECT_TUPLE_HEADER"
+
+"$CC" ${CFLAGS:-} -std=c11 -Wall \
+  -Werror=implicit-function-declaration -Werror=return-type \
+  -Werror=incompatible-pointer-types -Werror=uninitialized \
+  -I "$DIRECT_TUPLE_INCLUDE" -c "$DIRECT_TUPLE_SOURCE" \
+  -o "$TMP_DIR/direct_tuple_regressions.o"
+"$CC" ${CFLAGS:-} -std=c11 -Wall \
+  -Werror=implicit-function-declaration -Werror=return-type \
+  -Werror=incompatible-pointer-types \
+  -I "$DIRECT_TUPLE_INCLUDE" \
+  "$TEST_DIR/direct_tuple_regressions_harness.c" \
+  "$TMP_DIR/direct_tuple_regressions.o" \
+  -o "$TMP_DIR/direct_tuple_regressions"
+"$TMP_DIR/direct_tuple_regressions"
+
+# A tuple with an earlier managed field is ineligible for the direct ABI. The
+# optimized model therefore retains Return_via and rejects the managed list at
+# its ordinary representation boundary instead of emitting a mismatched ABI.
+if "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
+    --all-modules \
+    --c-optimized-model --c-package evmsail \
+    --c-output-dir "$TMP_DIR/direct-tuple-nonstack/ffi/optimized" \
+    --c-optimized-include-dir "$TMP_DIR/direct-tuple-nonstack/ffi/optimized/include" \
+    --c-preserve nonstack_first --c-preserve nonstack_first_value \
+    "$TEST_DIR/direct_tuple_nonstack.sail_project" \
+    >"$TMP_DIR/direct-tuple-nonstack.stdout" 2>"$TMP_DIR/direct-tuple-nonstack.stderr"; then
+  echo 'optimized extraction unexpectedly accepted a direct tuple ABI with a non-stack field' >&2
+  exit 1
+fi
+grep -Fq 'definition nonstack_first still contains' "$TMP_DIR/direct-tuple-nonstack.stderr"
+grep -Fq 'Managed JIB representation(s): %list(%u8).' "$TMP_DIR/direct-tuple-nonstack.stderr"
