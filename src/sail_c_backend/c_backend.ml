@@ -3042,6 +3042,146 @@ let scalarize_direct_tuple_call_carriers abis instrs =
   in
   rewrite instrs
 
+(* JIB represents a tuple-valued conditional expression with one aggregate
+   local assigned independently by each arm, even when every later use
+   immediately projects one field.  After direct-result lowering this leaves
+   an otherwise unnecessary C struct at the branch join.  Split such a local
+   into field locals when its complete lifetime consists only of field
+   reads/writes and complete tuple-literal assignments.  In particular, reject
+   assignments that read the old carrier: expanding those into sequential
+   scalar writes would not preserve simultaneous tuple assignment semantics. *)
+let scalarize_projected_tuple_carriers instrs =
+  let carrier_read_whole carrier arity values =
+    let whole = ref false in
+    let visitor =
+      object
+        inherit empty_jib_visitor
+
+        method! vcval = function
+          | V_tuple_member (V_id (source, _), source_arity, index)
+            when Name.compare source carrier = 0
+                 && source_arity = arity
+                 && index >= 0 && index < arity ->
+              whole := true;
+              SkipChildren
+          | V_id (source, _) when Name.compare source carrier = 0 ->
+              whole := true;
+              SkipChildren
+          | _ -> DoChildren
+      end
+    in
+    List.iter (fun value -> ignore (visit_cval visitor value)) values;
+    !whole
+  in
+  let carrier_is_projected carrier arity instrs =
+    let compatible = ref true in
+    let visitor =
+      object
+        inherit empty_jib_visitor
+
+        method! vcval = function
+          | V_tuple_member (V_id (source, _), source_arity, index)
+            when Name.compare source carrier = 0
+                 && source_arity = arity
+                 && index >= 0 && index < arity ->
+              SkipChildren
+          | V_id (source, _) when Name.compare source carrier = 0 ->
+              compatible := false;
+              SkipChildren
+          | _ -> DoChildren
+
+        method! vclexp = function
+          | CL_tuple (CL_id (destination, _), index)
+            when Name.compare destination carrier = 0
+                 && index >= 0 && index < arity ->
+              SkipChildren
+          | CL_id (destination, _) when Name.compare destination carrier = 0 ->
+              compatible := false;
+              SkipChildren
+          | _ -> DoChildren
+      end
+    in
+    List.iter
+      (iter_instr (fun (I_aux (aux, _) as instr) ->
+           match aux with
+           | I_copy (CL_id (destination, _), V_tuple values)
+             when Name.compare destination carrier = 0
+                  && List.length values = arity ->
+               if carrier_read_whole carrier arity values then compatible := false
+           | I_decl (_, name) | I_clear (_, name) | I_reset (_, name)
+             when Name.compare name carrier = 0 ->
+               compatible := false
+           | I_init (_, name, _) | I_reinit (_, name, _)
+             when Name.compare name carrier = 0 ->
+               compatible := false
+           | _ -> ignore (visit_instr visitor instr)
+         ))
+      instrs;
+    !compatible
+  in
+  let scalarize carrier field_ctyps instrs =
+    let arity = List.length field_ctyps in
+    let fields =
+      List.mapi
+        (fun index ctyp -> (direct_result_name ctyp index, ctyp))
+        field_ctyps
+    in
+    let replace_visitor =
+      object
+        inherit empty_jib_visitor
+
+        method! vcval = function
+          | V_tuple_member (V_id (source, _), source_arity, index)
+            when Name.compare source carrier = 0 && source_arity = arity ->
+              let name, ctyp = List.nth fields index in
+              ChangeTo (V_id (name, ctyp))
+          | _ -> DoChildren
+
+        method! vclexp = function
+          | CL_tuple (CL_id (destination, _), index)
+            when Name.compare destination carrier = 0 ->
+              let name, ctyp = List.nth fields index in
+              ChangeTo (CL_id (name, ctyp))
+          | _ -> DoChildren
+      end
+    in
+    let expand (I_aux (aux, instr_aux) as instr) =
+      match aux with
+      | I_copy (CL_id (destination, _), V_tuple values)
+        when Name.compare destination carrier = 0
+             && List.length values = arity ->
+          List.map2
+            (fun (name, ctyp) value ->
+              I_aux (I_copy (CL_id (name, ctyp), value), instr_aux)
+            )
+            fields values
+      | _ -> [instr]
+    in
+    let expanded = List.concat_map (concatmap_instr expand) instrs in
+    (fields, List.map (visit_instr replace_visitor) expanded)
+  in
+  let rec rewrite = function
+    | I_aux (I_decl (CT_tup field_ctyps, carrier), decl_aux)
+      :: remaining
+      when List.length field_ctyps >= 2
+           && carrier_is_projected carrier (List.length field_ctyps) remaining ->
+        let fields, remaining = scalarize carrier field_ctyps remaining in
+        List.map
+          (fun (name, ctyp) -> I_aux (I_decl (ctyp, name), decl_aux))
+          fields
+        @ rewrite remaining
+    | I_aux (I_if (condition, then_instrs, else_instrs), aux) :: remaining ->
+        I_aux (I_if (condition, rewrite then_instrs, rewrite else_instrs), aux)
+        :: rewrite remaining
+    | I_aux (I_block block, aux) :: remaining ->
+        I_aux (I_block (rewrite block), aux) :: rewrite remaining
+    | I_aux (I_try_block block, aux) :: remaining ->
+        I_aux (I_try_block (rewrite block), aux) :: rewrite remaining
+    | instr :: remaining -> instr :: rewrite remaining
+    | [] -> []
+  in
+  rewrite instrs
+
 let lower_direct_tuple_results ctx cdefs =
   let function_args =
     List.fold_left
@@ -3091,6 +3231,14 @@ let lower_direct_tuple_results ctx cdefs =
       | cdef -> cdef
     )
     cdefs
+  |> List.map (function
+       | CDEF_aux (CDEF_fundef (id, return_style, args, body), annot) ->
+           CDEF_aux
+             ( CDEF_fundef
+                 (id, return_style, args, scalarize_projected_tuple_carriers body),
+               annot
+             )
+       | cdef -> cdef)
 
 (* == --c-inline-attr ======================================================
    Calls to functions carrying the $[c_inline] attribute are inlined into
