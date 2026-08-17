@@ -46,7 +46,7 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve-type canonical_list \
   --c-preserve-type analyzed_code \
   --c-preserve-type sample_choice --c-preserve-type erased_unit_choice \
-  --c-preserve-type wide_word --c-preserve-type four_bytes --c-preserve-type twenty_bytes --c-preserve-type lane_five_bytes --c-preserve-type fixed_ids \
+  --c-preserve-type wide_word --c-preserve-type four_bytes --c-preserve-type twenty_bytes --c-preserve-type lane_five_bytes --c-preserve-type fixed_ids --c-preserve-type fixed_bytes_path \
   --c-preserve-type fixed_ids_box --c-preserve-type equality_pair \
   --c-preserve pair_sum --c-preserve byte_identity --c-preserve pack_widened_record --c-preserve widened_record_sum \
   --c-preserve construct_widened_record --c-preserve construct_widened_record_direct --c-preserve schema_widened_record \
@@ -58,7 +58,8 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve preserve_unused_parameter \
   --c-preserve widen_optional_byte \
   --c-preserve test_gas --c-preserve test_gas_alias --c-preserve test_fixed_bytes_zero \
-  --c-preserve test_fixed_bytes_one --c-preserve test_lane_bytes --c-preserve twenty_bytes_equal \
+  --c-preserve test_fixed_bytes_one --c-preserve test_lane_bytes \
+  --c-preserve fixed_bytes_path_empty --c-preserve fixed_bytes_path_local --c-preserve twenty_bytes_equal \
   --c-preserve runtime_label_test --c-preserve runtime_pair --c-preserve always_fatal --c-preserve fatal_error \
   --c-preserve terminal_assertion \
   --c-preserve decrement_byte --c-preserve increment_to --c-preserve count_four \
@@ -259,6 +260,14 @@ grep -Fq '.bytes = {' "$SPEC_SOURCE/base.c"
 grep -Fq 'extern const bytes4 TEST_FIXED_BYTES_ONE;' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'const bytes4 TEST_FIXED_BYTES_ONE = {' "$SPEC_SOURCE/base.c"
 grep -Fq 'INT64_C(1), INT64_C(0), INT64_C(0), INT64_C(0)' "$SPEC_SOURCE/base.c"
+sed -n '/^struct fixed_bytes_path fixed_bytes_path_local(/,/^}/p' \
+  "$SPEC_SOURCE/base.c" > "$TMP_DIR/fixed_bytes_path_local.c"
+grep -Fq '.data = ((bytes4){0})' "$TMP_DIR/fixed_bytes_path_local.c"
+if grep -Eq 'internal_vector_(init|update)|for \(size_t |(tmp_|result_)[A-Za-z0-9_]*' \
+    "$TMP_DIR/fixed_bytes_path_local.c"; then
+  echo 'optimized extraction retained semantic-vector scaffolding for a folded fixed-byte zero' >&2
+  exit 1
+fi
 if grep -Fq 'test_word_to_four(' "$SPEC_SOURCE/base.c"; then
   echo 'optimized extraction retained an explicitly static-evaluable fixed-byte initializer call' >&2
   exit 1

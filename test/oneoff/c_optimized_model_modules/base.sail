@@ -104,6 +104,11 @@ $[c_repr {representation = fixed_bytes_u64_lanes, name = lane_bytes5}]
 type lane_five_bytes = vector(5, inc, byte)
 type fixed_ids = vector(17, fixed_id)
 
+struct fixed_bytes_path = {
+  data : four_bytes,
+  len : byte,
+}
+
 let TEST_FIXED_BYTES_ZERO : four_bytes = vector_init(4, 0)
 $[c_static_eval "word_to_fixed_bytes"]
 val test_word_to_four : bits(32) -> four_bytes
@@ -227,6 +232,15 @@ function test_fixed_bytes_zero() -> four_bytes = TEST_FIXED_BYTES_ZERO
 function test_fixed_bytes_one() -> four_bytes = TEST_FIXED_BYTES_ONE
 
 function test_lane_bytes() -> lane_five_bytes = TEST_LANE_BYTES
+
+function fixed_bytes_path_empty() -> fixed_bytes_path =
+  struct { data = TEST_FIXED_BYTES_ZERO, len = 0 }
+
+function fixed_bytes_path_local(flag : bool) -> fixed_bytes_path = {
+  var path = fixed_bytes_path_empty();
+  if flag then path = fixed_bytes_path_empty();
+  path
+}
 
 function twenty_bytes_equal(left : twenty_bytes, right : twenty_bytes) -> bool =
   eq_anything(left, right)

@@ -4504,6 +4504,83 @@ let prune_constant_branches (CDEF_aux (aux, def_annot)) =
   | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
+(* Constant folding can inline a pure function that returns a record containing
+   an immutable fixed-byte zero.  The typed AST then contains a semantic byte
+   vector literal, whose ordinary JIB lowering is an initialized vector plus
+   one functional update per byte.  When that complete zero vector is copied
+   immediately into a fixed-byte representation, retain the constant as a
+   represented value instead.  This removes both the semantic vector and the
+   renderer's otherwise-necessary element-copy loop. *)
+let fold_fixed_bytes_zero_vectors (CDEF_aux (aux, def_annot)) =
+  let literal_integer = function
+    | V_lit (VL_int value, _) -> Some value
+    | V_lit (VL_bits bits, _) ->
+        if List.for_all (fun bit -> bit = Sail2_values.B0) bits then Some Big_int.zero else None
+    | _ -> None
+  in
+  let literal_is value expected =
+    match literal_integer value with Some value -> Big_int.equal value expected | None -> false
+  in
+  let same_local expected_name expected_ctyp name ctyp =
+    Name.compare expected_name name = 0 && ctyp_equal expected_ctyp ctyp
+  in
+  let function_named expected (id, _) = String.equal (string_of_id id) expected in
+  let rec collect_updates vector vector_ctyp length seen = function
+    | I_aux
+        ( I_funcall
+            (CR_one (CL_id (destination, destination_ctyp)), _, function_id, [V_id (source, source_ctyp); index; value]),
+          _
+        )
+      :: rest
+      when function_named "internal_vector_update" function_id
+           && same_local vector vector_ctyp destination destination_ctyp
+           && same_local vector vector_ctyp source source_ctyp
+           && literal_is value Big_int.zero -> (
+        match literal_integer index with
+        | Some index -> (
+            try
+              let index = Big_int.to_int index in
+              if index < 0 || index >= length || Util.IntSet.mem index seen then None
+              else collect_updates vector vector_ctyp length (Util.IntSet.add index seen) rest
+            with _ -> None
+          )
+        | None -> None
+      )
+    | I_aux (I_copy (target, V_id (source, source_ctyp)), copy_aux)
+      :: I_aux (I_clear (clear_ctyp, clear_name), _)
+      :: rest
+      when same_local vector vector_ctyp source source_ctyp
+           && same_local vector vector_ctyp clear_name clear_ctyp
+           && Util.IntSet.cardinal seen = length
+           && c_repr_fixed_bytes_length (clexp_ctyp target) = Some length ->
+        Some (I_aux (I_copy (target, V_lit (VL_int Big_int.zero, clexp_ctyp target)), copy_aux), rest)
+    | _ -> None
+  in
+  let rewrite_lists instrs =
+    let rec rewrite = function
+      | (I_aux (I_decl ((CT_fvector (length, (CT_fbits 8 | CT_fuint 8)) as vector_ctyp), vector), _) as
+         declaration)
+        :: ( I_aux (I_funcall (CR_one (CL_id (destination, destination_ctyp)), _, function_id, [requested_length]), _)
+             as initialization
+           )
+        :: rest
+        when function_named "internal_vector_init" function_id
+             && same_local vector vector_ctyp destination destination_ctyp
+             && literal_is requested_length (Big_int.of_int length) -> (
+          match collect_updates vector vector_ctyp length Util.IntSet.empty rest with
+          | Some (replacement, rest) -> replacement :: rewrite rest
+          | None -> declaration :: initialization :: rewrite rest
+        )
+      | instr :: rest -> instr :: rewrite rest
+      | [] -> []
+    in
+    rewrite instrs
+  in
+  let rewrite_body body = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
 (* Reassemble the field-by-field JIB lowering of a complete stack aggregate
    into one pure value.  Fixed integer fields retain a width-directed
    conversion only when the narrowing policy permits it at expression level;
@@ -6098,6 +6175,7 @@ let optimize ~have_rts ~specialize_c ~optimized_model ~narrowing_policy ctx recu
   cdefs
   |> (if !optimize_unit_results then List.map (discard_unread_stack_results ctx) else nothing)
   |> (if !optimize_pure_copies then List.map (flatten_unique_stack_blocks ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map fold_fixed_bytes_zero_vectors else nothing)
   |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction narrowing_policy ctx) else nothing)
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map merge_repeated_conditional_branches else nothing)
@@ -6768,6 +6846,7 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | VL_bits bs when is_c_repr_u256 ctyp -> sgen_u256_bits bs
     | VL_bits [] -> "UINT64_C(0)"
     | VL_bits bs -> "UINT64_C(" ^ sgen_bitlist bs ^ ")"
+    | VL_int i when is_c_repr_fixed_bytes ctyp && Big_int.equal i Big_int.zero -> "((" ^ sgen_ctyp ctyp ^ "){0})"
     | VL_int i -> (
         match ctyp with
         | ctyp when is_c_repr_u320 ctyp -> sgen_u320_int i
