@@ -2830,8 +2830,30 @@ let scalarize_direct_tuple_call_carriers abis instrs =
                _
              )
         :: instrs
-        when Name.compare name assigned = 0
-             && Name.compare source carrier = 0
+      when Name.compare name assigned = 0
+           && Name.compare source carrier = 0
+           && source_arity = arity
+           && selected index name ->
+          remove instrs
+      | I_aux
+          ( I_copy
+              ( CL_tuple (CL_id (source, _), index),
+                V_id (name, _)
+              ),
+            _
+          )
+        :: instrs
+        when Name.compare source carrier = 0 && selected index name ->
+          remove instrs
+      | I_aux
+          ( I_copy
+              ( CL_id (name, _),
+                V_tuple_member (V_id (source, _), source_arity, index)
+              ),
+            _
+          )
+        :: instrs
+        when Name.compare source carrier = 0
              && source_arity = arity
              && selected index name ->
           remove instrs
@@ -2840,21 +2862,44 @@ let scalarize_direct_tuple_call_carriers abis instrs =
     in
     remove instrs
   in
-  let call_writes_carrier carrier abi = function
-    | CR_one (CL_id (destination, _)) -> Name.compare destination carrier = 0
+  let call_carrier_bindings carrier abi = function
+    | CR_one (CL_id (destination, _)) when Name.compare destination carrier = 0 ->
+        Some (List.map (fun _ -> None) abi.direct_result_fields)
     | CR_one (CL_tuple (CL_id (destination, _), field_index)) ->
-        Name.compare destination carrier = 0
-        && field_index = abi.direct_return_field.direct_field_index
+        if
+          Name.compare destination carrier = 0
+          && field_index = abi.direct_return_field.direct_field_index
+        then Some (List.map (fun _ -> None) abi.direct_result_fields)
+        else None
     | CR_multi destinations when List.length destinations = List.length abi.direct_result_fields ->
-        List.mapi
-          (fun index -> function
-            | CL_tuple (CL_id (destination, _), field_index) ->
-                Name.compare destination carrier = 0 && field_index = index
-            | _ -> false
-          )
-          destinations
-        |> List.for_all Fun.id
-    | _ -> false
+        (* Direct-result lowering may already have coalesced an in/out field into
+           its input local while leaving the other fields in the tuple carrier. *)
+        let rec classify index fields destinations =
+          match (fields, destinations) with
+          | [], [] -> Some []
+          | field :: fields, destination :: destinations ->
+              let binding =
+                match destination with
+                | CL_tuple (CL_id (destination, _), field_index)
+                  when Name.compare destination carrier = 0 && field_index = index ->
+                    Some None
+                | CL_id (name, ctyp)
+                  when Option.is_some field.direct_input_index
+                       && ctyp_equal ctyp field.direct_field_ctyp ->
+                    Some (Some (name, ctyp))
+                | _ -> None
+              in
+              ( match (binding, classify (index + 1) fields destinations) with
+              | Some binding, Some bindings -> Some (binding :: bindings)
+              | _ -> None
+              )
+          | _ -> None
+        in
+        ( match classify 0 abi.direct_result_fields destinations with
+        | Some bindings when List.exists Option.is_none bindings -> Some bindings
+        | _ -> None
+        )
+    | _ -> None
   in
   let carrier_field carrier arity bindings = function
     | CL_tuple (CL_id (source, _), index)
@@ -2896,10 +2941,12 @@ let scalarize_direct_tuple_call_carriers abis instrs =
     | I_aux (I_funcall (destination, extern, ((callee, _) as uid), args), call_aux)
       :: remaining -> (
         match Bindings.find_opt callee abis with
-        | Some abi
-          when ctyp_equal carrier_ctyp abi.direct_result_ctyp
-               && call_writes_carrier carrier abi destination ->
-            Some (List.rev before, abi, extern, uid, args, call_aux, remaining)
+        | Some abi when ctyp_equal carrier_ctyp abi.direct_result_ctyp -> (
+            match call_carrier_bindings carrier abi destination with
+            | Some carrier_bindings ->
+                Some (List.rev before, abi, carrier_bindings, extern, uid, args, call_aux, remaining)
+            | None -> None
+          )
         | _ -> None
       )
     | (I_aux ((I_if _ | I_block _ | I_try_block _), _) as _instr) :: _ -> None
@@ -2910,34 +2957,48 @@ let scalarize_direct_tuple_call_carriers abis instrs =
   let rec rewrite = function
     | I_aux (I_decl (carrier_ctyp, carrier), decl_aux) :: remaining -> (
         match split_direct_call carrier carrier_ctyp [] remaining with
-        | Some (before, abi, extern, uid, args, call_aux, after) ->
+        | Some (before, abi, carrier_bindings, extern, uid, args, call_aux, after) ->
             let arity = List.length abi.direct_result_fields in
             let bindings =
-              List.mapi
-                (fun index field ->
-                  match find_projection carrier arity index after with
-                  | Some binding -> binding
-                  | None ->
-                      let source_name = string_of_name ~zencode:false field.direct_field_name in
-                      let source_name =
-                        match field.direct_input_index with
-                        | Some _ -> source_name ^ "_after"
-                        | None -> source_name
-                      in
-                      ( ngensym
-                          ~source_name
-                          ~source_type:(string_of_ctyp field.direct_field_ctyp)
-                          (),
-                        field.direct_field_ctyp,
-                        decl_aux
-                      )
-                )
-                abi.direct_result_fields
+              List.combine carrier_bindings abi.direct_result_fields
+              |> List.mapi (fun index (carrier_binding, field) ->
+                     match carrier_binding with
+                     | Some (name, ctyp) -> (name, ctyp, decl_aux)
+                     | None -> (
+                         match find_projection carrier arity index after with
+                         | Some binding -> binding
+                         | None ->
+                             let source_name = string_of_name ~zencode:false field.direct_field_name in
+                             let source_name =
+                               match field.direct_input_index with
+                               | Some _ -> source_name ^ "_after"
+                               | None -> source_name
+                             in
+                             ( ngensym
+                                 ~source_name
+                                 ~source_type:(string_of_ctyp field.direct_field_ctyp)
+                                 (),
+                               field.direct_field_ctyp,
+                               decl_aux
+                             )
+                       )
+                 )
             in
             if not (carrier_used_whole carrier arity (before @ after)) then
+              let existing =
+                List.fold_left
+                  (fun names -> function
+                    | Some (name, _) -> NameSet.add name names
+                    | None -> names
+                  )
+                  NameSet.empty carrier_bindings
+              in
               let declarations =
-                List.map
-                  (fun (name, ctyp, aux) -> I_aux (I_decl (ctyp, name), aux))
+                List.filter_map
+                  (fun (name, ctyp, aux) ->
+                    if NameSet.mem name existing then None
+                    else Some (I_aux (I_decl (ctyp, name), aux))
+                  )
                   bindings
               in
               let destinations =

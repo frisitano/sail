@@ -61,3 +61,15 @@ function count_four() -> byte = {
   };
   count
 }
+
+function decode_flag(cursor : incrementable_byte) -> (byte, bool) =
+  (cursor + 1, cursor == 0)
+
+function finish_flag(state : byte, flag : bool) -> (byte, bits(16)) =
+  (state, if flag then 0x0001 else 0x0000)
+
+function forward_flag(cursor : incrementable_byte, state : byte) -> (byte, byte, bits(16)) = {
+  let (next, flag) = decode_flag(cursor);
+  let (state_after, encoded) = finish_flag(state, flag);
+  (next, state_after, encoded)
+}

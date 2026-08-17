@@ -31,6 +31,7 @@ fi
   --c-preserve call_in_short_circuit --c-preserve field_snapshot_into_call \
   --c-preserve converted_field_into_external_call --c-preserve updated_record_into_call \
   --c-preserve updated_record_into_return --c-preserve count_four \
+  --c-preserve decode_flag --c-preserve finish_flag --c-preserve forward_flag \
   "$TEST_DIR/model.sail_project"
 
 SOURCE="$TMP_DIR/generated/src/spec/model.c"
@@ -93,5 +94,13 @@ grep -Eq 'while \(index <= \(int64_t\)UINT(8|64)_C\((0x)?3\)\)' "$TMP_DIR/count_
 grep -Eq 'index = \(index \+ \(int64_t\)UINT(8|64)_C\((0x)?1\)\);' "$TMP_DIR/count_four.c"
 if grep -Eq '(tmp_|result_)' "$TMP_DIR/count_four.c"; then
   echo 'optimized extraction retained closed literal loop bound or step temporaries' >&2
+  exit 1
+fi
+
+sed -n '/^uint64_t forward_flag(/,/^}/p' "$SOURCE" > "$TMP_DIR/forward_flag.c"
+grep -Fq 'decode_flag' "$TMP_DIR/forward_flag.c"
+grep -Fq 'finish_flag' "$TMP_DIR/forward_flag.c"
+if grep -Eq '(struct tuple_|\.tup[0-9]|tmp_|result_)' "$TMP_DIR/forward_flag.c"; then
+  echo 'optimized extraction retained a mixed scalar/tuple carrier for a direct-result call' >&2
   exit 1
 fi
