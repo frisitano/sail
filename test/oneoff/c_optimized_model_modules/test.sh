@@ -57,7 +57,7 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve call_discard_internal_parameter --c-preserve call_discard_computed_parameter \
   --c-preserve preserve_unused_parameter \
   --c-preserve widen_optional_byte \
-  --c-preserve test_gas --c-preserve test_gas_alias --c-preserve test_fixed_bytes_zero \
+  --c-preserve test_gas --c-preserve test_gas_alias --c-preserve test_fixed_bytes_zero --c-preserve test_fixed_bit_bytes_path_zero \
   --c-preserve test_fixed_bytes_one --c-preserve test_lane_bytes \
   --c-preserve fixed_bytes_path_empty --c-preserve fixed_bytes_path_local --c-preserve twenty_bytes_equal \
   --c-preserve runtime_label_test --c-preserve runtime_pair --c-preserve always_fatal --c-preserve fatal_error \
@@ -266,6 +266,10 @@ grep -Fq '.data = ((bytes4){0})' "$TMP_DIR/fixed_bytes_path_local.c"
 if grep -Eq 'internal_vector_(init|update)|for \(size_t |(tmp_|result_)[A-Za-z0-9_]*' \
     "$TMP_DIR/fixed_bytes_path_local.c"; then
   echo 'optimized extraction retained semantic-vector scaffolding for a folded fixed-byte zero' >&2
+  exit 1
+fi
+if grep -Eq 'internal_vector_(init|update)_vector_4_bits_8' "$SPEC_SOURCE/base.c"; then
+  echo 'optimized extraction retained semantic-vector scaffolding in a fixed-byte zero static let' >&2
   exit 1
 fi
 if grep -Fq 'test_word_to_four(' "$SPEC_SOURCE/base.c"; then

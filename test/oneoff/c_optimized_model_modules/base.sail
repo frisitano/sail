@@ -109,7 +109,17 @@ struct fixed_bytes_path = {
   len : byte,
 }
 
+type bit_byte = bits(8)
+$[c_repr fixed_bytes_u64_lanes]
+type four_bit_bytes = vector(4, inc, bit_byte)
+struct fixed_bit_bytes_path = {
+  data : four_bit_bytes,
+  len : byte,
+}
+
 let TEST_FIXED_BYTES_ZERO : four_bytes = vector_init(4, 0)
+let TEST_FIXED_BIT_BYTES_PATH_ZERO : fixed_bit_bytes_path =
+  struct { data = vector_init(4, 0b00000000), len = 0 }
 $[c_static_eval "word_to_fixed_bytes"]
 val test_word_to_four : bits(32) -> four_bytes
 function test_word_to_four(value) = [
@@ -228,6 +238,8 @@ function test_gas() -> int(21000) = TEST_GAS
 function test_gas_alias() -> int(21000) = TEST_GAS_ALIAS
 
 function test_fixed_bytes_zero() -> four_bytes = TEST_FIXED_BYTES_ZERO
+
+function test_fixed_bit_bytes_path_zero() -> fixed_bit_bytes_path = TEST_FIXED_BIT_BYTES_PATH_ZERO
 
 function test_fixed_bytes_one() -> four_bytes = TEST_FIXED_BYTES_ONE
 

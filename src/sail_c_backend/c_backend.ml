@@ -4504,13 +4504,13 @@ let prune_constant_branches (CDEF_aux (aux, def_annot)) =
   | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
-(* Constant folding can inline a pure function that returns a record containing
-   an immutable fixed-byte zero.  The typed AST then contains a semantic byte
+(* Constant folding can inline an immutable fixed-byte zero into a function or
+   top-level let initializer.  The typed AST then contains a semantic byte
    vector literal, whose ordinary JIB lowering is an initialized vector plus
    one functional update per byte.  When that complete zero vector is copied
-   immediately into a fixed-byte representation, retain the constant as a
-   represented value instead.  This removes both the semantic vector and the
-   renderer's otherwise-necessary element-copy loop. *)
+   into a fixed-byte representation and is then cleared or dead, retain the
+   constant as a represented value instead.  This removes both the semantic
+   vector and the renderer's otherwise-necessary element-copy loop. *)
 let fold_fixed_bytes_zero_vectors (CDEF_aux (aux, def_annot)) =
   let literal_integer = function
     | V_lit (VL_int value, _) -> Some value
@@ -4525,6 +4525,18 @@ let fold_fixed_bytes_zero_vectors (CDEF_aux (aux, def_annot)) =
     Name.compare expected_name name = 0 && ctyp_equal expected_ctyp ctyp
   in
   let function_named expected (id, _) = String.equal (string_of_id id) expected in
+  let rec remove_later_clear_or_dead vector vector_ctyp preserved = function
+    | I_aux (I_clear (clear_ctyp, clear_name), _) :: rest
+      when same_local vector vector_ctyp clear_name clear_ctyp ->
+        Some (List.rev_append preserved rest)
+    | instr :: rest
+      when not
+             (NameSet.mem vector (instr_reads ~direct:false instr)
+             || NameSet.mem vector (instr_writes ~direct:false instr)) ->
+        remove_later_clear_or_dead vector vector_ctyp (instr :: preserved) rest
+    | [] -> Some (List.rev preserved)
+    | _ -> None
+  in
   let rec collect_updates vector vector_ctyp length seen = function
     | I_aux
         ( I_funcall
@@ -4546,14 +4558,15 @@ let fold_fixed_bytes_zero_vectors (CDEF_aux (aux, def_annot)) =
           )
         | None -> None
       )
-    | I_aux (I_copy (target, V_id (source, source_ctyp)), copy_aux)
-      :: I_aux (I_clear (clear_ctyp, clear_name), _)
-      :: rest
+    | I_aux (I_copy (target, V_id (source, source_ctyp)), copy_aux) :: rest
       when same_local vector vector_ctyp source source_ctyp
-           && same_local vector vector_ctyp clear_name clear_ctyp
            && Util.IntSet.cardinal seen = length
-           && c_repr_fixed_bytes_length (clexp_ctyp target) = Some length ->
-        Some (I_aux (I_copy (target, V_lit (VL_int Big_int.zero, clexp_ctyp target)), copy_aux), rest)
+           && c_repr_fixed_bytes_length (clexp_ctyp target) = Some length -> (
+        match remove_later_clear_or_dead vector vector_ctyp [] rest with
+        | Some rest ->
+            Some (I_aux (I_copy (target, V_lit (VL_int Big_int.zero, clexp_ctyp target)), copy_aux), rest)
+        | None -> None
+      )
     | _ -> None
   in
   let rewrite_lists instrs =
@@ -4579,6 +4592,7 @@ let fold_fixed_bytes_zero_vectors (CDEF_aux (aux, def_annot)) =
   let rewrite_body body = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
   match aux with
   | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | CDEF_let (number, bindings, body) -> CDEF_aux (CDEF_let (number, bindings, rewrite_body body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
 (* Reassemble the field-by-field JIB lowering of a complete stack aggregate
