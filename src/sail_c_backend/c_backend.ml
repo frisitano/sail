@@ -4664,19 +4664,21 @@ let preserve_assignment_conversion narrowing_policy target_ctyp value =
   )
 
 let fold_stack_aggregate_construction narrowing_policy ctx (CDEF_aux (aux, def_annot)) =
-  let expected_fields = function
+  let record_fields = function
     | CT_struct (id, _) -> (
-        match Bindings.find_opt id ctx.records with
-        | Some (_, fields) -> Some (List.map fst (Bindings.bindings fields))
-        | None -> None
+        match Bindings.find_opt id ctx.records with Some (_, fields) -> Some (Bindings.bindings fields) | None -> None
       )
     | _ -> None
   in
+  let expected_fields ctyp = Option.map (List.map fst) (record_fields ctyp) in
   let complete expected actual =
     let actual_count = List.length actual in
     let expected = IdSet.of_list expected in
     let actual = List.fold_left (fun fields (field, _) -> IdSet.add field fields) IdSet.empty actual in
     IdSet.cardinal expected = actual_count && IdSet.equal expected actual
+  in
+  let find_field field fields =
+    List.find_map (fun (candidate, value) -> if Id.compare field candidate = 0 then Some value else None) fields
   in
   let rec reads destination = function
     | V_id (name, _) -> Name.compare destination name = 0
@@ -4691,7 +4693,7 @@ let fold_stack_aggregate_construction narrowing_policy ctx (CDEF_aux (aux, def_a
       | I_aux (I_copy (CL_field (CL_id (base, base_ctyp), field, field_ctyp), value), _) :: rest
         when Name.compare destination base = 0
              && ctyp_equal destination_ctyp base_ctyp
-             && (not (List.mem_assoc field rev_fields))
+             && Option.is_none (find_field field rev_fields)
              && not (reads destination value) -> (
           match preserve_assignment_conversion narrowing_policy field_ctyp value with
           | Some value -> collect ((field, value) :: rev_fields) rest
@@ -4700,6 +4702,17 @@ let fold_stack_aggregate_construction narrowing_policy ctx (CDEF_aux (aux, def_a
       | rest -> (List.rev rev_fields, rest)
     in
     collect [] instrs
+  in
+  let rec stable_record_base = function
+    | V_id _ -> true
+    | V_field (base, _, _) -> stable_record_base base
+    | _ -> false
+  in
+  let terminal_record_use destination = function
+    | I_aux (I_funcall (_, _, _, args), _) :: _ -> List.exists (reads destination) args
+    | I_aux (I_return value, _) :: _ -> reads destination value
+    | I_aux (I_copy (CL_id (Return _, _), value), _) :: _ -> reads destination value
+    | _ -> false
   in
   let collect_tuple destination destination_ctyp length instrs =
     let rec collect rev_fields = function
@@ -4748,28 +4761,53 @@ let fold_stack_aggregate_construction narrowing_policy ctx (CDEF_aux (aux, def_a
           )
           else I_aux (I_copy (CL_id (destination, destination_ctyp), source), copy_aux) :: rewrite rest
       | (I_aux (I_decl (ctyp, destination), declaration_aux) as declaration) :: rest when is_stack_ctyp ctx ctyp -> (
-          match expected_fields ctyp with
-          | Some expected ->
-              let fields, remaining = collect destination ctyp rest in
-              if fields <> [] && complete expected fields then
+          match (record_fields ctyp, rest) with
+          | Some fields, I_aux (I_copy (CL_id (assigned, assigned_ctyp), base), copy_aux) :: after_base
+            when Name.compare destination assigned = 0
+                 && ctyp_equal ctyp assigned_ctyp
+                 && ctyp_equal ctyp (cval_ctyp base)
+                 && stable_record_base base
+                 && not (reads destination base) ->
+              let updates, remaining = collect destination ctyp after_base in
+              if updates <> [] && terminal_record_use destination remaining then (
+                let fields =
+                  List.map
+                    (fun (field, field_ctyp) ->
+                      match find_field field updates with
+                      | Some value -> (field, value)
+                      | None -> (field, V_field (base, field, field_ctyp))
+                    )
+                    fields
+                in
                 declaration
-                :: I_aux (I_copy (CL_id (destination, ctyp), V_struct (fields, ctyp)), declaration_aux)
+                :: I_aux (I_copy (CL_id (destination, ctyp), V_struct (fields, ctyp)), copy_aux)
                 :: rewrite remaining
+              )
               else declaration :: rewrite rest
-          | None -> (
-              match ctyp with
-              | CT_tup field_ctyps ->
-                  let fields, remaining = collect_tuple destination ctyp (List.length field_ctyps) rest in
-                  if fields <> [] && complete_tuple (List.length field_ctyps) fields then (
-                    let values =
-                      List.sort (fun (left, _) (right, _) -> Int.compare left right) fields |> List.map snd
-                    in
+          | _ -> (
+              match expected_fields ctyp with
+              | Some expected ->
+                  let fields, remaining = collect destination ctyp rest in
+                  if fields <> [] && complete expected fields then
                     declaration
-                    :: I_aux (I_copy (CL_id (destination, ctyp), V_tuple values), declaration_aux)
+                    :: I_aux (I_copy (CL_id (destination, ctyp), V_struct (fields, ctyp)), declaration_aux)
                     :: rewrite remaining
-                  )
                   else declaration :: rewrite rest
-              | _ -> declaration :: rewrite rest
+              | None -> (
+                  match ctyp with
+                  | CT_tup field_ctyps ->
+                      let fields, remaining = collect_tuple destination ctyp (List.length field_ctyps) rest in
+                      if fields <> [] && complete_tuple (List.length field_ctyps) fields then (
+                        let values =
+                          List.sort (fun (left, _) (right, _) -> Int.compare left right) fields |> List.map snd
+                        in
+                        declaration
+                        :: I_aux (I_copy (CL_id (destination, ctyp), V_tuple values), declaration_aux)
+                        :: rewrite remaining
+                      )
+                      else declaration :: rewrite rest
+                  | _ -> declaration :: rewrite rest
+                )
             )
         )
       | (I_aux (I_copy (CL_tuple (CL_id (destination, destination_ctyp), _), _), copy_aux) as first) :: rest -> (

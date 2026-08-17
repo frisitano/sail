@@ -32,7 +32,13 @@ struct WideHolder = {
   value : wide_byte
 }
 
+struct Pair = {
+  left : byte,
+  right : byte
+}
+
 val consume_byte = pure { c: "consume_byte" } : byte -> unit
+val consume_pair = pure { c: "consume_pair" } : Pair -> unit
 
 function field_snapshot_into_call(holder : Holder) -> unit =
   consume_byte(holder.value)
@@ -41,3 +47,9 @@ function converted_field_into_external_call(holder : WideHolder) -> byte = {
   let value = holder.value;
   if value <= 255 then external_byte(value) else 0
 }
+
+function updated_record_into_call(pair : Pair, value : byte) -> unit =
+  consume_pair({ pair with right = value })
+
+function updated_record_into_return(pair : Pair, value : byte) -> Pair =
+  { pair with right = value }

@@ -29,7 +29,8 @@ fi
   --c-preserve next_byte --c-preserve call_in_return_comparison \
   --c-preserve call_in_eager_guard --c-preserve external_call_in_return \
   --c-preserve call_in_short_circuit --c-preserve field_snapshot_into_call \
-  --c-preserve converted_field_into_external_call \
+  --c-preserve converted_field_into_external_call --c-preserve updated_record_into_call \
+  --c-preserve updated_record_into_return \
   "$TEST_DIR/model.sail_project"
 
 SOURCE="$TMP_DIR/generated/src/spec/model.c"
@@ -67,8 +68,22 @@ if grep -Eq '(tmp_|result_|[A-Za-z0-9_]*_result_[A-Za-z0-9_]*)' "$TMP_DIR/field_
 fi
 
 sed -n '/^uint8_t converted_field_into_external_call(/,/^}/p' "$SOURCE" > "$TMP_DIR/converted_field_call.c"
-grep -Eq 'uint8_t [A-Za-z0-9_]+ = external_byte\(\(\(uint8_t\)holder\.value\)\);' "$TMP_DIR/converted_field_call.c"
+grep -Eq 'external_byte\(\(?\(uint8_t\)holder\.value\)?\)' "$TMP_DIR/converted_field_call.c"
 if grep -Eq '^  uint8_t ([A-Za-z0-9_]+);[[:space:]]*$' "$TMP_DIR/converted_field_call.c"; then
   echo 'optimized extraction separated a converted external-call result declaration from its assignment' >&2
+  exit 1
+fi
+
+sed -n '/^void updated_record_into_call(/,/^}/p' "$SOURCE" > "$TMP_DIR/updated_record_call.c"
+grep -Fq 'consume_pair(((struct Pair){.left = pair.left, .right = value}));' "$TMP_DIR/updated_record_call.c"
+if grep -Eq '(tmp_|result_|struct Pair [A-Za-z0-9_]+;)' "$TMP_DIR/updated_record_call.c"; then
+  echo 'optimized extraction retained a one-use functional record update before its call' >&2
+  exit 1
+fi
+
+sed -n '/^struct Pair updated_record_into_return(/,/^}/p' "$SOURCE" > "$TMP_DIR/updated_record_return.c"
+grep -Fq 'return ((struct Pair){.left = pair.left, .right = value});' "$TMP_DIR/updated_record_return.c"
+if grep -Eq '(tmp_|result_|struct Pair [A-Za-z0-9_]+;)' "$TMP_DIR/updated_record_return.c"; then
+  echo 'optimized extraction retained a one-use functional record update before its return' >&2
   exit 1
 fi
