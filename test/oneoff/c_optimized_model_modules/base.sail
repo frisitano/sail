@@ -178,6 +178,11 @@ function widened_tuple_match(choice : tuple_choice) -> (halfword, halfword) =
     TupleThree => (5, 6),
   }
 
+function widened_tuple_call(choice : tuple_choice) -> halfword = {
+  let (first, second) = widened_tuple_match(choice);
+  if first == second then first else second
+}
+
 function repeated_branch(first : bool, second : bool) -> byte =
   if first then 1 else if second then 1 else 2
 

@@ -51,7 +51,7 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve pair_sum --c-preserve byte_identity --c-preserve pack_widened_record --c-preserve widened_record_sum \
   --c-preserve construct_widened_record --c-preserve construct_widened_record_direct --c-preserve schema_widened_record \
   --c-preserve sample_choice_value --c-preserve added_is_nonzero \
-  --c-preserve boolean_cleanup --c-preserve positive_branch --c-preserve early_wide_guard --c-preserve short_circuit_guard --c-preserve widened_tuple_match \
+  --c-preserve boolean_cleanup --c-preserve positive_branch --c-preserve early_wide_guard --c-preserve short_circuit_guard --c-preserve widened_tuple_match --c-preserve widened_tuple_call \
   --c-preserve repeated_branch \
   --c-preserve repeated_call_branch --c-preserve boolean_value_join --c-preserve boolean_comparison_join \
   --c-preserve call_discard_internal_parameter --c-preserve call_discard_computed_parameter \
@@ -403,15 +403,24 @@ if grep -Eq 'bool (tmp_|result_)|if \((tmp_|result_)' "$TMP_DIR/short_circuit_gu
   exit 1
 fi
 sed -n \
-  '/^struct tuple_uint_16_uint_16 widened_tuple_match(/,/^}/p' \
+  '/^uint16_t widened_tuple_match(/,/^}/p' \
   "$SPEC_SOURCE/base.c" > "$TMP_DIR/widened_tuple_match.c"
-test "$(grep -Fc 'return ((struct tuple_uint_16_uint_16){' "$TMP_DIR/widened_tuple_match.c")" -eq 3
-grep -Fq '.tup0 = UINT16_C(1), .tup1 = UINT16_C(2)' "$TMP_DIR/widened_tuple_match.c"
-grep -Fq '.tup0 = UINT16_C(3), .tup1 = UINT16_C(4)' "$TMP_DIR/widened_tuple_match.c"
-grep -Fq '.tup0 = UINT16_C(5), .tup1 = UINT16_C(6)' "$TMP_DIR/widened_tuple_match.c"
+grep -Eq '^uint16_t widened_tuple_match\(enum tuple_choice choice, uint16_t \*restrict field_0_[A-Za-z0-9_]+\)' \
+  "$TMP_DIR/widened_tuple_match.c"
+test "$(grep -Ec '\(\*field_0_[A-Za-z0-9_]+\) = UINT16_C\(' "$TMP_DIR/widened_tuple_match.c")" -eq 3
+test "$(grep -Fc 'return UINT16_C(' "$TMP_DIR/widened_tuple_match.c")" -eq 3
 grep -Fq 'switch (choice)' "$TMP_DIR/widened_tuple_match.c"
-if grep -Eq 'goto |finish_match_|tmp_|result_' "$TMP_DIR/widened_tuple_match.c"; then
-  echo 'optimized extraction retained a mutable join or labels for a widened tuple match' >&2
+if grep -Eq 'goto |finish_match_|struct tuple_|\.tup[0-9]|tmp_|result_' "$TMP_DIR/widened_tuple_match.c"; then
+  echo 'optimized extraction retained an aggregate, mutable join, or labels for a widened tuple match' >&2
+  exit 1
+fi
+sed -n \
+  '/^uint16_t widened_tuple_call(/,/^}/p' \
+  "$SPEC_SOURCE/base.c" > "$TMP_DIR/widened_tuple_call.c"
+grep -Eq '^  uint16_t [A-Za-z0-9_]+ = widened_tuple_match\(choice, &[A-Za-z0-9_]+\);$' \
+  "$TMP_DIR/widened_tuple_call.c"
+if test "$(grep -Ec '^  uint16_t [A-Za-z0-9_]+;$' "$TMP_DIR/widened_tuple_call.c")" -ne 1; then
+  echo 'optimized extraction split a direct tuple call result declaration from its initializer' >&2
   exit 1
 fi
 sed -n \
@@ -662,7 +671,7 @@ fi
 grep -Fq 'u256 wide_identity(u256 value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'u256 as_u256(u256 value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'struct tuple_u256_u256 {' "$SPEC_INCLUDE/evmsail/spec/base.h"
-grep -Eq 'struct tuple_u256_u256 wide_pair_identity\(u256 arg_0_[[:alnum:]_]+, u256 arg_1_[[:alnum:]_]+\);' \
+grep -Eq 'u256 wide_pair_identity\(u256 arg_0_[[:alnum:]_]+, u256 arg_1_[[:alnum:]_]+, u256 \*restrict [[:alnum:]_]+\);' \
   "$SPEC_INCLUDE/evmsail/spec/base.h"
 if grep -REq 'proof_(identity|branch).*bounds' "$SPEC_INCLUDE/evmsail/spec" "$SPEC_SOURCE"; then
   echo 'optimized extraction leaked proof-bound hashes into represented specialization symbols' >&2
@@ -680,7 +689,7 @@ if grep -Fq 'lt_int_result' "$SPEC_SOURCE/base.c"; then
   echo 'optimized extraction retained an unread pure predicate temporary' >&2
   exit 1
 fi
-grep -Eq 'wide_pair_identity\(u256 arg_0_[[:alnum:]_]+, u256 arg_1_[[:alnum:]_]+\)' \
+grep -Eq 'wide_pair_identity\(u256 arg_0_[[:alnum:]_]+, u256 arg_1_[[:alnum:]_]+, u256 \*restrict [[:alnum:]_]+\)' \
   "$SPEC_SOURCE/base.c"
 awk '
   /^u256 wide_identity\(/ { printing = 1 }
@@ -1303,7 +1312,7 @@ if ! "$SAIL" "$@" --no-color --no-memo-z3 -O --Oconstant-fold -c \
   exit 1
 fi
 
-grep -Eq 'struct tuple_bool_uint_8_invalid_state_status invalid_state_order\(uint8_t state_word, bool state_flag\);' \
+grep -Eq 'enum invalid_state_status invalid_state_order\(uint8_t state_word, bool state_flag, bool \*restrict condition_[A-Za-z0-9_]+, uint8_t \*restrict field_1_[A-Za-z0-9_]+\);' \
   "$TMP_DIR/state-passing-invalid/ffi/optimized/include/evmsail/spec/state_passing_invalid.h"
-grep -Fq 'struct tuple_bool_uint_8 state_last_product(uint8_t state_word);' \
+grep -Eq 'uint8_t state_last_product\(uint8_t state_word, bool \*restrict condition_[A-Za-z0-9_]+\);' \
   "$TMP_DIR/state-passing-invalid/ffi/optimized/include/evmsail/spec/state_passing_invalid.h"

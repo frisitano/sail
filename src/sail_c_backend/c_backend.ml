@@ -2209,11 +2209,12 @@ let rec insert_heap_returns ctx ret_ctyps = function
   | cdef :: cdefs -> cdef :: insert_heap_returns ctx ret_ctyps cdefs
   | [] -> []
 
-(* Optimized C lowers an internal tuple result as a state-passing ABI when all
-   fields except the final result uniquely mirror one contiguous block of input
-   parameters. Those fields become named in/out pointers and the final field is
-   returned natively. Other tuple shapes remain ordinary product values: the
-   compiler must not guess which inputs an ambiguous product updates. *)
+(* Optimized C lowers internal tuple results directly: one field is returned
+   natively and the remaining fields become named output parameters.  When all
+   non-return fields uniquely mirror one contiguous block of input parameters,
+   preserve the stronger state-passing ABI and make those parameters in/out.
+   Other tuple shapes use ordinary output-only parameters; they must not be
+   guessed to update unrelated inputs merely because their types coincide. *)
 type direct_tuple_result_field = {
   direct_field_index : int;
   direct_field_ctyp : ctyp;
@@ -2234,7 +2235,7 @@ let direct_result_name ctyp index =
     match ctyp with
     | CT_bool -> "condition"
     | CT_enum id | CT_struct (id, _) | CT_variant (id, _) -> String.lowercase_ascii (string_of_id id)
-    | _ -> "result_" ^ string_of_int index
+    | _ -> "field_" ^ string_of_int index
   in
   ngensym ~source_name ~source_type:(string_of_ctyp ctyp) ()
 
@@ -2243,10 +2244,18 @@ let direct_output_for_input abi input_index =
     (fun field -> match field.direct_input_index with Some index -> index = input_index | None -> false)
     abi.direct_result_fields
 
+let direct_field_is_return abi field =
+  field.direct_field_index = abi.direct_return_field.direct_field_index
+
+let direct_output_parameters abi =
+  List.filter
+    (fun field -> not (direct_field_is_return abi field) && Option.is_none field.direct_input_index)
+    abi.direct_result_fields
+
 let direct_result_destinations abi =
   List.map (fun field -> CL_id (field.direct_field_name, field.direct_field_ctyp)) abi.direct_result_fields
 
-let make_direct_tuple_result_abi arg_ctyps args ret_ctyp =
+let make_direct_tuple_result_abi ctx arg_ctyps args ret_ctyp =
   match ret_ctyp with
   | CT_tup field_ctyps when List.length field_ctyps >= 2 ->
       let state_ctyps = List.rev field_ctyps |> List.tl |> List.rev in
@@ -2293,6 +2302,26 @@ let make_direct_tuple_result_abi arg_ctyps args ret_ctyp =
               direct_result_ctyp = ret_ctyp;
               direct_result_fields = state_fields @ [return_field];
               direct_return_field = return_field;
+            }
+      | _ when is_stack_ctyp ctx return_ctyp ->
+          let return_index = List.length field_ctyps - 1 in
+          let fields =
+            List.mapi
+              (fun field_index field_ctyp ->
+                {
+                  direct_field_index = field_index;
+                  direct_field_ctyp = field_ctyp;
+                  direct_field_name = direct_result_name field_ctyp field_index;
+                  direct_input_index = None;
+                }
+              )
+              field_ctyps
+          in
+          Some
+            {
+              direct_result_ctyp = ret_ctyp;
+              direct_result_fields = fields;
+              direct_return_field = List.nth fields return_index;
             }
       | _ -> None
       )
@@ -2346,15 +2375,17 @@ let lower_direct_tuple_function id ctx abi body =
   in
   let return_result aux value =
     let values = result_values value in
-    let state_values = List.rev values |> List.tl |> List.rev in
-    let state_destinations = List.rev destinations |> List.tl |> List.rev in
     let state_assignments =
-      List.map2 (fun destination value -> (destination, value)) state_destinations state_values
-      |> List.filter_map (fun (destination, value) ->
-             if identity_copy destination value then None else Some (I_aux (I_copy (destination, value), aux))
+      List.map2
+        (fun field (destination, value) -> (field, destination, value))
+        abi.direct_result_fields (List.combine destinations values)
+      |> List.filter_map (fun (field, destination, value) ->
+             if direct_field_is_return abi field || identity_copy destination value then None
+             else Some (I_aux (I_copy (destination, value), aux))
          )
     in
-    state_assignments @ [I_aux (I_return (List.hd (List.rev values)), aux)]
+    let return_value = List.nth values abi.direct_return_field.direct_field_index in
+    state_assignments @ [I_aux (I_return return_value, aux)]
   in
   let same_result_arity ctyp =
     match ctyp with
@@ -2962,7 +2993,7 @@ let lower_direct_tuple_results ctx cdefs =
         | CDEF_aux (CDEF_val (id, _, arg_ctyps, (CT_tup _ as ret_ctyp), _), _) -> (
             match (ctx_is_extern id ctx, Bindings.find_opt id function_args) with
             | false, Some args -> (
-                match make_direct_tuple_result_abi arg_ctyps args ret_ctyp with
+                match make_direct_tuple_result_abi ctx arg_ctyps args ret_ctyp with
                 | Some abi -> Bindings.add id abi abis
                 | None -> abis)
             | _ -> abis)
@@ -8641,6 +8672,23 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       | _ -> None
     )
 
+  let call_returns_into_stack_local declared declared_ctyp = function
+    | I_aux (I_funcall (CR_one (CL_id (destination, destination_ctyp)), _, _, _), _) ->
+        Name.compare declared destination = 0
+        && stack_call_initializer_compatible declared_ctyp destination_ctyp
+    | I_aux (I_funcall (CR_multi destinations, Call _, f, _), _) -> (
+        match Bindings.find_opt (fst f) !direct_tuple_result_abis with
+        | Some abi when List.length destinations = List.length abi.direct_result_fields -> (
+            match List.nth destinations abi.direct_return_field.direct_field_index with
+            | CL_id (destination, destination_ctyp) ->
+                Name.compare declared destination = 0
+                && stack_call_initializer_compatible declared_ctyp destination_ctyp
+            | _ -> false
+          )
+        | _ -> false
+      )
+    | _ -> false
+
   let rec codegen_instr fid ctx (I_aux (instr, (_, l))) =
     match instr with
     | I_decl (ctyp, id) when is_stack_ctyp ctx ctyp -> ksprintf string "  %s %s;" (sgen_ctyp ctyp) (sgen_name id)
@@ -8728,18 +8776,10 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
               | None -> x
             in
             let carrier_declaration =
-              ( match return_carrier with
+              match return_carrier with
               | Some (name, destination_ctyp) ->
                   [ksprintf string "  %s %s;" (sgen_ctyp destination_ctyp) (sgen_name name)]
               | None -> []
-              )
-              @
-              match (!stack_call_initializer, x) with
-              | Some (declared, declared_ctyp), CR_one (CL_id (destination, destination_ctyp))
-                when Name.compare declared destination = 0
-                     && stack_call_initializer_compatible declared_ctyp destination_ctyp ->
-                  [ksprintf string "  %s %s;" (sgen_ctyp declared_ctyp) (sgen_name declared)]
-              | _ -> []
             in
             let destinations =
               match x with
@@ -8773,6 +8813,13 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                 args
               |> List.filter_map Fun.id
             in
+            let output_arguments =
+              direct_output_parameters abi
+              |> List.map (fun field ->
+                     sgen_clexp l (List.nth destinations field.direct_field_index)
+                 )
+            in
+            let ordinary_arguments = ordinary_arguments @ output_arguments in
             let arguments = String.concat ", " ordinary_arguments in
             let regs_argument =
               if register_file_threaded_function (fst f) then
@@ -8792,7 +8839,10 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
               match return_destination with
               | CL_id (Return _, _) -> "  return " ^ call ^ ";"
               | CL_void _ -> "  " ^ call ^ ";"
-              | _ -> "  " ^ sgen_clexp_pure l return_destination ^ " = " ^ call ^ ";"
+              | _ ->
+                  "  "
+                  ^ sgen_stack_call_destination l abi.direct_return_field.direct_field_ctyp return_destination
+                  ^ " = " ^ call ^ ";"
             in
             let return_statement =
               match return_carrier with
@@ -9639,11 +9689,10 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
             (Option.get (stack_conversion_initializer destination_ctyp value))
           :: docs rest
       | I_aux (I_decl (declared_ctyp, declared), _)
-        :: (I_aux (I_funcall (CR_one (CL_id (destination, destination_ctyp)), _, _, _), _) as call)
+        :: (I_aux (I_funcall _, _) as call)
         :: rest
         when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
-             && Name.compare declared destination = 0
-             && stack_call_initializer_compatible declared_ctyp destination_ctyp ->
+             && call_returns_into_stack_local declared declared_ctyp call ->
           let previous = !stack_call_initializer in
           stack_call_initializer := Some (declared, declared_ctyp);
           let call_doc = codegen_instr fid ctx call in
@@ -13249,6 +13298,14 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
               parameters
             |> List.filter_map Fun.id
           in
+          let ordinary_args =
+            ordinary_args
+            @ List.map
+                (fun field ->
+                  sgen_ctyp field.direct_field_ctyp ^ " *restrict " ^ sgen_name field.direct_field_name
+                )
+                (direct_output_parameters abi)
+          in
           let ordinary_args = if thread_regs then register_file_thread_parameter :: ordinary_args else ordinary_args in
           with_call_compat
             (string
@@ -13328,9 +13385,8 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
             | Some abi ->
                 List.fold_left
                   (fun names field ->
-                    match field.direct_input_index with
-                    | Some _ -> NameSet.add field.direct_field_name names
-                    | None -> names
+                    if direct_field_is_return abi field then names
+                    else NameSet.add field.direct_field_name names
                   )
                   NameSet.empty abi.direct_result_fields
             | None -> NameSet.empty
@@ -13373,6 +13429,14 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
                     )
                     named_parameters
                   |> List.filter_map Fun.id
+                in
+                let ordinary_args =
+                  ordinary_args
+                  @ List.map
+                      (fun field ->
+                        sgen_ctyp field.direct_field_ctyp ^ " *restrict " ^ sgen_name field.direct_field_name
+                      )
+                      (direct_output_parameters abi)
                 in
                 let ordinary_args =
                   if thread_regs then register_file_thread_parameter :: ordinary_args else ordinary_args
