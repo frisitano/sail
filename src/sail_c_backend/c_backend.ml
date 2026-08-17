@@ -8094,12 +8094,14 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     | true, None, [] -> "void"
     | _ -> extra_params () ^ String.concat ", " parameters
 
-  (* An adjacent stack-local declaration and returning call can be emitted as
-     one ordinary C initializer.  Keep this code-generation-only: JIB still
+  (* Adjacent stack-local declarations and a returning call can be emitted as
+     ordinary C initializers.  Keep this code-generation-only: JIB still
      models calls explicitly, which is important to the effect and exception
      passes, while the final optimized C need not expose that administrative
-     split. *)
-  let stack_call_initializer = ref None
+     split.  Direct tuple calls can initialize both a carried state output and
+     their native return value, so retain the complete adjacent declaration
+     run rather than just the final declaration. *)
+  let stack_call_initializers = ref []
 
   let stack_call_initializer_compatible declared destination =
     ctyp_equal declared destination
@@ -8111,13 +8113,22 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
     in
     native_integer declared && native_integer destination
 
+  let stack_call_initializer_for destination destination_ctyp =
+    List.find_opt
+      (fun (declared, declared_ctyp) ->
+        Name.compare declared destination = 0
+        && stack_call_initializer_compatible declared_ctyp destination_ctyp
+      )
+      !stack_call_initializers
+
   let sgen_stack_call_destination l ctyp clexp =
-    match (!stack_call_initializer, clexp) with
-    | Some (declared, declared_ctyp), CL_id (destination, destination_ctyp)
-      when Name.compare declared destination = 0
-           && stack_call_initializer_compatible declared_ctyp ctyp
-           && stack_call_initializer_compatible declared_ctyp destination_ctyp ->
-        sprintf "%s %s" (sgen_ctyp declared_ctyp) (sgen_name declared)
+    match clexp with
+    | CL_id (destination, destination_ctyp) -> (
+        match stack_call_initializer_for destination destination_ctyp with
+        | Some (declared, declared_ctyp) when stack_call_initializer_compatible declared_ctyp ctyp ->
+            sprintf "%s %s" (sgen_ctyp declared_ctyp) (sgen_name declared)
+        | _ -> sgen_clexp_pure l clexp
+      )
     | _ -> sgen_clexp_pure l clexp
 
   (* [sgen_cval] parenthesizes C operators so that values remain safe when
@@ -8672,18 +8683,31 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       | _ -> None
     )
 
-  let call_returns_into_stack_local declared declared_ctyp = function
+  let call_initializes_stack_local declared declared_ctyp = function
     | I_aux (I_funcall (CR_one (CL_id (destination, destination_ctyp)), _, _, _), _) ->
         Name.compare declared destination = 0
         && stack_call_initializer_compatible declared_ctyp destination_ctyp
-    | I_aux (I_funcall (CR_multi destinations, Call _, f, _), _) -> (
+    | I_aux (I_funcall (CR_multi destinations, Call _, f, args), (_, l)) -> (
         match Bindings.find_opt (fst f) !direct_tuple_result_abis with
         | Some abi when List.length destinations = List.length abi.direct_result_fields -> (
-            match List.nth destinations abi.direct_return_field.direct_field_index with
-            | CL_id (destination, destination_ctyp) ->
+            let destination_matches = function
+              | CL_id (destination, destination_ctyp) ->
                 Name.compare declared destination = 0
                 && stack_call_initializer_compatible declared_ctyp destination_ctyp
-            | _ -> false
+              | _ -> false
+            in
+            destination_matches (List.nth destinations abi.direct_return_field.direct_field_index)
+            || List.exists
+                 (fun field ->
+                   match field.direct_input_index with
+                   | Some input_index ->
+                       let destination = List.nth destinations field.direct_field_index in
+                       let argument = List.nth args input_index in
+                       destination_matches destination
+                       && not (String.equal (sgen_clexp_pure l destination) (sgen_cval argument))
+                   | None -> false
+                 )
+                 abi.direct_result_fields
           )
         | _ -> false
       )
@@ -8798,7 +8822,20 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
                          let destination = List.nth destinations field.direct_field_index in
                          let argument = List.nth args input_index in
                          if String.equal (sgen_clexp_pure l destination) (sgen_cval argument) then None
-                         else Some (codegen_conversion l ctx destination argument)
+                         else
+                           match destination with
+                           | CL_id (destination, destination_ctyp) -> (
+                               match stack_call_initializer_for destination destination_ctyp with
+                               | Some (declared, declared_ctyp)
+                                 when Option.is_some (stack_conversion_initializer destination_ctyp argument) ->
+                                   Some
+                                     (ksprintf string "  %s %s = %s;" (sgen_ctyp declared_ctyp)
+                                        (sgen_name declared)
+                                        (Option.get (stack_conversion_initializer destination_ctyp argument))
+                                     )
+                               | _ -> Some (codegen_conversion l ctx (CL_id (destination, destination_ctyp)) argument)
+                             )
+                           | _ -> Some (codegen_conversion l ctx destination argument)
                  )
             in
             let ordinary_arguments =
@@ -9688,16 +9725,34 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           ksprintf string "  %s %s = %s;" (sgen_ctyp declared_ctyp) (sgen_name declared)
             (Option.get (stack_conversion_initializer destination_ctyp value))
           :: docs rest
-      | I_aux (I_decl (declared_ctyp, declared), _)
-        :: (I_aux (I_funcall _, _) as call)
-        :: rest
-        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
-             && call_returns_into_stack_local declared declared_ctyp call ->
-          let previous = !stack_call_initializer in
-          stack_call_initializer := Some (declared, declared_ctyp);
-          let call_doc = codegen_instr fid ctx call in
-          stack_call_initializer := previous;
-          call_doc :: docs rest
+      | (I_aux (I_decl (declared_ctyp, declared), _) as declaration) :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp ->
+          let rec collect_declarations reversed = function
+            | (I_aux (I_decl (ctyp, name), _) as declaration) :: rest when is_stack_ctyp ctx ctyp ->
+                collect_declarations ((declaration, name, ctyp) :: reversed) rest
+            | rest -> (List.rev reversed, rest)
+          in
+          let declarations, following = collect_declarations [(declaration, declared, declared_ctyp)] rest in
+          ( match following with
+          | (I_aux (I_funcall _, _) as call) :: after_call ->
+              let initializers, declarations =
+                List.partition
+                  (fun (_, declared, declared_ctyp) ->
+                    call_initializes_stack_local declared declared_ctyp call
+                  )
+                  declarations
+              in
+              if List.is_empty initializers then codegen_instr fid ctx declaration :: docs rest
+              else
+                let previous = !stack_call_initializers in
+                stack_call_initializers :=
+                  List.map (fun (_, declared, declared_ctyp) -> (declared, declared_ctyp)) initializers;
+                let call_doc = codegen_instr fid ctx call in
+                stack_call_initializers := previous;
+                List.map (fun (declaration, _, _) -> codegen_instr fid ctx declaration) declarations
+                @ (call_doc :: docs after_call)
+          | _ -> codegen_instr fid ctx declaration :: docs rest
+          )
       | instr :: rest -> codegen_instr fid ctx instr :: docs rest
       | [] -> []
     in

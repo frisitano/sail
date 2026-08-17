@@ -181,6 +181,12 @@ sed -n '/^bool state_passing_guard_failed(/,/^}/p' \
   "$SPEC_SOURCE/machine.c" > "$TMP_DIR/state_passing_guard_failed.c"
 grep -Eq 'state_passing_guard\(read_only, &state_after(_[0-9]+)*, fail\)' \
   "$TMP_DIR/state_passing_guard_failed.c"
+grep -Eq '^  uint32_t state_after(_[0-9]+)* = state;$' \
+  "$TMP_DIR/state_passing_guard_failed.c"
+if grep -Eq '^  uint32_t state_after(_[0-9]+)*;$' "$TMP_DIR/state_passing_guard_failed.c"; then
+  echo 'state-passing call split an in/out declaration from its initializer' >&2
+  exit 1
+fi
 if grep -Eq 'tuple_|\.tup[0-9]|rop[0-9]' "$TMP_DIR/state_passing_guard_failed.c"; then
   echo 'non-state-returning caller retained a state-passing tuple carrier' >&2
   exit 1
