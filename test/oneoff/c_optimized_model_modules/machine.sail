@@ -1,5 +1,6 @@
 register public_counter : word
 register public_pair : pair
+register startup_public_pair : startup_pair = struct { first = 0, second = 0 }
 
 type test_fork = range(0, 1)
 
@@ -27,6 +28,60 @@ function preserve_counter_snapshot(value : word) -> word = {
 
 function make_public_pair(value : byte) -> pair =
   struct { first = value, second = value }
+
+function initialize_public_pair(value : byte) -> unit =
+  public_pair = struct { first = value, second = value }
+
+function startup_pair_first() -> byte = startup_public_pair.first
+
+val terminal_proven_narrow_sum : forall 'start 'size,
+  0 <= 'start & 'start < 2 ^ 256 & 0 <= 'size & 'size < 2 ^ 256.
+  (int('start), int('size)) -> word_endpoint
+function terminal_proven_narrow_sum(start, size) = {
+  if size == 0 then 0
+  else if start <= 4294967295 then {
+    let (bounded_start as 'bounded_start) :
+      {'bounded_start, 'bounded_start == 'start & 0 <= 'bounded_start & 'bounded_start <= 4294967295.
+       int('bounded_start)} = start;
+    if size <= 4294967295 - bounded_start then {
+      let (bounded_size as 'bounded_size) :
+        {'bounded_size,
+         'bounded_size == 'size & 0 < 'bounded_size & 'bounded_size <= 4294967295 - 'bounded_start.
+         int('bounded_size)} = size;
+      let endpoint : word_endpoint = bounded_start + bounded_size;
+      endpoint
+    } else 4294967296
+  } else 4294967296
+}
+
+function pair_field_value(value : byte) -> byte = value
+
+function call_result_in_struct(value : byte) -> pair =
+  struct { first = pair_field_value(value), second = value }
+
+function consume_field_value(value : byte) -> byte = value
+
+function call_result_as_argument(value : byte) -> byte =
+  consume_field_value(pair_field_value(value))
+
+function consume_second_field_value(first : byte, second : byte) -> range(0, 510) = first + second
+
+function call_result_as_later_argument(value : byte) -> range(0, 510) =
+  consume_second_field_value(value, pair_field_value(value))
+
+function consume_wide_field_value(value : range(0, 256)) -> range(0, 256) = value
+
+function call_result_through_expression(value : byte) -> range(0, 256) =
+  consume_wide_field_value(pair_field_value(value) + 1)
+
+function pure_extern_result_through_expression(value : byte) -> range(0, 256) =
+  consume_wide_field_value(host_pure_byte_exact(value) + 1)
+
+function pure_call_after_register_write(value : byte) -> byte = {
+  let selected = pair_field_value(value);
+  public_counter = 0;
+  selected
+}
 
 function save_pair_then_read(value : byte) -> byte = {
   let next = make_public_pair(value);
@@ -67,6 +122,12 @@ function conditional_word(flag : bool, left : word, right : word) -> bool = {
   selected == public_counter
 }
 
+function widened_branch_join(flag : bool, left : byte, right : byte) -> word = {
+  let selected : word = if flag then left else right;
+  public_counter = selected;
+  selected
+}
+
 function conditional_bool(flag : bool, fallback : bool) -> bool = {
   let selected = if flag then true else fallback;
   public_counter = 0;
@@ -77,6 +138,14 @@ function conditional_bool_false(flag : bool, fallback : bool) -> bool = {
   let selected = if flag then fallback else false;
   public_counter = 0;
   selected
+}
+
+function nested_pair_join(flag : bool, valid : bool, left : byte, right : byte) -> byte = {
+  let selected : pair =
+    if flag then {
+      if valid then make_public_pair(left) else fatal_error(TestFatal)
+    } else make_public_pair(right);
+  consume_field_value(selected.first)
 }
 
 enum terminal_choice = {
@@ -225,6 +294,18 @@ function terminal_unit_variant_match(choice : erased_unit_choice) -> unit =
     ByteChoice(value) => terminal_unit_byte(value),
   }
 
+function terminal_variant_after_write(fail : bool) -> erased_unit_choice = {
+  if fail then {
+    let selected = EmptyChoice();
+    public_counter = 0;
+    selected
+  } else {
+    let selected = OtherEmptyChoice();
+    public_counter = 1;
+    selected
+  }
+}
+
 function terminal_assertion(flag : bool) -> byte =
   if not_bool(flag) then {
     assert(false, "terminal assertion");
@@ -237,6 +318,9 @@ function terminal_fixed_bytes_match(bytes : four_bytes) -> byte =
     _ if eq_anything(bytes, TEST_FIXED_BYTES_ONE) => 1,
     _ => 2,
   }
+
+function fixed_bytes_differ(left : four_bytes, right : four_bytes) -> bool =
+  not_bool(eq_anything(left, right))
 
 function machine_pick_zero(index : four_index) -> byte = {
   let bytes : four_bytes = vector_init(4, 0);

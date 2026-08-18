@@ -2,6 +2,7 @@ val host_mix = impure {c: "host_mix_exact"} : (word, byte) -> word
 val host_wide_pair = impure {c: "host_wide_pair_exact"} : (word, word) -> bool
 val host_jumpdest_alloc = impure {c: "test_jumpdest_alloc"} : byte -> jump_table_index
 val host_reset = impure {c: "host_reset_exact"} : unit -> unit
+val host_pure_byte_exact = pure {c: "host_pure_byte_exact"} : byte -> byte
 
 enum fatal_reason = { TestFatal }
 

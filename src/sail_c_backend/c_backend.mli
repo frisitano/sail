@@ -141,8 +141,8 @@ module type CODEGEN_CONFIG = sig
       before JIB lowering, so their representation is necessarily structural at that byte width. *)
   val c_repr_fixed_bytes_u64_lane_alias_lengths : int list
 
-  (** Explicit C carrier names for structurally represented fixed-byte widths. *)
-  val c_repr_fixed_bytes_names : (int * string) list
+  (** Explicit C carrier names keyed by fixed-byte representation and width. *)
+  val c_repr_fixed_bytes_names : ((string * int) * string) list
 
   (** Pure functions explicitly authorized by the typed Sail AST for static evaluation of top-level represented
       constants. *)

@@ -7,6 +7,7 @@ type halfword = range(0, 65535)
 type byte_offset = range(0, 254)
 type three_byte = range(0, 16777215)
 type word = range(0, 4294967295)
+type word_endpoint = range(0, 4294967296)
 type signed_byte = range(-128, 127)
 type signed_halfword = range(-32768, 32767)
 type signed_word = range(-2147483648, 2147483647)
@@ -36,6 +37,11 @@ struct pair = {
   second : byte,
 }
 
+struct startup_pair = {
+  first : byte,
+  second : byte,
+}
+
 enum profile_choice = { ProfileLegacy, ProfileCurrent }
 
 let profile_legacy : profile_choice = ProfileLegacy
@@ -61,6 +67,13 @@ struct byte_slice = {
   bytes : byte,
   len : byte,
 }
+
+function make_byte_slice(bytes : byte, len : byte) -> byte_slice =
+  struct { bytes = bytes, len = len }
+
+let EMPTY_BYTE_SLICE : byte_slice = make_byte_slice(0, 0)
+
+function empty_byte_slice_len() -> byte = EMPTY_BYTE_SLICE.len
 
 struct byte_slice_small = {
   bytes : byte_offset,

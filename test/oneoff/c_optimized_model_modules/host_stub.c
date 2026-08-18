@@ -40,3 +40,8 @@ bool host_wide_pair_exact(uint32_t left, uint32_t right)
 void host_reset_exact(void)
 {
 }
+
+uint8_t host_pure_byte_exact(uint8_t value)
+{
+  return value;
+}

@@ -195,6 +195,7 @@ let is_c_repr_value ctyp =
    locals and call results incorrectly acquire CREATE/KILL ownership calls for
    the hidden Sail fields.  This set is reset for every C compilation below. *)
 let c_repr_external_value_types = ref IdSet.empty
+let c_repr_external_type_names = ref Bindings.empty
 
 let rec ctyp_suprema_for_c specialize = function
   | ctyp when specialize && is_c_repr_value ctyp -> ctyp
@@ -2526,6 +2527,30 @@ let lower_direct_tuple_function id ctx abi body =
                   Some index
               | _ -> None
             in
+            let identity_forward =
+              returns
+              && List.length values = List.length callee_abi.direct_result_fields
+              && List.for_all2
+                   (fun field value ->
+                     match member_index value with
+                     | Some index -> index = field.direct_field_index
+                     | None -> false
+                   )
+                   callee_abi.direct_result_fields values
+            in
+            if identity_forward then
+              let call_destinations =
+                List.map
+                  (fun field ->
+                    if direct_field_is_return abi field then
+                      CL_id (Return (-1), field.direct_field_ctyp)
+                    else List.nth destinations field.direct_field_index
+                  )
+                  abi.direct_result_fields
+              in
+              I_aux (I_funcall (CR_multi call_destinations, extern, uid, args), call_aux)
+              :: rewrite instrs
+            else
             let scalar_results =
               List.map
                 (fun field ->
@@ -4162,6 +4187,18 @@ let fuse_fixed_bitvector_webs cdefs =
   in
   (cdefs, !fusions)
 
+let effect_source_id id =
+  List.find_map
+    (fun (trace : Jib_compile.representation_specialization) ->
+      if Id.compare trace.specialized_id id = 0 then Some trace.source_id else None
+    )
+    !Jib_compile.representation_specializations
+  |> Option.value ~default:id
+
+let function_is_pure ctx id =
+  let source = effect_source_id id in
+  Effects.function_is_pure source ctx.effect_info
+
 (* A call whose stack-typed destination is never read disappears when Sail's
    effect analysis proves the callee pure; otherwise it becomes a bare call
    and the destination's declaration disappears. This keeps generated C free
@@ -4171,21 +4208,13 @@ let fuse_fixed_bitvector_webs cdefs =
    conversion may include a runtime domain check. Only local [Name]
    destinations proven unread across the whole body are rewritten. *)
 let discard_unread_stack_results ctx (CDEF_aux (aux, def_annot)) =
-  let effect_source id =
-    List.find_map
-      (fun (trace : Jib_compile.representation_specialization) ->
-        if Id.compare trace.specialized_id id = 0 then Some trace.source_id else None
-      )
-      !Jib_compile.representation_specializations
-    |> Option.value ~default:id
-  in
   let call_is_pure (id, _) =
     (* The assertion marker lowers to a trap even though its source-level
        predicate computation is otherwise pure.  Its unit result may be
        unread, but the check itself is observable and must never disappear. *)
     let external_name = if ctx_is_extern id ctx then ctx_get_extern id ctx else string_of_id id in
     (not (String.equal external_name "__sail_fixed_assert" || String.equal external_name "fatal_error"))
-    && Effects.function_is_pure (effect_source id) ctx.effect_info
+    && function_is_pure ctx id
   in
   let rewrite_body id body =
     let locals = ref NameSet.empty in
@@ -4616,6 +4645,29 @@ let short_circuit_boolean_expression condition then_value else_value =
 let collapse_short_circuit_booleans (CDEF_aux (aux, def_annot)) =
   let rewrite_lists instrs =
     let rec rewrite = function
+      | (I_aux (I_decl (temporary_ctyp, temporary), _) as temporary_declaration)
+        :: (I_aux (I_if (condition, then_instrs, else_instrs), if_aux) as producer)
+        :: (I_aux (I_if (V_id (source, source_ctyp), consumer_then, consumer_else), consumer_aux) as consumer)
+        :: rest
+        when ctyp_equal temporary_ctyp CT_bool
+             && Name.compare temporary source = 0
+             && ctyp_equal source_ctyp CT_bool
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:temporary ~direct:false instr)
+                     (consumer_then @ consumer_else @ rest)
+                  ) -> (
+          match
+            (assigned_boolean_value temporary then_instrs, assigned_boolean_value temporary else_instrs)
+          with
+          | Some then_value, Some else_value -> (
+              match short_circuit_boolean_expression condition then_value else_value with
+              | Some value ->
+                  I_aux (I_if (value, consumer_then, consumer_else), consumer_aux) :: rewrite rest
+              | None -> temporary_declaration :: producer :: consumer :: rewrite rest
+            )
+          | _ -> temporary_declaration :: producer :: consumer :: rewrite rest
+        )
       | (I_aux (I_decl (result_ctyp, result), _) as result_declaration)
         :: (I_aux (I_decl (temporary_ctyp, temporary), _) as temporary_declaration)
         :: I_aux (I_if (condition, then_instrs, else_instrs), if_aux)
@@ -4665,9 +4717,114 @@ let collapse_short_circuit_booleans (CDEF_aux (aux, def_annot)) =
     in
     rewrite instrs
   in
-  let rewrite_body body = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+  let rewrite_body body =
+    let rec fixpoint n body =
+      let rewritten = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+      if n = 0 || rewritten = body then rewritten else fixpoint (n - 1) rewritten
+    in
+    fixpoint 8 body
+  in
   match aux with
   | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* Inline a stack value into its sole, unconditionally evaluated use.  JIB's
+   cvals are pure, but [&&], [||], and the arms of [?:] are conditional: moving
+   an eager initializer into one of those positions would change whether it is
+   evaluated.  Count those positions separately and accept only one eager use.
+   This removes ANF aliases such as [tmp = p; result = tmp ? a : b] without
+   weakening the evaluation-order guarantees used by the call-sinking passes. *)
+let inline_single_eager_stack_values ctx (CDEF_aux (aux, def_annot)) =
+  let add_pair (left_eager, left_conditional) (right_eager, right_conditional) =
+    (left_eager + right_eager, left_conditional + right_conditional)
+  in
+  let rec value_reads target conditional = function
+    | V_id (name, _) ->
+        if Name.compare name target = 0 then if conditional then (0, 1) else (1, 0) else (0, 0)
+    | V_call ((Band | Bor), first :: rest) ->
+        List.fold_left
+          (fun counts value -> add_pair counts (value_reads target true value))
+          (value_reads target conditional first) rest
+    | V_call (Ite, [condition; then_value; else_value]) ->
+        add_pair (value_reads target conditional condition)
+          (add_pair (value_reads target true then_value) (value_reads target true else_value))
+    | V_call (_, values) | V_tuple values ->
+        List.fold_left
+          (fun counts value -> add_pair counts (value_reads target conditional value))
+          (0, 0) values
+    | V_field (value, _, _)
+    | V_tuple_member (value, _, _)
+    | V_ctor_kind (value, _)
+    | V_ctor_unwrap (value, _, _) ->
+        value_reads target conditional value
+    | V_struct (fields, _) ->
+        List.fold_left
+          (fun counts (_, value) -> add_pair counts (value_reads target conditional value))
+          (0, 0) fields
+    | V_member _ | V_lit _ -> (0, 0)
+  in
+  let substitute target replacement value =
+    map_cval (function V_id (name, _) when Name.compare name target = 0 -> replacement | value -> value) value
+  in
+  let rewrite_consumer target replacement = function
+    | (I_aux (I_copy (destination, value), annot) as instr)
+      when not (NameSet.mem target (instr_writes ~direct:false instr)) ->
+        if value_reads target false value = (1, 0) then
+          Some (I_aux (I_copy (destination, substitute target replacement value), annot))
+        else None
+    | I_aux (I_if (condition, then_instrs, else_instrs), annot) ->
+        if
+          value_reads target false condition = (1, 0)
+          && not
+               (List.exists
+                  (fun instr -> instr_references ~read:target ~direct:false instr)
+                  (then_instrs @ else_instrs)
+               )
+        then Some (I_aux (I_if (substitute target replacement condition, then_instrs, else_instrs), annot))
+        else None
+    | I_aux (I_return value, annot) ->
+        if value_reads target false value = (1, 0) then
+          Some (I_aux (I_return (substitute target replacement value), annot))
+        else None
+    | _ -> None
+  in
+  let rewrite_lists instrs =
+    let rec rewrite = function
+      | (I_aux (I_decl (ctyp, temporary), _) as declaration)
+        :: (I_aux (I_copy (CL_id (assigned, assigned_ctyp), value), _) as initialization)
+        :: consumer :: rest
+        when is_stack_ctyp ctx ctyp
+             && Name.compare temporary assigned = 0
+             && ctyp_equal ctyp assigned_ctyp
+             && ctyp_equal ctyp (cval_ctyp value)
+             && not (List.exists (fun instr -> instr_references ~read:temporary ~direct:false instr) rest) -> (
+          match rewrite_consumer temporary value consumer with
+          | Some consumer -> consumer :: rewrite rest
+          | None -> declaration :: initialization :: consumer :: rewrite rest
+        )
+      | (I_aux (I_init (ctyp, temporary, Init_cval value), _) as initialization) :: consumer :: rest
+        when is_stack_ctyp ctx ctyp
+             && ctyp_equal ctyp (cval_ctyp value)
+             && not (List.exists (fun instr -> instr_references ~read:temporary ~direct:false instr) rest) -> (
+          match rewrite_consumer temporary value consumer with
+          | Some consumer -> consumer :: rewrite rest
+          | None -> initialization :: consumer :: rewrite rest
+        )
+      | instr :: rest -> instr :: rewrite rest
+      | [] -> []
+    in
+    rewrite instrs
+  in
+  let rewrite_body body =
+    let rec fixpoint n body =
+      let rewritten = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+      if n = 0 || rewritten = body then rewritten else fixpoint (n - 1) rewritten
+    in
+    fixpoint 8 body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | CDEF_let (number, bindings, body) -> CDEF_aux (CDEF_let (number, bindings, rewrite_body body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
 (* Merge repeated bodies in adjacent conditional arms while retaining C's
@@ -4945,10 +5102,20 @@ let preserve_assignment_conversion narrowing_policy target_ctyp value =
           (max_int (fixed_integer_storage_width to_width)) source
     | _ -> false
   in
-  if narrowing_policy = Narrowing_checked && contains_proven_narrow value then None
-  else if ctyp_equal source_ctyp target_ctyp then Some value
+  (* An exact-typed value already carries every proved conversion inside its
+     expression.  Moving that value does not relocate an assignment-driven
+     conversion, so nested [Proven_narrow] nodes remain safe. *)
+  if ctyp_equal source_ctyp target_ctyp then Some value
+  else if narrowing_policy = Narrowing_checked && contains_proven_narrow value then None
   else (
     match (target_ctyp, source_ctyp) with
+    | (CT_fuint _ | CT_fint _), source
+      when is_c_repr_u128 source || is_c_repr_u256 source || is_c_repr_u320 source ->
+        (* The ordinary assignment renderer projects these fixed wide
+           representations through the policy-selected checked/unchecked
+           helper.  Preserve that boundary explicitly when the assignment is
+           folded into a return or aggregate expression. *)
+        Some (V_call (Proven_narrow target_ctyp, [value]))
     | CT_fuint width, (CT_fuint _ | CT_fint _ | CT_fbits _ | CT_constant _)
       when narrowing_policy = Narrowing_all || total_conversion ->
         Some (V_call (Unsigned width, [value]))
@@ -5129,6 +5296,176 @@ let fold_stack_aggregate_construction narrowing_policy ctx (CDEF_aux (aux, def_a
   | CDEF_let (number, bindings, body) -> CDEF_aux (CDEF_let (number, bindings, rewrite_body body), def_annot)
   | _ -> CDEF_aux (aux, def_annot)
 
+(* JIB constructs some records through a private aggregate and then copies the
+   completed value into its real destination:
+
+     struct T temporary;
+     temporary.first = ...;
+     temporary.second = ...;
+     destination = temporary;
+
+   Retarget the field writes to [destination].  This is deliberately narrower
+   than general aggregate copy propagation: every top-level field must be
+   initialized, the construction region may contain only writes rooted at the
+   temporary, and none of their values may read either the temporary or the
+   destination.  Consequently advancing the destination writes cannot expose
+   a partially constructed value or change any right-hand-side evaluation.
+   Nested record construction is handled inner-first by the fixpoint.  Two
+   nominal Sail structs that select the same named external C representation
+   have the same storage contract and may therefore be retargeted across that
+   erased nominal boundary. *)
+let retarget_private_record_construction ctx (CDEF_aux (aux, def_annot)) =
+  let same_name left right = Name.compare left right = 0 in
+  let same_external_representation left right =
+    match (left, right) with
+    | CT_struct (left_id, []), CT_struct (right_id, []) -> (
+        match
+          ( Bindings.find_opt left_id !c_repr_external_type_names,
+            Bindings.find_opt right_id !c_repr_external_type_names )
+        with
+        | Some left_name, Some right_name -> String.equal left_name right_name
+        | _ -> false
+      )
+    | _ -> false
+  in
+  let same_storage_type left right = ctyp_equal left right || same_external_representation left right in
+  let rec reads name = function
+    | V_id (source, _) -> same_name name source
+    | V_member _ | V_lit _ -> false
+    | V_call (_, values) | V_tuple values -> List.exists (reads name) values
+    | V_field (value, _, _)
+    | V_tuple_member (value, _, _)
+    | V_ctor_kind (value, _)
+    | V_ctor_unwrap (value, _, _) ->
+        reads name value
+    | V_struct (fields, _) -> List.exists (fun (_, value) -> reads name value) fields
+  in
+  let rec top_field temporary = function
+    | CL_field (CL_id (base, _), field, _) when same_name temporary base -> Some field
+    | CL_field (base, _, _) -> top_field temporary base
+    | _ -> None
+  in
+  let rec replace_root temporary replacement = function
+    | CL_id (base, _) when same_name temporary base -> Some replacement
+    | CL_field (base, field, ctyp) ->
+        Option.map (fun base -> CL_field (base, field, ctyp)) (replace_root temporary replacement base)
+    | CL_tuple (base, index) ->
+        Option.map (fun base -> CL_tuple (base, index)) (replace_root temporary replacement base)
+    | CL_addr base -> Option.map (fun base -> CL_addr base) (replace_root temporary replacement base)
+    | CL_id _ | CL_rmw _ | CL_void _ -> None
+  in
+  let rec destination_roots = function
+    | CL_id (name, _) -> Some (NameSet.singleton name)
+    | CL_rmw (read, write, _) -> Some (NameSet.of_list [read; write])
+    | CL_field (base, _, _) | CL_tuple (base, _) | CL_addr base -> destination_roots base
+    | CL_void _ -> None
+  in
+  let expected_fields = function
+    | CT_struct (id, _) -> (
+        match Bindings.find_opt id ctx.records with
+        | Some (_, fields) -> Some (Bindings.bindings fields |> List.map fst |> IdSet.of_list)
+        | None -> None
+      )
+    | _ -> None
+  in
+  let complete expected fields = IdSet.equal expected fields in
+  let collect destination_allowed temporary temporary_ctyp expected instrs =
+    let rec scan fields rev_writes = function
+      | I_aux (I_copy (destination_lvalue, V_id (source, source_ctyp)), _) :: rest
+        when same_name temporary source
+             && ctyp_equal temporary_ctyp source_ctyp
+             && same_storage_type temporary_ctyp (clexp_ctyp destination_lvalue)
+             && complete expected fields -> (
+          match destination_roots destination_lvalue with
+          | Some destinations
+            when NameSet.for_all destination_allowed destinations
+                 && not (NameSet.exists (same_name temporary) destinations)
+                 && List.for_all
+                      (fun (_, value, _) -> NameSet.for_all (fun destination -> not (reads destination value)) destinations)
+                      rev_writes ->
+              let writes =
+                List.rev_map
+                  (fun (lvalue, value, annot) ->
+                    match replace_root temporary destination_lvalue lvalue with
+                    | Some lvalue -> I_aux (I_copy (lvalue, value), annot)
+                    | None -> assert false
+                  )
+                  rev_writes
+              in
+              Some (writes @ rest)
+          | _ -> None
+        )
+      | I_aux (I_copy (lvalue, value), annot) :: rest
+        when not (reads temporary value) -> (
+          match top_field temporary lvalue with
+          | Some field -> scan (IdSet.add field fields) ((lvalue, value, annot) :: rev_writes) rest
+          | None -> None
+        )
+      | _ -> None
+    in
+    scan IdSet.empty [] instrs
+  in
+  let rewrite_lists destination_allowed instrs =
+    let rec rewrite = function
+      | (I_aux (I_decl ((CT_struct _ as temporary_ctyp), temporary), _) as declaration) :: rest -> (
+          match expected_fields temporary_ctyp with
+          | Some expected -> (
+              match collect destination_allowed temporary temporary_ctyp expected rest with
+              | Some rewritten -> rewrite rewritten
+              | None -> declaration :: rewrite rest
+            )
+          | None -> declaration :: rewrite rest
+        )
+      | instr :: rest -> instr :: rewrite rest
+      | [] -> []
+    in
+    rewrite instrs
+  in
+  let rewrite_body destination_allowed body =
+    let rec fixpoint remaining body =
+      let rewrite = rewrite_lists destination_allowed in
+      let rewritten = List.map (map_instrs rewrite) body |> rewrite in
+      if remaining = 0 || rewritten = body then rewritten else fixpoint (remaining - 1) rewritten
+    in
+    fixpoint 8 body
+  in
+  let function_locals args body =
+    let locals = ref (NameSet.of_list args) in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (aux, _) as sub) ->
+               ( match aux with
+               | I_decl (_, name) | I_init (_, name, _) -> locals := NameSet.add name !locals
+               | I_funcall _ ->
+                   let generated_destinations =
+                     instr_writes ~direct:true sub |> NameSet.filter (function Gen _ -> true | _ -> false)
+                   in
+                   locals := NameSet.union generated_destinations !locals
+               | _ -> ()
+               );
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    !locals
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      let locals = function_locals args body in
+      let destination_allowed = function Return _ -> true | name -> NameSet.mem name locals in
+      CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body destination_allowed body), def_annot)
+  | CDEF_register (id, ctyp, body) ->
+      CDEF_aux (CDEF_register (id, ctyp, rewrite_body (fun _ -> true) body), def_annot)
+  | CDEF_let (number, bindings, body) ->
+      let destinations = NameSet.of_list (List.map (fun (id, _) -> name id) bindings) in
+      let destination_allowed name = NameSet.mem name destinations in
+      CDEF_aux (CDEF_let (number, bindings, rewrite_body destination_allowed body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
 (* Turn a structured expression whose one arm exits into an early guard.
    Sail often needs an arm to retain dependent-type facts, but C no longer
    needs that lexical proof scope after JIB has fixed every ctyp:
@@ -5268,40 +5605,57 @@ let flatten_terminal_guards ctx (CDEF_aux (aux, def_annot)) =
    type, so assigning the producer directly performs the same C conversion as
    assigning it through the temporary first.  This intentionally does not
    substitute a differently typed producer into arbitrary arithmetic. *)
-let fold_copy_conversions (CDEF_aux (aux, def_annot)) =
-  let rewrite_lists instrs =
+let fold_copy_conversions narrowing_policy (CDEF_aux (aux, def_annot)) =
+  let rewrite_lists ~fold_init ~fold_temporary instrs =
     let rec rewrite = function
       | I_aux (I_funcall (CR_one (CL_id (temporary, temporary_ctyp)), extern, callee, args), call_aux)
         :: I_aux (I_return (V_id (result, result_ctyp)), _)
         :: rest
         when Name.compare temporary result = 0 && ctyp_equal temporary_ctyp result_ctyp ->
           I_aux (I_funcall (CR_one (CL_id (Return (-1), result_ctyp)), extern, callee, args), call_aux) :: rewrite rest
-      | I_aux (I_init (temporary_ctyp, temporary, Init_cval cval), _)
+      | (I_aux (I_init (temporary_ctyp, temporary, Init_cval cval), _) as initialization)
         :: I_aux (I_return (V_id (result, result_ctyp)), return_aux)
         :: rest
         when Name.compare temporary result = 0
-             && ctyp_equal temporary_ctyp result_ctyp
-             && ctyp_equal temporary_ctyp (cval_ctyp cval) ->
-          I_aux (I_return cval, return_aux) :: rewrite rest
-      | I_aux (I_copy (CL_id (temporary, temporary_ctyp), cval), _)
+             && ctyp_equal temporary_ctyp result_ctyp -> (
+          match preserve_assignment_conversion narrowing_policy result_ctyp cval with
+          | Some cval -> I_aux (I_return cval, return_aux) :: rewrite rest
+          | None -> initialization :: I_aux (I_return (V_id (result, result_ctyp)), return_aux) :: rewrite rest
+        )
+      | (I_aux (I_copy (CL_id (temporary, temporary_ctyp), cval), _) as copy)
         :: I_aux (I_return (V_id (result, result_ctyp)), return_aux)
         :: rest
         when Name.compare temporary result = 0
-             && ctyp_equal temporary_ctyp result_ctyp
-             && ctyp_equal temporary_ctyp (cval_ctyp cval) ->
-          I_aux (I_return cval, return_aux) :: rewrite rest
+             && ctyp_equal temporary_ctyp result_ctyp -> (
+          match preserve_assignment_conversion narrowing_policy result_ctyp cval with
+          | Some cval -> I_aux (I_return cval, return_aux) :: rewrite rest
+          | None -> copy :: I_aux (I_return (V_id (result, result_ctyp)), return_aux) :: rewrite rest
+        )
       | I_aux (I_copy (CL_id (temporary, temporary_ctyp), cval), _)
         :: I_aux (I_copy (destination, V_id (source, source_ctyp)), copy_aux)
         :: rest
-        when Name.compare temporary source = 0
+        when fold_temporary temporary_ctyp
+             && Name.compare temporary source = 0
              && ctyp_equal temporary_ctyp source_ctyp
              && ctyp_equal temporary_ctyp (clexp_ctyp destination)
+             && not (List.exists (fun instr -> instr_references ~read:temporary ~direct:false instr) rest) ->
+          I_aux (I_copy (destination, cval), copy_aux) :: rewrite rest
+      | I_aux (I_init (temporary_ctyp, temporary, Init_cval cval), _)
+        :: I_aux (I_copy (destination, V_id (source, source_ctyp)), copy_aux)
+        :: rest
+        when fold_init
+             && fold_temporary temporary_ctyp
+             && Name.compare temporary source = 0
+             && ctyp_equal temporary_ctyp source_ctyp
+             && ctyp_equal temporary_ctyp (clexp_ctyp destination)
+             && ctyp_equal temporary_ctyp (cval_ctyp cval)
              && not (List.exists (fun instr -> instr_references ~read:temporary ~direct:false instr) rest) ->
           I_aux (I_copy (destination, cval), copy_aux) :: rewrite rest
       | I_aux (I_funcall (CR_one (CL_id (temporary, temporary_ctyp)), extern, callee, args), call_aux)
         :: I_aux (I_copy (destination, V_id (source, source_ctyp)), _)
         :: rest
-        when Name.compare temporary source = 0
+        when fold_temporary temporary_ctyp
+             && Name.compare temporary source = 0
              && ctyp_equal temporary_ctyp source_ctyp
              && ctyp_equal temporary_ctyp (clexp_ctyp destination)
              && not (List.exists (fun instr -> instr_references ~read:temporary ~direct:false instr) rest) ->
@@ -5311,7 +5665,282 @@ let fold_copy_conversions (CDEF_aux (aux, def_annot)) =
     in
     rewrite instrs
   in
+  let rewrite_body ~fold_init ~fold_temporary body =
+    let rec fixpoint n body =
+      let rewrite = rewrite_lists ~fold_init ~fold_temporary in
+      let rewritten = List.map (map_instrs rewrite) body |> rewrite in
+      if n = 0 || rewritten = body then rewritten else fixpoint (n - 1) rewritten
+    in
+    fixpoint 2 body
+  in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) ->
+      CDEF_aux
+        ( CDEF_fundef
+            (id, ret, args, rewrite_body ~fold_init:true ~fold_temporary:(fun _ -> true) body),
+          def_annot
+        )
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* A fixed-layout variant constructor or an effect-analysis-proven pure call is
+   a pure value operation.  JIB can nevertheless leave its result in a
+   generated local while state-passing output assignments are emitted before
+   the sole consumer:
+
+     outcome = Failed(kind);
+     *gas = 0;
+     return outcome;
+
+   Move only constructor or proven-pure calls, and only through one
+   straight-line sequence which neither mentions the result nor changes an
+   argument root.  The call can then target the return or assignment
+   destination directly.  Restricting this to stack representations avoids
+   changing managed-value ownership or allocation order.  Ordinary pure calls
+   are not moved across another call: a C extern declared pure may still read
+   storage reachable through a pointer argument, and an intervening call could
+   mutate an alias which JIB's root analysis cannot see. *)
+let sink_single_use_pure_stack_calls ctx (CDEF_aux (aux, def_annot)) =
+  let same_name left right = Name.compare left right = 0 in
+  let mentioned name instr = NameSet.mem name (instr_ids ~direct:false instr) in
+  let later_mention name instrs = List.exists (mentioned name) instrs in
+  let call_is_proven_pure callee = function_is_pure ctx (fst callee) in
+  let straight_line allow_calls = function
+    | I_aux ((I_decl _ | I_init _ | I_reinit _ | I_reset _ | I_copy _ | I_comment _), _) -> true
+    | I_aux (I_funcall _, _) -> allow_calls
+    | _ -> false
+  in
+  let safe_gap_instr allow_calls temporary roots instr =
+    straight_line allow_calls instr
+    && not (mentioned temporary instr)
+    && NameSet.disjoint roots (instr_writes ~direct:false instr)
+  in
+  (* Retargeting differs from sinking: the call remains before the gap, so its
+     effects and exception point are unchanged.  Only a plain local can be
+     targeted this way; assigning a Return destination would emit an early C
+     return and therefore still uses the pure sinking path below. *)
+  let retarget_call temporary temporary_ctyp extern callee args call_aux rest =
+    let straight_line = function
+      | I_aux ((I_decl _ | I_init _ | I_reinit _ | I_reset _ | I_copy _ | I_comment _ | I_funcall _), _) ->
+          true
+      | _ -> false
+    in
+    let rec find rev_gap = function
+      | I_aux
+          ( I_copy
+              ((CL_id (destination_name, _) as destination), V_id (source, source_ctyp)),
+            _
+          )
+        :: tail
+        when same_name temporary source
+             && ctyp_equal temporary_ctyp source_ctyp
+             && ctyp_equal temporary_ctyp (clexp_ctyp destination)
+             && (match destination_name with Return _ -> false | _ -> true)
+             && List.for_all (fun instr -> not (mentioned destination_name instr)) rev_gap
+             && not (later_mention temporary tail) ->
+          Some
+            ( I_aux (I_funcall (CR_one destination, extern, callee, args), call_aux)
+              :: List.rev_append rev_gap tail
+            )
+      | instr :: tail when straight_line instr && not (mentioned temporary instr) -> find (instr :: rev_gap) tail
+      | _ -> None
+    in
+    find [] rest
+  in
+  let sink_call allow_calls temporary temporary_ctyp extern callee args call_aux rest =
+    let roots =
+      instr_reads ~direct:true
+        (I_aux (I_funcall (CR_one (CL_void temporary_ctyp), extern, callee, args), call_aux))
+    in
+    let rec find rev_gap = function
+      | I_aux (I_return (V_id (result, result_ctyp)), _) :: tail
+        when same_name temporary result
+             && ctyp_equal temporary_ctyp result_ctyp
+             && not (later_mention temporary tail) ->
+          Some
+            ( List.rev rev_gap
+              @ [I_aux (I_funcall (CR_one (CL_id (Return (-1), result_ctyp)), extern, callee, args), call_aux)]
+              @ tail
+            )
+      | I_aux (I_copy (destination, V_id (source, source_ctyp)), _) :: tail
+        when same_name temporary source
+             && ctyp_equal temporary_ctyp source_ctyp
+             && ctyp_equal temporary_ctyp (clexp_ctyp destination)
+             && not (later_mention temporary tail) ->
+          Some
+            ( List.rev rev_gap
+              @ [I_aux (I_funcall (CR_one destination, extern, callee, args), call_aux)]
+              @ tail
+            )
+      | instr :: tail when safe_gap_instr allow_calls temporary roots instr -> find (instr :: rev_gap) tail
+      | _ -> None
+    in
+    find [] rest
+  in
+  let rewrite_lists instrs =
+    let rec rewrite = function
+      | I_aux (I_decl (decl_ctyp, declared), decl_aux) ::
+        I_aux
+          ( I_funcall (CR_one (CL_id (temporary, temporary_ctyp)), (Call _ as extern), callee, args),
+            call_aux
+        ) :: rest
+        when same_name declared temporary
+             && ctyp_equal decl_ctyp temporary_ctyp
+             && is_stack_ctyp ctx temporary_ctyp -> (
+          match retarget_call temporary temporary_ctyp extern callee args call_aux rest with
+          | Some rewritten -> rewrite rewritten
+          | None when is_variant_constructor ctx (fst callee) || call_is_proven_pure callee -> (
+              let allow_calls = is_variant_constructor ctx (fst callee) in
+              match sink_call allow_calls temporary temporary_ctyp extern callee args call_aux rest with
+              | Some rewritten -> rewrite rewritten
+              | None ->
+                  I_aux (I_decl (decl_ctyp, declared), decl_aux)
+                  :: I_aux (I_funcall (CR_one (CL_id (temporary, temporary_ctyp)), extern, callee, args), call_aux)
+                  :: rewrite rest
+            )
+          | None ->
+              I_aux (I_decl (decl_ctyp, declared), decl_aux)
+              :: I_aux (I_funcall (CR_one (CL_id (temporary, temporary_ctyp)), extern, callee, args), call_aux)
+              :: rewrite rest
+        )
+      | ( I_aux
+            ( I_funcall (CR_one (CL_id (temporary, temporary_ctyp)), (Call _ as extern), callee, args),
+              call_aux
+            ) as call
+        ) :: rest
+        when is_stack_ctyp ctx temporary_ctyp -> (
+          match retarget_call temporary temporary_ctyp extern callee args call_aux rest with
+          | Some rewritten -> rewrite rewritten
+          | None when is_variant_constructor ctx (fst callee) || call_is_proven_pure callee -> (
+              let allow_calls = is_variant_constructor ctx (fst callee) in
+              match sink_call allow_calls temporary temporary_ctyp extern callee args call_aux rest with
+              | Some rewritten -> rewrite rewritten
+              | None -> call :: rewrite rest
+            )
+          | None -> call :: rewrite rest
+        )
+      | instr :: rest -> instr :: rewrite rest
+      | [] -> []
+    in
+    rewrite instrs
+  in
+  let rewrite_body body = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
+  match aux with
+  | CDEF_fundef (id, ret, args, body) -> CDEF_aux (CDEF_fundef (id, ret, args, rewrite_body body), def_annot)
+  | _ -> CDEF_aux (aux, def_annot)
+
+(* JIB lowers a value-producing conditional which is nested inside a larger
+   expression through a private join local, even when the enclosing expression
+   has already introduced its final named destination:
+
+     if (condition) temporary = left; else temporary = right;
+     destination = temporary;
+
+   Retarget each producing arm to [destination] and remove the copy.  Unlike
+   call sinking this never changes instruction order, so effectful calls and
+   their exception checks remain at the original point.  Whole-function
+   read/write counts prove that the local is private to this exact join, while
+   [sink] accepts a non-producing arm only when it is already terminal. *)
+let retarget_structured_stack_joins narrowing_policy ctx (CDEF_aux (aux, def_annot)) =
+  let same_name left right = Name.compare left right = 0 in
+  let rec destination_names = function
+    | CL_id (name, _) -> NameSet.singleton name
+    | CL_rmw (read, write, _) -> NameSet.of_list [read; write]
+    | CL_field (base, _, _) | CL_tuple (base, _) | CL_addr base -> destination_names base
+    | CL_void _ -> NameSet.empty
+  in
+  let rec terminal = function
+    | [] -> false
+    | instrs -> (
+        match List.rev instrs with
+        | I_aux (I_exit _, _) :: _
+        | I_aux (I_return _, _) :: _
+        | I_aux (I_copy (CL_id (Return _, _), _), _) :: _
+        | I_aux (I_funcall (CR_one (CL_id (Return _, _)), _, _, _), _) :: _ ->
+            true
+        | I_aux (I_if (_, then_instrs, else_instrs), _) :: _ -> terminal then_instrs && terminal else_instrs
+        | I_aux (I_block instrs, _) :: _ | I_aux (I_try_block instrs, _) :: _ -> terminal instrs
+        | _ -> false
+      )
+  in
+  let rec sink temporary temporary_ctyp destination instrs =
+    match List.rev instrs with
+    | I_aux (I_copy (CL_id (assigned, assigned_ctyp), value), copy_aux) :: rev_prefix
+      when same_name temporary assigned && ctyp_equal temporary_ctyp assigned_ctyp -> (
+        match preserve_assignment_conversion narrowing_policy (clexp_ctyp destination) value with
+        | Some value -> Some (List.rev (I_aux (I_copy (destination, value), copy_aux) :: rev_prefix), 1)
+        | None -> None
+      )
+    | I_aux (I_funcall (CR_one (CL_id (assigned, assigned_ctyp)), extern, callee, args), call_aux) :: rev_prefix
+      when same_name temporary assigned
+           && ctyp_equal temporary_ctyp assigned_ctyp
+           && ctyp_equal temporary_ctyp (clexp_ctyp destination) ->
+        Some
+          ( List.rev (I_aux (I_funcall (CR_one destination, extern, callee, args), call_aux) :: rev_prefix),
+            1
+          )
+    | I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rev_prefix -> (
+        match (sink temporary temporary_ctyp destination then_instrs, sink temporary temporary_ctyp destination else_instrs) with
+        | Some (then_instrs, then_writes), Some (else_instrs, else_writes) ->
+            Some
+              ( List.rev (I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rev_prefix),
+                then_writes + else_writes
+              )
+        | Some (then_instrs, then_writes), None when terminal else_instrs ->
+            Some (List.rev (I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rev_prefix), then_writes)
+        | None, Some (else_instrs, else_writes) when terminal then_instrs ->
+            Some (List.rev (I_aux (I_if (condition, then_instrs, else_instrs), if_aux) :: rev_prefix), else_writes)
+        | _ -> None
+      )
+    | I_aux (I_block block, block_aux) :: rev_prefix -> (
+        match sink temporary temporary_ctyp destination block with
+        | Some (block, writes) -> Some (List.rev (I_aux (I_block block, block_aux) :: rev_prefix), writes)
+        | None -> None
+      )
+    | I_aux (I_try_block block, block_aux) :: rev_prefix -> (
+        match sink temporary temporary_ctyp destination block with
+        | Some (block, writes) -> Some (List.rev (I_aux (I_try_block block, block_aux) :: rev_prefix), writes)
+        | None -> None
+      )
+    | _ -> None
+  in
+  let count_occurrences select name body =
+    let count = ref 0 in
+    List.iter
+      (fun instr ->
+        ignore
+          (map_instr
+             (fun (I_aux (_, _) as sub) ->
+               if NameSet.mem name (select ~direct:true sub) then incr count;
+               sub
+             )
+             instr
+          )
+      )
+      body;
+    !count
+  in
   let rewrite_body body =
+    let read_count name = count_occurrences instr_reads name body in
+    let write_count name = count_occurrences instr_writes name body in
+    let rec rewrite_lists = function
+      | (I_aux ((I_if _ | I_block _ | I_try_block _), _) as structured)
+        :: (I_aux
+              ( I_copy
+                  (destination, V_id (temporary, temporary_ctyp)),
+                _
+              ) as copy)
+        :: rest
+        when is_stack_ctyp ctx temporary_ctyp
+             && read_count temporary = 1
+             && ctyp_equal temporary_ctyp (clexp_ctyp destination)
+             && NameSet.disjoint (destination_names destination) (instr_ids ~direct:false structured) -> (
+          match sink temporary temporary_ctyp destination [structured] with
+          | Some (rewritten, writes) when writes = write_count temporary -> rewritten @ rewrite_lists rest
+          | _ -> structured :: copy :: rewrite_lists rest
+        )
+      | instr :: rest -> instr :: rewrite_lists rest
+      | [] -> []
+    in
     let rec fixpoint n body =
       let rewritten = List.map (map_instrs rewrite_lists) body |> rewrite_lists in
       if n = 0 || rewritten = body then rewritten else fixpoint (n - 1) rewritten
@@ -6528,6 +7157,7 @@ let optimize ~have_rts ~specialize_c ~optimized_model ~narrowing_policy ctx recu
   |> (if !optimize_pure_copies then List.map (flatten_unique_stack_blocks ctx) else nothing)
   |> (if !optimize_pure_copies then List.map fold_fixed_bytes_zero_vectors else nothing)
   |> (if !optimize_pure_copies then List.map (fold_stack_aggregate_construction narrowing_policy ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map (retarget_private_record_construction ctx) else nothing)
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map merge_repeated_conditional_branches else nothing)
   |> (if !optimize_pure_copies then List.map simplify_bounded_integer_predicates else nothing)
@@ -6535,14 +7165,14 @@ let optimize ~have_rts ~specialize_c ~optimized_model ~narrowing_policy ctx recu
   |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
-  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_copy_conversions narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_alias then List.concat_map remove_alias else nothing)
   |> (if !optimize_alias then combine_variables ctx else nothing)
-  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_copy_conversions narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
@@ -6560,7 +7190,7 @@ let optimize ~have_rts ~specialize_c ~optimized_model ~narrowing_policy ctx recu
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
-  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_copy_conversions narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   (* We need the runtime to initialize hoisted allocations *)
@@ -6571,13 +7201,13 @@ let optimize ~have_rts ~specialize_c ~optimized_model ~narrowing_policy ctx recu
   |> remove_stack_clears ctx
   |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
   |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
-  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_copy_conversions narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
-  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_copy_conversions narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_unit_results then List.map (discard_unread_stack_results ctx) else nothing)
@@ -6608,8 +7238,12 @@ let optimize ~have_rts ~specialize_c ~optimized_model ~narrowing_policy ctx recu
   |> (if !optimize_pure_copies then List.map simplify_boolean_control_flow else nothing)
   |> (if !optimize_pure_copies then List.map merge_repeated_conditional_branches else nothing)
   |> (if !optimize_pure_copies then List.map (initialize_stack_locals narrowing_policy) else nothing)
-  |> (if !optimize_pure_copies then List.map fold_copy_conversions else nothing)
+  |> (if !optimize_pure_copies then List.map (inline_single_eager_stack_values ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
+  |> (if !optimize_pure_copies then List.map (fold_copy_conversions narrowing_policy) else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_single_use_pure_stack_calls ctx) else nothing)
   |> (if !optimize_pure_copies then List.map structure_forward_match_joins else nothing)
+  |> (if !optimize_pure_copies then List.map (retarget_structured_stack_joins narrowing_policy ctx) else nothing)
   |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   (* Late return sinking creates new terminal branches after the earlier guard
@@ -6624,12 +7258,18 @@ let optimize ~have_rts ~specialize_c ~optimized_model ~narrowing_policy ctx recu
   |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
   |> (if !optimize_pure_copies then propagate_pure_copies narrowing_policy ctx else nothing)
   |> (if !optimize_pure_copies then List.map structure_forward_match_joins else nothing)
+  |> (if !optimize_pure_copies then List.map (retarget_structured_stack_joins narrowing_policy ctx) else nothing)
   |> (if !optimize_pure_copies then List.map (sink_terminal_stack_returns narrowing_policy) else nothing)
   |> (if !optimize_pure_copies then List.map (flatten_terminal_guards ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map (sink_single_use_pure_stack_calls ctx) else nothing)
   |> (if !optimize_pure_copies then List.map (consolidate_named_aggregate_returns ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map (inline_single_eager_stack_values ctx) else nothing)
+  |> (if !optimize_pure_copies then List.map collapse_short_circuit_booleans else nothing)
+  |> (if !optimize_pure_copies then List.map (retarget_private_record_construction ctx) else nothing)
   |> List.map (prune_after_noreturn_call ctx)
   |> (if !optimize_unit_results then List.map (discard_unread_stack_results ctx) else nothing)
-  |> if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing
+  |> (if !optimize_pure_copies then List.map (fold_copy_conversions narrowing_policy) else nothing)
+  |> (if !optimize_pure_copies then List.map simplify_pure_copy_scaffolding else nothing)
 
 (**************************************************************************)
 (* 6. Code generation                                                     *)
@@ -6685,7 +7325,7 @@ module type CODEGEN_CONFIG = sig
   val c_repr_fixed_bytes : int Bindings.t
   val c_repr_fixed_bytes_u64_lanes : int Bindings.t
   val c_repr_fixed_bytes_u64_lane_alias_lengths : int list
-  val c_repr_fixed_bytes_names : (int * string) list
+  val c_repr_fixed_bytes_names : ((string * int) * string) list
   val c_static_evaluators : string Bindings.t
   val specialize_c : bool
   val require_bounded_int : bool
@@ -6974,7 +7614,8 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
 
   let fixed_bytes_type_name ctyp =
     let length = Option.get (c_repr_fixed_bytes_length ctyp) in
-    match List.assoc_opt length Config.c_repr_fixed_bytes_names with
+    let representation = if is_c_repr_fixed_bytes_u64_lanes ctyp then "fixed_bytes_u64_lanes" else "fixed_bytes" in
+    match List.assoc_opt (representation, length) Config.c_repr_fixed_bytes_names with
     | Some name -> name
     | None when is_c_repr_fixed_bytes_u64_lanes ctyp -> "fixed_bytes_u64_lanes_" ^ string_of_int length
     | None -> "fixed_bytes_" ^ string_of_int length
@@ -9179,13 +9820,17 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       )
     | _ -> false
 
-  (* Return the C expression for the ordinary internal-call subset whose
-     renderer is exactly [sgen_function_uid(args)].  Calls routed through an
-     extern, a direct tuple ABI, or one of the runtime primitive spellings
-     below need the full statement renderer and are deliberately excluded.
-     Keeping this predicate beside the call renderer makes the few expression
-     fusions below conservative: if a runtime primitive acquires a special
-     spelling, it must remain a statement until it is added here. *)
+  (* Return the C expression for the ordinary stack-call subset whose renderer
+     is a plain function application.  Internal calls use
+     [sgen_function_uid(args)]; an explicitly pure C extern uses its bound
+     symbol directly.  Calls routed through a backend extern mapping, a direct
+     tuple ABI, or most runtime primitive spellings below need the full
+     statement renderer and are deliberately excluded.  The small
+     [runtime_expression_name] subset duplicates the statement renderer's
+     spelling exactly for pure scalar access/equality operations.  Keeping the
+     exception list beside the call renderer makes the few expression fusions
+     below conservative: a runtime primitive must be added explicitly here
+     before it can be rendered at a single use site. *)
   let inlineable_internal_stack_call_expression ctx extern_info f args result_ctyp =
     let runtime_primitive_name = function
       | "__sail_from_bytes_le_fixed_u256"
@@ -9227,22 +9872,39 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
       | "reg_deref" -> true
       | _ -> false
     in
-    match extern_info with
-    | Jib.Extern _ -> None
-    | Jib.Call _
-      when (not (ctx_is_extern (fst f) ctx))
-           && is_stack_ctyp ctx result_ctyp
-           && (not (ctyp_equal result_ctyp CT_unit))
-           && Option.is_none (Bindings.find_opt (fst f) !direct_tuple_result_abis) ->
-        let args =
-          if erase_unit_values && not (is_variant_constructor ctx (fst f)) then
-            List.filter (fun arg -> not (ctyp_equal (cval_ctyp arg) CT_unit)) args
-          else args
-        in
-        let fname = sgen_function_uid f in
-        if runtime_primitive_name fname then None
+    let runtime_expression_name fname =
+      match (fname, args) with
+      | "eq_anything", cval :: _ -> Some (sprintf "eq_%s" (sgen_ctyp_name (cval_ctyp cval)))
+      | "fast_vector_access", cval :: _ ->
+          Some (sprintf "fast_vector_access_%s" (sgen_ctyp_name (cval_ctyp cval)))
+      | "fast_unsigned_vector_access", cval :: _ ->
+          Some (sprintf "fast_unsigned_vector_access_%s" (sgen_ctyp_name (cval_ctyp cval)))
+      | _ -> None
+    in
+    let inlineable_result =
+      is_stack_ctyp ctx result_ctyp
+      && (not (ctyp_equal result_ctyp CT_unit))
+      && Option.is_none (Bindings.find_opt (fst f) !direct_tuple_result_abis)
+    in
+    let filtered_args =
+      if erase_unit_values && not (is_variant_constructor ctx (fst f)) then
+        List.filter (fun arg -> not (ctyp_equal (cval_ctyp arg) CT_unit)) args
+      else args
+    in
+    let application ~is_extern fname =
+      let runtime_fname = runtime_expression_name fname in
+      match runtime_fname with
+      | None when runtime_primitive_name fname -> None
+      | _ ->
+        let fname = Option.value ~default:fname runtime_fname in
+        let arguments = Util.string_of_list ", " sgen_cval_in_value_context filtered_args in
+        if Option.is_some runtime_fname then
+          current_static_helper_demands := Util.StringSet.add fname !current_static_helper_demands;
+        if is_extern then (
+          emitted_external_functions := Util.StringSet.add fname !emitted_external_functions;
+          Some (Printf.sprintf "%s(%s%s)" fname (extra_arguments true) arguments)
+        )
         else
-          let arguments = Util.string_of_list ", " sgen_cval_in_value_context args in
           let regs_argument =
             if register_file_threaded_function (fst f) then
               if !current_function_threaded then register_file_param else "&" ^ register_file_variable
@@ -9255,6 +9917,18 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           in
           current_static_helper_demands := Util.StringSet.add fname !current_static_helper_demands;
           Some (Printf.sprintf "%s(%s%s)" fname (extra_arguments false) arguments)
+    in
+    match extern_info with
+    | Jib.Extern _ when inlineable_result && function_is_pure ctx (fst f) ->
+        application ~is_extern:true (string_of_id (fst f))
+    | Jib.Extern _ -> None
+    | Jib.Call _
+      when ctx_is_extern (fst f) ctx && inlineable_result && function_is_pure ctx (fst f) ->
+        application ~is_extern:true (ctx_get_extern (fst f) ctx)
+    | Jib.Call _
+      when (not (ctx_is_extern (fst f) ctx))
+           && inlineable_result ->
+        application ~is_extern:false (sgen_function_uid f)
     | Jib.Call _ -> None
 
   let rec codegen_instr fid ctx (I_aux (instr, (_, l))) =
@@ -10091,6 +10765,84 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
          expose another one immediately before emission. *)
       | instr :: I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp -> docs (instr :: rest)
       | I_aux (I_clear (ctyp, _), _) :: rest when is_stack_ctyp ctx ctyp -> docs rest
+      (* ANF may place one pure scalar expression between an internal call and
+         its eventual consumer:
+
+           call_result = make_value(...);
+           argument = pure_expression(call_result);
+           consume(argument);
+
+         The intervening declaration has no effect.  Substitute the call into
+         that expression and let the existing initializer/consumer folds
+         continue from there.  This retains the producer's original eager
+         evaluation point: it moves only across a declaration, not across a
+         read, write, or second call. *)
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux
+             ( I_funcall
+                 ( CR_one (CL_id (destination, destination_ctyp)),
+                   extern_info,
+                   callee,
+                   arguments
+                 ),
+               _
+             )
+        :: (I_aux (I_decl (_, expression_local), _) as expression_declaration)
+        :: (I_aux
+              (I_copy (CL_id (expression_destination, _), expression), _)
+             as expression_initialization
+           )
+        :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
+             && Name.compare declared destination = 0
+             && Name.compare expression_local expression_destination = 0
+             && stack_call_initializer_compatible declared_ctyp destination_ctyp
+             && cval_name_read_count declared expression = 1
+             && not (cval_has_short_circuit expression)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:declared ~direct:false instr)
+                     rest
+                  )
+             && Option.is_some
+                  (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp) ->
+          let call =
+            Option.get
+              (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp)
+          in
+          with_inline_cval_expression declared ("(" ^ call ^ ")") (fun () ->
+              docs (expression_declaration :: expression_initialization :: rest)
+          )
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux
+             ( I_funcall
+                 ( CR_one (CL_id (destination, destination_ctyp)),
+                   extern_info,
+                   callee,
+                   arguments
+                 ),
+               _
+             )
+        :: (I_aux (I_init (_, initialized, Init_cval expression), _) as initialization)
+        :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
+             && Name.compare declared destination = 0
+             && Name.compare declared initialized <> 0
+             && stack_call_initializer_compatible declared_ctyp destination_ctyp
+             && cval_name_read_count declared expression = 1
+             && not (cval_has_short_circuit expression)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:declared ~direct:false instr)
+                     rest
+                  )
+             && Option.is_some
+                  (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp) ->
+          let call =
+            Option.get
+              (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp)
+          in
+          with_inline_cval_expression declared ("(" ^ call ^ ")") (fun () -> docs (initialization :: rest))
       (* A pure scalar snapshot consumed by the immediately following call has
          no independent lifetime.  Render the existing safe initializer at the
          argument use site.  In particular, reuse [stack_conversion_initializer]
@@ -10223,6 +10975,87 @@ module Codegen (Config : CODEGEN_CONFIG) = struct
           in
           with_inline_cval_expression declared ("(" ^ call ^ ")") (fun () ->
               codegen_instr fid ctx return_instruction
+          )
+          :: docs rest
+      (* The same single-use call shape also occurs when ANF builds a
+         stack-represented aggregate:
+
+           field_result = make_field(...);
+           aggregate = { .field = field_result, ... };
+
+         The aggregate cval is pure, so rendering the internal call at its
+         sole read preserves the original evaluation point and call order.
+         As with return and guard fusion, exclude short-circuit expressions,
+         externs, direct tuple ABIs, managed values, and every later use. *)
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux
+             ( I_funcall
+                 ( CR_one (CL_id (destination, destination_ctyp)),
+                   extern_info,
+                   callee,
+                   arguments
+                 ),
+               _
+             )
+        :: (I_aux (I_copy (_, copied_value), _) as copy_instruction)
+        :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
+             && Name.compare declared destination = 0
+             && stack_call_initializer_compatible declared_ctyp destination_ctyp
+             && cval_name_read_count declared copied_value = 1
+             && not (cval_has_short_circuit copied_value)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:declared ~direct:false instr)
+                     rest
+                  )
+             && Option.is_some
+                  (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp) ->
+          let call =
+            Option.get
+              (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp)
+          in
+          with_inline_cval_expression declared ("(" ^ call ^ ")") (fun () ->
+              codegen_instr fid ctx copy_instruction
+          )
+          :: docs rest
+      (* A proven-pure producer used once by the immediately following call has
+         no independent lifetime.  JIB call arguments are value expressions:
+         the other arguments cannot perform writes, and the consumer still
+         runs only after the producer has returned.  It is therefore safe to
+         substitute into a multi-argument consumer as well as a unary one. *)
+      | I_aux (I_decl (declared_ctyp, declared), _)
+        :: I_aux
+             ( I_funcall
+                 ( CR_one (CL_id (destination, destination_ctyp)),
+                   extern_info,
+                   callee,
+                   arguments
+                 ),
+               _
+             )
+        :: (I_aux (I_funcall (_, _, consumer, consumer_arguments), _) as consumer_instruction)
+        :: rest
+        when Config.optimized_model && (not Config.cpp) && is_stack_ctyp ctx declared_ctyp
+             && Name.compare declared destination = 0
+             && stack_call_initializer_compatible declared_ctyp destination_ctyp
+             && cvals_name_read_count declared consumer_arguments = 1
+             && not (List.exists cval_has_short_circuit consumer_arguments)
+             && not (instr_references ~write:declared ~direct:false consumer_instruction)
+             && function_is_pure ctx (fst callee)
+             && not
+                  (List.exists
+                     (fun instr -> instr_references ~read:declared ~direct:false instr)
+                     rest
+                  )
+             && Option.is_some
+                  (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp) ->
+          let call =
+            Option.get
+              (inlineable_internal_stack_call_expression ctx extern_info callee arguments destination_ctyp)
+          in
+          with_inline_cval_expression declared ("(" ^ call ^ ")") (fun () ->
+              codegen_instr fid ctx consumer_instruction
           )
           :: docs rest
       | I_aux (I_decl (declared_ctyp, declared), _)
@@ -14541,6 +15374,7 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
     optimize_stack_aggregates := Config.optimized_model;
     c_repr_external_value_types :=
       Bindings.fold (fun id _ types -> IdSet.add id types) Config.external_type_names IdSet.empty;
+    c_repr_external_type_names := Config.external_type_names;
     let module Jibc = Make (C_config (struct
       let branch_coverage = Config.branch_coverage
       let assert_to_exception = Config.assert_to_exception
@@ -15726,6 +16560,21 @@ static inline %s fast_unsigned_vector_init_%s(const uint64_t length_arg, const u
           direct_tuple_result_abis := Bindings.empty;
           cdefs
         )
+      in
+      (* Direct tuple lowering turns a terminal aggregate field into the
+         ordinary straight-line shape consumed by constructor sinking:
+
+           outcome = Continue(UNIT);
+           *gas = gas_after;
+           *sp = sp_after;
+           return outcome;
+
+         Run the typed transform once more at that ABI boundary so the
+         constructor can become the native return expression directly. *)
+      let cdefs =
+        if Config.optimized_model && !optimize_pure_copies then
+          List.map (sink_single_use_pure_stack_calls ctx) cdefs
+        else cdefs
       in
 
       generated := IdSet.empty;

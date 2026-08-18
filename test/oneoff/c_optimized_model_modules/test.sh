@@ -53,14 +53,14 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve sample_choice_value --c-preserve added_is_nonzero \
   --c-preserve boolean_cleanup --c-preserve positive_branch --c-preserve early_wide_guard --c-preserve short_circuit_guard --c-preserve widened_tuple_match --c-preserve widened_tuple_call \
   --c-preserve repeated_branch \
-  --c-preserve repeated_call_branch --c-preserve boolean_value_join --c-preserve boolean_comparison_join \
+  --c-preserve repeated_call_branch --c-preserve boolean_value_join --c-preserve boolean_comparison_join --c-preserve widened_branch_join \
   --c-preserve call_discard_internal_parameter --c-preserve call_discard_computed_parameter \
   --c-preserve preserve_unused_parameter \
   --c-preserve widen_optional_byte \
   --c-preserve test_gas --c-preserve test_gas_alias --c-preserve test_fixed_bytes_zero --c-preserve test_fixed_bit_bytes_path_zero \
   --c-preserve test_fixed_bytes_one --c-preserve test_lane_bytes \
   --c-preserve fixed_bytes_path_empty --c-preserve fixed_bytes_path_local --c-preserve twenty_bytes_equal \
-  --c-preserve runtime_label_test --c-preserve runtime_pair --c-preserve always_fatal --c-preserve fatal_error \
+  --c-preserve runtime_label_test --c-preserve runtime_pair --c-preserve empty_byte_slice_len --c-preserve always_fatal --c-preserve fatal_error \
   --c-preserve terminal_assertion \
   --c-preserve decrement_byte --c-preserve increment_to --c-preserve count_four \
   --c-preserve increment_to_via_call \
@@ -91,9 +91,10 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve main --c-preserve run --c-preserve step --c-preserve pick_fixed_id --c-preserve pick_initialized_id \
   --c-preserve pick_guarded_id --c-preserve pick_test_discount \
   --c-preserve machine_pick_zero --c-preserve reset_counter --c-preserve preserve_counter_snapshot \
-  --c-preserve make_public_pair --c-preserve save_pair_then_read --c-preserve initialized_comparison_return \
+  --c-preserve make_public_pair --c-preserve initialize_public_pair --c-preserve startup_pair_first --c-preserve terminal_proven_narrow_sum --c-preserve save_pair_then_read --c-preserve initialized_comparison_return \
   --c-preserve call_specialized_comparison --c-preserve call_specialized_enum_comparison \
   --c-preserve conditional_word --c-preserve conditional_bool --c-preserve conditional_bool_false \
+  --c-preserve nested_pair_join \
   --c-preserve terminal_choice --c-preserve terminal_enum_match --c-preserve terminal_enum_grouped \
   --c-preserve state_passing_outcome --c-preserve state_passing_guard --c-preserve call_state_passing_guard \
   --c-preserve state_passing_guard_failed \
@@ -109,8 +110,14 @@ cp "$TEST_DIR/external_types.h" "$HOST_INCLUDE/types.h"
   --c-preserve terminal_signed_word_or_fatal \
   --c-preserve terminal_signed_doubleword_or_fatal \
   --c-preserve throwing_signed_byte --c-preserve recover_throwing_signed_byte \
-  --c-preserve terminal_unit_variant_match \
-  --c-preserve terminal_fixed_bytes_match \
+  --c-preserve terminal_unit_variant_match --c-preserve terminal_variant_after_write \
+  --c-preserve call_result_in_struct \
+  --c-preserve call_result_as_argument \
+  --c-preserve call_result_as_later_argument \
+  --c-preserve call_result_through_expression \
+  --c-preserve pure_extern_result_through_expression \
+  --c-preserve pure_call_after_register_write \
+  --c-preserve terminal_fixed_bytes_match --c-preserve fixed_bytes_differ \
   --c-preserve catch_byte \
   "$TEST_DIR/model.sail_project"
 
@@ -156,6 +163,19 @@ if grep -Eq 'struct widened_record_fields (tmp_|result_|[A-Za-z0-9_]+;)' \
   exit 1
 fi
 grep -Fq 'uint8_t canonical_slice_len(TestBytes value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
+if grep -Eq 'struct startup_pair (tmp_|result_)' "$SPEC_SOURCE/entry.c"; then
+  echo 'optimized extraction retained an aggregate temporary for a register initializer' >&2
+  exit 1
+fi
+grep -Fq 'startup_public_pair.first = UINT8_C(0);' "$SPEC_SOURCE/entry.c"
+grep -Fq 'startup_public_pair.second = UINT8_C(0);' "$SPEC_SOURCE/entry.c"
+sed -n '/^uint64_t terminal_proven_narrow_sum(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/terminal_proven_narrow_sum.c"
+grep -Fq 'return UINT64_C(4294967296);' "$TMP_DIR/terminal_proven_narrow_sum.c"
+if grep -Eq 'uint64_t (tmp_|result_)' "$TMP_DIR/terminal_proven_narrow_sum.c"; then
+  echo 'optimized extraction retained a terminal result around a proven inner narrowing' >&2
+  exit 1
+fi
 grep -Fq 'uint8_t canonical_list_count(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'TestList canonical_list_identity(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'uint8_t canonical_list_count_after_identity(TestList value);' "$SPEC_INCLUDE/evmsail/spec/base.h"
@@ -223,8 +243,26 @@ sed -n '/^uint8_t one_use_guard_in_reversed_composed_condition(/,/^}/p' \
 grep -Eq 'if \(fallback \|\| .*value != UINT8_C\(0\).*\)' \
   "$TMP_DIR/one_use_guard_in_reversed_composed_condition.c"
 if grep -Eq 'bool [A-Za-z0-9_]+ = .*value != UINT8_C\(0\)' \
-  "$TMP_DIR/one_use_guard_in_reversed_composed_condition.c"; then
+    "$TMP_DIR/one_use_guard_in_reversed_composed_condition.c"; then
   echo 'optimized extraction retained a one-use boolean inside a reversed composed guard' >&2
+  exit 1
+fi
+sed -n '/^uint8_t nested_pair_join(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/nested_pair_join.c"
+grep -Eq 'selected(_[0-9]+)* = make_public_pair\(left\);' \
+  "$TMP_DIR/nested_pair_join.c"
+grep -Eq 'selected(_[0-9]+)* = make_public_pair\(right\);' \
+  "$TMP_DIR/nested_pair_join.c"
+if grep -Eq 'struct pair (tmp_|result_)' "$TMP_DIR/nested_pair_join.c"; then
+  echo 'optimized extraction retained a private structured-join aggregate temporary' >&2
+  exit 1
+fi
+sed -n '/^void initialize_public_pair(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/initialize_public_pair.c"
+grep -Eq 'public_pair = \(\(struct pair\)\{\.first = value, \.second = value\}\);' \
+  "$TMP_DIR/initialize_public_pair.c"
+if grep -Eq 'struct pair (tmp_|result_)' "$TMP_DIR/initialize_public_pair.c"; then
+  echo 'optimized extraction retained a private record temporary before a register assignment' >&2
   exit 1
 fi
 if grep -Fq 'struct canonical_slice' "$SPEC_INCLUDE/evmsail/spec/base.h"; then
@@ -233,6 +271,12 @@ if grep -Fq 'struct canonical_slice' "$SPEC_INCLUDE/evmsail/spec/base.h"; then
 fi
 if grep -Fq 'struct canonical_list' "$SPEC_INCLUDE/evmsail/spec/base.h"; then
   echo 'optimized extraction emitted a managed nominal definition for an external representation' >&2
+  exit 1
+fi
+grep -Eq '^  EMPTY_BYTE_SLICE\.bytes = ' "$SPEC_SOURCE/base.c"
+grep -Eq '^  EMPTY_BYTE_SLICE\.len = UINT8_C\(0\);$' "$SPEC_SOURCE/base.c"
+if grep -Eq 'EMPTY_BYTE_SLICE = (tmp_|result_)' "$SPEC_SOURCE/base.c"; then
+  echo 'optimized extraction retained a private record temporary before a top-level let assignment' >&2
   exit 1
 fi
 if grep -Fq 'bool eq_anything(' "$SPEC_INCLUDE/evmsail/spec/base.h"; then
@@ -255,8 +299,7 @@ grep -Fq 'UINT16_C(256), UINT16_C(16), UINT16_C(15)' "$SPEC_SOURCE/base.c"
 grep -Fq 'UINT16_C(3), UINT16_C(2),' "$SPEC_SOURCE/base.c"
 grep -Fq 'UINT16_C(1)' "$SPEC_SOURCE/base.c"
 grep -Fq 'extern const bytes4 TEST_FIXED_BYTES_ZERO;' "$SPEC_INCLUDE/evmsail/spec/base.h"
-grep -Fq 'const bytes4 TEST_FIXED_BYTES_ZERO = {' "$SPEC_SOURCE/base.c"
-grep -Fq '.bytes = {' "$SPEC_SOURCE/base.c"
+grep -Fq 'const bytes4 TEST_FIXED_BYTES_ZERO = ((bytes4){0});' "$SPEC_SOURCE/base.c"
 grep -Fq 'extern const bytes4 TEST_FIXED_BYTES_ONE;' "$SPEC_INCLUDE/evmsail/spec/base.h"
 grep -Fq 'const bytes4 TEST_FIXED_BYTES_ONE = {' "$SPEC_SOURCE/base.c"
 grep -Fq 'INT64_C(1), INT64_C(0), INT64_C(0), INT64_C(0)' "$SPEC_SOURCE/base.c"
@@ -273,9 +316,9 @@ if grep -Eq 'internal_vector_(init|update)_vector_4_bits_8' "$SPEC_SOURCE/base.c
   exit 1
 fi
 if ! grep -Fq \
-    'TEST_FIXED_BIT_BYTES_PATH_ZERO = ((struct fixed_bit_bytes_path){.data = ((bytes4){0}), .len = UINT8_C(0)});' \
+    'TEST_FIXED_BIT_BYTES_PATH_ZERO = ((struct fixed_bit_bytes_path){.data = ((fixed_bytes_u64_lanes_4){0}), .len = UINT8_C(0)});' \
     "$SPEC_SOURCE/base.c"; then
-  echo 'optimized extraction retained aggregate temporaries in a fixed-byte zero static let' >&2
+  echo 'optimized extraction retained aggregate temporaries or crossed fixed-byte representations in a zero static let' >&2
   exit 1
 fi
 if grep -Fq 'test_word_to_four(' "$SPEC_SOURCE/base.c"; then
@@ -324,7 +367,7 @@ fi
 sed -n \
   '/^uint8_t count_four(/,/^}/p' \
   "$SPEC_SOURCE/base.c" > "$TMP_DIR/count_four.c"
-grep -Eq 'while \(_?index <= [A-Za-z0-9_]+\)' "$TMP_DIR/count_four.c"
+grep -Eq 'while \(_?index <= ' "$TMP_DIR/count_four.c"
 if grep -Eq 'goto |for_start_[0-9]+:|for_end_[0-9]+:' "$TMP_DIR/count_four.c"; then
   echo 'optimized extraction retained JIB foreach labels or back edge' >&2
   exit 1
@@ -353,7 +396,11 @@ awk '
   printing { print }
   printing && /^}/ { printing = 0 }
 ' "$SPEC_SOURCE/base.c" > "$TMP_DIR/added_is_nonzero.c"
-grep -Eq 'uint16_t [A-Za-z0-9_]+ = add_byte\(left, right\);' "$TMP_DIR/added_is_nonzero.c"
+grep -Fq 'return (bool)((add_byte(left, right)) != UINT8_C(0));' "$TMP_DIR/added_is_nonzero.c"
+if grep -Eq '(tmp_|result_)[A-Za-z0-9_]*' "$TMP_DIR/added_is_nonzero.c"; then
+  echo 'optimized extraction retained a one-use pure call result before a comparison' >&2
+  exit 1
+fi
 awk '
   /^uint8_t boolean_cleanup\(/ { printing = 1 }
   printing { print }
@@ -512,15 +559,24 @@ if grep -Eq 'uint32_t (tmp_|result_)' "$TMP_DIR/widened_result_or_fatal.c"; then
   echo 'optimized extraction retained a widened mutable join beside a noreturn arm' >&2
   exit 1
 fi
+sed -n \
+  '/^uint32_t widened_branch_join(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/widened_branch_join.c"
+grep -Eq 'uint32_t selected = flag \? \(uint32_t\)left : \(uint32_t\)right;' \
+  "$TMP_DIR/widened_branch_join.c"
+grep -Fq 'public_counter = selected;' "$TMP_DIR/widened_branch_join.c"
+if grep -Eq 'uint(8|32)_t (tmp_|result_)' "$TMP_DIR/widened_branch_join.c"; then
+  echo 'optimized extraction retained a mismatched-type structured-join temporary' >&2
+  exit 1
+fi
 for signed_case in \
   'int8_t terminal_signed_byte_or_fatal' \
   'int16_t terminal_signed_halfword_or_fatal' \
   'int32_t terminal_signed_word_or_fatal' \
   'int64_t terminal_signed_doubleword_or_fatal'
 do
-  set -- $signed_case
-  result_type=$1
-  function_name=$2
+  result_type=${signed_case%% *}
+  function_name=${signed_case#* }
   sed -n "/^$result_type $function_name(/,/^}/p" \
     "$SPEC_SOURCE/machine.c" > "$TMP_DIR/$function_name.c"
   grep -Fq -- "-INT64_C(1)" "$TMP_DIR/$function_name.c"
@@ -565,6 +621,73 @@ if grep -Fq 'if (choice.kind' "$TMP_DIR/terminal_unit_variant_match.c"; then
   exit 1
 fi
 sed -n \
+  '/^struct erased_unit_choice terminal_variant_after_write(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/terminal_variant_after_write.c"
+grep -Fq 'return EmptyChoice(UNIT);' "$TMP_DIR/terminal_variant_after_write.c"
+grep -Fq 'return OtherEmptyChoice(UNIT);' "$TMP_DIR/terminal_variant_after_write.c"
+if grep -Eq '(EmptyChoice|OtherEmptyChoice)_result_|struct erased_unit_choice [A-Za-z0-9_]+;' \
+    "$TMP_DIR/terminal_variant_after_write.c"; then
+  echo 'terminal variant constructor retained a one-use result carrier across a state write' >&2
+  exit 1
+fi
+sed -n \
+  '/^struct pair call_result_in_struct(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/call_result_in_struct.c"
+grep -Fq '.first = (pair_field_value(value))' "$TMP_DIR/call_result_in_struct.c"
+if grep -Eq 'pair_field_value_result_|uint8_t [A-Za-z0-9_]*result[A-Za-z0-9_]*;' \
+    "$TMP_DIR/call_result_in_struct.c"; then
+  echo 'single-use stack call retained a result carrier before an aggregate assignment' >&2
+  exit 1
+fi
+sed -n \
+  '/^uint8_t call_result_as_argument(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/call_result_as_argument.c"
+grep -Fq 'return consume_field_value((pair_field_value(value)));' \
+  "$TMP_DIR/call_result_as_argument.c"
+if grep -Eq 'pair_field_value_result_|uint8_t [A-Za-z0-9_]*result[A-Za-z0-9_]*;' \
+    "$TMP_DIR/call_result_as_argument.c"; then
+  echo 'single-use unary call argument retained a result carrier' >&2
+  exit 1
+fi
+sed -n \
+  '/^uint16_t call_result_as_later_argument(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/call_result_as_later_argument.c"
+grep -Fq 'return consume_second_field_value(value, (pair_field_value(value)));' \
+  "$TMP_DIR/call_result_as_later_argument.c"
+if grep -Eq 'pair_field_value_result_|uint(8|16)_t [A-Za-z0-9_]*result[A-Za-z0-9_]*;' \
+    "$TMP_DIR/call_result_as_later_argument.c"; then
+  echo 'single-use multi-argument call retained a result carrier' >&2
+  exit 1
+fi
+sed -n \
+  '/^uint16_t call_result_through_expression(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/call_result_through_expression.c"
+grep -Fq 'pair_field_value(value)' "$TMP_DIR/call_result_through_expression.c"
+if grep -Eq 'pair_field_value_result_|uint8_t [A-Za-z0-9_]*result[A-Za-z0-9_]*;' \
+    "$TMP_DIR/call_result_through_expression.c"; then
+  echo 'single-use call retained a result carrier before a pure argument expression' >&2
+  exit 1
+fi
+sed -n \
+  '/^uint16_t pure_extern_result_through_expression(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/pure_extern_result_through_expression.c"
+grep -Fq 'host_pure_byte_exact(value)' "$TMP_DIR/pure_extern_result_through_expression.c"
+if grep -Eq 'host_pure_byte_exact_result_|uint8_t [A-Za-z0-9_]*result[A-Za-z0-9_]*;' \
+    "$TMP_DIR/pure_extern_result_through_expression.c"; then
+  echo 'single-use pure extern retained a result carrier before a pure argument expression' >&2
+  exit 1
+fi
+sed -n \
+  '/^uint8_t pure_call_after_register_write(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/pure_call_after_register_write.c"
+grep -Eq 'public_counter = UINT(32|64)_C\(0\);' "$TMP_DIR/pure_call_after_register_write.c"
+grep -Fq 'return pair_field_value(value);' "$TMP_DIR/pure_call_after_register_write.c"
+if grep -Eq 'pair_field_value_result_|uint8_t [A-Za-z0-9_]*selected[A-Za-z0-9_]*;' \
+    "$TMP_DIR/pure_call_after_register_write.c"; then
+  echo 'single-use pure call retained a result carrier across a register write' >&2
+  exit 1
+fi
+sed -n \
   '/^uint8_t terminal_assertion(/,/^}/p' \
   "$SPEC_SOURCE/machine.c" > "$TMP_DIR/terminal_assertion.c"
 grep -Fq '__builtin_trap();' "$TMP_DIR/terminal_assertion.c"
@@ -579,6 +702,25 @@ test "$(grep -Fc 'return UINT8_C(' "$TMP_DIR/terminal_fixed_bytes_match.c")" -eq
 test "$(grep -Fc 'eq_bytes4(bytes,' "$TMP_DIR/terminal_fixed_bytes_match.c")" -eq 2
 if grep -Eq 'goto |finish_match_|tmp_|result_' "$TMP_DIR/terminal_fixed_bytes_match.c"; then
   echo 'optimized extraction retained a mutable join or labels for a guarded fixed-byte match' >&2
+  exit 1
+fi
+sed -n \
+  '/^bool fixed_bytes_differ(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/fixed_bytes_differ.c"
+grep -Fq 'return (bool)(!eq_bytes4(left, right));' "$TMP_DIR/fixed_bytes_differ.c"
+if grep -Eq 'eq_anything_result_|bool [A-Za-z0-9_]*result[A-Za-z0-9_]*;' \
+    "$TMP_DIR/fixed_bytes_differ.c"; then
+  echo 'optimized extraction retained a pure runtime equality result carrier' >&2
+  exit 1
+fi
+sed -n \
+  '/^uint8_t machine_pick_zero(/,/^}/p' \
+  "$SPEC_SOURCE/machine.c" > "$TMP_DIR/machine_pick_zero.c"
+grep -Fq 'return fast_unsigned_vector_access_bytes4(((bytes4){0}), index);' \
+  "$TMP_DIR/machine_pick_zero.c"
+if grep -Eq 'plain_vector_access_result_|uint64_t [A-Za-z0-9_]*result[A-Za-z0-9_]*;' \
+    "$TMP_DIR/machine_pick_zero.c"; then
+  echo 'optimized extraction retained a pure runtime vector-access result carrier' >&2
   exit 1
 fi
 awk '
@@ -833,8 +975,8 @@ awk '
   printing { print }
   printing && /^}/ { printing = 0 }
 ' "$SPEC_SOURCE/base.c" > "$TMP_DIR/nested_wide_identity.c"
-grep -Fq '= wide_identity(value);' "$TMP_DIR/nested_wide_identity.c"
-grep -Eq 'return (as_)?u256(_u256_to_u256)?\(' "$TMP_DIR/nested_wide_identity.c"
+grep -Eq 'return (as_)?u256(_u256_to_u256)?\(\(wide_identity\(value\)\)\);' \
+  "$TMP_DIR/nested_wide_identity.c"
 if grep -Eq '^[[:space:]]+u256 [[:alnum:]_]+;$|^[[:space:]]+\{$' "$TMP_DIR/nested_wide_identity.c"; then
   echo 'optimized extraction retained split declaration/call assignment or nested copy scope' >&2
   exit 1
@@ -1060,7 +1202,7 @@ grep -Eq 'return [A-Za-z0-9_]+\.second;' "$TMP_DIR/save_pair_then_read.c"
 sed -n \
   '/^bool initialized_comparison_return(/,/^}/p' \
   "$SPEC_SOURCE/machine.c" > "$TMP_DIR/initialized_comparison_return.c"
-grep -Fq 'return (bool)(snapshot.first >= UINT8_C(1));' \
+grep -Fq 'return (bool)(public_pair.first >= UINT8_C(1));' \
   "$TMP_DIR/initialized_comparison_return.c"
 if grep -Eq 'bool [A-Za-z0-9_]+ = .*;' "$TMP_DIR/initialized_comparison_return.c"; then
   echo 'optimized extraction retained an initialized scalar used only by the immediate return' >&2
@@ -1069,7 +1211,7 @@ fi
 sed -n \
   '/^bool specialized_comparison(void)/,/^}/p' \
   "$SPEC_SOURCE/machine.c" > "$TMP_DIR/specialized_comparison.c"
-grep -Fq 'return (bool)(snapshot.first >= UINT8_C(1));' \
+grep -Fq 'return (bool)(public_pair.first >= UINT8_C(1));' \
   "$TMP_DIR/specialized_comparison.c"
 if grep -Eq 'bool [A-Za-z0-9_]+ = .*;' "$TMP_DIR/specialized_comparison.c"; then
   echo 'optimized extraction retained a specialized scalar used only by the immediate return' >&2
@@ -1078,7 +1220,7 @@ fi
 sed -n \
   '/^bool specialized_enum_comparison(/,/^}/p' \
   "$SPEC_SOURCE/machine.c" > "$TMP_DIR/specialized_enum_comparison.c"
-grep -Fq 'return (bool)(execution_profile.protocol.fork >= TestAfter);' \
+grep -Fq 'return (bool)(public_execution_profile.protocol.fork >= TestAfter);' \
   "$TMP_DIR/specialized_enum_comparison.c"
 if grep -Eq 'bool [A-Za-z0-9_]+ = .*;' "$TMP_DIR/specialized_enum_comparison.c"; then
   echo 'optimized extraction retained a specialized enum comparison temporary' >&2
@@ -1143,8 +1285,10 @@ fi
 # every generated translation unit.
 grep -Fq 'internal_vector_init_vector_17_uint_16' "$SPEC_SOURCE/base.c"
 grep -Fq 'internal_vector_update_vector_17_uint_16' "$SPEC_SOURCE/base.c"
-grep -Fq 'internal_vector_init_vector_4_uint_8' "$SPEC_SOURCE/machine.c"
-grep -Fq 'internal_vector_update_vector_4_uint_8' "$SPEC_SOURCE/machine.c"
+if grep -Eq 'internal_vector_(init|update)_vector_4_uint_8' "$SPEC_SOURCE/machine.c"; then
+  echo 'optimized extraction expanded a fixed-width zero constant through generic vector helpers' >&2
+  exit 1
+fi
 grep -Fq 'EQUAL(vector_17_uint_16)' "$SPEC_INCLUDE/evmsail/spec/support.h"
 for module in base host_contracts machine entry; do
   if test "$(grep -Fc '#include "evmsail/spec/support.h"' "$SPEC_SOURCE/$module.c")" -ne 1; then

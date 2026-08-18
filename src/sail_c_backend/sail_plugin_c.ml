@@ -744,14 +744,16 @@ let collect_c_name_info ast (mode : c_backend_mode) =
                       let length = Big_int.to_int length in
                       ( match c_name with
                       | Some name -> (
-                          match List.assoc_opt length !c_repr_fixed_bytes_names with
+                          let key = (byte_repr, length) in
+                          match List.assoc_opt key !c_repr_fixed_bytes_names with
                           | Some existing when existing <> name ->
                               c_repr_error attr_loc
-                                (Printf.sprintf "byte width %d already has explicit C name %s (cannot also name it %s)"
-                                   length existing name
+                                (Printf.sprintf
+                                   "%s byte width %d already has explicit C name %s (cannot also name it %s)"
+                                   byte_repr length existing name
                                 )
                           | Some _ -> ()
-                          | None -> c_repr_fixed_bytes_names := (length, name) :: !c_repr_fixed_bytes_names
+                          | None -> c_repr_fixed_bytes_names := (key, name) :: !c_repr_fixed_bytes_names
                         )
                       | None -> ()
                       );
@@ -824,7 +826,7 @@ let collect_c_name_info ast (mode : c_backend_mode) =
     !c_repr_fixed_bytes,
     !c_repr_fixed_bytes_u64_lanes,
     List.sort_uniq Int.compare !c_repr_fixed_bytes_u64_lane_alias_lengths,
-    List.sort (fun (left, _) (right, _) -> Int.compare left right) !c_repr_fixed_bytes_names,
+    List.sort (fun (left, _) (right, _) -> compare left right) !c_repr_fixed_bytes_names,
     !c_repr_external_names
   )
 
